@@ -276,4 +276,52 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
+
+    #[test]
+    fn malformed_metadata_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let atc_dir = temp.path().join(".atc");
+        fs::create_dir(&atc_dir).unwrap();
+
+        fs::write(atc_dir.join("contest.toml"), "version = ???").unwrap();
+
+        let error = load_metadata(temp.path()).expect_err("malformed metadata should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn missing_required_metadata_field_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let atc_dir = temp.path().join(".atc");
+        fs::create_dir(&atc_dir).unwrap();
+
+        fs::write(atc_dir.join("contest.toml"), "version = 1\nproblems = []\n").unwrap();
+
+        let error = load_metadata(temp.path()).expect_err("missing required field should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unknown_metadata_field_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let atc_dir = temp.path().join(".atc");
+        fs::create_dir(&atc_dir).unwrap();
+
+        fs::write(
+            atc_dir.join("contest.toml"),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "problems = []\n",
+                "unexpected = true\n",
+            ),
+        )
+        .unwrap();
+
+        let error = load_metadata(temp.path()).expect_err("unknown field should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }
