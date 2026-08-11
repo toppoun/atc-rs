@@ -30,6 +30,7 @@ fn run() -> Result<(), AppError> {
         cli::Command::New { contest } => {
             commands::new(&contest, &mut reporter)?;
         }
+        cli::Command::Refresh { contest } => commands::refresh(contest, &mut reporter)?,
         cli::Command::Run { problem } => {
             println!("run problem: {problem}");
         }

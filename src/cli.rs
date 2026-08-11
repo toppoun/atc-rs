@@ -10,7 +10,15 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    New { contest: String },
-    Run { problem: String },
+    New {
+        contest: String,
+    },
+    Refresh {
+        #[arg(short, long)]
+        contest: Option<String>,
+    },
+    Run {
+        problem: String,
+    },
     Login,
 }

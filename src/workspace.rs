@@ -38,8 +38,6 @@ pub fn save_metadata(destination: &Path, contest: &Contest) -> io::Result<()> {
     Ok(())
 }
 
-// Local-only commands will use this once they are implemented.
-#[allow(dead_code)]
 pub fn load_metadata(destination: &Path) -> io::Result<Contest> {
     let path = destination.join(".atc").join("contest.toml");
 
@@ -123,6 +121,34 @@ fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
         io::ErrorKind::InvalidInput,
         format!("invalid {kind} for a file name: {value:?}"),
     ))
+}
+
+pub fn validate_refresh_destination(cwd: &Path, contest_id: &str) -> std::io::Result<()> {
+    let directory_name = cwd.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current directory has no directory name",
+        )
+    })?;
+
+    if directory_name != std::ffi::OsStr::new(contest_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("current directory is not {contest_id}: {}", cwd.display()),
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn clear_tests(destination: &Path) -> io::Result<()> {
+    let tests_dir = destination.join("tests");
+
+    if tests_dir.try_exists()? {
+        fs::remove_dir_all(tests_dir)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

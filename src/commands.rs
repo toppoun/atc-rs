@@ -1,7 +1,9 @@
 use crate::atcoder;
 use crate::error::AppError;
+use crate::model::{Contest, Sample};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
+use crate::workspace::validate_refresh_destination;
 use std::path::Path;
 
 const TEMPLATE: &str = r#"#include <bits/stdc++.h>
@@ -60,44 +62,7 @@ fn new_at(
         return Ok(());
     }
 
-    reporter.report(Event::ContestFetching { contest_id });
-
-    let contest = atcoder.fetch_contest(contest_id)?;
-
-    reporter.report(Event::ContestFetched {
-        contest_id: &contest.contest_id,
-        problems: contest.problems.len(),
-    });
-
-    let total = contest.problems.len();
-    let mut samples_by_problem = Vec::with_capacity(total);
-
-    for (i, problem) in contest.problems.iter().enumerate() {
-        reporter.report(Event::ProblemFetching {
-            index: &problem.index,
-            current: i + 1,
-            total,
-        });
-        match atcoder.fetch_samples(problem) {
-            Ok(samples) => {
-                reporter.report(Event::ProblemFetched {
-                    index: &problem.index,
-                    samples: samples.len(),
-                });
-                samples_by_problem.push(Some(samples));
-            }
-
-            Err(err) => {
-                let message = err.to_string();
-
-                reporter.report(Event::ProblemFetchFailed {
-                    index: &problem.index,
-                    error: &message,
-                });
-                samples_by_problem.push(None);
-            }
-        }
-    }
+    let (contest, samples_by_problem) = fetch_contest_data(contest_id, atcoder, reporter)?;
 
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -152,6 +117,85 @@ fn existing_contest_is_noop(destination: &Path) -> std::io::Result<bool> {
             destination.display()
         ),
     ))
+}
+
+fn fetch_contest_data(
+    contest_id: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+) -> Result<(Contest, Vec<Option<Vec<Sample>>>), AppError> {
+    reporter.report(Event::ContestFetching { contest_id });
+
+    let contest = atcoder.fetch_contest(contest_id)?;
+
+    reporter.report(Event::ContestFetched {
+        contest_id: &contest.contest_id,
+        problems: contest.problems.len(),
+    });
+
+    let total = contest.problems.len();
+    let mut samples_by_problem = Vec::with_capacity(total);
+
+    for (i, problem) in contest.problems.iter().enumerate() {
+        reporter.report(Event::ProblemFetching {
+            index: &problem.index,
+            current: i + 1,
+            total,
+        });
+        match atcoder.fetch_samples(problem) {
+            Ok(samples) => {
+                reporter.report(Event::ProblemFetched {
+                    index: &problem.index,
+                    samples: samples.len(),
+                });
+                samples_by_problem.push(Some(samples));
+            }
+
+            Err(err) => {
+                let message = err.to_string();
+
+                reporter.report(Event::ProblemFetchFailed {
+                    index: &problem.index,
+                    error: &message,
+                });
+                samples_by_problem.push(None);
+            }
+        }
+    }
+    Ok((contest, samples_by_problem))
+}
+
+// ----- Refresh -----
+pub fn refresh(contest: Option<String>, reporter: &mut dyn Reporter) -> Result<(), AppError> {
+    let cwd = std::env::current_dir()?;
+
+    let contest_id = match contest {
+        Some(contest_id) => {
+            validate_refresh_destination(&cwd, &contest_id)?;
+            contest_id
+        }
+        None => workspace::load_metadata(&cwd)?.contest_id,
+    };
+
+    let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
+        atcoder::AtCoderClient::fixture(path)
+    } else {
+        atcoder::AtCoderClient::new()?
+    };
+
+    let (contest, samples_by_problem) = fetch_contest_data(&contest_id, &atcoder, reporter)?;
+
+    workspace::clear_tests(&cwd)?;
+
+    for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
+        if let Some(samples) = samples {
+            workspace::save_samples(&cwd, problem, &samples)?;
+        }
+    }
+
+    workspace::save_metadata(&cwd, &contest)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
