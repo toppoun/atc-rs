@@ -22,3 +22,22 @@ pub enum Command {
     },
     Login,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_refresh_with_and_without_contest_override() {
+        let cli =
+            Cli::try_parse_from(["atc", "refresh"]).expect("refresh without override should parse");
+        assert!(matches!(cli.command, Command::Refresh { contest: None }));
+
+        let cli = Cli::try_parse_from(["atc", "refresh", "-c", "abc466"])
+            .expect("refresh with override should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Refresh { contest: Some(contest) } if contest == "abc466"
+        ));
+    }
+}

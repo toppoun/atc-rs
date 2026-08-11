@@ -24,6 +24,9 @@ pub enum Event<'a> {
     WorkspaceCreated {
         destination: &'a Path,
     },
+    WorkspaceRefreshed {
+        destination: &'a Path,
+    },
 }
 
 pub trait Reporter {
@@ -64,6 +67,10 @@ impl Reporter for TerminalReporter {
 
             Event::WorkspaceCreated { destination } => {
                 eprintln!("Created {}", destination.display());
+            }
+
+            Event::WorkspaceRefreshed { destination } => {
+                eprintln!("Refreshed {}", destination.display());
             }
         }
     }
