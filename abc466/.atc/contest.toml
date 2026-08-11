@@ -1,0 +1,44 @@
+version = 1
+contest_id = "abc466"
+
+[[problems]]
+index = "A"
+title = "Compromise"
+task_id = "abc466_a"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_a"
+
+[[problems]]
+index = "B"
+title = "Representative Balls"
+task_id = "abc466_b"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_b"
+
+[[problems]]
+index = "C"
+title = "Count Close Pairs"
+task_id = "abc466_c"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_c"
+
+[[problems]]
+index = "D"
+title = "Placing Rooks"
+task_id = "abc466_d"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_d"
+
+[[problems]]
+index = "E"
+title = "Range Flip"
+task_id = "abc466_e"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_e"
+
+[[problems]]
+index = "F"
+title = "Many Mod Calculation"
+task_id = "abc466_f"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_f"
+
+[[problems]]
+index = "G"
+title = "Segment Sum Constraints"
+task_id = "abc466_g"
+url = "https://atcoder.jp/contests/abc466/tasks/abc466_g"

@@ -1,5 +1,6 @@
 use crate::atcoder;
 use crate::error::AppError;
+use crate::ui::{Event, Reporter};
 use crate::workspace;
 use std::path::Path;
 
@@ -32,7 +33,7 @@ int main() {
 }
 "#;
 
-pub fn new(contest_id: &str) -> Result<(), AppError> {
+pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     let destination = workspace::contest_path(&cwd, contest_id)?;
 
@@ -46,30 +47,53 @@ pub fn new(contest_id: &str) -> Result<(), AppError> {
         atcoder::AtCoderClient::new()?
     };
 
-    new_at(&destination, contest_id, &atcoder)
+    new_at(&destination, contest_id, &atcoder, reporter)
 }
 
 fn new_at(
     destination: &Path,
     contest_id: &str,
     atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     if existing_contest_is_noop(destination)? {
         return Ok(());
     }
 
-    let contest = atcoder.fetch_contest(contest_id)?;
-    let mut samples_by_problem = Vec::with_capacity(contest.problems.len());
+    reporter.report(Event::ContestFetching { contest_id });
 
-    for problem in &contest.problems {
+    let contest = atcoder.fetch_contest(contest_id)?;
+
+    reporter.report(Event::ContestFetched {
+        contest_id: &contest.contest_id,
+        problems: contest.problems.len(),
+    });
+
+    let total = contest.problems.len();
+    let mut samples_by_problem = Vec::with_capacity(total);
+
+    for (i, problem) in contest.problems.iter().enumerate() {
+        reporter.report(Event::ProblemFetching {
+            index: &problem.index,
+            current: i + 1,
+            total,
+        });
         match atcoder.fetch_samples(problem) {
-            Ok(samples) => samples_by_problem.push(Some(samples)),
+            Ok(samples) => {
+                reporter.report(Event::ProblemFetched {
+                    index: &problem.index,
+                    samples: samples.len(),
+                });
+                samples_by_problem.push(Some(samples));
+            }
 
             Err(err) => {
-                eprintln!(
-                    "[WARN] failed to fetch samples for {}: {err}",
-                    problem.index
-                );
+                let message = err.to_string();
+
+                reporter.report(Event::ProblemFetchFailed {
+                    index: &problem.index,
+                    error: &message,
+                });
                 samples_by_problem.push(None);
             }
         }
@@ -104,6 +128,7 @@ fn new_at(
     match std::fs::rename(staging.path(), destination) {
         Ok(()) => {
             drop(staging.keep());
+            reporter.report(Event::WorkspaceCreated { destination });
             Ok(())
         }
         Err(_) if destination.is_dir() => Ok(()),
@@ -135,17 +160,21 @@ mod tests {
     use crate::workspace;
     use std::path::PathBuf;
 
+    use crate::ui::NullReporter;
+
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
     }
 
     #[test]
     fn new_flow_runs_entirely_from_fixtures() {
+        let mut reporter = NullReporter;
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let destination = temp.path().join("abc466");
         let client = atcoder::AtCoderClient::fixture(fixture_root());
 
-        new_at(&destination, "abc466", &client).expect("fixture new flow should succeed");
+        new_at(&destination, "abc466", &client, &mut reporter)
+            .expect("fixture new flow should succeed");
 
         let contest =
             workspace::load_metadata(&destination).expect("created metadata should be readable");
@@ -167,6 +196,7 @@ mod tests {
 
     #[test]
     fn existing_contest_is_a_noop_before_fixture_access() {
+        let mut reporter = NullReporter;
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let destination = temp.path().join("abc466");
         std::fs::create_dir(&destination).expect("contest directory should be created");
@@ -174,7 +204,8 @@ mod tests {
             .expect("existing source should be written");
         let client = atcoder::AtCoderClient::fixture(temp.path().join("missing-fixtures"));
 
-        new_at(&destination, "abc466", &client).expect("existing contest should be a no-op");
+        new_at(&destination, "abc466", &client, &mut reporter)
+            .expect("existing contest should be a no-op");
 
         assert_eq!(
             std::fs::read_to_string(destination.join("A.cpp"))
@@ -185,6 +216,7 @@ mod tests {
 
     #[test]
     fn failed_workspace_build_does_not_leave_partial_contest() {
+        let mut reporter = NullReporter;
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let fixture_root = temp.path().join("fixtures");
         let contests = fixture_root.join("contests");
@@ -200,8 +232,8 @@ mod tests {
         let destination = temp.path().join("broken");
         let client = atcoder::AtCoderClient::fixture(&fixture_root);
 
-        let error =
-            new_at(&destination, "broken", &client).expect_err("unsafe workspace path should fail");
+        let error = new_at(&destination, "broken", &client, &mut reporter)
+            .expect_err("unsafe workspace path should fail");
 
         assert!(matches!(
             error,
