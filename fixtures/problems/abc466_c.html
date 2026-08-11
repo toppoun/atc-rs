@@ -9,7 +9,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-	<title>A - Compromise </title>
+	<title>C - Count Close Pairs </title>
 	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 	<meta http-equiv="Content-Language" content="en">
 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -37,15 +37,15 @@
 
 	<meta property="og:site_name" content="AtCoder">
 	
-	<meta property="og:title" content="A - Compromise " />
+	<meta property="og:title" content="C - Count Close Pairs " />
 	<meta property="og:description" content="AtCoder is a programming contest site for anyone from beginners to experts. We hold weekly programming contests online." />
 	<meta property="og:type" content="website" />
-	<meta property="og:url" content="https://atcoder.jp/contests/abc466/tasks/abc466_a" />
+	<meta property="og:url" content="https://atcoder.jp/contests/abc466/tasks/abc466_c" />
 	<meta property="og:image" content="https://img.atcoder.jp/assets/atcoder.png" />
 	<meta name="twitter:card" content="summary" />
 	<meta name="twitter:site" content="@atcoder" />
 	
-	<meta property="twitter:title" content="A - Compromise " />
+	<meta property="twitter:title" content="C - Count Close Pairs " />
 
 	<link href="//fonts.googleapis.com/css?family=Lato:400,700" rel="stylesheet" type="text/css">
 	<link rel="stylesheet" type="text/css" href="//img.atcoder.jp/public/cd2aee3/css/bootstrap.min.css">
@@ -60,7 +60,7 @@
 	<script>
 		var LANG = "en";
 		var userScreenName = "";
-		var csrfToken = "gY158xNqtPWSdBG6VPro3tycfttAH3LlMe+lFO/9/IM="
+		var csrfToken = "SW10UTxyRKfvpC2BiQgNCo19b5+TZJHAq9CqSr9w1ss="
 	</script>
 	<script src="//img.atcoder.jp/public/cd2aee3/js/utils.js"></script>
 	
@@ -179,22 +179,22 @@
 							<img src='//img.atcoder.jp/assets/top/img/flag-lang/en.png'> English <span class="caret"></span>
 						</a>
 						<ul class="dropdown-menu">
-							<li><a href="/contests/abc466/tasks/abc466_a?lang=ja"><img src='//img.atcoder.jp/assets/top/img/flag-lang/ja.png'> 日本語</a></li>
-							<li><a href="/contests/abc466/tasks/abc466_a?lang=en"><img src='//img.atcoder.jp/assets/top/img/flag-lang/en.png'> English</a></li>
+							<li><a href="/contests/abc466/tasks/abc466_c?lang=ja"><img src='//img.atcoder.jp/assets/top/img/flag-lang/ja.png'> 日本語</a></li>
+							<li><a href="/contests/abc466/tasks/abc466_c?lang=en"><img src='//img.atcoder.jp/assets/top/img/flag-lang/en.png'> English</a></li>
 						</ul>
 					</li>
 					
 					
-						<li><a href="/register?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_a">Sign Up</a></li>
-						<li><a href="/login?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_a">Sign In</a></li>
+						<li><a href="/register?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_c">Sign Up</a></li>
+						<li><a href="/login?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_c">Sign In</a></li>
 					
 				</ul>
 			</div>
 		</div>
 	</nav>
 
-	<form method="POST" name="form_logout" action="/logout?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_a">
-		<input type="hidden" name="csrf_token" value="gY158xNqtPWSdBG6VPro3tycfttAH3LlMe&#43;lFO/9/IM=" />
+	<form method="POST" name="form_logout" action="/logout?continue=https%3A%2F%2Fatcoder.jp%2Fcontests%2Fabc466%2Ftasks%2Fabc466_c">
+		<input type="hidden" name="csrf_token" value="SW10UTxyRKfvpC2BiQgNCo19b5&#43;TZJHAq9CqSr9w1ss=" />
 	</form>
 	<div id="main-container" class="container"
 		 	style="padding-top:50px;">
@@ -264,8 +264,8 @@
 </div>
 	<div class="col-sm-12">
 		<span class="h2">
-			A - Compromise 
-			<a class="btn btn-default btn-sm" href="/contests/abc466/tasks/abc466_a/editorial">Editorial</a>
+			C - Count Close Pairs 
+			<a class="btn btn-default btn-sm" href="/contests/abc466/tasks/abc466_c/editorial">Editorial</a>
 		</span>
 		<span id="task-lang-btn" class="pull-right"><span data-lang="ja"><img src='//img.atcoder.jp/assets/top/img/flag-lang/ja.png'></span> / <span data-lang="en"><img src='//img.atcoder.jp/assets/top/img/flag-lang/en.png'></span></span>
 		<script>
@@ -328,177 +328,258 @@
 			
 			<span class="lang">
 <span class="lang-ja">
-<p>配点 : <var>100</var> 点</p>
+<p>配点 : <var>300</var> 点</p>
 
 <div class="part">
 <section>
-<h3>問題文</h3><p><var>N</var> 個の選択肢があります。</p>
-<p>あなたは、これらの中から <var>1</var> つの選択肢を選びます。あなたが <var>i</var> 番目の選択肢を選んだときの嬉しさは <var>X_i</var> です。</p>
-<p>どの選択肢を選んでも嬉しさが負になる場合は <code>Yes</code> を、そうでない場合は <code>No</code> を出力してください。</p>
+<h3>問題文</h3><p>この問題は <strong>インタラクティブな問題</strong>（あなたが作成したプログラムとジャッジプログラムが標準入出力を介して対話を行う形式の問題）です。</p>
+<p>数直線上に、点 <var>1</var>, <var>2</var>, <var>\ldots</var>, <var>N</var> が <strong>この順に</strong> 左から右に並んでいます。  </p>
+<p>最初、あなたには整数 <var>N</var> のみが与えられます。</p>
+<p>その後、あなたはジャッジに以下の質問を <var>\bm{2N}</var> 回まで行うことができます。</p>
+<ul>
+<li><var>1 \leq i &lt; j \leq N</var> を満たす整数 <var>i,j</var> を選び、点 <var>i</var> と点 <var>j</var> の距離が <var>1</var> 以下であるか質問する。</li>
+</ul>
+<p>距離が <var>1</var> 以下の <var>2</var> 点組の個数、すなわち <var>1\leq i&lt;j\leq N</var> をみたす整数の組 <var>(i,j)</var> であって、点 <var>i</var> と点 <var>j</var> の距離が <var>1</var> 以下であるようなものの個数を出力してください。</p>
 </section>
 </div>
 
 <div class="part">
 <section>
 <h3>制約</h3><ul>
-<li><var>2 \leq N \leq 10</var></li>
-<li><var>-100 \leq X_i \leq 100</var></li>
-<li>入力される値はすべて整数</li>
+<li><var>2 \leq N \leq 10^3</var></li>
+<li><var>N</var> は整数</li>
 </ul>
 </section>
 </div>
 
-<hr />
-<div class="io-style">
 <div class="part">
 <section>
-<h3>入力</h3><p>入力は以下の形式で標準入力から与えられる。</p>
+<h3>入出力</h3><p>最初に、点の個数を表す整数 <var>N</var> を標準入力から受け取ってください。</p>
 <pre><var>N</var>
-<var>X_1</var> <var>X_2</var> <var>\ldots</var> <var>X_N</var>
+</pre>
+<p>次に、あなたはジャッジに対して問題文中の質問を <var>2N</var> 回まで繰り返すことができます。</p>
+<p>質問は、以下の形式で標準出力に出力してください。
+ここで、<var>i,j</var> は <var>1 \leq i&lt;j \leq N</var> を満たす整数である必要があります。</p>
+<pre>? <var>i</var> <var>j</var>
+</pre>
+<p>これに対する応答として、以下のどちらかが標準入力から与えられます。</p>
+<pre>Yes
+</pre>
+<pre>No
+</pre>
+<p>ここで、<code>Yes</code> ならば点 <var>i</var> と点 <var>j</var> の距離が <var>1</var> 以下であることを、<code>No</code> ならば点 <var>i</var> と点 <var>j</var> の距離が <var>1</var> より大きいことを表します。</p>
+<p>問題の答え <var>X</var> が求まったら、解答を以下の形式で出力してください。
+その後、ただちにプログラムを終了してください。</p>
+<pre>! <var>X</var>
 </pre>
 </section>
 </div>
 
 <div class="part">
 <section>
-<h3>出力</h3><p>問題文中の指示に従って <code>Yes</code>、<code>No</code> のいずれかを出力せよ。</p>
-</section>
-</div>
-</div>
-
-<hr />
-<div class="part">
-<section>
-<h3>入力例 1</h3><pre>4
-2 0 -1 2
-</pre>
+<h3>注意点</h3><ul>
+<li><span style = "color:red"><strong>出力を行うたびに、末尾に改行を入れて標準出力を flush してください。そうしなかった場合、ジャッジ結果が <span class="label label-warning" data-toggle="tooltip" data-placement="top" title="" data-original-title="実行時間制限超過">TLE</span> となる可能性があります。</strong></span></li>
+<li><strong>対話の途中で不正な出力を行った、あるいはプログラムが途中で終了した場合のジャッジ結果は不定です。</strong></li>
+<li>解答を出力したらただちにプログラムを終了してください。そうしない場合、ジャッジ結果は不定です。</li>
+<li>点の配置および答えはあなたとジャッジの対話の開始時に固定され、あなたが行った質問などに応じて変更されることはありません。</li>
+</ul>
 </section>
 </div>
 
 <div class="part">
 <section>
-<h3>出力例 1</h3><pre>No
-</pre>
-<p>選択肢 <var>1, 2, 4</var> のいずれかを選んだとき、嬉しさは負になりません。</p>
-</section>
-</div>
+<h3>入出力例</h3><p>以下は、<var>N = 3</var>、点 <var>1,2,3</var> の座標がそれぞれ <var>0,0.7,1.5</var> の場合の入出力例です。（点 <var>1,2,3</var> の座標は入力として与えられません。）</p>
+<table class="table table-bordered">
 
-<hr />
-<div class="part">
-<section>
-<h3>入力例 2</h3><pre>3
--5 -2 -1
-</pre>
-</section>
-</div>
+<thead>
+<tr>
+<th>入力</th>
+<th>出力</th>
+<th>説明</th>
+</tr>
+</thead>
 
-<div class="part">
-<section>
-<h3>出力例 2</h3><pre>Yes
-</pre>
-</section>
-</div>
+<tbody>
+<tr>
+<td><code>3</code></td>
+<td></td>
+<td><var>N</var> が与えられます。</td>
+</tr>
 
-<hr />
-<div class="part">
-<section>
-<h3>入力例 3</h3><pre>4
-0 -2 0 -1
-</pre>
-</section>
-</div>
+<tr>
+<td></td>
+<td><code>? 1 2</code></td>
+<td>点 <var>1,2</var> の間の距離が <var>1</var> 以下かをジャッジに質問します。</td>
+</tr>
 
-<div class="part">
-<section>
-<h3>出力例 3</h3><pre>No
-</pre></section>
+<tr>
+<td><code>Yes</code></td>
+<td></td>
+<td>ジャッジから、点 <var>1,2</var> の間の距離が <var>1</var> 以下であるという返答を得ます。</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>? 1 3</code></td>
+<td>点 <var>1,3</var> の間の距離が <var>1</var> 以下かをジャッジに質問します。</td>
+</tr>
+
+<tr>
+<td><code>No</code></td>
+<td></td>
+<td>ジャッジから、点 <var>1,3</var> の間の距離が <var>1</var> 以下でないという返答を得ます。</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>? 2 3</code></td>
+<td>点 <var>2,3</var> の間の距離が <var>1</var> 以下かをジャッジに質問します。</td>
+</tr>
+
+<tr>
+<td><code>Yes</code></td>
+<td></td>
+<td>ジャッジから、点 <var>2,3</var> の間の距離が <var>1</var> 以下であるという返答を得ます。</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>! 2</code></td>
+<td>条件をみたす組の数として <var>2</var> を解答します。</td>
+</tr>
+
+</tbody>
+</table>
+
+<p>質問回数は <var>3</var> 回であり、特に <var>2N=6</var> 回以下です。<br />
+解答した組の数も正しいため、この後ただちにプログラムを終了することで、正解と判定されます。</p></section>
 </div>
 </span>
 <span class="lang-en">
-<p>Score : <var>100</var> points</p>
+<p>Score : <var>300</var> points</p>
 
 <div class="part">
 <section>
-<h3>Problem Statement</h3><p>There are <var>N</var> choices.</p>
-<p>You will choose one of these choices. If you choose the <var>i</var>-th choice, your happiness will be <var>X_i</var>.</p>
-<p>If your happiness will be negative no matter which choice you choose, output <code>Yes</code>; otherwise, output <code>No</code>.</p>
+<h3>Problem Statement</h3><p>This is an <strong>interactive problem</strong> (in which your program and the judge program communicate via Standard Input and Output).</p>
+<p>On a number line, points <var>1</var>, <var>2</var>, <var>\ldots</var>, <var>N</var> are arranged from left to right <strong>in that order</strong>.</p>
+<p>Initially, you are given only the integer <var>N</var>.</p>
+<p>Then, you can ask the judge the following question at most <var>\bm{2N}</var> times.</p>
+<ul>
+<li>Choose integers <var>i</var> and <var>j</var> satisfying <var>1 \leq i &lt; j \leq N</var>, and ask whether the distance between points <var>i</var> and <var>j</var> is at most <var>1</var>.</li>
+</ul>
+<p>Output the number of pairs of points whose distance is at most <var>1</var>, that is, the number of pairs of integers <var>(i,j)</var> satisfying <var>1 \leq i &lt; j \leq N</var> such that the distance between points <var>i</var> and <var>j</var> is at most <var>1</var>.</p>
 </section>
 </div>
 
 <div class="part">
 <section>
 <h3>Constraints</h3><ul>
-<li><var>2 \leq N \leq 10</var></li>
-<li><var>-100 \leq X_i \leq 100</var></li>
-<li>All input values are integers.</li>
+<li><var>2 \leq N \leq 10^3</var></li>
+<li><var>N</var> is an integer.</li>
 </ul>
 </section>
 </div>
 
-<hr />
-<div class="io-style">
 <div class="part">
 <section>
-<h3>Input</h3><p>The input is given from Standard Input in the following format:</p>
+<h3>Interaction</h3><p>First, receive the integer <var>N</var> representing the number of points from Standard Input:</p>
 <pre><var>N</var>
-<var>X_1</var> <var>X_2</var> <var>\ldots</var> <var>X_N</var>
+</pre>
+<p>Then, you can repeat the question described in the problem statement to the judge at most <var>2N</var> times.</p>
+<p>Output the question to Standard Output in the following format,
+where <var>i</var> and <var>j</var> must be integers satisfying <var>1 \leq i&lt;j \leq N</var>:</p>
+<pre>? <var>i</var> <var>j</var>
+</pre>
+<p>As a response to this, one of the following will be given from Standard Input:</p>
+<pre>Yes
+</pre>
+<pre>No
+</pre>
+<p>Here, <code>Yes</code> indicates that the distance between points <var>i</var> and <var>j</var> is at most <var>1</var>, and <code>No</code> indicates that the distance between points <var>i</var> and <var>j</var> is greater than <var>1</var>.</p>
+<p>Once you have found the answer <var>X</var> to the problem, output your answer in the following format, and then terminate the program immediately:</p>
+<pre>! <var>X</var>
 </pre>
 </section>
 </div>
 
 <div class="part">
 <section>
-<h3>Output</h3><p>Output <code>Yes</code> or <code>No</code> according to the instructions in the problem statement.</p>
-</section>
-</div>
-</div>
-
-<hr />
-<div class="part">
-<section>
-<h3>Sample Input 1</h3><pre>4
-2 0 -1 2
-</pre>
+<h3>Notes</h3><ul>
+<li><span style = "color:red"><strong>Each time you output something, insert a newline at the end and flush Standard Output. Otherwise, the judge result may be <span class="label label-warning" data-toggle="tooltip" data-placement="top" title="" data-original-title="Time Limit Exceeded">TLE</span>.</strong></span></li>
+<li><strong>The judge result is indeterminate if you output something invalid during the interaction, or if the program terminates prematurely.</strong></li>
+<li>Terminate the program immediately after outputting your answer. Otherwise, the judge result is indeterminate.</li>
+<li>The arrangement of the points and the answer are fixed at the start of the interaction between you and the judge, and do not change depending on, for example, the questions you make.</li>
+</ul>
 </section>
 </div>
 
 <div class="part">
 <section>
-<h3>Sample Output 1</h3><pre>No
-</pre>
-<p>If you choose choice <var>1</var>, <var>2</var>, or <var>4</var>, the happiness will not be negative.</p>
-</section>
-</div>
+<h3>Sample Interaction</h3><p>Below is an example of interaction where <var>N = 3</var> and the coordinates of points <var>1,2,3</var> are <var>0, 0.7, 1.5</var>, respectively. (The coordinates of points <var>1,2,3</var> are not given as input.)</p>
+<table class="table table-bordered">
 
-<hr />
-<div class="part">
-<section>
-<h3>Sample Input 2</h3><pre>3
--5 -2 -1
-</pre>
-</section>
-</div>
+<thead>
+<tr>
+<th>Input</th>
+<th>Output</th>
+<th>Explanation</th>
+</tr>
+</thead>
 
-<div class="part">
-<section>
-<h3>Sample Output 2</h3><pre>Yes
-</pre>
-</section>
-</div>
+<tbody>
+<tr>
+<td><code>3</code></td>
+<td></td>
+<td><var>N</var> is given.</td>
+</tr>
 
-<hr />
-<div class="part">
-<section>
-<h3>Sample Input 3</h3><pre>4
-0 -2 0 -1
-</pre>
-</section>
-</div>
+<tr>
+<td></td>
+<td><code>? 1 2</code></td>
+<td>Ask the judge whether the distance between points <var>1</var> and <var>2</var> is at most <var>1</var>.</td>
+</tr>
 
-<div class="part">
-<section>
-<h3>Sample Output 3</h3><pre>No
-</pre></section>
+<tr>
+<td><code>Yes</code></td>
+<td></td>
+<td>Obtain the response from the judge that the distance between points <var>1</var> and <var>2</var> is at most <var>1</var>.</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>? 1 3</code></td>
+<td>Ask the judge whether the distance between points <var>1</var> and <var>3</var> is at most <var>1</var>.</td>
+</tr>
+
+<tr>
+<td><code>No</code></td>
+<td></td>
+<td>Obtain the response from the judge that the distance between points <var>1</var> and <var>3</var> is not at most <var>1</var>.</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>? 2 3</code></td>
+<td>Ask the judge whether the distance between points <var>2</var> and <var>3</var> is at most <var>1</var>.</td>
+</tr>
+
+<tr>
+<td><code>Yes</code></td>
+<td></td>
+<td>Obtain the response from the judge that the distance between points <var>2</var> and <var>3</var> is at most <var>1</var>.</td>
+</tr>
+
+<tr>
+<td></td>
+<td><code>! 2</code></td>
+<td>Answer <var>2</var> as the number of pairs satisfying the condition.</td>
+</tr>
+
+</tbody>
+</table>
+
+<p>The number of questions is <var>3</var>, which is in particular at most <var>2N=6</var>.<br />
+Since the answered number of pairs is also correct, the program will be judged as correct if it terminates immediately after this.</p></section>
 </div>
 </span>
 </span>
@@ -519,7 +600,7 @@
 			
 			
 			
-<div class="a2a_kit a2a_kit_size_20 a2a_default_style pull-right" data-a2a-url="https://atcoder.jp/contests/abc466/tasks/abc466_a?lang=en" data-a2a-title="A - Compromise ">
+<div class="a2a_kit a2a_kit_size_20 a2a_default_style pull-right" data-a2a-url="https://atcoder.jp/contests/abc466/tasks/abc466_c?lang=en" data-a2a-title="C - Count Close Pairs ">
 	<a class="a2a_button_facebook"></a>
 	<a class="a2a_button_twitter"></a>
 	

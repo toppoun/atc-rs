@@ -6,10 +6,12 @@ use reqwest::header::RETRY_AFTER;
 
 use scraper::{Html, Selector};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BASE_URL: &str = "https://atcoder.jp";
 
@@ -25,11 +27,57 @@ const MAX_429_RETRIES: usize = 3;
 #[derive(Debug)]
 pub enum AtCoderError {
     Http(reqwest::Error),
-    Io(std::io::Error),
+    Fixture {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Parse(String),
+    InvalidIdentifier {
+        kind: &'static str,
+        value: String,
+    },
+    InvalidProblemUrl(String),
 
     // 429がretryしても解消しなかった
-    RateLimited { url: String },
+    RateLimited {
+        url: String,
+    },
+}
+
+impl fmt::Display for AtCoderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(error) => write!(formatter, "HTTP request failed: {error}"),
+            Self::Fixture { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read fixture {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Parse(message) => write!(formatter, "failed to parse AtCoder HTML: {message}"),
+            Self::InvalidIdentifier { kind, value } => {
+                write!(formatter, "invalid AtCoder {kind}: {value:?}")
+            }
+            Self::InvalidProblemUrl(url) => write!(formatter, "invalid AtCoder problem URL: {url}"),
+            Self::RateLimited { url } => {
+                write!(formatter, "rate limit persisted after retries: {url}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AtCoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http(error) => Some(error),
+            Self::Fixture { source, .. } => Some(source),
+            Self::Parse(_)
+            | Self::InvalidIdentifier { .. }
+            | Self::InvalidProblemUrl(_)
+            | Self::RateLimited { .. } => None,
+        }
+    }
 }
 
 impl From<reqwest::Error> for AtCoderError {
@@ -38,19 +86,17 @@ impl From<reqwest::Error> for AtCoderError {
     }
 }
 
-impl From<std::io::Error> for AtCoderError {
-    fn from(err: std::io::Error) -> Self {
-        AtCoderError::Io(err)
-    }
-}
-
 enum Source {
-    Http,
+    Http(HttpSource),
     Fixture(PathBuf),
 }
 
-pub struct AtCoderClient {
+struct HttpSource {
     client: Client,
+    last_request: Mutex<Option<Instant>>,
+}
+
+pub struct AtCoderClient {
     source: Source,
 }
 
@@ -65,18 +111,17 @@ impl AtCoderClient {
             .build()?;
 
         Ok(Self {
-            client,
-            source: Source::Http,
+            source: Source::Http(HttpSource {
+                client,
+                last_request: Mutex::new(None),
+            }),
         })
     }
 
-    pub fn fixture(root: impl Into<PathBuf>) -> Result<Self, AtCoderError> {
-        let client = Client::builder().build()?;
-
-        Ok(Self {
-            client,
+    pub fn fixture(root: impl Into<PathBuf>) -> Self {
+        Self {
             source: Source::Fixture(root.into()),
-        })
+        }
     }
 
     // ============================================================
@@ -84,17 +129,19 @@ impl AtCoderClient {
     // ============================================================
 
     pub fn fetch_contest(&self, contest_id: &str) -> Result<Contest, AtCoderError> {
+        validate_identifier("contest ID", contest_id)?;
+
         let html = match &self.source {
-            Source::Http => {
+            Source::Http(http) => {
                 let url = format!("{BASE_URL}/contests/{contest_id}/tasks");
 
-                self.get_text(&url)?
+                Self::get_text(http, &url)?
             }
 
             Source::Fixture(root) => {
                 let path = root.join("contests").join(format!("{contest_id}.html"));
 
-                std::fs::read_to_string(path)?
+                read_fixture(path)?
             }
         };
 
@@ -107,14 +154,18 @@ impl AtCoderClient {
 
     pub fn fetch_samples(&self, problem: &Problem) -> Result<Vec<Sample>, AtCoderError> {
         let html = match &self.source {
-            Source::Http => self.get_text(&problem.url)?,
+            Source::Http(http) => {
+                validate_problem_url(&problem.url)?;
+                Self::get_text(http, &problem.url)?
+            }
 
             Source::Fixture(root) => {
+                validate_identifier("task ID", &problem.task_id)?;
                 let path = root
                     .join("problems")
                     .join(format!("{}.html", problem.task_id));
 
-                std::fs::read_to_string(path)?
+                read_fixture(path)?
             }
         };
 
@@ -125,28 +176,20 @@ impl AtCoderClient {
     // HTTP
     // ============================================================
 
-    fn get_text(&self, url: &str) -> Result<String, AtCoderError> {
+    fn get_text(http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
         for retry_count in 0..=MAX_429_RETRIES {
-            let response = self.client.get(url).send()?;
-
-            println!("status: {}", response.status());
+            wait_for_request_slot(http);
+            let response = http.client.get(url).send()?;
 
             // 429だけ特別扱い
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                println!("429 Too Many Requests");
                 if retry_count == MAX_429_RETRIES {
                     return Err(AtCoderError::RateLimited {
                         url: url.to_string(),
                     });
                 }
 
-                let wait = response
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(Duration::from_secs)
-                    .unwrap_or(DEFAULT_RETRY_WAIT);
+                let wait = retry_wait(response.headers());
 
                 thread::sleep(wait);
 
@@ -158,14 +201,80 @@ impl AtCoderClient {
 
             let html = response.text()?;
 
-            // 次のrequestを即座に送らない
-            thread::sleep(REQUEST_INTERVAL);
-
             return Ok(html);
         }
 
-        unreachable!()
+        Err(AtCoderError::RateLimited {
+            url: url.to_string(),
+        })
     }
+}
+
+fn read_fixture(path: PathBuf) -> Result<String, AtCoderError> {
+    std::fs::read_to_string(&path).map_err(|source| AtCoderError::Fixture { path, source })
+}
+
+fn validate_identifier(kind: &'static str, value: &str) -> Result<(), AtCoderError> {
+    let valid = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+
+    if valid {
+        Ok(())
+    } else {
+        Err(AtCoderError::InvalidIdentifier {
+            kind,
+            value: value.to_string(),
+        })
+    }
+}
+
+fn validate_problem_url(url: &str) -> Result<(), AtCoderError> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| AtCoderError::InvalidProblemUrl(url.to_string()))?;
+    let valid = parsed.scheme() == "https"
+        && parsed.host_str() == Some("atcoder.jp")
+        && parsed.port().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path().starts_with("/contests/")
+        && parsed.path().contains("/tasks/");
+
+    if valid {
+        Ok(())
+    } else {
+        Err(AtCoderError::InvalidProblemUrl(url.to_string()))
+    }
+}
+
+fn wait_for_request_slot(http: &HttpSource) {
+    let mut last_request = match http.last_request.lock() {
+        Ok(last_request) => last_request,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let now = Instant::now();
+    if let Some(wait) = remaining_request_interval(*last_request, now) {
+        thread::sleep(wait);
+    }
+
+    *last_request = Some(Instant::now());
+}
+
+fn remaining_request_interval(previous: Option<Instant>, now: Instant) -> Option<Duration> {
+    previous
+        .and_then(|previous| REQUEST_INTERVAL.checked_sub(now.saturating_duration_since(previous)))
+        .filter(|wait| !wait.is_zero())
+}
+
+fn retry_wait(headers: &reqwest::header::HeaderMap) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RETRY_WAIT)
 }
 
 // ============================================================
@@ -178,17 +287,20 @@ fn parse_contest(contest_id: &str, html: &str) -> Result<Contest, AtCoderError> 
     let row_selector = Selector::parse("table tbody tr")
         .map_err(|_| AtCoderError::Parse("invalid row selector".to_string()))?;
 
-    let link_selector = Selector::parse("td a")
+    let link_selector = Selector::parse("td a[href*='/tasks/']")
         .map_err(|_| AtCoderError::Parse("invalid link selector".to_string()))?;
 
     let mut problems = Vec::new();
+    let mut indexes = BTreeSet::new();
+    let mut task_ids = BTreeSet::new();
+    let expected_href_prefix = format!("/contests/{contest_id}/tasks/");
 
     for row in document.select(&row_selector) {
         let mut links = row.select(&link_selector);
 
-        let index_link = links
-            .next()
-            .ok_or_else(|| AtCoderError::Parse("problem index not found".to_string()))?;
+        let Some(index_link) = links.next() else {
+            continue;
+        };
 
         let title_link = links
             .next()
@@ -198,23 +310,48 @@ fn parse_contest(contest_id: &str, html: &str) -> Result<Contest, AtCoderError> 
 
         let title = title_link.text().collect::<String>().trim().to_string();
 
+        if index.is_empty() || title.is_empty() {
+            return Err(AtCoderError::Parse(
+                "problem index or title is empty".to_string(),
+            ));
+        }
+
         let href = index_link
             .value()
             .attr("href")
             .ok_or_else(|| AtCoderError::Parse("problem url not found".to_string()))?;
 
+        let title_href = title_link
+            .value()
+            .attr("href")
+            .ok_or_else(|| AtCoderError::Parse("problem title url not found".to_string()))?;
+
+        if title_href != href {
+            return Err(AtCoderError::Parse(format!(
+                "problem links do not match for index {index}"
+            )));
+        }
+
         let task_id = href
-            .rsplit('/')
-            .next()
-            .ok_or_else(|| AtCoderError::Parse("task id not found".to_string()))?
-            .to_string();
+            .strip_prefix(&expected_href_prefix)
+            .ok_or_else(|| AtCoderError::Parse(format!("unexpected problem url: {href}")))?;
+        validate_identifier("task ID", task_id)?;
+
+        if !indexes.insert(index.clone()) {
+            return Err(AtCoderError::Parse(format!(
+                "duplicate problem index: {index}"
+            )));
+        }
+        if !task_ids.insert(task_id.to_string()) {
+            return Err(AtCoderError::Parse(format!("duplicate task ID: {task_id}")));
+        }
 
         let url = format!("{BASE_URL}{href}");
 
         problems.push(Problem {
             index,
             title,
-            task_id,
+            task_id: task_id.to_string(),
             url,
         });
     }
@@ -272,21 +409,22 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
             continue;
         };
 
-        let heading = h3.text().next().unwrap_or("").trim();
+        let heading = h3.text().collect::<String>();
+        let heading = heading.trim();
 
         // 「入力例 1」→ ("input", "1")
         // 「出力例 1」→ ("output", "1")
         // それ以外     → None
 
         let sample_kind = if let Some(number) = heading.strip_prefix(input_prefix) {
-            Some(("input", number))
+            Some((true, number))
         } else {
             heading
                 .strip_prefix(output_prefix)
-                .map(|number| ("output", number))
+                .map(|number| (false, number))
         };
 
-        let Some((kind, number)) = sample_kind else {
+        let Some((is_input, number)) = sample_kind else {
             continue;
         };
 
@@ -302,16 +440,16 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
 
         let content = pre.text().collect::<String>();
 
-        match kind {
-            "input" => {
-                inputs.insert(number, content);
-            }
+        let previous = if is_input {
+            inputs.insert(number, content)
+        } else {
+            outputs.insert(number, content)
+        };
 
-            "output" => {
-                outputs.insert(number, content);
-            }
-
-            _ => unreachable!(),
+        if previous.is_some() {
+            return Err(AtCoderError::Parse(format!(
+                "duplicate sample number: {heading}"
+            )));
         }
     }
 
@@ -326,6 +464,12 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
     if inputs.len() != outputs.len() {
         return Err(AtCoderError::Parse(
             "sample input/output count mismatch".to_string(),
+        ));
+    }
+
+    if inputs.keys().copied().ne(1..=inputs.len()) {
+        return Err(AtCoderError::Parse(
+            "sample numbers must be consecutive starting at 1".to_string(),
         ));
     }
 
@@ -346,4 +490,166 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
     }
 
     Ok(samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
+    #[test]
+    fn parses_contest_from_tasks_fixture() {
+        let client = AtCoderClient::fixture(fixture_root());
+
+        let contest = client
+            .fetch_contest("abc466")
+            .expect("contest fixture should parse");
+
+        assert_eq!(contest.contest_id, "abc466");
+        assert_eq!(contest.problems.len(), 7);
+        assert_eq!(contest.problems[0].index, "A");
+        assert_eq!(contest.problems[0].title, "Compromise");
+        assert_eq!(contest.problems[0].task_id, "abc466_a");
+        assert_eq!(
+            contest.problems[0].url,
+            "https://atcoder.jp/contests/abc466/tasks/abc466_a"
+        );
+    }
+
+    #[test]
+    fn parses_samples_from_problem_fixture() {
+        let client = AtCoderClient::fixture(fixture_root());
+        let problem = Problem {
+            index: "A".to_string(),
+            title: "Compromise".to_string(),
+            task_id: "abc466_a".to_string(),
+            url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+        };
+
+        let samples = client
+            .fetch_samples(&problem)
+            .expect("problem fixture should parse");
+
+        assert_eq!(samples.len(), 3);
+        assert_eq!(
+            samples[0],
+            Sample {
+                input: "4\n2 0 -1 2\n".to_string(),
+                output: "No\n".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn interactive_statement_without_samples_returns_empty_samples() {
+        let html = r#"
+            <div id="task-statement">
+                <span class="lang-ja">
+                    <div class="part"><section><h3>問題文</h3><p>対話型です。</p></section></div>
+                </span>
+            </div>
+        "#;
+
+        let samples = parse_samples(html).expect("interactive statement should parse");
+
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn missing_fixture_reports_its_path() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let client = AtCoderClient::fixture(temp.path());
+
+        let error = client
+            .fetch_contest("abc999")
+            .expect_err("missing fixture should fail");
+
+        match error {
+            AtCoderError::Fixture { path, source } => {
+                assert_eq!(path, temp.path().join("contests").join("abc999.html"));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn malformed_tasks_fixture_is_a_parse_error() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let contests = temp.path().join("contests");
+        std::fs::create_dir(&contests).expect("contest fixture directory should be created");
+        std::fs::write(contests.join("broken.html"), "<html><body></body></html>")
+            .expect("fixture should be written");
+        let client = AtCoderClient::fixture(temp.path());
+
+        let error = client
+            .fetch_contest("broken")
+            .expect_err("malformed fixture should fail");
+
+        assert!(matches!(error, AtCoderError::Parse(message) if message == "no problems found"));
+    }
+
+    #[test]
+    fn fixture_mode_ignores_problem_url_and_never_uses_http() {
+        let client = AtCoderClient::fixture(fixture_root());
+        let problem = Problem {
+            index: "A".to_string(),
+            title: "Compromise".to_string(),
+            task_id: "abc466_a".to_string(),
+            url: "http://127.0.0.1:1/must-not-be-requested".to_string(),
+        };
+
+        let samples = client
+            .fetch_samples(&problem)
+            .expect("fixture lookup should not inspect or request the URL");
+
+        assert_eq!(samples.len(), 3);
+        assert!(matches!(client.source, Source::Fixture(_)));
+    }
+
+    #[test]
+    fn incomplete_sample_pair_is_a_parse_error() {
+        let html = r#"
+            <div id="task-statement">
+                <span class="lang-en">
+                    <div class="part"><section><h3>Sample Input 1</h3><pre>1\n</pre></section></div>
+                </span>
+            </div>
+        "#;
+
+        let error = parse_samples(html).expect_err("incomplete sample should fail");
+
+        assert!(matches!(error, AtCoderError::Parse(message) if message.contains("mismatch")));
+    }
+
+    #[test]
+    fn request_interval_is_measured_between_request_starts() {
+        let previous = Instant::now();
+
+        assert_eq!(
+            remaining_request_interval(Some(previous), previous + Duration::from_millis(125)),
+            Some(Duration::from_millis(375))
+        );
+        assert_eq!(
+            remaining_request_interval(Some(previous), previous + Duration::from_millis(500)),
+            None
+        );
+        assert_eq!(remaining_request_interval(None, previous), None);
+    }
+
+    #[test]
+    fn retry_after_delta_seconds_is_used_with_a_fallback() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("7"));
+        assert_eq!(retry_wait(&headers), Duration::from_secs(7));
+
+        headers.insert(
+            RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(retry_wait(&headers), DEFAULT_RETRY_WAIT);
+    }
 }

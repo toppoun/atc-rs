@@ -1,38 +1,35 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use std::process::ExitCode;
 
 mod atcoder;
+mod cli;
 mod commands;
 mod error;
 mod model;
 mod workspace;
 use crate::error::AppError;
 
-/// AtCoder用CLIツール
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    New { contest: String },
-    Run { problem: String },
-    Login,
-}
-
-fn main() -> Result<(), AppError> {
-    let cli = Cli::parse();
+fn run() -> Result<(), AppError> {
+    let cli = cli::Cli::parse();
 
     match cli.command {
-        Commands::New { contest } => {
-            commands::new(contest)?;
+        cli::Command::New { contest } => {
+            commands::new(&contest)?;
         }
-        Commands::Run { problem } => {
+        cli::Command::Run { problem } => {
             println!("run problem: {problem}");
         }
-        Commands::Login => {
+        cli::Command::Login => {
             println!("login");
         }
     }
