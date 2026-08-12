@@ -39,7 +39,9 @@ fn run() -> Result<(), AppError> {
         cli::Command::New { contest, language } => {
             commands::new(&contest, language, &mut reporter)?;
         }
-        cli::Command::Refresh { contest } => commands::refresh(contest, &mut reporter)?,
+        cli::Command::Refresh { contest, force } => {
+            commands::refresh(contest, force, &mut reporter)?
+        }
         cli::Command::Test {
             problem,
             language,

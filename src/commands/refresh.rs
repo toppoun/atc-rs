@@ -8,10 +8,11 @@ use std::path::Path;
 
 pub(crate) fn refresh(
     contest: Option<String>,
+    force: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
-    let contest_id = resolve_refresh_contest_id(&cwd, contest.as_deref())?;
+    let contest_id = resolve_refresh_contest_id(&cwd, contest.as_deref(), force)?;
 
     let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         atcoder::AtCoderClient::fixture(path)
@@ -19,16 +20,17 @@ pub(crate) fn refresh(
         atcoder::AtCoderClient::new()?
     };
 
-    refresh_at(&cwd, &contest_id, &atcoder, reporter)
+    refresh_at(&cwd, &contest_id, force, &atcoder, reporter)
 }
 
 pub(super) fn resolve_refresh_contest_id(
     destination: &Path,
     specified_contest_id: Option<&str>,
+    force: bool,
 ) -> Result<String, AppError> {
     match specified_contest_id {
         Some(contest_id) => {
-            validate_refresh_destination(destination, contest_id)?;
+            validate_refresh_destination(destination, contest_id, force)?;
             Ok(contest_id.to_string())
         }
         None => {
@@ -41,10 +43,11 @@ pub(super) fn resolve_refresh_contest_id(
 pub(super) fn refresh_at(
     destination: &Path,
     contest_id: &str,
+    force: bool,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    workspace::validate_workspace_marker(destination)?;
+    validate_refresh_destination(destination, contest_id, force)?;
 
     let FetchedContestData {
         contest,
@@ -63,7 +66,7 @@ pub(super) fn refresh_at(
     }
     workspace::save_metadata(staging.path(), &contest)?;
 
-    workspace::replace_refresh_data(destination, staging)?;
+    workspace::replace_refresh_data(destination, staging, force)?;
     reporter.report(Event::WorkspaceRefreshed { destination });
 
     Ok(())

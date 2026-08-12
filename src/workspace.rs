@@ -318,9 +318,20 @@ pub fn validate_workspace_marker(destination: &Path) -> io::Result<()> {
     ))
 }
 
-pub fn validate_refresh_destination(cwd: &Path, contest_id: &str) -> std::io::Result<()> {
+pub fn validate_refresh_destination(
+    cwd: &Path,
+    contest_id: &str,
+    allow_missing_marker: bool,
+) -> std::io::Result<()> {
     validate_path_component(contest_id, "contest ID")?;
-    validate_workspace_marker(cwd)?;
+
+    let marker = cwd.join(".atc");
+    if !existing_real_directory(&marker, "workspace marker")? && !allow_missing_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("workspace marker not found: {}", marker.display()),
+        ));
+    }
 
     let directory_name = cwd.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -339,21 +350,35 @@ pub fn validate_refresh_destination(cwd: &Path, contest_id: &str) -> std::io::Re
     Ok(())
 }
 
-pub fn replace_refresh_data(destination: &Path, staging: TempDir) -> io::Result<()> {
-    validate_workspace_marker(destination)?;
-
+pub fn replace_refresh_data(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+) -> io::Result<()> {
     let staging_root = staging.path().to_path_buf();
     let destination_tests = destination.join("tests");
     let staged_tests = staging_root.join("tests");
     let backup_tests = staging_root.join("previous-tests");
-    let destination_metadata = destination.join(".atc").join("contest.toml");
+    let destination_marker = destination.join(".atc");
+    let destination_metadata = destination_marker.join("contest.toml");
     let staged_metadata = staging_root.join(".atc").join("contest.toml");
     let backup_metadata = staging_root.join("previous-contest.toml");
 
+    let had_destination_marker = existing_real_directory(&destination_marker, "workspace marker")?;
+    if !had_destination_marker && !allow_missing_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace marker not found: {}",
+                destination_marker.display()
+            ),
+        ));
+    }
+
     let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")?;
     let has_staged_tests = existing_real_directory(&staged_tests, "staged tests path")?;
-    let had_destination_metadata =
-        existing_regular_file(&destination_metadata, "existing metadata path")?;
+    let had_destination_metadata = had_destination_marker
+        && existing_regular_file(&destination_metadata, "existing metadata path")?;
     if !existing_regular_file(&staged_metadata, "staged metadata path")? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -389,6 +414,21 @@ pub fn replace_refresh_data(destination: &Path, staging: TempDir) -> io::Result<
         return Err(refresh_update_error(staging, error, rollback_errors));
     }
 
+    let created_destination_marker = if had_destination_marker {
+        false
+    } else if let Err(error) = fs::create_dir(&destination_marker) {
+        let rollback_errors = rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            has_staged_tests,
+            had_destination_tests,
+        );
+        return Err(refresh_update_error(staging, error, rollback_errors));
+    } else {
+        true
+    };
+
     if let Err(error) = fs::rename(&staged_metadata, &destination_metadata) {
         let mut rollback_errors = Vec::new();
         if had_destination_metadata
@@ -397,6 +437,14 @@ pub fn replace_refresh_data(destination: &Path, staging: TempDir) -> io::Result<
             rollback_errors.push(format!(
                 "failed to restore metadata {}: {rollback_error}",
                 destination_metadata.display()
+            ));
+        }
+        if created_destination_marker
+            && let Err(rollback_error) = fs::remove_dir(&destination_marker)
+        {
+            rollback_errors.push(format!(
+                "failed to remove new workspace marker {}: {rollback_error}",
+                destination_marker.display()
             ));
         }
         rollback_errors.extend(rollback_tests(
@@ -1085,7 +1133,7 @@ mod tests {
         };
         save_metadata(staging.path(), &new_contest).unwrap();
 
-        let error = replace_refresh_data(&destination, staging)
+        let error = replace_refresh_data(&destination, staging, false)
             .expect_err("a tests file must not be deleted as a directory");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

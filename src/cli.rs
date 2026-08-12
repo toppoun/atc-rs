@@ -20,6 +20,10 @@ pub enum Command {
     Refresh {
         #[arg(short, long)]
         contest: Option<String>,
+
+        /// Allow refresh when the .atc workspace marker is missing
+        #[arg(short, long)]
+        force: bool,
     },
     Test {
         problem: String,
@@ -46,6 +50,7 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_new_contest_and_optional_language() {
@@ -81,14 +86,51 @@ mod tests {
     fn parses_refresh_with_and_without_contest_override() {
         let cli =
             Cli::try_parse_from(["atc", "refresh"]).expect("refresh without override should parse");
-        assert!(matches!(cli.command, Command::Refresh { contest: None }));
+        assert!(matches!(
+            cli.command,
+            Command::Refresh {
+                contest: None,
+                force: false,
+            }
+        ));
 
         let cli = Cli::try_parse_from(["atc", "refresh", "-c", "abc466"])
             .expect("refresh with override should parse");
         assert!(matches!(
             cli.command,
-            Command::Refresh { contest: Some(contest) } if contest == "abc466"
+            Command::Refresh {
+                contest: Some(contest),
+                force: false,
+            } if contest == "abc466"
         ));
+
+        let cli = Cli::try_parse_from(["atc", "refresh", "-c", "abc350", "-f"])
+            .expect("forced refresh should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Refresh {
+                contest: Some(contest),
+                force: true,
+            } if contest == "abc350"
+        ));
+
+        let cli = Cli::try_parse_from(["atc", "refresh", "--contest", "abc350", "--force"])
+            .expect("long forced refresh options should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Refresh {
+                contest: Some(contest),
+                force: true,
+            } if contest == "abc350"
+        ));
+
+        let mut command = Cli::command();
+        let refresh = command
+            .find_subcommand_mut("refresh")
+            .expect("refresh subcommand should exist");
+        let help = refresh.render_long_help().to_string();
+        assert!(help.contains("-f, --force"));
+        assert!(help.contains("Allow refresh when the .atc workspace marker is missing"));
     }
 
     #[test]
