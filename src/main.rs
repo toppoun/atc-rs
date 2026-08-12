@@ -7,6 +7,7 @@ mod commands;
 mod error;
 mod language;
 mod model;
+mod paths;
 mod template;
 mod ui;
 mod workspace;
@@ -14,6 +15,9 @@ use crate::error::AppError;
 use ui::TerminalReporter;
 
 fn main() -> ExitCode {
+    println!("config dir : {}", paths::config_dir().unwrap().display());
+    println!("config file: {}", paths::config_file().unwrap().display());
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
