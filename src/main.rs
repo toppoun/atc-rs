@@ -9,6 +9,7 @@ mod error;
 mod language;
 mod model;
 mod paths;
+mod runner;
 mod template;
 mod ui;
 mod workspace;
