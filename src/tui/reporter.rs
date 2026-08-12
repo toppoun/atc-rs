@@ -206,4 +206,67 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
     }
+
+    #[test]
+    fn converts_run_boundaries_and_recoverable_terminal_events() {
+        let (tx, rx) = mpsc::channel();
+        let mut reporter = ChannelReporter::new(9, 1, tx);
+
+        reporter.report(Event::TestRunStarted {
+            problem_index: "B",
+            total_cases: 2,
+        });
+        reporter.report(Event::TestRunFinished {
+            problem_index: "B",
+            accepted: 1,
+            total_cases: 2,
+        });
+        reporter.report(Event::NoSamples { problem_index: "B" });
+        reporter.report(Event::CompileFailed { stderr: "error" });
+        reporter.report(Event::CompileTimedOut {
+            elapsed: Duration::from_secs(3),
+        });
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            messages[0],
+            Message::RunEvent {
+                run_id: 9,
+                problem: 1,
+                event: TestEvent::TestRunStarted { total_cases: 2 },
+            }
+        ));
+        assert!(matches!(
+            messages[1],
+            Message::RunEvent {
+                run_id: 9,
+                problem: 1,
+                event: TestEvent::TestRunFinished {
+                    accepted: 1,
+                    total_cases: 2,
+                },
+            }
+        ));
+        assert!(matches!(
+            messages[2],
+            Message::RunEvent {
+                event: TestEvent::NoSamples,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &messages[3],
+            Message::RunEvent {
+                event: TestEvent::CompileFailed { stderr },
+                ..
+            } if stderr == "error"
+        ));
+        assert!(matches!(
+            messages[4],
+            Message::RunEvent {
+                event: TestEvent::CompileTimedOut { elapsed },
+                ..
+            } if elapsed == Duration::from_secs(3)
+        ));
+    }
 }

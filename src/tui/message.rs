@@ -73,6 +73,8 @@ pub enum Message {
 
     WatcherFailed(io::Error),
 
+    WorkerFailed(io::Error),
+
     RunStarted {
         run_id: RunId,
         problem: usize,

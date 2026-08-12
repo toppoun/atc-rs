@@ -53,7 +53,6 @@ pub struct RunState {
     pub id: Option<RunId>,
     pub phase: RunPhase,
     pub language: Option<Language>,
-    pub debug: bool,
 
     pub accepted: usize,
     pub total_cases: usize,
@@ -66,7 +65,6 @@ impl Default for RunState {
             id: None,
             phase: RunPhase::Idle,
             language: None,
-            debug: false,
 
             accepted: 0,
             total_cases: 0,
@@ -248,7 +246,6 @@ impl WatchApp {
             id: Some(run_id),
             phase: RunPhase::Queued,
             language: Some(language),
-            debug,
             accepted: 0,
             total_cases: 0,
             error: None,
@@ -275,6 +272,10 @@ impl WatchApp {
             return false;
         };
 
+        if run.phase != RunPhase::Queued {
+            return false;
+        }
+
         run.phase = match run.language {
             Some(Language::Cpp) => RunPhase::Compiling,
             _ => RunPhase::Running,
@@ -288,23 +289,27 @@ impl WatchApp {
         };
 
         match event {
-            TestEvent::NoSamples => {
+            TestEvent::NoSamples
+                if matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
+            {
                 run.phase = RunPhase::NoSamples;
                 true
             }
 
-            TestEvent::CompileFailed { stderr } => {
+            TestEvent::CompileFailed { stderr } if run.phase == RunPhase::Compiling => {
                 run.phase = RunPhase::CompileError;
                 run.error = Some(stderr);
                 true
             }
 
-            TestEvent::CompileTimedOut { .. } => {
+            TestEvent::CompileTimedOut { .. } if run.phase == RunPhase::Compiling => {
                 run.phase = RunPhase::CompileTimedOut;
                 true
             }
 
-            TestEvent::TestRunStarted { total_cases } => {
+            TestEvent::TestRunStarted { total_cases }
+                if matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
+            {
                 run.phase = RunPhase::Running;
                 run.accepted = 0;
                 run.total_cases = total_cases;
@@ -314,7 +319,7 @@ impl WatchApp {
             TestEvent::TestRunFinished {
                 accepted,
                 total_cases,
-            } => {
+            } if run.phase == RunPhase::Running => {
                 run.phase = RunPhase::Finished;
                 run.accepted = accepted;
                 run.total_cases = total_cases;
@@ -325,10 +330,14 @@ impl WatchApp {
             | TestEvent::TestCaseWrongAnswer { .. }
             | TestEvent::TestCaseRuntimeError { .. }
             | TestEvent::TestCaseTimedOut { .. }
-            | TestEvent::TestCaseStderr { .. } => {
+            | TestEvent::TestCaseStderr { .. }
+                if run.phase == RunPhase::Running =>
+            {
                 // Phase 5でCaseStateへ保存する。
                 false
             }
+
+            _ => false,
         }
     }
     pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
@@ -354,6 +363,13 @@ impl WatchApp {
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
         };
+
+        if !matches!(
+            run.phase,
+            RunPhase::Queued | RunPhase::Compiling | RunPhase::Running
+        ) {
+            return false;
+        }
 
         run.phase = RunPhase::Failed;
         run.error = Some(error);
@@ -576,7 +592,6 @@ mod tests {
         assert_eq!(run.id, Some(1));
         assert_eq!(run.phase, RunPhase::Queued);
         assert_eq!(run.language, Some(Language::Cpp));
-        assert!(!run.debug);
     }
 
     #[test]
@@ -670,6 +685,22 @@ mod tests {
         assert_eq!(app.current_problem().unwrap().run.id, Some(current.run_id));
 
         assert_eq!(app.current_problem().unwrap().run.phase, RunPhase::Queued);
+
+        assert!(!app.run_event(
+            0,
+            old.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 3,
+                total_cases: 3,
+            },
+        ));
+        assert!(!app.run_completed(0, old.run_id));
+        assert!(!app.run_failed(0, old.run_id, "old failure".to_string()));
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.id, Some(current.run_id));
+        assert_eq!(run.phase, RunPhase::Queued);
+        assert!(run.error.is_none());
     }
     #[test]
     fn completed_does_not_overwrite_compile_error() {
@@ -696,5 +727,64 @@ mod tests {
         assert_eq!(run.phase, RunPhase::CompileError);
 
         assert_eq!(run.error.as_deref(), Some("compile error"));
+    }
+
+    #[test]
+    fn terminal_run_states_ignore_late_messages() {
+        let mut app = WatchApp::new(&contest(1), vec![3]).unwrap();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::CompileTimedOut {
+                elapsed: std::time::Duration::from_secs(1),
+            },
+        ));
+
+        assert!(!app.run_started(0, request.run_id));
+        assert!(!app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 3 },
+        ));
+        assert!(!app.run_completed(0, request.run_id));
+        assert!(!app.run_failed(0, request.run_id, "late failure".to_string()));
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.phase, RunPhase::CompileTimedOut);
+        assert!(run.error.is_none());
+    }
+
+    #[test]
+    fn fatal_run_error_transitions_only_an_active_run_to_failed() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_failed(0, request.run_id, "runner failed".to_string()));
+        assert!(!app.run_completed(0, request.run_id));
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.phase, RunPhase::Failed);
+        assert_eq!(run.error.as_deref(), Some("runner failed"));
+    }
+
+    #[test]
+    fn no_samples_is_terminal_and_is_not_overwritten_by_completed() {
+        let mut app = WatchApp::new(&contest(1), vec![0]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(0, request.run_id, TestEvent::NoSamples));
+        assert!(!app.run_completed(0, request.run_id));
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.phase, RunPhase::NoSamples);
+        assert_eq!(run.accepted, 0);
+        assert_eq!(run.total_cases, 0);
     }
 }

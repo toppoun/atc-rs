@@ -48,6 +48,10 @@ fn handle_messages(
                 return Err(error);
             }
 
+            Ok(Message::WorkerFailed(error)) => {
+                return Err(error);
+            }
+
             Err(TryRecvError::Empty) => {
                 break;
             }
@@ -372,6 +376,15 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "watch failed");
 
+        let (tx, rx) = mpsc::channel();
+        tx.send(Message::WorkerFailed(io::Error::other("worker panicked")))
+            .unwrap();
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        let error = handle_messages(&mut app, &rx, &run_tx).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "worker panicked");
+
         // background側の全Senderが消えた場合
         let (tx, rx) = mpsc::channel::<Message>();
         drop(tx);
@@ -423,5 +436,58 @@ mod tests {
             key(KeyCode::Down, KeyEventKind::Press)
         ));
         assert_eq!(app.selected_case(), 1);
+    }
+
+    #[test]
+    fn stale_run_messages_in_the_same_drain_cannot_overwrite_a_newer_request() {
+        let mut app = app();
+        let (tx, rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        tx.send(Message::SourceChanged {
+            problem: 0,
+            path: PathBuf::from("A.cpp"),
+            language: Language::Cpp,
+        })
+        .unwrap();
+        tx.send(Message::RunStarted {
+            run_id: 1,
+            problem: 0,
+        })
+        .unwrap();
+        tx.send(Message::SourceChanged {
+            problem: 0,
+            path: PathBuf::from("A.py"),
+            language: Language::Python,
+        })
+        .unwrap();
+        tx.send(Message::RunEvent {
+            run_id: 1,
+            problem: 0,
+            event: message::TestEvent::TestRunFinished {
+                accepted: 3,
+                total_cases: 3,
+            },
+        })
+        .unwrap();
+        tx.send(Message::RunCompleted {
+            run_id: 1,
+            problem: 0,
+        })
+        .unwrap();
+
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+
+        let requests: Vec<_> = run_rx.try_iter().collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].run_id, 1);
+        assert_eq!(requests[1].run_id, 2);
+        assert_eq!(requests[1].language, Language::Python);
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.id, Some(2));
+        assert_eq!(run.phase, app::RunPhase::Queued);
+        assert_eq!(run.language, Some(Language::Python));
+        assert_eq!(run.accepted, 0);
     }
 }

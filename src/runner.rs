@@ -115,6 +115,13 @@ pub fn execute_with_cancel(
     timeout: Duration,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ExecutionResult, io::Error> {
+    if is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "process execution cancelled",
+        ));
+    }
+
     let child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -536,5 +543,19 @@ mod tests {
             ExecutionOutcome::Exited(status)
                 if status.success()
         ));
+    }
+
+    #[test]
+    fn already_cancelled_execution_does_not_spawn_the_program() {
+        let error = execute_with_cancel(
+            Path::new("definitely-not-a-real-program"),
+            &[],
+            "",
+            Duration::from_secs(1),
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 }

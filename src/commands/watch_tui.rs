@@ -20,29 +20,35 @@ const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 struct WatcherThread {
     shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl WatcherThread {
-    fn stop(mut self) -> io::Result<()> {
-        self.stop_and_join()
+    fn request_stop(&self) {
+        self.shutdown.store(true, Ordering::Release);
     }
 
-    fn stop_and_join(&mut self) -> io::Result<()> {
-        self.shutdown.store(true, Ordering::Release);
+    fn join(&mut self) -> io::Result<()> {
         let Some(handle) = self.handle.take() else {
             return Ok(());
         };
 
-        handle
-            .join()
-            .map_err(|_| io::Error::other("filesystem watcher thread panicked"))
+        handle.join().map_err(|_| {
+            io::Error::other("filesystem watcher thread panicked before reporting")
+        })??;
+        Ok(())
+    }
+
+    fn stop(mut self) -> io::Result<()> {
+        self.request_stop();
+        self.join()
     }
 }
 
 impl Drop for WatcherThread {
     fn drop(&mut self) {
-        let _ = self.stop_and_join();
+        self.request_stop();
+        let _ = self.join();
     }
 }
 
@@ -57,31 +63,48 @@ fn start_watcher(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
+    let panic_tx = tx.clone();
 
     let handle = thread::Builder::new()
         .name("atc-watch-fs".to_string())
         .spawn(move || {
-            while !thread_shutdown.load(Ordering::Acquire) {
-                let paths = match file_watcher.next_batch_timeout(WATCHER_POLL_INTERVAL) {
-                    Ok(Some(paths)) => paths,
-                    Ok(None) => continue,
+            run_watcher_guarded(panic_tx, || {
+                while !thread_shutdown.load(Ordering::Acquire) {
+                    let paths = match file_watcher.next_batch_timeout(WATCHER_POLL_INTERVAL) {
+                        Ok(Some(paths)) => paths,
+                        Ok(None) => continue,
 
-                    Err(error) => {
-                        let _ = tx.send(Message::WatcherFailed(error));
+                        Err(error) => {
+                            let _ = tx.send(Message::WatcherFailed(error));
+                            return;
+                        }
+                    };
+
+                    if !send_source_changes(paths, &watched_sources, &tx) {
                         return;
                     }
-                };
-
-                if !send_source_changes(paths, &watched_sources, &tx) {
-                    return;
                 }
-            }
+            })
         })?;
 
     Ok(WatcherThread {
         shutdown,
         handle: Some(handle),
     })
+}
+
+fn run_watcher_guarded(panic_tx: mpsc::Sender<Message>, run: impl FnOnce()) -> io::Result<()> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    if result.is_ok() {
+        return Ok(());
+    }
+
+    let error = io::Error::other("filesystem watcher thread panicked");
+    let _ = panic_tx.send(Message::WatcherFailed(io::Error::new(
+        error.kind(),
+        error.to_string(),
+    )));
+    Err(error)
 }
 
 fn send_source_changes(
@@ -161,10 +184,13 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
         Err(error) => {
             drop(message_rx);
 
-            let worker_result = test_worker.stop_and_join();
-            let watcher_result = watcher_thread.stop();
+            test_worker.request_stop();
+            watcher_thread.request_stop();
 
             ratatui::restore();
+
+            let worker_result = test_worker.stop_and_join();
+            let watcher_result = watcher_thread.stop();
 
             worker_result?;
             watcher_result?;
@@ -175,12 +201,15 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
     let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx, run_tx);
 
-    // test実行中だった場合、先にworkerをcancelして止める。
-    let worker_result = test_worker.stop_and_join();
+    // test実行中だった場合、runnerまでcancelを先に伝える。
+    test_worker.request_stop();
+    watcher_thread.request_stop();
 
-    let watcher_result = watcher_thread.stop();
-
+    // joinが予想外に長引いてもterminalは先に復元する。
     let restore_result = ratatui::try_restore();
+
+    let worker_result = test_worker.stop_and_join();
+    let watcher_result = watcher_thread.stop();
 
     result?;
     worker_result?;
@@ -340,6 +369,7 @@ mod tests {
             while !thread_shutdown.load(Ordering::Acquire) {
                 thread::yield_now();
             }
+            Ok(())
         });
         let worker = WatcherThread {
             shutdown,
@@ -351,10 +381,18 @@ mod tests {
 
     #[test]
     fn watcher_thread_panic_is_an_error() {
+        let (tx, rx) = mpsc::channel();
         let worker = WatcherThread {
             shutdown: Arc::new(AtomicBool::new(false)),
-            handle: Some(thread::spawn(|| panic!("watcher panic"))),
+            handle: Some(thread::spawn(move || {
+                run_watcher_guarded(tx, || panic!("watcher panic"))
+            })),
         };
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Message::WatcherFailed(error) if error.to_string().contains("panicked")
+        ));
 
         let error = worker.stop().unwrap_err();
 

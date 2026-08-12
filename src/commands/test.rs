@@ -209,14 +209,15 @@ pub(super) fn test_problem(
     debug: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    test_problem_with_cancel(
+    test_problem_with_debug_header_and_cancel(
         destination,
         problem,
         language,
         runner_config,
         debug,
         reporter,
-        &|| false,
+        crate::debug::materialize_debug_header,
+        None,
     )
 }
 
@@ -239,13 +240,14 @@ pub(super) fn test_problem_with_cancel(
         debug,
         reporter,
         crate::debug::materialize_debug_header,
-        is_cancelled,
+        Some(is_cancelled),
     )
 }
 
 // 既存テスト用。
 // debug.hpp を作る処理だけ差し替えられる。
 // cancel は発生しない。
+#[cfg(test)]
 pub(super) fn test_problem_with_debug_header(
     destination: &Path,
     problem: &Problem,
@@ -263,12 +265,13 @@ pub(super) fn test_problem_with_debug_header(
         debug,
         reporter,
         materialize_debug_header,
-        &|| false,
+        None,
     )
 }
 
 // 実際の test 処理は全部ここ。
 // 上3つの関数は、この共通実装への入口。
+#[allow(clippy::too_many_arguments)]
 fn test_problem_with_debug_header_and_cancel(
     destination: &Path,
     problem: &Problem,
@@ -277,7 +280,7 @@ fn test_problem_with_debug_header_and_cancel(
     debug: bool,
     reporter: &mut dyn Reporter,
     materialize_debug_header: impl FnOnce() -> Result<std::path::PathBuf, AppError>,
-    is_cancelled: &dyn Fn() -> bool,
+    is_cancelled: Option<&dyn Fn() -> bool>,
 ) -> Result<(), AppError> {
     let source = destination.join(format!("{}.{}", problem.index, language.extension()));
 
@@ -312,13 +315,22 @@ fn test_problem_with_debug_header_and_cancel(
                 &problem.index,
                 &samples,
                 |sample| {
-                    runner::execute_python_with_cancel(
-                        &source,
-                        &sample.input,
-                        &runner_config.python,
-                        timeout,
-                        is_cancelled,
-                    )
+                    if let Some(is_cancelled) = is_cancelled {
+                        runner::execute_python_with_cancel(
+                            &source,
+                            &sample.input,
+                            &runner_config.python,
+                            timeout,
+                            is_cancelled,
+                        )
+                    } else {
+                        runner::execute_python(
+                            &source,
+                            &sample.input,
+                            &runner_config.python,
+                            timeout,
+                        )
+                    }
                 },
                 reporter,
             )?;
@@ -340,15 +352,26 @@ fn test_problem_with_debug_header_and_cancel(
                 runner::BuildOptions::default()
             };
 
-            let compile_result = runner::compile_cpp_with_cancel(
-                &source,
-                &output,
-                &runner_config.cpp_compiler,
-                &runner_config.cpp_flags,
-                compile_timeout,
-                &build_options,
-                is_cancelled,
-            )?;
+            let compile_result = if let Some(is_cancelled) = is_cancelled {
+                runner::compile_cpp_with_cancel(
+                    &source,
+                    &output,
+                    &runner_config.cpp_compiler,
+                    &runner_config.cpp_flags,
+                    compile_timeout,
+                    &build_options,
+                    is_cancelled,
+                )?
+            } else {
+                runner::compile_cpp(
+                    &source,
+                    &output,
+                    &runner_config.cpp_compiler,
+                    &runner_config.cpp_flags,
+                    compile_timeout,
+                    &build_options,
+                )?
+            };
 
             if !report_compile_result(&compile_result, reporter) {
                 return Ok(());
@@ -358,7 +381,17 @@ fn test_problem_with_debug_header_and_cancel(
                 &problem.index,
                 &samples,
                 |sample| {
-                    runner::execute_with_cancel(&output, &[], &sample.input, timeout, is_cancelled)
+                    if let Some(is_cancelled) = is_cancelled {
+                        runner::execute_with_cancel(
+                            &output,
+                            &[],
+                            &sample.input,
+                            timeout,
+                            is_cancelled,
+                        )
+                    } else {
+                        runner::execute(&output, &[], &sample.input, timeout)
+                    }
                 },
                 reporter,
             )?;
