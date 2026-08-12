@@ -1,4 +1,5 @@
 use crate::atcoder;
+use crate::config::Config;
 use crate::error::AppError;
 use crate::language::Language;
 use crate::model::{Contest, Sample};
@@ -20,6 +21,8 @@ pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError
     if existing_contest_is_noop(&destination)? {
         return Ok(());
     }
+    let config = Config::load()?;
+    let language = config.defaults.language;
 
     let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         atcoder::AtCoderClient::fixture(path)
@@ -27,12 +30,13 @@ pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError
         atcoder::AtCoderClient::new()?
     };
 
-    new_at(&destination, contest_id, &atcoder, reporter)
+    new_at(&destination, contest_id, language, &atcoder, reporter)
 }
 
 fn new_at(
     destination: &Path,
     contest_id: &str,
+    language: Language,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
@@ -40,7 +44,6 @@ fn new_at(
         return Ok(());
     }
 
-    let language = Language::Cpp;
     let template = builtin_template(language);
 
     let FetchedContestData {
@@ -279,8 +282,14 @@ mod tests {
         let destination = temp.path().join("abc466");
         let client = atcoder::AtCoderClient::fixture(fixture_root());
 
-        new_at(&destination, "abc466", &client, &mut reporter)
-            .expect("fixture new flow should succeed");
+        new_at(
+            &destination,
+            "abc466",
+            Language::Cpp,
+            &client,
+            &mut reporter,
+        )
+        .expect("fixture new flow should succeed");
 
         let contest =
             workspace::load_metadata(&destination).expect("created metadata should be readable");
@@ -310,8 +319,14 @@ mod tests {
             .expect("existing source should be written");
         let client = atcoder::AtCoderClient::fixture(temp.path().join("missing-fixtures"));
 
-        new_at(&destination, "abc466", &client, &mut reporter)
-            .expect("existing contest should be a no-op");
+        new_at(
+            &destination,
+            "abc466",
+            Language::Cpp,
+            &client,
+            &mut reporter,
+        )
+        .expect("existing contest should be a no-op");
 
         assert_eq!(
             std::fs::read_to_string(destination.join("A.cpp"))
@@ -338,8 +353,14 @@ mod tests {
         let destination = temp.path().join("broken");
         let client = atcoder::AtCoderClient::fixture(&fixture_root);
 
-        let error = new_at(&destination, "broken", &client, &mut reporter)
-            .expect_err("unsafe workspace path should fail");
+        let error = new_at(
+            &destination,
+            "broken",
+            Language::Cpp,
+            &client,
+            &mut reporter,
+        )
+        .expect_err("unsafe workspace path should fail");
 
         assert!(matches!(
             error,
