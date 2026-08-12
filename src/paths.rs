@@ -13,6 +13,10 @@ pub fn cache_dir() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(choose_base_strategy()?.cache_dir().join("atc"))
 }
 
+pub fn debug_include_dir() -> Result<PathBuf, etcetera::HomeDirError> {
+    Ok(cache_dir()?.join("include"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
