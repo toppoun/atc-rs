@@ -6,7 +6,7 @@ use ratatui::{
 use super::app::WatchApp;
 
 pub fn render(frame: &mut Frame, app: &WatchApp) {
-    let current_problem = app.problems.get(app.selected_problem);
+    let current_problem = app.current_problem();
 
     let problem = current_problem
         .map(|problem| problem.index.as_str())
@@ -23,10 +23,10 @@ pub fn render(frame: &mut Frame, app: &WatchApp) {
     let sample = if total_cases == 0 {
         "-".to_string()
     } else {
-        format!("{} / {}", app.selected_case + 1, total_cases)
+        format!("{} / {}", app.selected_case() + 1, total_cases)
     };
 
-    let debug = if app.debug { "ON" } else { "OFF" };
+    let debug = if app.debug_enabled() { "ON" } else { "OFF" };
 
     let text = format!(
         "Contest: {}\n\
@@ -37,7 +37,11 @@ pub fn render(frame: &mut Frame, app: &WatchApp) {
      j/k or ↓/↑ : sample\n\
      d           : debug\n\
      q           : quit",
-        app.contest_id, problem, title, sample, debug,
+        app.contest_id(),
+        problem,
+        title,
+        sample,
+        debug,
     );
 
     let block = Block::default().title(" atc watch ").borders(Borders::ALL);

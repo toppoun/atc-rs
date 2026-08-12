@@ -159,5 +159,9 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "watch"]).unwrap();
 
         assert!(matches!(cli.command, Command::Watch { tui: false }));
+
+        let cli = Cli::try_parse_from(["atc-rs", "watch", "--tui"]).unwrap();
+
+        assert!(matches!(cli.command, Command::Watch { tui: true }));
     }
 }
