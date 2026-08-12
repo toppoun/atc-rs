@@ -123,7 +123,31 @@ struct CaseDisplay {
 
 #[derive(Debug)]
 struct TestDisplayState {
+    problem_index: String,
+    total_cases: usize,
     cases: Vec<CaseDisplay>,
+}
+
+impl TestDisplayState {
+    fn record_case(&mut self, case: CaseDisplay) {
+        if self
+            .cases
+            .iter()
+            .any(|existing| existing.number == case.number)
+        {
+            return;
+        }
+
+        self.cases.push(case);
+    }
+
+    fn record_stderr(&mut self, number: usize, stderr: &str) {
+        if let Some(case) = self.cases.iter_mut().find(|case| case.number == number)
+            && case.stderr.is_none()
+        {
+            case.stderr = Some(stderr.to_owned());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -169,10 +193,12 @@ impl Reporter for TerminalReporter {
                 eprintln!("Refreshed {}", destination.display());
             }
             Event::NoSamples { problem_index } => {
+                self.current_test = None;
                 println!("No samples for {problem_index}");
             }
 
             Event::CompileFailed { stderr } => {
+                self.current_test = None;
                 println!("Compile Error");
                 if !stderr.is_empty() {
                     eprintln!("{stderr}");
@@ -180,12 +206,13 @@ impl Reporter for TerminalReporter {
             }
 
             Event::CompileTimedOut { elapsed } => {
+                self.current_test = None;
                 println!("Compile Timed Out ({elapsed:.2?})");
             }
 
             Event::TestCaseAccepted { number, elapsed } => {
                 if let Some(test) = &mut self.current_test {
-                    test.cases.push(CaseDisplay {
+                    test.record_case(CaseDisplay {
                         number,
                         verdict: DisplayVerdict::Ac,
                         elapsed,
@@ -203,7 +230,7 @@ impl Reporter for TerminalReporter {
                 elapsed,
             } => {
                 if let Some(test) = &mut self.current_test {
-                    test.cases.push(CaseDisplay {
+                    test.record_case(CaseDisplay {
                         number,
                         verdict: DisplayVerdict::Wa,
                         elapsed,
@@ -215,7 +242,7 @@ impl Reporter for TerminalReporter {
             }
             Event::TestCaseRuntimeError { number, elapsed } => {
                 if let Some(test) = &mut self.current_test {
-                    test.cases.push(CaseDisplay {
+                    test.record_case(CaseDisplay {
                         number,
                         verdict: DisplayVerdict::Re,
                         elapsed,
@@ -228,7 +255,7 @@ impl Reporter for TerminalReporter {
 
             Event::TestCaseTimedOut { number, elapsed } => {
                 if let Some(test) = &mut self.current_test {
-                    test.cases.push(CaseDisplay {
+                    test.record_case(CaseDisplay {
                         number,
                         verdict: DisplayVerdict::Tle,
                         elapsed,
@@ -240,10 +267,8 @@ impl Reporter for TerminalReporter {
             }
 
             Event::TestCaseStderr { number, stderr } => {
-                if let Some(test) = &mut self.current_test
-                    && let Some(case) = test.cases.iter_mut().find(|case| case.number == number)
-                {
-                    case.stderr = Some(stderr.to_owned());
+                if let Some(test) = &mut self.current_test {
+                    test.record_stderr(number, stderr);
                 }
             }
             Event::SourceCreated { path } => {
@@ -254,6 +279,7 @@ impl Reporter for TerminalReporter {
             }
 
             Event::WatchSourceChanged { source } => {
+                self.current_test = None;
                 println!();
                 println!(
                     "Changed {}",
@@ -264,60 +290,82 @@ impl Reporter for TerminalReporter {
                 );
             }
             Event::TestRunStarted {
-                problem_index: _,
+                problem_index,
                 total_cases,
             } => {
                 self.current_test = Some(TestDisplayState {
+                    problem_index: problem_index.to_owned(),
+                    total_cases,
                     cases: Vec::with_capacity(total_cases),
                 });
             }
 
             Event::TestRunFinished {
+                problem_index,
                 accepted,
                 total_cases,
-                ..
             } => {
-                self.print_test_result(accepted, total_cases);
+                if let Some(output) = self.finish_test_result(problem_index, accepted, total_cases)
+                {
+                    print!("{output}");
+                }
             }
         }
     }
 }
 
-fn print_section(text: &str) {
+fn print_section(text: &str) -> String {
     if text.is_empty() {
-        println!("<empty>");
-        return;
+        return "<empty>\n".to_string();
     }
 
-    print!("{text}");
+    let mut output = text.to_owned();
 
     if !text.ends_with('\n') {
-        println!();
+        output.push('\n');
     }
+
+    output
 }
 
 impl TerminalReporter {
-    fn print_test_result(&mut self, accepted: usize, total_cases: usize) {
-        let Some(test) = self.current_test.take() else {
-            return;
-        };
+    fn finish_test_result(
+        &mut self,
+        problem_index: &str,
+        accepted: usize,
+        total_cases: usize,
+    ) -> Option<String> {
+        let current = self.current_test.as_ref()?;
 
-        println!("Test Results");
-        println!();
+        if current.problem_index != problem_index || current.total_cases != total_cases {
+            return None;
+        }
 
-        println!("{:<12} {:<8} {:>10}", "Case", "Result", "Time");
+        let test = self.current_test.take()?;
+        let mut output = String::new();
+
+        use std::fmt::Write as _;
+
+        writeln!(output, "Test Results").expect("writing to String cannot fail");
+        writeln!(output).expect("writing to String cannot fail");
+
+        writeln!(output, "{:<12} {:<8} {:>10}", "Case", "Result", "Time")
+            .expect("writing to String cannot fail");
 
         for case in &test.cases {
-            println!(
+            writeln!(
+                output,
                 "{:<12} {:<8} {:>7.2} ms",
                 format!("sample-{}", case.number),
                 case.verdict.as_str(),
                 case.elapsed.as_secs_f64() * 1000.0,
-            );
+            )
+            .expect("writing to String cannot fail");
         }
 
-        println!();
-        println!("Result: {accepted}/{total_cases} AC");
+        writeln!(output).expect("writing to String cannot fail");
+        writeln!(output, "Result: {accepted}/{total_cases} AC")
+            .expect("writing to String cannot fail");
 
         for case in &test.cases {
             let has_stderr = case
@@ -331,29 +379,37 @@ impl TerminalReporter {
                 continue;
             }
 
-            println!();
-            println!("=== sample-{} {} ===", case.number, case.verdict.as_str());
+            writeln!(output).expect("writing to String cannot fail");
+            writeln!(
+                output,
+                "=== sample-{} {} ===",
+                case.number,
+                case.verdict.as_str()
+            )
+            .expect("writing to String cannot fail");
 
             if let Some(expected) = &case.expected {
-                println!();
-                println!("expected:");
-                print_section(expected);
+                writeln!(output).expect("writing to String cannot fail");
+                writeln!(output, "expected:").expect("writing to String cannot fail");
+                output.push_str(&print_section(expected));
             }
 
             if let Some(actual) = &case.actual {
-                println!();
-                println!("actual:");
-                print_section(actual);
+                writeln!(output).expect("writing to String cannot fail");
+                writeln!(output, "actual:").expect("writing to String cannot fail");
+                output.push_str(&print_section(actual));
             }
 
             if let Some(stderr) = &case.stderr
                 && !stderr.is_empty()
             {
-                println!();
-                println!("stderr:");
-                print_section(stderr);
+                writeln!(output).expect("writing to String cannot fail");
+                writeln!(output, "stderr:").expect("writing to String cannot fail");
+                output.push_str(&print_section(stderr));
             }
         }
+
+        Some(output)
     }
 }
 
@@ -363,4 +419,186 @@ pub struct NullReporter;
 #[cfg(test)]
 impl Reporter for NullReporter {
     fn report(&mut self, _: Event<'_>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ELAPSED: Duration = Duration::from_micros(7_200);
+
+    fn start(reporter: &mut TerminalReporter, problem_index: &str, total_cases: usize) {
+        reporter.report(Event::TestRunStarted {
+            problem_index,
+            total_cases,
+        });
+    }
+
+    #[test]
+    fn renders_summary_and_only_required_case_details() {
+        let mut reporter = TerminalReporter::default();
+        start(&mut reporter, "A", 4);
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: ELAPSED,
+        });
+        reporter.report(Event::TestCaseWrongAnswer {
+            number: 2,
+            expected: "",
+            actual: "",
+            elapsed: Duration::from_micros(6_800),
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 2,
+            stderr: "warning  \n",
+        });
+        reporter.report(Event::TestCaseRuntimeError {
+            number: 3,
+            elapsed: Duration::from_millis(2),
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 3,
+            stderr: "runtime error",
+        });
+        reporter.report(Event::TestCaseTimedOut {
+            number: 4,
+            elapsed: Duration::from_secs(2),
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 4,
+            stderr: " \t\n",
+        });
+
+        let output = reporter.finish_test_result("A", 1, 4).unwrap();
+
+        assert!(output.contains("sample-1     AC"));
+        assert!(output.contains("sample-2     WA"));
+        assert!(output.contains("sample-3     RE"));
+        assert!(output.contains("sample-4     TLE"));
+        assert!(output.contains("Result: 1/4 AC"));
+        assert!(!output.contains("=== sample-1 AC ==="));
+        assert!(output.contains(
+            "=== sample-2 WA ===\n\nexpected:\n<empty>\n\nactual:\n<empty>\n\nstderr:\nwarning  \n"
+        ));
+        assert!(output.contains("=== sample-3 RE ===\n\nstderr:\nruntime error\n"));
+        assert!(output.contains("=== sample-4 TLE ===\n\nstderr:\n \t\n"));
+    }
+
+    #[test]
+    fn accepted_case_with_stderr_has_details_and_keeps_whitespace() {
+        let mut reporter = TerminalReporter::default();
+        start(&mut reporter, "A", 1);
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: ELAPSED,
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 1,
+            stderr: "  debug output  ",
+        });
+
+        let output = reporter.finish_test_result("A", 1, 1).unwrap();
+
+        assert!(output.contains("=== sample-1 AC ===\n\nstderr:\n  debug output  \n"));
+    }
+
+    #[test]
+    fn ignores_case_events_without_a_started_run() {
+        let mut reporter = TerminalReporter::default();
+
+        reporter.report(Event::TestCaseWrongAnswer {
+            number: 1,
+            expected: "expected",
+            actual: "actual",
+            elapsed: ELAPSED,
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 1,
+            stderr: "stderr",
+        });
+
+        assert!(reporter.current_test.is_none());
+        assert!(reporter.finish_test_result("A", 0, 1).is_none());
+    }
+
+    #[test]
+    fn mismatched_finish_does_not_consume_the_current_run() {
+        let mut reporter = TerminalReporter::default();
+        start(&mut reporter, "A", 1);
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: ELAPSED,
+        });
+
+        assert!(reporter.finish_test_result("B", 1, 1).is_none());
+        assert!(reporter.finish_test_result("A", 1, 2).is_none());
+        assert!(reporter.current_test.is_some());
+
+        let output = reporter.finish_test_result("A", 1, 1).unwrap();
+        assert!(output.contains("sample-1     AC"));
+        assert!(reporter.current_test.is_none());
+    }
+
+    #[test]
+    fn duplicate_case_and_stderr_events_are_idempotent() {
+        let mut reporter = TerminalReporter::default();
+        start(&mut reporter, "A", 1);
+
+        for _ in 0..2 {
+            reporter.report(Event::TestCaseAccepted {
+                number: 1,
+                elapsed: ELAPSED,
+            });
+        }
+        reporter.report(Event::TestCaseStderr {
+            number: 1,
+            stderr: "first",
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 1,
+            stderr: "second",
+        });
+
+        let test = reporter.current_test.as_ref().unwrap();
+        assert_eq!(test.cases.len(), 1);
+        assert_eq!(test.cases[0].stderr.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn new_boundaries_reset_incomplete_or_previous_state() {
+        let mut reporter = TerminalReporter::default();
+        start(&mut reporter, "A", 2);
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: ELAPSED,
+        });
+
+        start(&mut reporter, "B", 1);
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: ELAPSED,
+        });
+        let output = reporter.finish_test_result("B", 1, 1).unwrap();
+        assert_eq!(output.matches("sample-1").count(), 1);
+
+        start(&mut reporter, "C", 1);
+        reporter.report(Event::NoSamples { problem_index: "D" });
+        assert!(reporter.current_test.is_none());
+
+        start(&mut reporter, "E", 1);
+        reporter.report(Event::CompileFailed { stderr: "error" });
+        assert!(reporter.current_test.is_none());
+
+        start(&mut reporter, "F", 1);
+        reporter.report(Event::CompileTimedOut { elapsed: ELAPSED });
+        assert!(reporter.current_test.is_none());
+    }
+
+    #[test]
+    fn print_section_preserves_content_and_supplies_only_a_missing_final_newline() {
+        assert_eq!(print_section(""), "<empty>\n");
+        assert_eq!(print_section("  text  "), "  text  \n");
+        assert_eq!(print_section("line  \n\n"), "line  \n\n");
+        assert_eq!(print_section(" \t\n"), " \t\n");
+    }
 }

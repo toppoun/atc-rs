@@ -625,6 +625,71 @@ fn recoverable_case_results_do_not_stop_later_samples() {
 }
 
 #[test]
+fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
+    let samples = vec![
+        Sample {
+            input: String::new(),
+            output: "expected\n".to_string(),
+        },
+        Sample {
+            input: String::new(),
+            output: "expected\n".to_string(),
+        },
+        Sample {
+            input: String::new(),
+            output: "expected\n".to_string(),
+        },
+    ];
+    let mut results = VecDeque::from([
+        execution(ExecutionOutcome::Exited(exit_status(0)), "expected\n", ""),
+        execution(ExecutionOutcome::Exited(exit_status(0)), "wrong\n", "wa"),
+        execution(
+            ExecutionOutcome::Exited(exit_status(0)),
+            "expected\n",
+            "debug",
+        ),
+    ]);
+    let mut reporter = RecordingReporter::default();
+
+    run_test_cases(
+        "A",
+        &samples,
+        |_| Ok(results.pop_front().unwrap()),
+        &mut reporter,
+    )
+    .unwrap();
+    run_test_cases(
+        "B",
+        &samples[..1],
+        |_| {
+            Ok(execution(
+                ExecutionOutcome::Exited(exit_status(0)),
+                "expected\n",
+                "",
+            ))
+        },
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        reporter.events,
+        [
+            "test-started:A:3",
+            "case-accepted:1",
+            "case-wrong-answer:2",
+            "case-stderr:2:wa",
+            "case-accepted:3",
+            "case-stderr:3:debug",
+            "test-finished:A:2:3",
+            "test-started:B:1",
+            "case-accepted:1",
+            "test-finished:B:1:1",
+        ]
+    );
+}
+
+#[test]
 fn stderr_does_not_change_an_accepted_stdout_verdict() {
     let sample = Sample {
         input: String::new(),

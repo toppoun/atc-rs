@@ -35,6 +35,31 @@ fn process_changed_paths(
     paths: Vec<std::path::PathBuf>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
+    process_changed_paths_with(
+        destination,
+        contest,
+        runner_config,
+        paths,
+        reporter,
+        test_problem,
+    )
+}
+
+fn process_changed_paths_with(
+    destination: &Path,
+    contest: &Contest,
+    runner_config: &RunnerConfig,
+    paths: Vec<std::path::PathBuf>,
+    reporter: &mut dyn Reporter,
+    mut run_test: impl FnMut(
+        &Path,
+        &Problem,
+        Language,
+        &RunnerConfig,
+        bool,
+        &mut dyn Reporter,
+    ) -> Result<(), AppError>,
+) -> Result<(), AppError> {
     for path in paths {
         // remove途中など、一時的に存在しない場合は無視
         if !path.is_file() {
@@ -47,7 +72,7 @@ fn process_changed_paths(
 
         reporter.report(Event::WatchSourceChanged { source: &path });
 
-        test_problem(
+        run_test(
             destination,
             problem,
             language,
@@ -116,6 +141,25 @@ mod tests {
                 }
                 Event::NoSamples { problem_index } => {
                     self.events.push(format!("no-samples:{problem_index}"));
+                }
+                Event::TestRunStarted {
+                    problem_index,
+                    total_cases,
+                } => {
+                    self.events
+                        .push(format!("test-started:{problem_index}:{total_cases}"));
+                }
+                Event::TestCaseAccepted { number, .. } => {
+                    self.events.push(format!("case-accepted:{number}"));
+                }
+                Event::TestRunFinished {
+                    problem_index,
+                    accepted,
+                    total_cases,
+                } => {
+                    self.events.push(format!(
+                        "test-finished:{problem_index}:{accepted}:{total_cases}"
+                    ));
                 }
                 _ => panic!("unexpected event while testing watch"),
             }
@@ -222,5 +266,53 @@ mod tests {
         .unwrap();
 
         assert!(reporter.events.is_empty());
+    }
+
+    #[test]
+    fn changed_header_precedes_the_shared_test_run_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let source = destination.join("A.py");
+        std::fs::write(&source, "source").unwrap();
+        let contest = contest(vec![problem("A")]);
+        let mut reporter = RecordingReporter::default();
+
+        process_changed_paths_with(
+            destination,
+            &contest,
+            &RunnerConfig::default(),
+            vec![source.clone()],
+            &mut reporter,
+            |_, problem, language, _, debug, reporter| {
+                assert_eq!(problem.index, "A");
+                assert_eq!(language, Language::Python);
+                assert!(!debug);
+                reporter.report(Event::TestRunStarted {
+                    problem_index: &problem.index,
+                    total_cases: 1,
+                });
+                reporter.report(Event::TestCaseAccepted {
+                    number: 1,
+                    elapsed: std::time::Duration::from_millis(1),
+                });
+                reporter.report(Event::TestRunFinished {
+                    problem_index: &problem.index,
+                    accepted: 1,
+                    total_cases: 1,
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            reporter.events,
+            [
+                format!("changed:{}", source.display()),
+                "test-started:A:1".to_string(),
+                "case-accepted:1".to_string(),
+                "test-finished:A:1:1".to_string(),
+            ]
+        );
     }
 }
