@@ -150,4 +150,11 @@ mod tests {
 
         assert!(Cli::try_parse_from(["atc-rs", "create", "A", "-l", "py"]).is_err());
     }
+
+    #[test]
+    fn parses_plain_watch() {
+        let cli = Cli::try_parse_from(["atc-rs", "watch"]).unwrap();
+
+        assert!(matches!(cli.command, Command::Watch));
+    }
 }
