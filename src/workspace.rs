@@ -1,3 +1,4 @@
+use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -93,11 +94,12 @@ pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -
 pub fn create_source_files(
     destination: &Path,
     problems: &[Problem],
+    language: Language,
     template: &str,
 ) -> io::Result<()> {
     for problem in problems {
         validate_path_component(&problem.index, "problem index")?;
-        let path = destination.join(format!("{}.cpp", problem.index));
+        let path = destination.join(format!("{}.{}", problem.index, language.extension(),));
 
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => file.write_all(template.as_bytes())?,
@@ -405,7 +407,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let problems = vec![problem("A"), problem("B"), problem("C")];
 
-        create_source_files(temp.path(), &problems, "template").unwrap();
+        create_source_files(temp.path(), &problems, Language::Cpp, "template").unwrap();
 
         for problem in problems {
             assert_eq!(
@@ -421,7 +423,7 @@ mod tests {
         let source = temp.path().join("A.cpp");
         fs::write(&source, "user source").unwrap();
 
-        create_source_files(temp.path(), &[problem("A")], "template").unwrap();
+        create_source_files(temp.path(), &[problem("A")], Language::Cpp, "template").unwrap();
 
         assert_eq!(fs::read_to_string(source).unwrap(), "user source");
     }
@@ -430,8 +432,13 @@ mod tests {
     fn rejects_problem_index_that_escapes_destination() {
         let temp = tempfile::tempdir().unwrap();
 
-        let error = create_source_files(temp.path(), &[problem("../outside")], "template")
-            .expect_err("unsafe problem index should fail");
+        let error = create_source_files(
+            temp.path(),
+            &[problem("../outside")],
+            Language::Cpp,
+            "template",
+        )
+        .expect_err("unsafe problem index should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!temp.path().join("outside.cpp").exists());

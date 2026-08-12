@@ -1,6 +1,8 @@
 use crate::atcoder;
 use crate::error::AppError;
+use crate::language::Language;
 use crate::model::{Contest, Sample};
+use crate::template::builtin_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::validate_refresh_destination;
@@ -10,35 +12,6 @@ struct FetchedContestData {
     contest: Contest,
     samples_by_problem: Vec<Option<Vec<Sample>>>,
 }
-
-const TEMPLATE: &str = r#"#include <bits/stdc++.h>
-using namespace std;
-
-#ifdef LOCAL
-#include <atc/debug.hpp>
-#else
-#define debug(...) ((void)0)
-#endif
-
-using ll = long long;
-
-// 1. 見方・状態:
-// 
-// 2. 答えに必要な情報:
-// 
-// 3. 捨てる情報と根拠:
-// 
-// 4. 初期化・更新・判定・計算量:
-// 
-
-
-int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    return 0;
-}
-"#;
 
 pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
@@ -67,6 +40,9 @@ fn new_at(
         return Ok(());
     }
 
+    let language = Language::Cpp;
+    let template = builtin_template(language);
+
     let FetchedContestData {
         contest,
         samples_by_problem,
@@ -85,7 +61,7 @@ fn new_at(
         .prefix(".atc-new-")
         .tempdir_in(parent)?;
 
-    workspace::create_source_files(staging.path(), &contest.problems, TEMPLATE)?;
+    workspace::create_source_files(staging.path(), &contest.problems, language, template)?;
     for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
         if let Some(samples) = samples {
             workspace::save_samples(staging.path(), problem, &samples)?;
