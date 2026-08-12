@@ -32,7 +32,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), AppError> {
     let cli = cli::Cli::parse();
 
-    let mut reporter = TerminalReporter;
+    let mut reporter = TerminalReporter::default();
 
     match cli.command {
         cli::Command::New { contest, language } => {

@@ -129,6 +129,20 @@ impl Reporter for RecordingReporter {
             Event::WatchSourceChanged { source } => {
                 format!("watch-source-changed:{}", source.display())
             }
+            Event::TestRunStarted {
+                problem_index,
+                total_cases,
+            } => {
+                format!("test-started:{problem_index}:{total_cases}")
+            }
+
+            Event::TestRunFinished {
+                problem_index,
+                accepted,
+                total_cases,
+            } => {
+                format!("test-finished:{problem_index}:{accepted}:{total_cases}")
+            }
         };
         self.events.push(event);
     }
@@ -423,7 +437,10 @@ fn normal_cpp_build_neither_materializes_nor_requires_debug_header() {
     )
     .unwrap();
 
-    assert_eq!(reporter.events, ["case-accepted:1"]);
+    assert_eq!(
+        reporter.events,
+        ["test-started:A:1", "case-accepted:1", "test-finished:A:1:1",]
+    );
 }
 
 #[test]
@@ -472,9 +489,11 @@ fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() 
     )
     .unwrap();
 
-    assert_eq!(reporter.events[0], "case-accepted:1");
-    assert!(reporter.events[1].starts_with("case-stderr:1:"));
-    assert!(reporter.events[1].contains("x = 7"));
+    assert_eq!(reporter.events[0], "test-started:A:1");
+    assert_eq!(reporter.events[1], "case-accepted:1");
+    assert!(reporter.events[2].starts_with("case-stderr:1:"));
+    assert!(reporter.events[2].contains("x = 7"));
+    assert_eq!(reporter.events[3], "test-finished:A:1:1");
 }
 
 #[test]
@@ -580,6 +599,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
     let mut reporter = RecordingReporter::default();
 
     run_test_cases(
+        "A",
         &samples,
         |_| Ok(results.pop_front().unwrap()),
         &mut reporter,
@@ -590,6 +610,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
     assert_eq!(
         reporter.events,
         [
+            "test-started:A:4",
             "case-wrong-answer:1",
             "case-stderr:1:wa stderr",
             "case-runtime-error:2",
@@ -598,6 +619,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
             "case-stderr:3:tle stderr",
             "case-accepted:4",
             "case-stderr:4:ac stderr",
+            "test-finished:A:1:4",
         ]
     );
 }

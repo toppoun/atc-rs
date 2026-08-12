@@ -11,8 +11,8 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-#[derive(Debug)]
-enum CaseVerdict {
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CaseVerdict {
     Accepted,
     WrongAnswer,
     RuntimeError,
@@ -37,8 +37,9 @@ pub(super) fn report_case_result(
     sample: &Sample,
     result: &runner::ExecutionResult,
     reporter: &mut dyn Reporter,
-) {
-    match judge_case(sample, result) {
+) -> CaseVerdict {
+    let verdict = judge_case(sample, result);
+    match verdict {
         CaseVerdict::Accepted => {
             reporter.report(Event::TestCaseAccepted {
                 number,
@@ -75,17 +76,37 @@ pub(super) fn report_case_result(
             stderr: &result.stderr,
         });
     }
+    verdict
 }
 
 pub(super) fn run_test_cases(
+    problem_index: &str,
     samples: &[Sample],
     mut execute_case: impl FnMut(&Sample) -> io::Result<runner::ExecutionResult>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
+    reporter.report(Event::TestRunStarted {
+        problem_index,
+        total_cases: samples.len(),
+    });
+
+    let mut accepted = 0;
+
     for (index, sample) in samples.iter().enumerate() {
         let result = execute_case(sample)?;
-        report_case_result(index + 1, sample, &result, reporter);
+
+        let verdict = report_case_result(index + 1, sample, &result, reporter);
+
+        if matches!(verdict, CaseVerdict::Accepted) {
+            accepted += 1;
+        }
     }
+
+    reporter.report(Event::TestRunFinished {
+        problem_index,
+        accepted,
+        total_cases: samples.len(),
+    });
 
     Ok(())
 }
@@ -225,6 +246,7 @@ pub(super) fn test_problem_with_debug_header(
     match language {
         Language::Python => {
             run_test_cases(
+                &problem.index,
                 &samples,
                 |sample| {
                     runner::execute_python(&source, &sample.input, &runner_config.python, timeout)
@@ -261,6 +283,7 @@ pub(super) fn test_problem_with_debug_header(
             }
 
             run_test_cases(
+                &problem.index,
                 &samples,
                 |sample| runner::execute(&output, &[], &sample.input, timeout),
                 reporter,
