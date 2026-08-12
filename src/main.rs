@@ -18,6 +18,9 @@ use crate::error::AppError;
 use ui::TerminalReporter;
 
 fn main() -> ExitCode {
+    println!("config: {}", paths::config_dir().unwrap().display());
+
+    println!("cache : {}", paths::cache_dir().unwrap().display());
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -9,6 +9,10 @@ pub fn config_file() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(config_dir()?.join("config.toml"))
 }
 
+pub fn cache_dir() -> Result<PathBuf, etcetera::HomeDirError> {
+    Ok(choose_base_strategy()?.cache_dir().join("atc"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
