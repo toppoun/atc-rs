@@ -239,6 +239,26 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
     Ok(samples)
 }
 
+pub fn create_source_file(
+    destination: &Path,
+    name: &str,
+    language: Language,
+    template: &str,
+) -> io::Result<PathBuf> {
+    validate_path_component(name, "source name")?;
+
+    let path = destination.join(format!("{}.{}", name, language.extension()));
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+
+    file.write_all(template.as_bytes())?;
+
+    Ok(path)
+}
+
 pub fn create_source_files(
     destination: &Path,
     problems: &[Problem],
@@ -246,14 +266,7 @@ pub fn create_source_files(
     template: &str,
 ) -> io::Result<()> {
     for problem in problems {
-        validate_path_component(&problem.index, "problem index")?;
-        let path = destination.join(format!("{}.{}", problem.index, language.extension()));
-
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => file.write_all(template.as_bytes())?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
+        create_source_file(destination, &problem.index, language, template)?;
     }
 
     Ok(())

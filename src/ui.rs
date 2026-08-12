@@ -54,7 +54,6 @@ pub enum Event<'a> {
 
     TestCaseRuntimeError {
         number: usize,
-        stderr: &'a str,
         elapsed: Duration,
     },
 
@@ -65,6 +64,9 @@ pub enum Event<'a> {
     TestCaseStderr {
         number: usize,
         stderr: &'a str,
+    },
+    SourceCreated {
+        path: &'a Path,
     },
 }
 
@@ -143,16 +145,8 @@ impl Reporter for TerminalReporter {
                 println!("{actual}");
             }
 
-            Event::TestCaseRuntimeError {
-                number,
-                stderr,
-                elapsed,
-            } => {
+            Event::TestCaseRuntimeError { number, elapsed } => {
                 println!("Sample {number}: RE ({elapsed:.2?})");
-
-                if !stderr.is_empty() {
-                    eprintln!("{stderr}");
-                }
             }
 
             Event::TestCaseTimedOut { number, elapsed } => {
@@ -161,6 +155,9 @@ impl Reporter for TerminalReporter {
             Event::TestCaseStderr { number, stderr } => {
                 eprintln!("Sample {number} stderr:");
                 eprint!("{stderr}");
+            }
+            Event::SourceCreated { path } => {
+                println!("Created {}", path.display());
             }
         }
     }

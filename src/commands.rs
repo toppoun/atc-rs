@@ -267,7 +267,6 @@ fn report_case_result(
         CaseVerdict::RuntimeError => {
             reporter.report(Event::TestCaseRuntimeError {
                 number,
-                stderr: &result.stderr,
                 elapsed: result.elapsed,
             });
         }
@@ -347,6 +346,17 @@ fn resolve_test_language(cli_language: Option<Language>, config: &Config) -> Lan
     cli_language.unwrap_or(config.defaults.language)
 }
 
+fn validate_debug_language(language: Language, debug: bool) -> io::Result<()> {
+    if debug && language != Language::Cpp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--debug is only supported for C++",
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn test(
     problem_index: &str,
     cli_language: Option<Language>,
@@ -366,13 +376,7 @@ pub fn test(
 
     let config = Config::load()?;
     let language = resolve_test_language(cli_language, &config);
-    if debug && language != Language::Cpp {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--debug is only supported for C++",
-        )
-        .into());
-    }
+    validate_debug_language(language, debug)?;
     test_problem(&cwd, problem, language, &config.runner, debug, reporter)
 }
 
@@ -383,6 +387,26 @@ fn test_problem(
     runner_config: &RunnerConfig,
     debug: bool,
     reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    test_problem_with_debug_header(
+        destination,
+        problem,
+        language,
+        runner_config,
+        debug,
+        reporter,
+        crate::debug::materialize_debug_header,
+    )
+}
+
+fn test_problem_with_debug_header(
+    destination: &Path,
+    problem: &crate::model::Problem,
+    language: Language,
+    runner_config: &RunnerConfig,
+    debug: bool,
+    reporter: &mut dyn Reporter,
+    materialize_debug_header: impl FnOnce() -> Result<std::path::PathBuf, AppError>,
 ) -> Result<(), AppError> {
     let source = destination.join(format!("{}.{}", problem.index, language.extension()));
 
@@ -428,7 +452,7 @@ fn test_problem(
                     .join(format!("{}{}", problem.index, std::env::consts::EXE_SUFFIX));
             let build_options = if debug {
                 runner::BuildOptions {
-                    debug_include_dir: Some(crate::debug::materialize_debug_header()?),
+                    debug_include_dir: Some(materialize_debug_header()?),
                 }
             } else {
                 runner::BuildOptions::default()
@@ -453,6 +477,24 @@ fn test_problem(
             )?;
         }
     }
+
+    Ok(())
+}
+
+pub fn create(
+    name: &str,
+    specified_language: Option<Language>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let config = Config::load()?;
+    let language = specified_language.unwrap_or(config.defaults.language);
+
+    let cwd = std::env::current_dir()?;
+    let template = builtin_template(language);
+
+    let path = workspace::create_source_file(&cwd, name, language, template)?;
+
+    reporter.report(Event::SourceCreated { path: &path });
 
     Ok(())
 }
@@ -488,12 +530,32 @@ mod tests {
     use crate::workspace;
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    use std::process::ExitStatus;
+    use std::process::{Command as ProcessCommand, ExitStatus};
 
     use crate::ui::NullReporter;
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
+    fn available_cpp_compiler() -> Option<String> {
+        ["g++", "clang++"].into_iter().find_map(|compiler| {
+            ProcessCommand::new(compiler)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|_| compiler.to_string())
+        })
+    }
+
+    fn test_problem_model() -> crate::model::Problem {
+        crate::model::Problem {
+            index: "A".to_string(),
+            title: "Problem A".to_string(),
+            task_id: "abc466_a".to_string(),
+            url: "https://example.invalid/a".to_string(),
+        }
     }
 
     #[cfg(unix)]
@@ -583,7 +645,10 @@ mod tests {
                     format!("case-timed-out:{number}")
                 }
                 Event::TestCaseStderr { number, stderr } => {
-                    format!("case-stderr:{number}")
+                    format!("case-stderr:{number}:{stderr}")
+                }
+                Event::SourceCreated { path } => {
+                    format!("source-created:{}", path.display())
                 }
             };
             self.events.push(event);
@@ -633,14 +698,19 @@ mod tests {
     }
 
     #[test]
+    fn python_debug_is_rejected_by_commands_policy() {
+        let error = validate_debug_language(Language::Python, true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("only supported for C++"));
+        assert!(validate_debug_language(Language::Cpp, true).is_ok());
+        assert!(validate_debug_language(Language::Python, false).is_ok());
+    }
+
+    #[test]
     fn no_samples_is_reported_without_starting_a_runner() {
         let temp = tempfile::tempdir().unwrap();
-        let problem = crate::model::Problem {
-            index: "A".to_string(),
-            title: "Problem A".to_string(),
-            task_id: "abc466_a".to_string(),
-            url: "https://example.invalid/a".to_string(),
-        };
+        let problem = test_problem_model();
         std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
         let runner_config = RunnerConfig {
             cpp_compiler: "definitely-not-a-real-compiler".to_string(),
@@ -662,14 +732,170 @@ mod tests {
     }
 
     #[test]
+    fn no_samples_in_debug_mode_does_not_materialize_header_or_start_compiler() {
+        let temp = tempfile::tempdir().unwrap();
+        let problem = test_problem_model();
+        std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
+        let runner_config = RunnerConfig {
+            cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+            ..RunnerConfig::default()
+        };
+        let mut reporter = RecordingReporter::default();
+
+        test_problem_with_debug_header(
+            temp.path(),
+            &problem,
+            Language::Cpp,
+            &runner_config,
+            true,
+            &mut reporter,
+            || panic!("debug header must not be materialized without samples"),
+        )
+        .unwrap();
+
+        assert_eq!(reporter.events, ["no-samples:A"]);
+    }
+
+    #[test]
+    fn normal_cpp_build_neither_materializes_nor_requires_debug_header() {
+        let Some(compiler) = available_cpp_compiler() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let problem = test_problem_model();
+        std::fs::write(
+            temp.path().join("A.cpp"),
+            concat!(
+                "#ifdef LOCAL\n",
+                "#error LOCAL must not be defined in a normal build\n",
+                "#endif\n",
+                "#include <iostream>\n",
+                "int main() { std::cout << 7 << '\\n'; }\n",
+            ),
+        )
+        .unwrap();
+        workspace::save_samples(
+            temp.path(),
+            &problem,
+            &[Sample {
+                input: String::new(),
+                output: "7\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let runner_config = RunnerConfig {
+            cpp_compiler: compiler,
+            ..RunnerConfig::default()
+        };
+        let mut reporter = RecordingReporter::default();
+
+        test_problem_with_debug_header(
+            temp.path(),
+            &problem,
+            Language::Cpp,
+            &runner_config,
+            false,
+            &mut reporter,
+            || panic!("normal build must not materialize the debug header"),
+        )
+        .unwrap();
+
+        assert_eq!(reporter.events, ["case-accepted:1"]);
+    }
+
+    #[test]
+    fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() {
+        let Some(compiler) = available_cpp_compiler() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let problem = test_problem_model();
+        std::fs::write(
+            temp.path().join("A.cpp"),
+            concat!(
+                "#ifndef LOCAL\n",
+                "#error LOCAL must be defined in a debug build\n",
+                "#endif\n",
+                "#include <atc/debug.hpp>\n",
+                "#include <iostream>\n",
+                "int main() { int x = 7; std::cout << x << '\\n'; debug(x); }\n",
+            ),
+        )
+        .unwrap();
+        workspace::save_samples(
+            temp.path(),
+            &problem,
+            &[Sample {
+                input: String::new(),
+                output: "7\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let runner_config = RunnerConfig {
+            cpp_compiler: compiler,
+            ..RunnerConfig::default()
+        };
+        let cache_dir = temp.path().join("cache root with spaces");
+        let mut reporter = RecordingReporter::default();
+
+        test_problem_with_debug_header(
+            temp.path(),
+            &problem,
+            Language::Cpp,
+            &runner_config,
+            true,
+            &mut reporter,
+            || Ok(crate::debug::materialize_debug_header_in(&cache_dir)?),
+        )
+        .unwrap();
+
+        assert_eq!(reporter.events[0], "case-accepted:1");
+        assert!(reporter.events[1].starts_with("case-stderr:1:"));
+        assert!(reporter.events[1].contains("x = 7"));
+    }
+
+    #[test]
+    fn debug_header_materialization_error_is_fatal_before_compiler_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let problem = test_problem_model();
+        std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
+        workspace::save_samples(
+            temp.path(),
+            &problem,
+            &[Sample {
+                input: String::new(),
+                output: String::new(),
+            }],
+        )
+        .unwrap();
+        let runner_config = RunnerConfig {
+            cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+            ..RunnerConfig::default()
+        };
+        let mut reporter = RecordingReporter::default();
+
+        let error = test_problem_with_debug_header(
+            temp.path(),
+            &problem,
+            Language::Cpp,
+            &runner_config,
+            true,
+            &mut reporter,
+            || Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache is read-only").into()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Io(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(reporter.events.is_empty());
+    }
+
+    #[test]
     fn resolved_language_does_not_fall_back_to_an_existing_other_source() {
         let temp = tempfile::tempdir().unwrap();
-        let problem = crate::model::Problem {
-            index: "A".to_string(),
-            title: "Problem A".to_string(),
-            task_id: "abc466_a".to_string(),
-            url: "https://example.invalid/a".to_string(),
-        };
+        let problem = test_problem_model();
         std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
         let mut reporter = RecordingReporter::default();
 
@@ -715,10 +941,18 @@ mod tests {
             })
             .collect();
         let mut results = VecDeque::from([
-            execution(ExecutionOutcome::Exited(exit_status(0)), "wrong\n", ""),
+            execution(
+                ExecutionOutcome::Exited(exit_status(0)),
+                "wrong\n",
+                "wa stderr",
+            ),
             execution(ExecutionOutcome::Exited(exit_status(1)), "", "runtime"),
-            execution(ExecutionOutcome::TimedOut, "", ""),
-            execution(ExecutionOutcome::Exited(exit_status(0)), "expected\n", ""),
+            execution(ExecutionOutcome::TimedOut, "", "tle stderr"),
+            execution(
+                ExecutionOutcome::Exited(exit_status(0)),
+                "expected\n",
+                "ac stderr",
+            ),
         ]);
         let mut reporter = RecordingReporter::default();
 
@@ -734,10 +968,35 @@ mod tests {
             reporter.events,
             [
                 "case-wrong-answer:1",
+                "case-stderr:1:wa stderr",
                 "case-runtime-error:2",
+                "case-stderr:2:runtime",
                 "case-timed-out:3",
+                "case-stderr:3:tle stderr",
                 "case-accepted:4",
+                "case-stderr:4:ac stderr",
             ]
+        );
+    }
+
+    #[test]
+    fn stderr_does_not_change_an_accepted_stdout_verdict() {
+        let sample = Sample {
+            input: String::new(),
+            output: "answer\n".to_string(),
+        };
+        let result = execution(
+            ExecutionOutcome::Exited(exit_status(0)),
+            "answer\n",
+            "debug output\n",
+        );
+        let mut reporter = RecordingReporter::default();
+
+        report_case_result(1, &sample, &result, &mut reporter);
+
+        assert_eq!(
+            reporter.events,
+            ["case-accepted:1", "case-stderr:1:debug output\n"]
         );
     }
 

@@ -45,6 +45,9 @@ fn run() -> Result<(), AppError> {
         } => {
             commands::test(&problem, language, debug, &mut reporter)?;
         }
+        cli::Command::Create { name, language } => {
+            commands::create(&name, language, &mut reporter)?
+        }
         cli::Command::Login => {
             println!("login");
         }

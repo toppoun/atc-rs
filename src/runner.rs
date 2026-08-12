@@ -44,6 +44,17 @@ pub fn compile_cpp(
     timeout: Duration,
     options: &BuildOptions,
 ) -> Result<ExecutionResult, io::Error> {
+    let args = cpp_arguments(source, output, cpp_flags, options);
+
+    execute(Path::new(compiler), &args, "", timeout)
+}
+
+fn cpp_arguments(
+    source: &Path,
+    output: &Path,
+    cpp_flags: &[String],
+    options: &BuildOptions,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = cpp_flags.iter().map(OsString::from).collect();
 
     args.push(source.as_os_str().to_owned());
@@ -57,7 +68,7 @@ pub fn compile_cpp(
         args.push(include_dir.as_os_str().to_os_string());
     }
 
-    execute(Path::new(compiler), &args, "", timeout)
+    args
 }
 
 pub fn execute(
@@ -241,6 +252,73 @@ mod tests {
             OsString::from("--ignored"),
             OsString::from("--nocapture"),
         ]
+    }
+
+    #[test]
+    fn cpp_arguments_add_debug_flags_and_include_root_only_for_debug_builds() {
+        let source = Path::new("source.cpp");
+        let output = Path::new("program");
+        let flags = vec!["-std=c++23".to_string(), "-O2".to_string()];
+
+        let normal = cpp_arguments(source, output, &flags, &BuildOptions::default());
+        assert_eq!(
+            normal,
+            ["-std=c++23", "-O2", "source.cpp", "-o", "program"].map(OsString::from)
+        );
+
+        let include_dir = PathBuf::from("cache root with spaces").join("include");
+        let debug = cpp_arguments(
+            source,
+            output,
+            &flags,
+            &BuildOptions {
+                debug_include_dir: Some(include_dir.clone()),
+            },
+        );
+        assert_eq!(&debug[..5], &normal);
+        assert_eq!(debug[5], OsString::from("-DLOCAL"));
+        assert_eq!(debug[6], OsString::from("-I"));
+        assert_eq!(debug[7], include_dir.as_os_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpp_arguments_preserve_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let source = PathBuf::from(OsString::from_vec(vec![b's', 0xff]));
+        let include = PathBuf::from(OsString::from_vec(vec![b'i', 0xfe]));
+        let args = cpp_arguments(
+            &source,
+            Path::new("program"),
+            &[],
+            &BuildOptions {
+                debug_include_dir: Some(include.clone()),
+            },
+        );
+
+        assert_eq!(args[0], source.as_os_str());
+        assert_eq!(args[5], include.as_os_str());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpp_arguments_preserve_non_unicode_paths() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let source = PathBuf::from(OsString::from_wide(&[b's' as u16, 0xd800]));
+        let include = PathBuf::from(OsString::from_wide(&[b'i' as u16, 0xd801]));
+        let args = cpp_arguments(
+            &source,
+            Path::new("program.exe"),
+            &[],
+            &BuildOptions {
+                debug_include_dir: Some(include.clone()),
+            },
+        );
+
+        assert_eq!(args[0], source.as_os_str());
+        assert_eq!(args[5], include.as_os_str());
     }
 
     #[test]

@@ -30,4 +30,14 @@ mod tests {
         assert_eq!(directory.file_name().unwrap(), "atc");
         assert_eq!(file, directory.join("config.toml"));
     }
+
+    #[test]
+    fn debug_include_directory_is_under_atc_cache_directory() {
+        let cache = cache_dir().unwrap();
+        let include = debug_include_dir().unwrap();
+
+        assert!(cache.is_absolute());
+        assert_eq!(cache.file_name().unwrap(), "atc");
+        assert_eq!(include, cache.join("include"));
+    }
 }
