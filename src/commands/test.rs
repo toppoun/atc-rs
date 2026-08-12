@@ -39,6 +39,7 @@ pub(super) fn report_case_result(
     reporter: &mut dyn Reporter,
 ) -> CaseVerdict {
     let verdict = judge_case(sample, result);
+
     match verdict {
         CaseVerdict::Accepted => {
             reporter.report(Event::TestCaseAccepted {
@@ -70,12 +71,14 @@ pub(super) fn report_case_result(
             });
         }
     }
+
     if !result.stderr.is_empty() {
         reporter.report(Event::TestCaseStderr {
             number,
             stderr: &result.stderr,
         });
     }
+
     verdict
 }
 
@@ -117,12 +120,14 @@ pub(super) fn report_compile_result(
 ) -> bool {
     match &result.outcome {
         ExecutionOutcome::Exited(status) if status.success() => true,
+
         ExecutionOutcome::Exited(_) => {
             reporter.report(Event::CompileFailed {
                 stderr: &result.stderr,
             });
             false
         }
+
         ExecutionOutcome::TimedOut => {
             reporter.report(Event::CompileTimedOut {
                 elapsed: result.elapsed,
@@ -140,6 +145,7 @@ pub(super) fn find_problem<'a>(
         .problems
         .iter()
         .filter(|problem| problem.index.eq_ignore_ascii_case(problem_index));
+
     let problem = matches.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -187,10 +193,14 @@ pub(crate) fn test(
 
     let config = Config::load()?;
     let language = resolve_language(cli_language, &config);
+
     validate_debug_language(language, debug)?;
+
     test_problem(&cwd, problem, language, &config.runner, debug, reporter)
 }
 
+// 通常の test / plain watch 用。
+// cancel は絶対に発生しない。
 pub(super) fn test_problem(
     destination: &Path,
     problem: &Problem,
@@ -199,7 +209,29 @@ pub(super) fn test_problem(
     debug: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    test_problem_with_debug_header(
+    test_problem_with_cancel(
+        destination,
+        problem,
+        language,
+        runner_config,
+        debug,
+        reporter,
+        &|| false,
+    )
+}
+
+// TUI worker 用。
+// worker の shutdown flag を is_cancelled として受け取る。
+pub(super) fn test_problem_with_cancel(
+    destination: &Path,
+    problem: &Problem,
+    language: Language,
+    runner_config: &RunnerConfig,
+    debug: bool,
+    reporter: &mut dyn Reporter,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AppError> {
+    test_problem_with_debug_header_and_cancel(
         destination,
         problem,
         language,
@@ -207,9 +239,13 @@ pub(super) fn test_problem(
         debug,
         reporter,
         crate::debug::materialize_debug_header,
+        is_cancelled,
     )
 }
 
+// 既存テスト用。
+// debug.hpp を作る処理だけ差し替えられる。
+// cancel は発生しない。
 pub(super) fn test_problem_with_debug_header(
     destination: &Path,
     problem: &Problem,
@@ -218,6 +254,30 @@ pub(super) fn test_problem_with_debug_header(
     debug: bool,
     reporter: &mut dyn Reporter,
     materialize_debug_header: impl FnOnce() -> Result<std::path::PathBuf, AppError>,
+) -> Result<(), AppError> {
+    test_problem_with_debug_header_and_cancel(
+        destination,
+        problem,
+        language,
+        runner_config,
+        debug,
+        reporter,
+        materialize_debug_header,
+        &|| false,
+    )
+}
+
+// 実際の test 処理は全部ここ。
+// 上3つの関数は、この共通実装への入口。
+fn test_problem_with_debug_header_and_cancel(
+    destination: &Path,
+    problem: &Problem,
+    language: Language,
+    runner_config: &RunnerConfig,
+    debug: bool,
+    reporter: &mut dyn Reporter,
+    materialize_debug_header: impl FnOnce() -> Result<std::path::PathBuf, AppError>,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), AppError> {
     let source = destination.join(format!("{}.{}", problem.index, language.extension()));
 
@@ -230,14 +290,17 @@ pub(super) fn test_problem_with_debug_header(
     }
 
     let samples = workspace::load_samples(destination, &problem.index)?;
+
     if samples.is_empty() {
         reporter.report(Event::NoSamples {
             problem_index: &problem.index,
         });
+
         return Ok(());
     }
 
     let timeout = duration_from_seconds(runner_config.timeout_seconds, "runner.timeout_seconds")?;
+
     let compile_timeout = duration_from_seconds(
         runner_config.compile_timeout_seconds,
         "runner.compile_timeout_seconds",
@@ -249,7 +312,13 @@ pub(super) fn test_problem_with_debug_header(
                 &problem.index,
                 &samples,
                 |sample| {
-                    runner::execute_python(&source, &sample.input, &runner_config.python, timeout)
+                    runner::execute_python_with_cancel(
+                        &source,
+                        &sample.input,
+                        &runner_config.python,
+                        timeout,
+                        is_cancelled,
+                    )
                 },
                 reporter,
             )?;
@@ -262,6 +331,7 @@ pub(super) fn test_problem_with_debug_header(
                 build_dir
                     .path()
                     .join(format!("{}{}", problem.index, std::env::consts::EXE_SUFFIX));
+
             let build_options = if debug {
                 runner::BuildOptions {
                     debug_include_dir: Some(materialize_debug_header()?),
@@ -269,13 +339,15 @@ pub(super) fn test_problem_with_debug_header(
             } else {
                 runner::BuildOptions::default()
             };
-            let compile_result = runner::compile_cpp(
+
+            let compile_result = runner::compile_cpp_with_cancel(
                 &source,
                 &output,
                 &runner_config.cpp_compiler,
                 &runner_config.cpp_flags,
                 compile_timeout,
                 &build_options,
+                is_cancelled,
             )?;
 
             if !report_compile_result(&compile_result, reporter) {
@@ -285,7 +357,9 @@ pub(super) fn test_problem_with_debug_header(
             run_test_cases(
                 &problem.index,
                 &samples,
-                |sample| runner::execute(&output, &[], &sample.input, timeout),
+                |sample| {
+                    runner::execute_with_cancel(&output, &[], &sample.input, timeout, is_cancelled)
+                },
                 reporter,
             )?;
         }

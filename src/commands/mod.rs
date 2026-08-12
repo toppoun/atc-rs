@@ -5,6 +5,7 @@ mod test;
 mod watch;
 mod watch_source;
 mod watch_tui;
+mod watch_worker;
 
 pub(crate) use create::create;
 pub(crate) use new::new;

@@ -1,13 +1,14 @@
 pub mod app;
 pub mod message;
+pub mod reporter;
 pub mod view;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use message::Message;
 use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use message::{Message, RunRequest};
 use ratatui::DefaultTerminal;
 
 use crate::model::Contest;
@@ -15,7 +16,11 @@ use app::WatchApp;
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 
-fn handle_messages(app: &mut WatchApp, message_rx: &Receiver<Message>) -> io::Result<bool> {
+fn handle_messages(
+    app: &mut WatchApp,
+    message_rx: &Receiver<Message>,
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
     let mut changed = false;
 
     for _ in 0..MAX_MESSAGES_PER_TICK {
@@ -27,6 +32,15 @@ fn handle_messages(app: &mut WatchApp, message_rx: &Receiver<Message>) -> io::Re
             }) => {
                 if app.source_changed(problem, path, language) {
                     changed = true;
+
+                    if let Some(request) = app.queue_run(problem) {
+                        run_tx.send(request).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "test worker request channel disconnected",
+                            )
+                        })?;
+                    }
                 }
             }
 
@@ -41,8 +55,39 @@ fn handle_messages(app: &mut WatchApp, message_rx: &Receiver<Message>) -> io::Re
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "watcher thread disconnected",
+                    "background message channel disconnected",
                 ));
+            }
+            Ok(Message::RunStarted { run_id, problem }) => {
+                if app.run_started(problem, run_id) {
+                    changed = true;
+                }
+            }
+
+            Ok(Message::RunEvent {
+                run_id,
+                problem,
+                event,
+            }) => {
+                if app.run_event(problem, run_id, event) {
+                    changed = true;
+                }
+            }
+
+            Ok(Message::RunCompleted { run_id, problem }) => {
+                if app.run_completed(problem, run_id) {
+                    changed = true;
+                }
+            }
+
+            Ok(Message::RunFailed {
+                run_id,
+                problem,
+                error,
+            }) => {
+                if app.run_failed(problem, run_id, error) {
+                    changed = true;
+                }
             }
         }
     }
@@ -55,13 +100,14 @@ pub fn run(
     contest: &Contest,
     sample_counts: Vec<usize>,
     message_rx: Receiver<Message>,
+    run_tx: Sender<RunRequest>,
 ) -> io::Result<()> {
     let mut app = WatchApp::new(contest, sample_counts)?;
 
     let mut dirty = true;
 
     while !app.should_quit() {
-        if handle_messages(&mut app, &message_rx)? {
+        if handle_messages(&mut app, &message_rx, &run_tx)? {
             dirty = true;
         }
 
@@ -227,7 +273,9 @@ mod tests {
         })
         .unwrap();
 
-        assert!(handle_messages(&mut app, &rx).unwrap());
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
 
         let problem = app.current_problem().unwrap();
         assert_eq!(problem.index, "B");
@@ -240,7 +288,11 @@ mod tests {
     #[test]
     fn message_drain_is_bounded_to_keep_input_responsive() {
         let mut app = app();
+
         let (tx, rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        // 最初の1tickで処理できる上限いっぱいまでC++の変更を積む
         for _ in 0..MAX_MESSAGES_PER_TICK {
             tx.send(Message::SourceChanged {
                 problem: 0,
@@ -249,6 +301,8 @@ mod tests {
             })
             .unwrap();
         }
+
+        // 257件目。これは最初のhandle_messagesでは処理されないはず
         tx.send(Message::SourceChanged {
             problem: 0,
             path: PathBuf::from("A.py"),
@@ -256,7 +310,9 @@ mod tests {
         })
         .unwrap();
 
-        assert!(handle_messages(&mut app, &rx).unwrap());
+        // 1tick目
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+
         assert_eq!(
             app.current_problem()
                 .unwrap()
@@ -266,7 +322,20 @@ mod tests {
                 .language,
             Language::Cpp
         );
-        assert!(handle_messages(&mut app, &rx).unwrap());
+
+        // 256件だけRunRequestが作られている
+        let first_requests: Vec<_> = run_rx.try_iter().collect();
+
+        assert_eq!(first_requests.len(), MAX_MESSAGES_PER_TICK);
+        assert_eq!(first_requests[0].run_id, 1);
+        assert_eq!(
+            first_requests.last().unwrap().run_id,
+            MAX_MESSAGES_PER_TICK as u64
+        );
+
+        // 2tick目で残っていたA.pyを処理
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+
         assert_eq!(
             app.current_problem()
                 .unwrap()
@@ -276,31 +345,49 @@ mod tests {
                 .language,
             Language::Python
         );
+
+        let second_requests: Vec<_> = run_rx.try_iter().collect();
+
+        assert_eq!(second_requests.len(), 1);
+        assert_eq!(second_requests[0].run_id, MAX_MESSAGES_PER_TICK as u64 + 1);
+        assert_eq!(second_requests[0].problem, 0);
+        assert_eq!(second_requests[0].language, Language::Python);
     }
 
     #[test]
     fn watcher_failure_and_disconnected_channel_are_errors() {
         let mut app = app();
+
         let (tx, rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+
         tx.send(Message::WatcherFailed(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "watch failed",
         )))
         .unwrap();
 
-        let error = handle_messages(&mut app, &rx).unwrap_err();
+        let error = handle_messages(&mut app, &rx, &run_tx).unwrap_err();
+
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "watch failed");
 
+        // background側の全Senderが消えた場合
         let (tx, rx) = mpsc::channel::<Message>();
         drop(tx);
-        let error = handle_messages(&mut app, &rx).unwrap_err();
+
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        let error = handle_messages(&mut app, &rx, &run_tx).unwrap_err();
+
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "background message channel disconnected");
     }
 
     #[test]
     fn key_and_source_message_processing_coexist() {
         let mut app = app_with_problems(&[3, 2]);
+
         assert!(handle_key_event(
             &mut app,
             key(KeyCode::Down, KeyEventKind::Press)
@@ -308,6 +395,8 @@ mod tests {
         assert_eq!(app.selected_case(), 1);
 
         let (tx, rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
         tx.send(Message::SourceChanged {
             problem: 1,
             path: PathBuf::from("B.py"),
@@ -315,9 +404,20 @@ mod tests {
         })
         .unwrap();
 
-        assert!(handle_messages(&mut app, &rx).unwrap());
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+
         assert_eq!(app.current_problem().unwrap().index, "B");
         assert_eq!(app.selected_case(), 0);
+
+        // source変更からworkerへのRunRequestも作られている
+        let request = run_rx.try_recv().unwrap();
+
+        assert_eq!(request.run_id, 1);
+        assert_eq!(request.problem, 1);
+        assert_eq!(request.language, Language::Python);
+        assert!(!request.debug);
+
+        // Message処理後もkeyboard操作できる
         assert!(handle_key_event(
             &mut app,
             key(KeyCode::Down, KeyEventKind::Press)

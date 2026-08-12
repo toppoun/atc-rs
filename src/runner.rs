@@ -6,6 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 #[derive(Debug)]
 pub enum ExecutionOutcome {
     Exited(ExitStatus),
@@ -36,6 +38,18 @@ pub fn execute_python(
     execute(Path::new(python), &args, input, timeout)
 }
 
+pub fn execute_python_with_cancel(
+    source: &Path,
+    input: &str,
+    python: &str,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ExecutionResult, io::Error> {
+    let args = vec![source.as_os_str().to_owned()];
+
+    execute_with_cancel(Path::new(python), &args, input, timeout, is_cancelled)
+}
+
 pub fn compile_cpp(
     source: &Path,
     output: &Path,
@@ -47,6 +61,20 @@ pub fn compile_cpp(
     let args = cpp_arguments(source, output, cpp_flags, options);
 
     execute(Path::new(compiler), &args, "", timeout)
+}
+
+pub fn compile_cpp_with_cancel(
+    source: &Path,
+    output: &Path,
+    compiler: &str,
+    cpp_flags: &[String],
+    timeout: Duration,
+    options: &BuildOptions,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ExecutionResult, io::Error> {
+    let args = cpp_arguments(source, output, cpp_flags, options);
+
+    execute_with_cancel(Path::new(compiler), &args, "", timeout, is_cancelled)
 }
 
 fn cpp_arguments(
@@ -77,12 +105,23 @@ pub fn execute(
     input: &str,
     timeout: Duration,
 ) -> Result<ExecutionResult, io::Error> {
+    execute_with_cancel(program, args, input, timeout, &|| false)
+}
+
+pub fn execute_with_cancel(
+    program: &Path,
+    args: &[OsString],
+    input: &str,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ExecutionResult, io::Error> {
     let child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
     let started = Instant::now();
     let mut child = ChildGuard::new(child);
 
@@ -90,29 +129,16 @@ pub fn execute(
     let stdout = child.take_stdout()?;
     let stderr = child.take_stderr()?;
 
-    // Start draining output before writing input. A program may write enough output to fill
-    // its pipe before it starts reading stdin, so doing either operation synchronously first
-    // can deadlock.
     let stdout_handle = thread::spawn(move || read_all(stdout));
     let stderr_handle = thread::spawn(move || read_all(stderr));
+
     let input = input.as_bytes().to_vec();
     let stdin_handle = thread::spawn(move || write_input(stdin, &input));
 
-    let remaining = timeout.saturating_sub(started.elapsed());
-    let outcome_result = match child.wait_timeout(remaining) {
-        Ok(Some(status)) => Ok(ExecutionOutcome::Exited(status)),
-        Ok(None) => child
-            .terminate_and_wait()
-            .map(|()| ExecutionOutcome::TimedOut),
-        Err(error) => {
-            let cleanup = child.terminate_and_wait();
-            Err(with_cleanup_error(error, cleanup.err()))
-        }
-    };
+    let outcome_result = wait_for_child(&mut child, started, timeout, is_cancelled);
+
     let elapsed = started.elapsed();
 
-    // Run the guard before joining the pipe workers if wait/kill failed. This makes one final
-    // kill + wait attempt, allowing every pipe to reach EOF instead of leaving detached workers.
     drop(child);
 
     let stdin_result = join_worker(stdin_handle, "stdin writer");
@@ -120,7 +146,9 @@ pub fn execute(
     let stderr_result = join_worker(stderr_handle, "stderr reader");
 
     let outcome = outcome_result?;
+
     stdin_result?;
+
     let stdout_bytes = stdout_result?;
     let stderr_bytes = stderr_result?;
 
@@ -130,6 +158,48 @@ pub fn execute(
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         elapsed,
     })
+}
+
+fn wait_for_child(
+    child: &mut ChildGuard,
+    started: Instant,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<ExecutionOutcome> {
+    loop {
+        if is_cancelled() {
+            let cleanup = child.terminate_and_wait();
+
+            let cancelled =
+                io::Error::new(io::ErrorKind::Interrupted, "process execution cancelled");
+
+            return Err(with_cleanup_error(cancelled, cleanup.err()));
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+
+        let wait_for = remaining.min(CANCEL_POLL_INTERVAL);
+
+        match child.wait_timeout(wait_for) {
+            Ok(Some(status)) => {
+                return Ok(ExecutionOutcome::Exited(status));
+            }
+
+            Ok(None) if started.elapsed() >= timeout => {
+                child.terminate_and_wait()?;
+
+                return Ok(ExecutionOutcome::TimedOut);
+            }
+
+            Ok(None) => {}
+
+            Err(error) => {
+                let cleanup = child.terminate_and_wait();
+
+                return Err(with_cleanup_error(error, cleanup.err()));
+            }
+        }
+    }
 }
 
 fn read_all(mut pipe: impl Read) -> io::Result<Vec<u8>> {
@@ -244,6 +314,10 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn helper_args(name: &str) -> Vec<OsString> {
         vec![
@@ -416,5 +490,51 @@ mod tests {
     #[ignore = "launched as a child process by runner tests"]
     fn close_stdin_helper() {
         println!("closed-stdin");
+    }
+    #[test]
+    fn cancellation_kills_and_reaps_child() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let trigger = {
+            let cancelled = Arc::clone(&cancelled);
+
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+
+        let started = Instant::now();
+
+        let error = execute_with_cancel(
+            &std::env::current_exe().unwrap(),
+            &helper_args("sleep_helper"),
+            "",
+            Duration::from_secs(10),
+            &|| cancelled.load(Ordering::Relaxed),
+        )
+        .unwrap_err();
+
+        trigger.join().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // cancelしたprocessをちゃんとreapできていて、
+        // 次のprocess実行にも影響しないことを確認
+        let result = execute(
+            &std::env::current_exe().unwrap(),
+            &helper_args("success_helper"),
+            "",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.outcome,
+            ExecutionOutcome::Exited(status)
+                if status.success()
+        ));
     }
 }

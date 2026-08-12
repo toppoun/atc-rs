@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
@@ -9,6 +10,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use super::watch_worker::TestWorker;
 use crate::tui::message::Message;
 use crate::watcher;
 
@@ -47,12 +49,12 @@ impl Drop for WatcherThread {
 fn start_watcher(
     destination: &Path,
     contest: &Contest,
-) -> io::Result<(mpsc::Receiver<Message>, WatcherThread)> {
+    tx: mpsc::Sender<Message>,
+) -> io::Result<WatcherThread> {
     let watched_sources = build_watched_sources(destination, contest);
 
     let file_watcher = watcher::FileWatcher::new(destination)?;
 
-    let (tx, rx) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
 
@@ -76,13 +78,10 @@ fn start_watcher(
             }
         })?;
 
-    Ok((
-        rx,
-        WatcherThread {
-            shutdown,
-            handle: Some(handle),
-        },
-    ))
+    Ok(WatcherThread {
+        shutdown,
+        handle: Some(handle),
+    })
 }
 
 fn send_source_changes(
@@ -118,24 +117,73 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
     let (contest, sample_counts) = load_watch_input(&cwd)?;
 
-    let (message_rx, watcher_thread) = start_watcher(&cwd, &contest)?;
+    // workerが使うrunner設定。
+    // thread開始前に読み込んでおく。
+    let config = Config::load()?;
+
+    // background → TUI の共有Message channel。
+    let (message_tx, message_rx) = mpsc::channel();
+
+    // filesystem watcherも、このchannelへ送る。
+    let watcher_thread = start_watcher(&cwd, &contest, message_tx.clone())?;
+
+    // test workerも、同じchannelへ結果を送る。
+    let test_worker = match TestWorker::start(
+        cwd.clone(),
+        contest.problems.clone(),
+        config.runner,
+        message_tx.clone(),
+    ) {
+        Ok(worker) => worker,
+
+        Err(error) => {
+            drop(message_rx);
+            drop(message_tx);
+
+            let watcher_result = watcher_thread.stop();
+
+            watcher_result?;
+
+            return Err(error.into());
+        }
+    };
+    let run_tx = test_worker.sender();
+
+    // watch_tui自身はMessageを送らない。
+    //
+    // Senderをここに残すとwatcher/workerが両方終了しても
+    // Receiverから見るとchannelがconnectedのままになるのでdropする。
+    drop(message_tx);
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
+
         Err(error) => {
             drop(message_rx);
+
+            let worker_result = test_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
+
             ratatui::restore();
+
+            worker_result?;
             watcher_result?;
+
             return Err(error.into());
         }
     };
 
-    let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx);
+    let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx, run_tx);
+
+    // test実行中だった場合、先にworkerをcancelして止める。
+    let worker_result = test_worker.stop_and_join();
+
     let watcher_result = watcher_thread.stop();
+
     let restore_result = ratatui::try_restore();
 
     result?;
+    worker_result?;
     watcher_result?;
     restore_result?;
 
