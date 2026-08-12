@@ -93,4 +93,27 @@ mod tests {
     fn test_language_rejects_unsupported_alias() {
         assert!(Cli::try_parse_from(["atc-rs", "test", "A", "-l", "py"]).is_err());
     }
+
+    #[test]
+    fn parses_create_name_and_optional_language() {
+        let cli = Cli::try_parse_from(["atc-rs", "create", "A"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                name,
+                language: None,
+            } if name == "A"
+        ));
+
+        let cli = Cli::try_parse_from(["atc-rs", "create", "main", "-l", "python"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                name,
+                language: Some(Language::Python),
+            } if name == "main"
+        ));
+
+        assert!(Cli::try_parse_from(["atc-rs", "create", "A", "-l", "py"]).is_err());
+    }
 }

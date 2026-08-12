@@ -266,20 +266,28 @@ pub fn create_source_files(
     template: &str,
 ) -> io::Result<()> {
     for problem in problems {
-        create_source_file(destination, &problem.index, language, template)?;
+        match create_source_file(destination, &problem.index, language, template) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(())
 }
 
 fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
+    let contains_path_separator = value.contains('/') || value.contains('\\');
+    let contains_windows_stream_separator = cfg!(windows) && value.contains(':');
+
     let mut components = Path::new(value).components();
     let is_single_normal_component = matches!(
         components.next(),
         Some(Component::Normal(component)) if component == OsStr::new(value)
     ) && components.next().is_none();
 
-    if is_single_normal_component {
+    if is_single_normal_component && !contains_path_separator && !contains_windows_stream_separator
+    {
         return Ok(());
     }
 
@@ -792,6 +800,119 @@ mod tests {
     }
 
     #[test]
+    fn creates_one_source_file_with_the_requested_extension_and_contents() {
+        let cpp = tempfile::tempdir().unwrap();
+        let cpp_path = create_source_file(cpp.path(), "A", Language::Cpp, "cpp template").unwrap();
+        assert_eq!(cpp_path, cpp.path().join("A.cpp"));
+        assert_eq!(fs::read_to_string(cpp_path).unwrap(), "cpp template");
+
+        let python = tempfile::tempdir().unwrap();
+        let python_path =
+            create_source_file(python.path(), "A", Language::Python, "python template").unwrap();
+        assert_eq!(python_path, python.path().join("A.py"));
+        assert_eq!(fs::read_to_string(python_path).unwrap(), "python template");
+    }
+
+    #[test]
+    fn creating_one_source_file_returns_already_exists_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        fs::write(&source, "complete user source").unwrap();
+
+        let error = create_source_file(temp.path(), "A", Language::Cpp, "template")
+            .expect_err("an existing source must not be overwritten");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(source).unwrap(), "complete user source");
+    }
+
+    #[test]
+    fn creating_one_source_file_rejects_unsafe_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("cwd");
+        fs::create_dir(&destination).unwrap();
+        let absolute = temp.path().join("absolute");
+        let unsafe_names = vec![
+            "../outside".to_string(),
+            "foo/bar".to_string(),
+            "foo\\bar".to_string(),
+            absolute
+                .to_str()
+                .expect("temporary path should be UTF-8")
+                .to_string(),
+        ];
+
+        for name in unsafe_names {
+            let error = create_source_file(&destination, &name, Language::Cpp, "template")
+                .expect_err("an unsafe name must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "name: {name:?}");
+        }
+
+        assert!(!temp.path().join("outside.cpp").exists());
+        assert!(!absolute.with_extension("cpp").exists());
+        assert!(!destination.join("foo").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creating_one_source_file_rejects_windows_alternate_data_stream_names() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = create_source_file(temp.path(), "base:stream", Language::Cpp, "template")
+            .expect_err("an alternate data stream name must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!temp.path().join("base").exists());
+    }
+
+    #[test]
+    fn creating_one_source_file_does_not_replace_a_directory_or_follow_a_symlink() {
+        let directory_root = tempfile::tempdir().unwrap();
+        let source_directory = directory_root.path().join("A.cpp");
+        fs::create_dir(&source_directory).unwrap();
+
+        create_source_file(directory_root.path(), "A", Language::Cpp, "template")
+            .expect_err("a directory must not be replaced");
+        assert!(source_directory.is_dir());
+
+        let symlink_root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_source = external.path().join("user.cpp");
+        fs::write(&external_source, "external user source").unwrap();
+        let source_symlink = symlink_root.path().join("A.cpp");
+        if !create_file_symlink(&external_source, &source_symlink) {
+            return;
+        }
+
+        create_source_file(symlink_root.path(), "A", Language::Cpp, "template")
+            .expect_err("a symlink must not be followed or replaced");
+        assert_eq!(
+            fs::read_to_string(external_source).unwrap(),
+            "external user source"
+        );
+        assert!(
+            fs::symlink_metadata(source_symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creating_one_source_file_respects_case_insensitive_existing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        fs::write(&source, "user source").unwrap();
+
+        let error = create_source_file(temp.path(), "a", Language::Cpp, "template")
+            .expect_err("a differently-cased existing source must not be overwritten");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(source).unwrap(), "user source");
+    }
+
+    #[test]
     fn existing_source_file_is_not_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("A.cpp");
@@ -833,6 +954,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read_to_string(source).unwrap(), "user source");
+    }
+
+    #[test]
+    fn bulk_source_creation_propagates_non_already_exists_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_destination = temp.path().join("missing");
+
+        let error = create_source_files(
+            &missing_destination,
+            &[problem("A")],
+            Language::Cpp,
+            "template",
+        )
+        .expect_err("a missing destination error must be propagated");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!missing_destination.exists());
     }
 
     #[test]

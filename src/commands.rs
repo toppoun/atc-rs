@@ -342,7 +342,7 @@ fn find_problem<'a>(
     Ok(problem)
 }
 
-fn resolve_test_language(cli_language: Option<Language>, config: &Config) -> Language {
+fn resolve_language(cli_language: Option<Language>, config: &Config) -> Language {
     cli_language.unwrap_or(config.defaults.language)
 }
 
@@ -375,7 +375,7 @@ pub fn test(
     let problem = find_problem(&contest, problem_index)?;
 
     let config = Config::load()?;
-    let language = resolve_test_language(cli_language, &config);
+    let language = resolve_language(cli_language, &config);
     validate_debug_language(language, debug)?;
     test_problem(&cwd, problem, language, &config.runner, debug, reporter)
 }
@@ -487,12 +487,22 @@ pub fn create(
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let config = Config::load()?;
-    let language = specified_language.unwrap_or(config.defaults.language);
-
     let cwd = std::env::current_dir()?;
+
+    create_at(&cwd, name, specified_language, &config, reporter)
+}
+
+fn create_at(
+    destination: &Path,
+    name: &str,
+    specified_language: Option<Language>,
+    config: &Config,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let language = resolve_language(specified_language, config);
     let template = builtin_template(language);
 
-    let path = workspace::create_source_file(&cwd, name, language, template)?;
+    let path = workspace::create_source_file(destination, name, language, template)?;
 
     reporter.report(Event::SourceCreated { path: &path });
 
@@ -686,15 +696,153 @@ mod tests {
     }
 
     #[test]
-    fn cli_language_overrides_config_language() {
+    fn language_resolution_uses_cli_then_config_then_builtin_default() {
         let mut config = Config::default();
-        config.defaults.language = Language::Cpp;
+        config.defaults.language = Language::Python;
 
         assert_eq!(
-            resolve_test_language(Some(Language::Python), &config),
-            Language::Python
+            resolve_language(Some(Language::Cpp), &config),
+            Language::Cpp
         );
-        assert_eq!(resolve_test_language(None, &config), Language::Cpp);
+        assert_eq!(resolve_language(None, &config), Language::Python);
+        assert_eq!(resolve_language(None, &Config::default()), Language::Cpp);
+    }
+
+    #[test]
+    fn create_cpp_source_outside_a_workspace_uses_the_builtin_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        create_at(temp.path(), "A", None, &Config::default(), &mut reporter).unwrap();
+
+        let source = temp.path().join("A.cpp");
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            builtin_template(Language::Cpp)
+        );
+        assert!(!temp.path().join("A.py").exists());
+        assert!(!temp.path().join(".atc").exists());
+        assert!(!temp.path().join("tests").exists());
+        assert_eq!(
+            reporter.events,
+            [format!("source-created:{}", source.display())]
+        );
+    }
+
+    #[test]
+    fn create_python_source_uses_config_and_the_builtin_template() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.defaults.language = Language::Python;
+        let mut reporter = RecordingReporter::default();
+
+        create_at(temp.path(), "A", None, &config, &mut reporter).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("A.py")).unwrap(),
+            builtin_template(Language::Python)
+        );
+        assert!(!temp.path().join("A.cpp").exists());
+    }
+
+    #[test]
+    fn create_cli_language_overrides_config_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.defaults.language = Language::Python;
+        let mut reporter = RecordingReporter::default();
+
+        create_at(
+            temp.path(),
+            "A",
+            Some(Language::Cpp),
+            &config,
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert!(temp.path().join("A.cpp").is_file());
+        assert!(!temp.path().join("A.py").exists());
+    }
+
+    #[test]
+    fn create_does_not_read_or_modify_workspace_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let atc_dir = temp.path().join(".atc");
+        let tests_dir = temp.path().join("tests");
+        std::fs::create_dir(&atc_dir).unwrap();
+        std::fs::create_dir(&tests_dir).unwrap();
+        let metadata = atc_dir.join("contest.toml");
+        let sample = tests_dir.join("local.txt");
+        std::fs::write(&metadata, "malformed metadata").unwrap();
+        std::fs::write(&sample, "local test data").unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        create_at(
+            temp.path(),
+            "not-in-metadata",
+            None,
+            &Config::default(),
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert!(temp.path().join("not-in-metadata.cpp").is_file());
+        assert_eq!(
+            std::fs::read_to_string(metadata).unwrap(),
+            "malformed metadata"
+        );
+        assert_eq!(std::fs::read_to_string(sample).unwrap(), "local test data");
+    }
+
+    #[test]
+    fn create_preserves_an_existing_source_and_reports_only_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        std::fs::write(&source, "user source").unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        let error = create_at(temp.path(), "A", None, &Config::default(), &mut reporter)
+            .expect_err("an existing source must not be overwritten");
+
+        assert!(matches!(
+            error,
+            AppError::Io(ref error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "user source");
+        assert!(reporter.events.is_empty());
+    }
+
+    #[test]
+    fn create_rejects_unsafe_names_without_writing_outside_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("cwd");
+        std::fs::create_dir(&destination).unwrap();
+        let absolute = temp.path().join("absolute");
+        let unsafe_names = vec![
+            "../outside".to_string(),
+            "nested/name".to_string(),
+            "nested\\name".to_string(),
+            absolute
+                .to_str()
+                .expect("temporary path should be UTF-8")
+                .to_string(),
+        ];
+        let mut reporter = RecordingReporter::default();
+
+        for name in unsafe_names {
+            let error = create_at(&destination, &name, None, &Config::default(), &mut reporter)
+                .expect_err("an unsafe name must be rejected");
+            assert!(matches!(
+                error,
+                AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
+
+        assert!(!temp.path().join("outside.cpp").exists());
+        assert!(!absolute.with_extension("cpp").exists());
+        assert!(!destination.join("nested").exists());
+        assert!(reporter.events.is_empty());
     }
 
     #[test]
