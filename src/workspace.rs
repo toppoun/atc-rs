@@ -1064,6 +1064,23 @@ mod tests {
     }
 
     #[test]
+    fn forced_refresh_rejects_a_symlinked_workspace_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc350");
+        let external = tempfile::tempdir().unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        if !create_directory_symlink(external.path(), &destination.join(".atc")) {
+            return;
+        }
+
+        let error = validate_refresh_destination(&destination, "abc350", true)
+            .expect_err("force must not accept a symlinked marker");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn malformed_metadata_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let atc_dir = temp.path().join(".atc");

@@ -4,6 +4,7 @@ use crate::error::AppError;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::validate_refresh_destination;
+use std::io;
 use std::path::Path;
 
 pub(crate) fn refresh(
@@ -28,9 +29,31 @@ pub(super) fn resolve_refresh_contest_id(
     specified_contest_id: Option<&str>,
     force: bool,
 ) -> Result<String, AppError> {
+    if force {
+        let contest_id = match specified_contest_id {
+            Some(contest_id) => contest_id.to_string(),
+            None => destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "current directory has no UTF-8 directory name: {}",
+                            destination.display()
+                        ),
+                    )
+                })?
+                .to_string(),
+        };
+
+        validate_refresh_destination(destination, &contest_id, true)?;
+        return Ok(contest_id);
+    }
+
     match specified_contest_id {
         Some(contest_id) => {
-            validate_refresh_destination(destination, contest_id, force)?;
+            validate_refresh_destination(destination, contest_id, false)?;
             Ok(contest_id.to_string())
         }
         None => {

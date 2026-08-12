@@ -21,7 +21,7 @@ pub enum Command {
         #[arg(short, long)]
         contest: Option<String>,
 
-        /// Allow refresh when the .atc workspace marker is missing
+        /// Rebuild the current directory without trusting workspace metadata
         #[arg(short, long)]
         force: bool,
     },
@@ -114,6 +114,16 @@ mod tests {
             } if contest == "abc350"
         ));
 
+        let cli = Cli::try_parse_from(["atc", "refresh", "-f"])
+            .expect("forced refresh without an override should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Refresh {
+                contest: None,
+                force: true,
+            }
+        ));
+
         let cli = Cli::try_parse_from(["atc", "refresh", "--contest", "abc350", "--force"])
             .expect("long forced refresh options should parse");
         assert!(matches!(
@@ -130,7 +140,7 @@ mod tests {
             .expect("refresh subcommand should exist");
         let help = refresh.render_long_help().to_string();
         assert!(help.contains("-f, --force"));
-        assert!(help.contains("Allow refresh when the .atc workspace marker is missing"));
+        assert!(help.contains("Rebuild the current directory without trusting workspace metadata"));
     }
 
     #[test]
