@@ -11,10 +11,14 @@ use std::str::FromStr;
 pub struct Config {
     #[serde(default)]
     pub defaults: Defaults,
+
+    #[serde(default)]
+    pub runner: RunnerConfig,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+
 pub struct Defaults {
     #[serde(
         default = "default_language",
@@ -44,6 +48,33 @@ impl Default for Defaults {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunnerConfig {
+    pub python: String,
+    pub cpp_compiler: String,
+    pub cpp_flags: Vec<String>,
+    pub timeout_seconds: f64,
+    pub compile_timeout_seconds: f64,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            python: "python".to_string(),
+            cpp_compiler: "g++".to_string(),
+            cpp_flags: vec![
+                "-std=c++23".to_string(),
+                "-O2".to_string(),
+                "-Wall".to_string(),
+                "-Wextra".to_string(),
+            ],
+            timeout_seconds: 2.0,
+            compile_timeout_seconds: 10.0,
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self, AppError> {
         let path = crate::paths::config_file()?;
@@ -67,7 +98,31 @@ impl Config {
             )
         })?;
 
+        config.validate()?;
+
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        if !self.runner.timeout_seconds.is_finite() || self.runner.timeout_seconds <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runner.timeout_seconds must be a positive finite number",
+            )
+            .into());
+        }
+
+        if !self.runner.compile_timeout_seconds.is_finite()
+            || self.runner.compile_timeout_seconds <= 0.0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runner.compile_timeout_seconds must be a positive finite number",
+            )
+            .into());
+        }
+
+        Ok(())
     }
 }
 

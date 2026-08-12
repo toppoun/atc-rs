@@ -21,6 +21,45 @@ pub struct ExecutionResult {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Default)]
+pub struct BuildOptions {
+    pub debug: bool,
+}
+
+pub fn execute_python(
+    source: &Path,
+    input: &str,
+    python: &str,
+    timeout: Duration,
+) -> Result<ExecutionResult, std::io::Error> {
+    let args = vec![source.to_string_lossy().into_owned()];
+
+    execute(Path::new(python), &args, input, timeout)
+}
+
+pub fn compile_cpp(
+    source: &Path,
+    output: &Path,
+    compiler: &str,
+    cpp_flags: &[String],
+    timeout: Duration,
+    options: &BuildOptions,
+) -> Result<ExecutionResult, std::io::Error> {
+    let mut args = cpp_flags.to_vec();
+
+    args.push(source.to_string_lossy().into_owned());
+    args.push("-o".to_string());
+    args.push(output.to_string_lossy().into_owned());
+
+    // debug用フラグは後でここに足す
+    if options.debug {
+        // -DLOCAL
+        // -I <include dir>
+    }
+
+    execute(Path::new(compiler), &args, "", timeout)
+}
+
 pub fn execute(
     program: &Path,
     args: &[String],
@@ -52,7 +91,7 @@ pub fn execute(
         stderr.read_to_end(&mut output)?;
         Ok::<Vec<u8>, std::io::Error>(output)
     });
-    
+
     let outcome = match child.wait_timeout(timeout)? {
         Some(status) => ExecutionOutcome::Exited(status),
 

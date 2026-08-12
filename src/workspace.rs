@@ -1,6 +1,7 @@
 use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -89,6 +90,149 @@ pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+enum SampleFileKind {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Default)]
+struct SampleFiles {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+}
+
+fn parse_sample_filename(name: &OsStr) -> io::Result<Option<(usize, SampleFileKind)>> {
+    let Some(name) = name.to_str() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sample directory contains a non-UTF-8 file name",
+        ));
+    };
+
+    let Some(rest) = name.strip_prefix("sample-") else {
+        return Ok(None);
+    };
+
+    let Some((number, extension)) = rest.rsplit_once('.') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sample file name: {name}"),
+        ));
+    };
+
+    let number = number.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sample number in file name: {name}"),
+        )
+    })?;
+
+    if number == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sample number must start from 1: {name}"),
+        ));
+    }
+
+    let kind = match extension {
+        "in" => SampleFileKind::Input,
+        "out" => SampleFileKind::Output,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid sample file extension: {name}"),
+            ));
+        }
+    };
+
+    Ok(Some((number, kind)))
+}
+
+pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<Sample>> {
+    validate_path_component(problem_index, "problem index")?;
+
+    let test_dir = destination.join("tests").join(problem_index);
+
+    if !existing_real_directory(&test_dir, "problem tests directory")? {
+        return Ok(Vec::new());
+    }
+
+    let mut files = BTreeMap::<usize, SampleFiles>::new();
+
+    for entry in fs::read_dir(&test_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let Some((number, kind)) = parse_sample_filename(&entry.file_name())? else {
+            continue;
+        };
+
+        if !existing_regular_file(&path, "sample file")? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sample file not found: {}", path.display()),
+            ));
+        }
+
+        let sample = files.entry(number).or_default();
+
+        match kind {
+            SampleFileKind::Input => {
+                if sample.input.replace(path).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("duplicate sample input for sample {number}"),
+                    ));
+                }
+            }
+
+            SampleFileKind::Output => {
+                if sample.output.replace(path).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("duplicate sample output for sample {number}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut samples = Vec::with_capacity(files.len());
+
+    for (expected_number, (number, sample_files)) in (1usize..).zip(files) {
+        if number != expected_number {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sample numbers must be consecutive from 1: expected {expected_number}, found {number}"
+                ),
+            ));
+        }
+
+        let input_path = sample_files.input.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sample-{number}.in is missing"),
+            )
+        })?;
+
+        let output_path = sample_files.output.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sample-{number}.out is missing"),
+            )
+        })?;
+
+        let input = fs::read_to_string(&input_path)?;
+        let output = fs::read_to_string(&output_path)?;
+
+        samples.push(Sample { input, output });
+    }
+
+    Ok(samples)
 }
 
 pub fn create_source_files(

@@ -1,13 +1,17 @@
 use crate::atcoder;
+use crate::comparator::{self, ComparisonResult};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::language::Language;
 use crate::model::{Contest, Sample};
+use crate::runner::{self, ExecutionOutcome};
 use crate::template::builtin_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::validate_refresh_destination;
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 struct FetchedContestData {
     contest: Contest,
@@ -216,6 +220,162 @@ fn refresh_at(
     Ok(())
 }
 
+#[derive(Debug)]
+enum CaseVerdict {
+    Accepted,
+    WrongAnswer,
+    RuntimeError,
+    TimedOut,
+}
+
+fn judge_case(sample: &Sample, result: &runner::ExecutionResult) -> CaseVerdict {
+    match &result.outcome {
+        ExecutionOutcome::TimedOut => CaseVerdict::TimedOut,
+
+        ExecutionOutcome::Exited(status) if !status.success() => CaseVerdict::RuntimeError,
+
+        ExecutionOutcome::Exited(_) => match comparator::compare(&sample.output, &result.stdout) {
+            ComparisonResult::Accepted => CaseVerdict::Accepted,
+            ComparisonResult::WrongAnswer => CaseVerdict::WrongAnswer,
+        },
+    }
+}
+
+fn report_case_result(
+    number: usize,
+    sample: &Sample,
+    result: &runner::ExecutionResult,
+    reporter: &mut dyn Reporter,
+) {
+    match judge_case(sample, result) {
+        CaseVerdict::Accepted => {
+            reporter.report(Event::TestCaseAccepted {
+                number,
+                elapsed: result.elapsed,
+            });
+        }
+
+        CaseVerdict::WrongAnswer => {
+            reporter.report(Event::TestCaseWrongAnswer {
+                number,
+                expected: &sample.output,
+                actual: &result.stdout,
+                elapsed: result.elapsed,
+            });
+        }
+
+        CaseVerdict::RuntimeError => {
+            reporter.report(Event::TestCaseRuntimeError {
+                number,
+                stderr: &result.stderr,
+                elapsed: result.elapsed,
+            });
+        }
+
+        CaseVerdict::TimedOut => {
+            reporter.report(Event::TestCaseTimedOut {
+                number,
+                elapsed: result.elapsed,
+            });
+        }
+    }
+}
+
+pub fn test(
+    problem_index: &str,
+    cli_language: Option<Language>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let cwd = std::env::current_dir()?;
+
+    // contest directoryとして正しいか
+    workspace::validate_workspace_marker(&cwd)?;
+
+    // このcontestに本当にそのproblemがあるか
+    let contest = workspace::load_metadata(&cwd)?;
+    workspace::validate_contest_paths(&contest)?;
+
+    let problem = contest
+        .problems
+        .iter()
+        .find(|problem| problem.index.eq_ignore_ascii_case(problem_index))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("problem not found in this contest: {problem_index}"),
+            )
+        })?;
+
+    let config = Config::load()?;
+    let language = cli_language.unwrap_or(config.defaults.language);
+
+    let source = cwd.join(format!("{}.{}", problem.index, language.extension()));
+
+    if !source.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("source file not found: {}", source.display()),
+        )
+        .into());
+    }
+
+    let samples = workspace::load_samples(&cwd, &problem.index)?;
+
+    let timeout = Duration::from_secs_f64(config.runner.timeout_seconds);
+    let compile_timeout = Duration::from_secs_f64(config.runner.compile_timeout_seconds);
+
+    match language {
+        Language::Python => {
+            for (i, sample) in samples.iter().enumerate() {
+                let result =
+                    runner::execute_python(&source, &sample.input, &config.runner.python, timeout)?;
+
+                report_case_result(i + 1, sample, &result, reporter);
+            }
+        }
+
+        Language::Cpp => {
+            let build_dir = tempfile::tempdir()?;
+
+            let output =
+                build_dir
+                    .path()
+                    .join(format!("{}{}", problem.index, std::env::consts::EXE_SUFFIX));
+
+            let compile_result = runner::compile_cpp(
+                &source,
+                &output,
+                &config.runner.cpp_compiler,
+                &config.runner.cpp_flags,
+                compile_timeout,
+                &runner::BuildOptions::default(),
+            )?;
+
+            match compile_result.outcome {
+                ExecutionOutcome::Exited(status) if status.success() => {}
+
+                ExecutionOutcome::Exited(_) => {
+                    // TODO: CompileFailed Event
+                    return Ok(());
+                }
+
+                ExecutionOutcome::TimedOut => {
+                    // TODO: CompileTimedOut Event
+                    return Ok(());
+                }
+            }
+
+            for (i, sample) in samples.iter().enumerate() {
+                let result = runner::execute(&output, &[], &sample.input, timeout)?;
+
+                report_case_result(i + 1, sample, &result, reporter);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +429,29 @@ mod tests {
                 }
                 Event::WorkspaceRefreshed { destination } => {
                     format!("refreshed:{}", destination.display())
+                }
+                Event::NoSamples { problem_index } => {
+                    format!("no-samples:{problem_index}")
+                }
+
+                Event::CompileFailed { .. } => "compile-failed".to_string(),
+
+                Event::CompileTimedOut { .. } => "compile-timed-out".to_string(),
+
+                Event::TestCaseAccepted { number, .. } => {
+                    format!("case-accepted:{number}")
+                }
+
+                Event::TestCaseWrongAnswer { number, .. } => {
+                    format!("case-wrong-answer:{number}")
+                }
+
+                Event::TestCaseRuntimeError { number, .. } => {
+                    format!("case-runtime-error:{number}")
+                }
+
+                Event::TestCaseTimedOut { number, .. } => {
+                    format!("case-timed-out:{number}")
                 }
             };
             self.events.push(event);

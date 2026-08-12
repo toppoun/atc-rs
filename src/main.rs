@@ -4,6 +4,7 @@ use std::process::ExitCode;
 mod atcoder;
 mod cli;
 mod commands;
+mod comparator;
 mod config;
 mod error;
 mod language;
@@ -36,8 +37,8 @@ fn run() -> Result<(), AppError> {
             commands::new(&contest, &mut reporter)?;
         }
         cli::Command::Refresh { contest } => commands::refresh(contest, &mut reporter)?,
-        cli::Command::Run { problem } => {
-            println!("run problem: {problem}");
+        cli::Command::Test { problem, language } => {
+            commands::test(&problem, language, &mut reporter)?;
         }
         cli::Command::Login => {
             println!("login");

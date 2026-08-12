@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 pub enum Event<'a> {
     ContestFetching {
@@ -26,6 +27,40 @@ pub enum Event<'a> {
     },
     WorkspaceRefreshed {
         destination: &'a Path,
+    },
+    NoSamples {
+        problem_index: &'a str,
+    },
+
+    CompileFailed {
+        stderr: &'a str,
+    },
+
+    CompileTimedOut {
+        elapsed: Duration,
+    },
+
+    TestCaseAccepted {
+        number: usize,
+        elapsed: Duration,
+    },
+
+    TestCaseWrongAnswer {
+        number: usize,
+        expected: &'a str,
+        actual: &'a str,
+        elapsed: Duration,
+    },
+
+    TestCaseRuntimeError {
+        number: usize,
+        stderr: &'a str,
+        elapsed: Duration,
+    },
+
+    TestCaseTimedOut {
+        number: usize,
+        elapsed: Duration,
     },
 }
 
@@ -71,6 +106,53 @@ impl Reporter for TerminalReporter {
 
             Event::WorkspaceRefreshed { destination } => {
                 eprintln!("Refreshed {}", destination.display());
+            }
+            Event::NoSamples { problem_index } => {
+                println!("No samples for {problem_index}");
+            }
+
+            Event::CompileFailed { stderr } => {
+                println!("Compile Error");
+                if !stderr.is_empty() {
+                    eprintln!("{stderr}");
+                }
+            }
+
+            Event::CompileTimedOut { elapsed } => {
+                println!("Compile Timed Out ({elapsed:.2?})");
+            }
+
+            Event::TestCaseAccepted { number, elapsed } => {
+                println!("Sample {number}: AC ({elapsed:.2?})");
+            }
+
+            Event::TestCaseWrongAnswer {
+                number,
+                expected,
+                actual,
+                elapsed,
+            } => {
+                println!("Sample {number}: WA ({elapsed:.2?})");
+                println!("expected:");
+                println!("{expected}");
+                println!("actual:");
+                println!("{actual}");
+            }
+
+            Event::TestCaseRuntimeError {
+                number,
+                stderr,
+                elapsed,
+            } => {
+                println!("Sample {number}: RE ({elapsed:.2?})");
+
+                if !stderr.is_empty() {
+                    eprintln!("{stderr}");
+                }
+            }
+
+            Event::TestCaseTimedOut { number, elapsed } => {
+                println!("Sample {number}: TLE ({elapsed:.2?})");
             }
         }
     }

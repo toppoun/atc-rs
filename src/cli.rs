@@ -1,3 +1,4 @@
+use crate::language::Language;
 use clap::{Parser, Subcommand};
 
 /// AtCoder用CLIツール
@@ -17,8 +18,11 @@ pub enum Command {
         #[arg(short, long)]
         contest: Option<String>,
     },
-    Run {
+    Test {
         problem: String,
+
+        #[arg(short = 'l', long = "language")]
+        language: Option<Language>,
     },
     Login,
 }
