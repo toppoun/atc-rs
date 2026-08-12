@@ -13,6 +13,9 @@ pub struct Cli {
 pub enum Command {
     New {
         contest: String,
+
+        #[arg(short = 'l', long)]
+        language: Option<Language>,
     },
     Refresh {
         #[arg(short, long)]
@@ -39,6 +42,36 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_new_contest_and_optional_language() {
+        let cli = Cli::try_parse_from(["atc-rs", "new", "abc466"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::New {
+                contest,
+                language: None,
+            } if contest == "abc466"
+        ));
+
+        let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "-l", "python"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::New {
+                contest,
+                language: Some(Language::Python),
+            } if contest == "abc466"
+        ));
+
+        let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "--language", "cpp"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::New {
+                contest,
+                language: Some(Language::Cpp),
+            } if contest == "abc466"
+        ));
+    }
 
     #[test]
     fn parses_refresh_with_and_without_contest_override() {

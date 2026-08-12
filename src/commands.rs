@@ -18,7 +18,11 @@ struct FetchedContestData {
     samples_by_problem: Vec<Option<Vec<Sample>>>,
 }
 
-pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError> {
+pub fn new(
+    contest_id: &str,
+    cli_language: Option<Language>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     let destination = workspace::contest_path(&cwd, contest_id)?;
 
@@ -26,7 +30,7 @@ pub fn new(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError
         return Ok(());
     }
     let config = Config::load()?;
-    let language = config.defaults.language;
+    let language = resolve_language(cli_language, &config);
 
     let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         atcoder::AtCoderClient::fixture(path)
@@ -705,6 +709,12 @@ mod tests {
             Language::Cpp
         );
         assert_eq!(resolve_language(None, &config), Language::Python);
+
+        config.defaults.language = Language::Cpp;
+        assert_eq!(
+            resolve_language(Some(Language::Python), &config),
+            Language::Python
+        );
         assert_eq!(resolve_language(None, &Config::default()), Language::Cpp);
     }
 

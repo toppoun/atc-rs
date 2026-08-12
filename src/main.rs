@@ -34,8 +34,8 @@ fn run() -> Result<(), AppError> {
     let mut reporter = TerminalReporter;
 
     match cli.command {
-        cli::Command::New { contest } => {
-            commands::new(&contest, &mut reporter)?;
+        cli::Command::New { contest, language } => {
+            commands::new(&contest, language, &mut reporter)?;
         }
         cli::Command::Refresh { contest } => commands::refresh(contest, &mut reporter)?,
         cli::Command::Test {
