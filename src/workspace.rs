@@ -99,7 +99,7 @@ pub fn create_source_files(
 ) -> io::Result<()> {
     for problem in problems {
         validate_path_component(&problem.index, "problem index")?;
-        let path = destination.join(format!("{}.{}", problem.index, language.extension(),));
+        let path = destination.join(format!("{}.{}", problem.index, language.extension()));
 
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => file.write_all(template.as_bytes())?,
@@ -424,6 +424,39 @@ mod tests {
         fs::write(&source, "user source").unwrap();
 
         create_source_files(temp.path(), &[problem("A")], Language::Cpp, "template").unwrap();
+
+        assert_eq!(fs::read_to_string(source).unwrap(), "user source");
+    }
+
+    #[test]
+    fn creates_python_source_files_with_the_python_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let problems = vec![problem("A"), problem("B")];
+
+        create_source_files(temp.path(), &problems, Language::Python, "python template").unwrap();
+
+        for problem in problems {
+            assert_eq!(
+                fs::read_to_string(temp.path().join(format!("{}.py", problem.index))).unwrap(),
+                "python template"
+            );
+            assert!(!temp.path().join(format!("{}.cpp", problem.index)).exists());
+        }
+    }
+
+    #[test]
+    fn existing_python_source_file_is_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.py");
+        fs::write(&source, "user source").unwrap();
+
+        create_source_files(
+            temp.path(),
+            &[problem("A")],
+            Language::Python,
+            "python template",
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(source).unwrap(), "user source");
     }

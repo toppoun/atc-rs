@@ -297,6 +297,13 @@ mod tests {
         assert_eq!(contest.problems.len(), 7);
 
         for problem in &contest.problems {
+            assert_eq!(
+                std::fs::read_to_string(destination.join(format!("{}.cpp", problem.index)))
+                    .expect("C++ source should be readable"),
+                builtin_template(Language::Cpp)
+            );
+            assert!(!destination.join(format!("{}.py", problem.index)).exists());
+
             let test_dir = destination.join("tests").join(&problem.index);
 
             if problem.index == "C" {
@@ -306,6 +313,34 @@ mod tests {
 
                 assert!(test_dir.join("sample-1.out").is_file());
             }
+        }
+    }
+
+    #[test]
+    fn new_flow_creates_python_sources_from_the_builtin_template() {
+        let mut reporter = NullReporter;
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let destination = temp.path().join("abc466");
+        let client = atcoder::AtCoderClient::fixture(fixture_root());
+
+        new_at(
+            &destination,
+            "abc466",
+            Language::Python,
+            &client,
+            &mut reporter,
+        )
+        .expect("fixture new flow should succeed");
+
+        let contest =
+            workspace::load_metadata(&destination).expect("created metadata should be readable");
+        for problem in &contest.problems {
+            assert_eq!(
+                std::fs::read_to_string(destination.join(format!("{}.py", problem.index)))
+                    .expect("Python source should be readable"),
+                builtin_template(Language::Python)
+            );
+            assert!(!destination.join(format!("{}.cpp", problem.index)).exists());
         }
     }
 

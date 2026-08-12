@@ -10,3 +10,20 @@ pub fn builtin_template(language: Language) -> &'static str {
         Language::Python => PYTHON_TEMPLATE,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_template_for_each_language() {
+        let cpp = builtin_template(Language::Cpp);
+        let python = builtin_template(Language::Python);
+
+        assert!(cpp.contains("#include <bits/stdc++.h>"));
+        assert!(python.contains("def main():"));
+        assert!(cpp.ends_with('\n'));
+        assert!(python.ends_with('\n'));
+        assert_ne!(cpp, python);
+    }
+}

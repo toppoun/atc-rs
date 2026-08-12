@@ -19,7 +19,7 @@ impl FromStr for Language {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim().to_ascii_lowercase();
+        let s = s.to_ascii_lowercase();
 
         match s.as_str() {
             "cpp" => Ok(Language::Cpp),
@@ -49,6 +49,16 @@ mod tests {
     #[test]
     fn rejects_unknown_language() {
         assert!("rust".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_aliases() {
+        for alias in ["c++", "py", "python3", "pypy", " cpp "] {
+            assert!(
+                alias.parse::<Language>().is_err(),
+                "accepted alias: {alias}"
+            );
+        }
     }
 
     #[test]
