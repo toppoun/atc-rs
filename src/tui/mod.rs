@@ -1,6 +1,9 @@
 pub mod app;
+pub mod message;
 pub mod view;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
+use message::Message;
 use std::io;
 use std::time::Duration;
 
@@ -10,55 +13,113 @@ use ratatui::DefaultTerminal;
 use crate::model::Contest;
 use app::WatchApp;
 
+fn handle_messages(app: &mut WatchApp, message_rx: &Receiver<Message>) -> io::Result<bool> {
+    let mut changed = false;
+
+    loop {
+        match message_rx.try_recv() {
+            Ok(Message::SourceChanged {
+                problem,
+                path,
+                language,
+            }) => {
+                if app.source_changed(problem, path, language) {
+                    changed = true;
+                }
+            }
+
+            Ok(Message::WatcherFailed(error)) => {
+                return Err(error);
+            }
+
+            Err(TryRecvError::Empty) => {
+                break;
+            }
+
+            Err(TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "watcher thread disconnected",
+                ));
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
 pub fn run(
     terminal: &mut DefaultTerminal,
     contest: &Contest,
     sample_counts: Vec<usize>,
+    message_rx: Receiver<Message>,
 ) -> io::Result<()> {
     let mut app = WatchApp::new(contest, sample_counts)?;
 
-    while !app.should_quit() {
-        terminal.draw(|frame| {
-            view::render(frame, &app);
-        })?;
+    let mut dirty = true;
 
-        if event::poll(Duration::from_millis(50))?
+    while !app.should_quit() {
+        if handle_messages(&mut app, &message_rx)? {
+            dirty = true;
+        }
+
+        if dirty {
+            terminal.draw(|frame| {
+                view::render(frame, &app);
+            })?;
+
+            dirty = false;
+        }
+
+        if event::poll(Duration::from_millis(20))?
             && let Event::Key(key) = event::read()?
         {
-            handle_key_event(&mut app, key);
+            if handle_key_event(&mut app, key) {
+                dirty = true;
+            }
         }
     }
 
     Ok(())
 }
 
-fn handle_key_event(app: &mut WatchApp, key: KeyEvent) {
+fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return;
+        return false;
     }
 
     match key.code {
-        KeyCode::Char('q') => app.quit(),
+        KeyCode::Char('q') if key.kind == KeyEventKind::Press => {
+            app.quit();
+            true
+        }
 
-        KeyCode::Char('d') if key.kind == KeyEventKind::Press => app.toggle_debug(),
+        KeyCode::Char('d') if key.kind == KeyEventKind::Press => {
+            app.toggle_debug();
+            true
+        }
 
         KeyCode::Char('h') | KeyCode::Left => {
             app.previous_problem();
+            true
         }
 
         KeyCode::Char('l') | KeyCode::Right => {
             app.next_problem();
+            true
         }
 
         KeyCode::Char('j') | KeyCode::Down => {
             app.next_case();
+            true
         }
 
         KeyCode::Char('k') | KeyCode::Up => {
             app.previous_case();
+            true
         }
 
-        _ => {}
+        _ => false,
     }
 }
 

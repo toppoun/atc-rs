@@ -28,9 +28,22 @@ pub fn render(frame: &mut Frame, app: &WatchApp) {
 
     let debug = if app.debug_enabled() { "ON" } else { "OFF" };
 
+    let source = current_problem
+        .and_then(|problem| problem.source.as_ref())
+        .map(|source| {
+            source
+                .path
+                .file_name()
+                .unwrap_or(source.path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| "-".to_string());
+
     let text = format!(
         "Contest: {}\n\
      Problem: {} - {}\n\
+     Source: {}\n\
      Sample:  {}\n\
      Debug:   {}\n\n\
      h/l or ←/→ : problem\n\
@@ -40,6 +53,7 @@ pub fn render(frame: &mut Frame, app: &WatchApp) {
         app.contest_id(),
         problem,
         title,
+        source,
         sample,
         debug,
     );

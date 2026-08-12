@@ -1,12 +1,67 @@
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
+use std::io;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+
+use crate::tui::message::Message;
+use crate::watcher;
+
+use super::watch_source::{build_watched_sources, resolve_watched_source};
+
+fn start_watcher(destination: &Path, contest: &Contest) -> io::Result<mpsc::Receiver<Message>> {
+    let watched_sources = build_watched_sources(destination, contest);
+
+    let file_watcher = watcher::FileWatcher::new(destination)?;
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::Builder::new()
+        .name("atc-watch-fs".to_string())
+        .spawn(move || {
+            loop {
+                let paths = match file_watcher.next_batch() {
+                    Ok(paths) => paths,
+
+                    Err(error) => {
+                        let _ = tx.send(Message::WatcherFailed(error));
+                        return;
+                    }
+                };
+
+                for path in paths {
+                    if !path.is_file() {
+                        continue;
+                    }
+
+                    let Some(source) = resolve_watched_source(&watched_sources, &path) else {
+                        continue;
+                    };
+
+                    let message = Message::SourceChanged {
+                        problem: source.problem,
+                        path,
+                        language: source.language,
+                    };
+
+                    if tx.send(message).is_err() {
+                        return;
+                    }
+                }
+            }
+        })?;
+
+    Ok(rx)
+}
 
 pub(crate) fn watch_tui() -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
 
     let (contest, sample_counts) = load_watch_input(&cwd)?;
+
+    let message_rx = start_watcher(&cwd, &contest)?;
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -16,7 +71,8 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
         }
     };
 
-    let result = crate::tui::run(&mut terminal, &contest, sample_counts);
+    let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx);
+
     let restore_result = ratatui::try_restore();
 
     result?;

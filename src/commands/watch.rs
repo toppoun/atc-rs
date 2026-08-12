@@ -7,6 +7,8 @@ use crate::ui::{Event, Reporter};
 use crate::{watcher, workspace};
 use std::path::Path;
 
+use super::watch_source::{build_watched_sources, resolve_watched_source};
+
 pub(crate) fn watch(reporter: &mut dyn Reporter) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
 
@@ -60,22 +62,25 @@ fn process_changed_paths_with(
         &mut dyn Reporter,
     ) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
+    let watched_sources = build_watched_sources(destination, contest);
+
     for path in paths {
-        // remove途中など、一時的に存在しない場合は無視
         if !path.is_file() {
             continue;
         }
 
-        let Some((problem, language)) = resolve_watched_source(destination, contest, &path) else {
+        let Some(source) = resolve_watched_source(&watched_sources, &path) else {
             continue;
         };
+
+        let problem = &contest.problems[source.problem];
 
         reporter.report(Event::WatchSourceChanged { source: &path });
 
         run_test(
             destination,
             problem,
-            language,
+            source.language,
             runner_config,
             false,
             reporter,
@@ -83,24 +88,6 @@ fn process_changed_paths_with(
     }
 
     Ok(())
-}
-
-fn resolve_watched_source<'a>(
-    destination: &Path,
-    contest: &'a Contest,
-    path: &Path,
-) -> Option<(&'a Problem, Language)> {
-    for problem in &contest.problems {
-        for language in [Language::Cpp, Language::Python] {
-            let expected = destination.join(format!("{}.{}", problem.index, language.extension()));
-
-            if path == expected {
-                return Some((problem, language));
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -164,48 +151,6 @@ mod tests {
                 _ => panic!("unexpected event while testing watch"),
             }
         }
-    }
-
-    #[test]
-    fn resolves_exact_cpp_and_python_sources_from_metadata() {
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("workspace root with spaces");
-        std::fs::create_dir(&destination).unwrap();
-        let contest = contest(vec![problem("A"), problem("D")]);
-
-        let (cpp_problem, cpp_language) =
-            resolve_watched_source(&destination, &contest, &destination.join("A.cpp")).unwrap();
-        assert_eq!(cpp_problem.index, "A");
-        assert_eq!(cpp_language, Language::Cpp);
-
-        let (python_problem, python_language) =
-            resolve_watched_source(&destination, &contest, &destination.join("A.py")).unwrap();
-        assert_eq!(python_problem.index, "A");
-        assert_eq!(python_language, Language::Python);
-
-        assert!(
-            resolve_watched_source(&destination, &contest, &destination.join("D_brute.py"))
-                .is_none()
-        );
-        assert!(
-            resolve_watched_source(
-                &destination,
-                &contest,
-                &destination.join("tempCodeRunnerFile.py")
-            )
-            .is_none()
-        );
-        assert!(
-            resolve_watched_source(&destination, &contest, &destination.join("A.rs")).is_none()
-        );
-        assert!(
-            resolve_watched_source(
-                &destination,
-                &contest,
-                &destination.join("nested").join("A.cpp"),
-            )
-            .is_none()
-        );
     }
 
     #[test]
@@ -313,6 +258,40 @@ mod tests {
                 "case-accepted:1".to_string(),
                 "test-finished:A:1:1".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn resolves_only_exact_watched_source_paths() {
+        let destination = Path::new("workspace");
+
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A"), problem("D")],
+        };
+
+        let sources = build_watched_sources(destination, &contest);
+
+        let cpp = resolve_watched_source(&sources, &destination.join("A.cpp")).unwrap();
+
+        assert_eq!(cpp.problem, 0);
+        assert_eq!(cpp.language, Language::Cpp);
+
+        let python = resolve_watched_source(&sources, &destination.join("A.py")).unwrap();
+
+        assert_eq!(python.problem, 0);
+        assert_eq!(python.language, Language::Python);
+
+        assert!(resolve_watched_source(&sources, &destination.join("D_brute.py")).is_none());
+
+        assert!(
+            resolve_watched_source(&sources, &destination.join("tempCodeRunnerFile.py")).is_none()
+        );
+
+        assert!(resolve_watched_source(&sources, &destination.join("A.rs")).is_none());
+
+        assert!(
+            resolve_watched_source(&sources, &destination.join("nested").join("A.cpp")).is_none()
         );
     }
 }

@@ -1,11 +1,21 @@
-use crate::model::Contest;
 use std::io;
+use std::path::PathBuf;
+
+use crate::language::Language;
+use crate::model::Contest;
+
+#[derive(Debug)]
+pub struct SourceState {
+    pub path: PathBuf,
+    pub language: Language,
+}
 
 #[derive(Debug)]
 pub struct ProblemState {
     pub index: String,
     pub title: String,
     pub total_cases: usize,
+    pub source: Option<SourceState>,
 }
 
 #[derive(Debug)]
@@ -41,6 +51,7 @@ impl WatchApp {
                 index: problem.index.clone(),
                 title: problem.title.clone(),
                 total_cases,
+                source: None,
             })
             .collect();
 
@@ -148,6 +159,17 @@ impl WatchApp {
         } else {
             self.selected_case -= 1;
         }
+    }
+    pub fn source_changed(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
+        if problem >= self.problems.len() {
+            return false;
+        }
+
+        self.problems[problem].source = Some(SourceState { path, language });
+
+        self.select_problem(problem);
+
+        true
     }
 }
 
@@ -289,6 +311,50 @@ mod tests {
         assert!(!app.should_quit());
         app.quit();
         assert!(app.should_quit());
+        assert_selection_invariant(&app);
+    }
+    #[test]
+    fn source_change_selects_problem_and_resets_case() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
+
+        app.previous_case();
+        assert_eq!(app.selected_case(), 2);
+
+        assert!(app.source_changed(1, PathBuf::from("B.cpp"), Language::Cpp,));
+
+        assert_eq!(app.current_problem().unwrap().index, "B");
+        assert_eq!(app.selected_case(), 0);
+
+        let source = app.current_problem().unwrap().source.as_ref().unwrap();
+
+        assert_eq!(source.path, PathBuf::from("B.cpp"));
+        assert_eq!(source.language, Language::Cpp);
+
+        assert_selection_invariant(&app);
+    }
+
+    #[test]
+    fn latest_source_change_replaces_previous_source() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp,));
+
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python,));
+
+        let source = app.current_problem().unwrap().source.as_ref().unwrap();
+
+        assert_eq!(source.path, PathBuf::from("A.py"));
+        assert_eq!(source.language, Language::Python);
+    }
+
+    #[test]
+    fn invalid_source_change_is_ignored() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+
+        assert!(!app.source_changed(100, PathBuf::from("Z.cpp"), Language::Cpp,));
+
+        assert_eq!(app.current_problem().unwrap().index, "A");
+        assert!(app.current_problem().unwrap().source.is_none());
         assert_selection_invariant(&app);
     }
 }

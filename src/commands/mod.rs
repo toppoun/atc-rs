@@ -3,6 +3,7 @@ mod new;
 mod refresh;
 mod test;
 mod watch;
+mod watch_source;
 mod watch_tui;
 
 pub(crate) use create::create;
