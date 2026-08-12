@@ -18,7 +18,6 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-
 pub struct Defaults {
     #[serde(
         default = "default_language",
@@ -98,28 +97,45 @@ impl Config {
             )
         })?;
 
-        config.validate()?;
+        config
+            .validate()
+            .map_err(|err| config_io_error(path, "validate", err))?;
 
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), AppError> {
-        if !self.runner.timeout_seconds.is_finite() || self.runner.timeout_seconds <= 0.0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runner.timeout_seconds must be a positive finite number",
-            )
-            .into());
+    fn validate(&self) -> io::Result<()> {
+        for (name, value) in [
+            ("runner.timeout_seconds", self.runner.timeout_seconds),
+            (
+                "runner.compile_timeout_seconds",
+                self.runner.compile_timeout_seconds,
+            ),
+        ] {
+            let duration = std::time::Duration::try_from_secs_f64(value);
+            if !value.is_finite()
+                || value <= 0.0
+                || !matches!(duration, Ok(duration) if !duration.is_zero())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} must be a positive finite duration"),
+                ));
+            }
         }
 
-        if !self.runner.compile_timeout_seconds.is_finite()
-            || self.runner.compile_timeout_seconds <= 0.0
-        {
+        if self.runner.python.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "runner.compile_timeout_seconds must be a positive finite number",
-            )
-            .into());
+                "runner.python must not be empty",
+            ));
+        }
+
+        if self.runner.cpp_compiler.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runner.cpp_compiler must not be empty",
+            ));
         }
 
         Ok(())
@@ -201,8 +217,10 @@ mod tests {
             "[defaults]\nlanguage = \"cpp\"\nunexpected = true\n",
         )
         .unwrap();
+        let runner = temp.path().join("runner.toml");
+        std::fs::write(&runner, "[runner]\nunexpected = true\n").unwrap();
 
-        for path in [top_level, nested] {
+        for path in [top_level, nested, runner] {
             let err = Config::load_from(&path).unwrap_err();
             assert!(
                 matches!(err, AppError::Io(ref err) if err.kind() == io::ErrorKind::InvalidData)
@@ -217,5 +235,59 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         assert!(Config::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn partial_runner_config_uses_built_in_defaults() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[runner]\ntimeout_seconds = 3.5\n").unwrap();
+
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.runner.python, "python");
+        assert_eq!(config.runner.cpp_compiler, "g++");
+        assert_eq!(
+            config.runner.cpp_flags,
+            ["-std=c++23", "-O2", "-Wall", "-Wextra"]
+        );
+        assert_eq!(config.runner.timeout_seconds, 3.5);
+        assert_eq!(config.runner.compile_timeout_seconds, 10.0);
+    }
+
+    #[test]
+    fn runner_timeouts_must_be_positive_finite_and_representable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+
+        for field in ["timeout_seconds", "compile_timeout_seconds"] {
+            for value in ["0", "-1", "nan", "inf", "-inf", "1e-300", "1e300"] {
+                std::fs::write(&path, format!("[runner]\n{field} = {value}\n")).unwrap();
+
+                let error = Config::load_from(&path).unwrap_err();
+
+                assert!(
+                    matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData),
+                    "accepted {field} = {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runner_program_names_must_not_be_empty() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+
+        for (field, value) in [("python", ""), ("cpp_compiler", "   ")] {
+            std::fs::write(&path, format!("[runner]\n{field} = {value:?}\n")).unwrap();
+
+            let error = Config::load_from(&path).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
+            ));
+        }
     }
 }

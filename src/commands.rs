@@ -1,6 +1,6 @@
 use crate::atcoder;
 use crate::comparator::{self, ComparisonResult};
-use crate::config::Config;
+use crate::config::{Config, RunnerConfig};
 use crate::error::AppError;
 use crate::language::Language;
 use crate::model::{Contest, Sample};
@@ -281,6 +281,66 @@ fn report_case_result(
     }
 }
 
+fn run_test_cases(
+    samples: &[Sample],
+    mut execute_case: impl FnMut(&Sample) -> io::Result<runner::ExecutionResult>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    for (index, sample) in samples.iter().enumerate() {
+        let result = execute_case(sample)?;
+        report_case_result(index + 1, sample, &result, reporter);
+    }
+
+    Ok(())
+}
+
+fn report_compile_result(result: &runner::ExecutionResult, reporter: &mut dyn Reporter) -> bool {
+    match &result.outcome {
+        ExecutionOutcome::Exited(status) if status.success() => true,
+        ExecutionOutcome::Exited(_) => {
+            reporter.report(Event::CompileFailed {
+                stderr: &result.stderr,
+            });
+            false
+        }
+        ExecutionOutcome::TimedOut => {
+            reporter.report(Event::CompileTimedOut {
+                elapsed: result.elapsed,
+            });
+            false
+        }
+    }
+}
+
+fn find_problem<'a>(
+    contest: &'a Contest,
+    problem_index: &str,
+) -> io::Result<&'a crate::model::Problem> {
+    let mut matches = contest
+        .problems
+        .iter()
+        .filter(|problem| problem.index.eq_ignore_ascii_case(problem_index));
+    let problem = matches.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("problem not found in this contest: {problem_index}"),
+        )
+    })?;
+
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("ambiguous problem index in contest metadata: {problem_index}"),
+        ));
+    }
+
+    Ok(problem)
+}
+
+fn resolve_test_language(cli_language: Option<Language>, config: &Config) -> Language {
+    cli_language.unwrap_or(config.defaults.language)
+}
+
 pub fn test(
     problem_index: &str,
     cli_language: Option<Language>,
@@ -295,21 +355,22 @@ pub fn test(
     let contest = workspace::load_metadata(&cwd)?;
     workspace::validate_contest_paths(&contest)?;
 
-    let problem = contest
-        .problems
-        .iter()
-        .find(|problem| problem.index.eq_ignore_ascii_case(problem_index))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("problem not found in this contest: {problem_index}"),
-            )
-        })?;
+    let problem = find_problem(&contest, problem_index)?;
 
     let config = Config::load()?;
-    let language = cli_language.unwrap_or(config.defaults.language);
+    let language = resolve_test_language(cli_language, &config);
 
-    let source = cwd.join(format!("{}.{}", problem.index, language.extension()));
+    test_problem(&cwd, problem, language, &config.runner, reporter)
+}
+
+fn test_problem(
+    destination: &Path,
+    problem: &crate::model::Problem,
+    language: Language,
+    runner_config: &RunnerConfig,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let source = destination.join(format!("{}.{}", problem.index, language.extension()));
 
     if !source.is_file() {
         return Err(io::Error::new(
@@ -319,19 +380,29 @@ pub fn test(
         .into());
     }
 
-    let samples = workspace::load_samples(&cwd, &problem.index)?;
+    let samples = workspace::load_samples(destination, &problem.index)?;
+    if samples.is_empty() {
+        reporter.report(Event::NoSamples {
+            problem_index: &problem.index,
+        });
+        return Ok(());
+    }
 
-    let timeout = Duration::from_secs_f64(config.runner.timeout_seconds);
-    let compile_timeout = Duration::from_secs_f64(config.runner.compile_timeout_seconds);
+    let timeout = duration_from_seconds(runner_config.timeout_seconds, "runner.timeout_seconds")?;
+    let compile_timeout = duration_from_seconds(
+        runner_config.compile_timeout_seconds,
+        "runner.compile_timeout_seconds",
+    )?;
 
     match language {
         Language::Python => {
-            for (i, sample) in samples.iter().enumerate() {
-                let result =
-                    runner::execute_python(&source, &sample.input, &config.runner.python, timeout)?;
-
-                report_case_result(i + 1, sample, &result, reporter);
-            }
+            run_test_cases(
+                &samples,
+                |sample| {
+                    runner::execute_python(&source, &sample.input, &runner_config.python, timeout)
+                },
+                reporter,
+            )?;
         }
 
         Language::Cpp => {
@@ -345,47 +416,85 @@ pub fn test(
             let compile_result = runner::compile_cpp(
                 &source,
                 &output,
-                &config.runner.cpp_compiler,
-                &config.runner.cpp_flags,
+                &runner_config.cpp_compiler,
+                &runner_config.cpp_flags,
                 compile_timeout,
                 &runner::BuildOptions::default(),
             )?;
 
-            match compile_result.outcome {
-                ExecutionOutcome::Exited(status) if status.success() => {}
-
-                ExecutionOutcome::Exited(_) => {
-                    // TODO: CompileFailed Event
-                    return Ok(());
-                }
-
-                ExecutionOutcome::TimedOut => {
-                    // TODO: CompileTimedOut Event
-                    return Ok(());
-                }
+            if !report_compile_result(&compile_result, reporter) {
+                return Ok(());
             }
 
-            for (i, sample) in samples.iter().enumerate() {
-                let result = runner::execute(&output, &[], &sample.input, timeout)?;
-
-                report_case_result(i + 1, sample, &result, reporter);
-            }
+            run_test_cases(
+                &samples,
+                |sample| runner::execute(&output, &[], &sample.input, timeout),
+                reporter,
+            )?;
         }
     }
 
     Ok(())
 }
 
+fn duration_from_seconds(seconds: f64, name: &str) -> io::Result<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} must be a positive finite duration"),
+        ));
+    }
+
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {name}: {error}"),
+        )
+    })?;
+
+    if duration.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} is too small to represent as a positive duration"),
+        ));
+    }
+
+    Ok(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workspace;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::process::ExitStatus;
 
     use crate::ui::NullReporter;
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    fn execution(outcome: ExecutionOutcome, stdout: &str, stderr: &str) -> runner::ExecutionResult {
+        runner::ExecutionResult {
+            outcome,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            elapsed: Duration::from_millis(10),
+        }
     }
 
     fn old_contest(contest_id: &str) -> Contest {
@@ -456,6 +565,155 @@ mod tests {
             };
             self.events.push(event);
         }
+    }
+
+    #[test]
+    fn problem_lookup_is_ascii_case_insensitive_and_rejects_ambiguity() {
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![crate::model::Problem {
+                index: "A".to_string(),
+                title: "Problem A".to_string(),
+                task_id: "abc466_a".to_string(),
+                url: "https://example.invalid/a".to_string(),
+            }],
+        };
+
+        assert_eq!(find_problem(&contest, "a").unwrap().index, "A");
+
+        let ambiguous = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![
+                contest.problems[0].clone(),
+                crate::model::Problem {
+                    index: "a".to_string(),
+                    title: "Duplicate".to_string(),
+                    task_id: "duplicate".to_string(),
+                    url: "https://example.invalid/duplicate".to_string(),
+                },
+            ],
+        };
+        let error = find_problem(&ambiguous, "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn cli_language_overrides_config_language() {
+        let mut config = Config::default();
+        config.defaults.language = Language::Cpp;
+
+        assert_eq!(
+            resolve_test_language(Some(Language::Python), &config),
+            Language::Python
+        );
+        assert_eq!(resolve_test_language(None, &config), Language::Cpp);
+    }
+
+    #[test]
+    fn no_samples_is_reported_without_starting_a_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let problem = crate::model::Problem {
+            index: "A".to_string(),
+            title: "Problem A".to_string(),
+            task_id: "abc466_a".to_string(),
+            url: "https://example.invalid/a".to_string(),
+        };
+        std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
+        let runner_config = RunnerConfig {
+            cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+            ..RunnerConfig::default()
+        };
+        let mut reporter = RecordingReporter::default();
+
+        test_problem(
+            temp.path(),
+            &problem,
+            Language::Cpp,
+            &runner_config,
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert_eq!(reporter.events, ["no-samples:A"]);
+    }
+
+    #[test]
+    fn resolved_language_does_not_fall_back_to_an_existing_other_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let problem = crate::model::Problem {
+            index: "A".to_string(),
+            title: "Problem A".to_string(),
+            task_id: "abc466_a".to_string(),
+            url: "https://example.invalid/a".to_string(),
+        };
+        std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        let error = test_problem(
+            temp.path(),
+            &problem,
+            Language::Python,
+            &RunnerConfig::default(),
+            &mut reporter,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Io(ref error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(reporter.events.is_empty());
+    }
+
+    #[test]
+    fn compile_failure_and_compile_timeout_are_distinct_recoverable_events() {
+        let mut reporter = RecordingReporter::default();
+
+        assert!(!report_compile_result(
+            &execution(ExecutionOutcome::Exited(exit_status(1)), "", "error"),
+            &mut reporter,
+        ));
+        assert!(!report_compile_result(
+            &execution(ExecutionOutcome::TimedOut, "", ""),
+            &mut reporter,
+        ));
+
+        assert_eq!(reporter.events, ["compile-failed", "compile-timed-out"]);
+    }
+
+    #[test]
+    fn recoverable_case_results_do_not_stop_later_samples() {
+        let samples: Vec<_> = (0..4)
+            .map(|_| Sample {
+                input: String::new(),
+                output: "expected\n".to_string(),
+            })
+            .collect();
+        let mut results = VecDeque::from([
+            execution(ExecutionOutcome::Exited(exit_status(0)), "wrong\n", ""),
+            execution(ExecutionOutcome::Exited(exit_status(1)), "", "runtime"),
+            execution(ExecutionOutcome::TimedOut, "", ""),
+            execution(ExecutionOutcome::Exited(exit_status(0)), "expected\n", ""),
+        ]);
+        let mut reporter = RecordingReporter::default();
+
+        run_test_cases(
+            &samples,
+            |_| Ok(results.pop_front().unwrap()),
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(
+            reporter.events,
+            [
+                "case-wrong-answer:1",
+                "case-runtime-error:2",
+                "case-timed-out:3",
+                "case-accepted:4",
+            ]
+        );
     }
 
     #[test]

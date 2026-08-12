@@ -12,16 +12,12 @@ pub fn compare(expected: &str, actual: &str) -> ComparisonResult {
     }
 }
 
-fn normalize(text: &str) -> String {
+fn normalize(text: &str) -> Vec<String> {
     let text = text.replace("\r\n", "\n");
 
-    let mut lines: Vec<&str> = text.lines().map(|line| line.trim_end()).collect();
-
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-
-    lines.join("\n")
+    text.split_terminator('\n')
+        .map(|line| line.trim_end().to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -60,5 +56,26 @@ mod tests {
     #[test]
     fn rejects_different_output() {
         assert_eq!(compare("10\n", "11\n"), ComparisonResult::WrongAnswer);
+    }
+
+    #[test]
+    fn rejects_extra_trailing_blank_line() {
+        assert_eq!(compare("1\n", "1\n\n"), ComparisonResult::WrongAnswer);
+        assert_eq!(compare("", "\n"), ComparisonResult::WrongAnswer);
+    }
+
+    #[test]
+    fn preserves_blank_lines_while_ignoring_their_trailing_whitespace() {
+        assert_eq!(
+            compare("1\n\n2\n", "1\r\n \t\r\n2"),
+            ComparisonResult::Accepted
+        );
+        assert_eq!(compare("1\n\n2\n", "1\n2\n"), ComparisonResult::WrongAnswer);
+    }
+
+    #[test]
+    fn rejects_leading_and_internal_whitespace_differences() {
+        assert_eq!(compare("1 2\n", " 1 2\n"), ComparisonResult::WrongAnswer);
+        assert_eq!(compare("1 2\n", "1  2\n"), ComparisonResult::WrongAnswer);
     }
 }

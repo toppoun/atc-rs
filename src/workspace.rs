@@ -154,8 +154,12 @@ fn parse_sample_filename(name: &OsStr) -> io::Result<Option<(usize, SampleFileKi
 pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<Sample>> {
     validate_path_component(problem_index, "problem index")?;
 
-    let test_dir = destination.join("tests").join(problem_index);
+    let tests_dir = destination.join("tests");
+    if !existing_real_directory(&tests_dir, "tests directory")? {
+        return Ok(Vec::new());
+    }
 
+    let test_dir = tests_dir.join(problem_index);
     if !existing_real_directory(&test_dir, "problem tests directory")? {
         return Ok(Vec::new());
     }
@@ -473,6 +477,44 @@ mod tests {
         }
     }
 
+    fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create directory symlink: {error}"),
+        }
+    }
+
+    fn create_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create file symlink: {error}"),
+        }
+    }
+
     #[test]
     fn save_and_load_metadata() {
         let temp = tempfile::tempdir().unwrap();
@@ -544,6 +586,181 @@ mod tests {
         save_samples(temp.path(), &problem("A"), &[]).unwrap();
 
         assert!(!temp.path().join("tests").exists());
+    }
+
+    #[test]
+    fn loads_samples_in_numeric_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path().join("tests").join("A");
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(test_dir.join("sample-2.out"), "second output\n").unwrap();
+        fs::write(test_dir.join("sample-1.in"), "first input\n").unwrap();
+        fs::write(test_dir.join("sample-2.in"), "second input\n").unwrap();
+        fs::write(test_dir.join("sample-1.out"), "first output\n").unwrap();
+        fs::write(test_dir.join("README.txt"), "ignored").unwrap();
+
+        let samples = load_samples(temp.path(), "A").unwrap();
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].input, "first input\n");
+        assert_eq!(samples[0].output, "first output\n");
+        assert_eq!(samples[1].input, "second input\n");
+        assert_eq!(samples[1].output, "second output\n");
+    }
+
+    #[test]
+    fn missing_or_empty_problem_tests_returns_no_samples() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert!(load_samples(temp.path(), "A").unwrap().is_empty());
+
+        fs::create_dir_all(temp.path().join("tests").join("A")).unwrap();
+        assert!(load_samples(temp.path(), "A").unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_samples_rejects_unsafe_problem_index_and_non_directories() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = load_samples(temp.path(), "../outside").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        fs::write(temp.path().join("tests"), "not a directory").unwrap();
+        let error = load_samples(temp.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let second = tempfile::tempdir().unwrap();
+        fs::create_dir(second.path().join("tests")).unwrap();
+        fs::write(second.path().join("tests").join("A"), "not a directory").unwrap();
+        let error = load_samples(second.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_missing_sample_pair_and_number_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_pair = temp.path().join("tests").join("A");
+        fs::create_dir_all(&missing_pair).unwrap();
+        fs::write(missing_pair.join("sample-1.in"), "input").unwrap();
+
+        let error = load_samples(temp.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("sample-1.out is missing"));
+
+        let gap = temp.path().join("tests").join("B");
+        fs::create_dir_all(&gap).unwrap();
+        for number in [1, 3] {
+            fs::write(gap.join(format!("sample-{number}.in")), "input").unwrap();
+            fs::write(gap.join(format!("sample-{number}.out")), "output").unwrap();
+        }
+
+        let error = load_samples(temp.path(), "B").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("expected 2, found 3"));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_invalid_sample_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let duplicate = temp.path().join("tests").join("A");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::write(duplicate.join("sample-1.in"), "input").unwrap();
+        fs::write(duplicate.join("sample-01.in"), "duplicate").unwrap();
+        fs::write(duplicate.join("sample-1.out"), "output").unwrap();
+
+        let error = load_samples(temp.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate sample input"));
+
+        let invalid = temp.path().join("tests").join("B");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("sample-0.in"), "input").unwrap();
+
+        let error = load_samples(temp.path(), "B").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_directory_used_as_sample_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path().join("tests").join("A");
+        fs::create_dir_all(test_dir.join("sample-1.in")).unwrap();
+        fs::write(test_dir.join("sample-1.out"), "output").unwrap();
+
+        let error = load_samples(temp.path(), "A").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_non_utf8_sample_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path().join("tests").join("A");
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(test_dir.join("sample-1.in"), [0xff]).unwrap();
+        fs::write(test_dir.join("sample-1.out"), "output").unwrap();
+
+        let error = load_samples(temp.path(), "A").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_symlinked_tests_directory_and_sample_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_problem = external.path().join("A");
+        fs::create_dir(&external_problem).unwrap();
+        fs::write(external_problem.join("sample-1.in"), "input").unwrap();
+        fs::write(external_problem.join("sample-1.out"), "output").unwrap();
+
+        if !create_directory_symlink(external.path(), &temp.path().join("tests")) {
+            return;
+        }
+        let error = load_samples(temp.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let second = tempfile::tempdir().unwrap();
+        let problem_dir = second.path().join("tests").join("A");
+        fs::create_dir_all(&problem_dir).unwrap();
+        if !create_file_symlink(
+            &external_problem.join("sample-1.in"),
+            &problem_dir.join("sample-1.in"),
+        ) {
+            return;
+        }
+        fs::write(problem_dir.join("sample-1.out"), "output").unwrap();
+
+        let error = load_samples(second.path(), "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_file_name_in_sample_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path().join("tests").join("A");
+        fs::create_dir_all(&test_dir).unwrap();
+        let invalid_name = std::ffi::OsString::from_vec(vec![0xff]);
+        fs::write(test_dir.join(invalid_name), "invalid").unwrap();
+
+        let error = load_samples(temp.path(), "A").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_non_unicode_sample_file_name() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let invalid_name = std::ffi::OsString::from_wide(&[0xd800]);
+
+        let error = parse_sample_filename(&invalid_name).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

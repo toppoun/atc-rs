@@ -44,4 +44,29 @@ mod tests {
             Command::Refresh { contest: Some(contest) } if contest == "abc466"
         ));
     }
+
+    #[test]
+    fn parses_test_problem_and_optional_language() {
+        for problem in ["A", "a"] {
+            let cli = Cli::try_parse_from(["atc-rs", "test", problem]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Test { problem: parsed, language: None } if parsed == problem
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-l", "python"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                problem,
+                language: Some(Language::Python)
+            } if problem == "A"
+        ));
+    }
+
+    #[test]
+    fn test_language_rejects_unsupported_alias() {
+        assert!(Cli::try_parse_from(["atc-rs", "test", "A", "-l", "py"]).is_err());
+    }
 }
