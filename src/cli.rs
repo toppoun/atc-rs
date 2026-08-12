@@ -23,6 +23,9 @@ pub enum Command {
 
         #[arg(short = 'l', long = "language")]
         language: Option<Language>,
+
+        #[arg(short, long)]
+        debug: bool,
     },
     Login,
 }
@@ -51,7 +54,7 @@ mod tests {
             let cli = Cli::try_parse_from(["atc-rs", "test", problem]).unwrap();
             assert!(matches!(
                 cli.command,
-                Command::Test { problem: parsed, language: None } if parsed == problem
+                Command::Test { problem: parsed, language: None, debug } if parsed == problem
             ));
         }
 
@@ -60,8 +63,7 @@ mod tests {
             cli.command,
             Command::Test {
                 problem,
-                language: Some(Language::Python)
-            } if problem == "A"
+                language: Some(Language::Python), debug } if problem == "A"
         ));
     }
 

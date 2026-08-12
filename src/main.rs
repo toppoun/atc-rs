@@ -6,6 +6,7 @@ mod cli;
 mod commands;
 mod comparator;
 mod config;
+mod debug;
 mod error;
 mod language;
 mod model;
@@ -18,9 +19,6 @@ use crate::error::AppError;
 use ui::TerminalReporter;
 
 fn main() -> ExitCode {
-    println!("config: {}", paths::config_dir().unwrap().display());
-
-    println!("cache : {}", paths::cache_dir().unwrap().display());
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -40,8 +38,12 @@ fn run() -> Result<(), AppError> {
             commands::new(&contest, &mut reporter)?;
         }
         cli::Command::Refresh { contest } => commands::refresh(contest, &mut reporter)?,
-        cli::Command::Test { problem, language } => {
-            commands::test(&problem, language, &mut reporter)?;
+        cli::Command::Test {
+            problem,
+            language,
+            debug,
+        } => {
+            commands::test(&problem, language, debug, &mut reporter)?;
         }
         cli::Command::Login => {
             println!("login");

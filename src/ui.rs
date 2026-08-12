@@ -62,6 +62,10 @@ pub enum Event<'a> {
         number: usize,
         elapsed: Duration,
     },
+    TestCaseStderr {
+        number: usize,
+        stderr: &'a str,
+    },
 }
 
 pub trait Reporter {
@@ -153,6 +157,10 @@ impl Reporter for TerminalReporter {
 
             Event::TestCaseTimedOut { number, elapsed } => {
                 println!("Sample {number}: TLE ({elapsed:.2?})");
+            }
+            Event::TestCaseStderr { number, stderr } => {
+                eprintln!("Sample {number} stderr:");
+                eprint!("{stderr}");
             }
         }
     }

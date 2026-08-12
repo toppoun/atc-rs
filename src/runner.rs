@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ pub struct ExecutionResult {
 
 #[derive(Debug, Default)]
 pub struct BuildOptions {
-    pub debug: bool,
+    pub debug_include_dir: Option<PathBuf>,
 }
 
 pub fn execute_python(
@@ -50,10 +50,11 @@ pub fn compile_cpp(
     args.push(OsString::from("-o"));
     args.push(output.as_os_str().to_owned());
 
-    // debug用フラグは後でここに足す
-    if options.debug {
-        // -DLOCAL
-        // -I <include dir>
+    // debug用フラグ
+    if let Some(include_dir) = &options.debug_include_dir {
+        args.push("-DLOCAL".into());
+        args.push("-I".into());
+        args.push(include_dir.as_os_str().to_os_string());
     }
 
     execute(Path::new(compiler), &args, "", timeout)

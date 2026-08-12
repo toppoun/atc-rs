@@ -279,6 +279,12 @@ fn report_case_result(
             });
         }
     }
+    if !result.stderr.is_empty() {
+        reporter.report(Event::TestCaseStderr {
+            number,
+            stderr: &result.stderr,
+        });
+    }
 }
 
 fn run_test_cases(
@@ -344,6 +350,7 @@ fn resolve_test_language(cli_language: Option<Language>, config: &Config) -> Lan
 pub fn test(
     problem_index: &str,
     cli_language: Option<Language>,
+    debug: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
@@ -359,8 +366,14 @@ pub fn test(
 
     let config = Config::load()?;
     let language = resolve_test_language(cli_language, &config);
-
-    test_problem(&cwd, problem, language, &config.runner, reporter)
+    if debug && language != Language::Cpp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--debug is only supported for C++",
+        )
+        .into());
+    }
+    test_problem(&cwd, problem, language, &config.runner, debug, reporter)
 }
 
 fn test_problem(
@@ -368,6 +381,7 @@ fn test_problem(
     problem: &crate::model::Problem,
     language: Language,
     runner_config: &RunnerConfig,
+    debug: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let source = destination.join(format!("{}.{}", problem.index, language.extension()));
@@ -412,14 +426,20 @@ fn test_problem(
                 build_dir
                     .path()
                     .join(format!("{}{}", problem.index, std::env::consts::EXE_SUFFIX));
-
+            let build_options = if debug {
+                runner::BuildOptions {
+                    debug_include_dir: Some(crate::debug::materialize_debug_header()?),
+                }
+            } else {
+                runner::BuildOptions::default()
+            };
             let compile_result = runner::compile_cpp(
                 &source,
                 &output,
                 &runner_config.cpp_compiler,
                 &runner_config.cpp_flags,
                 compile_timeout,
-                &runner::BuildOptions::default(),
+                &build_options,
             )?;
 
             if !report_compile_result(&compile_result, reporter) {
@@ -562,6 +582,9 @@ mod tests {
                 Event::TestCaseTimedOut { number, .. } => {
                     format!("case-timed-out:{number}")
                 }
+                Event::TestCaseStderr { number, stderr } => {
+                    format!("case-stderr:{number}")
+                }
             };
             self.events.push(event);
         }
@@ -630,6 +653,7 @@ mod tests {
             &problem,
             Language::Cpp,
             &runner_config,
+            false,
             &mut reporter,
         )
         .unwrap();
@@ -654,6 +678,7 @@ mod tests {
             &problem,
             Language::Python,
             &RunnerConfig::default(),
+            false,
             &mut reporter,
         )
         .unwrap_err();
