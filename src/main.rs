@@ -13,6 +13,7 @@ mod model;
 mod paths;
 mod runner;
 mod template;
+mod tui;
 mod ui;
 mod watcher;
 mod workspace;
@@ -49,8 +50,12 @@ fn run() -> Result<(), AppError> {
         cli::Command::Create { name, language } => {
             commands::create(&name, language, &mut reporter)?
         }
-        cli::Command::Watch => {
+        cli::Command::Watch { tui: false } => {
             commands::watch(&mut reporter)?;
+        }
+
+        cli::Command::Watch { tui: true } => {
+            commands::watch_tui()?;
         }
         cli::Command::Login => {
             println!("login");

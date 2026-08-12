@@ -36,7 +36,10 @@ pub enum Command {
         #[arg(short = 'l', long)]
         language: Option<Language>,
     },
-    Watch,
+    Watch {
+        #[arg(long)]
+        tui: bool,
+    },
     Login,
 }
 
@@ -155,6 +158,6 @@ mod tests {
     fn parses_plain_watch() {
         let cli = Cli::try_parse_from(["atc-rs", "watch"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Watch));
+        assert!(matches!(cli.command, Command::Watch { tui: false }));
     }
 }

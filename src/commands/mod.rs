@@ -3,12 +3,14 @@ mod new;
 mod refresh;
 mod test;
 mod watch;
+mod watch_tui;
 
 pub(crate) use create::create;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
 pub(crate) use test::test;
 pub(crate) use watch::watch;
+pub(crate) use watch_tui::watch_tui;
 
 use crate::atcoder;
 use crate::config::Config;
