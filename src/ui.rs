@@ -68,6 +68,13 @@ pub enum Event<'a> {
     SourceCreated {
         path: &'a Path,
     },
+    WatchStarted {
+        destination: &'a Path,
+    },
+
+    WatchSourceChanged {
+        source: &'a Path,
+    },
 }
 
 pub trait Reporter {
@@ -158,6 +165,20 @@ impl Reporter for TerminalReporter {
             }
             Event::SourceCreated { path } => {
                 println!("Created {}", path.display());
+            }
+            Event::WatchStarted { destination } => {
+                println!("Watching {}", destination.display());
+            }
+
+            Event::WatchSourceChanged { source } => {
+                println!();
+                println!(
+                    "Changed {}",
+                    source
+                        .file_name()
+                        .unwrap_or(source.as_os_str())
+                        .to_string_lossy()
+                );
             }
         }
     }

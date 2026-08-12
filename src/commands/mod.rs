@@ -2,11 +2,13 @@ mod create;
 mod new;
 mod refresh;
 mod test;
+mod watch;
 
 pub(crate) use create::create;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
 pub(crate) use test::test;
+pub(crate) use watch::watch;
 
 use crate::atcoder;
 use crate::config::Config;

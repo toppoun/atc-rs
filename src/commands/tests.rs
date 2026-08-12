@@ -122,6 +122,13 @@ impl Reporter for RecordingReporter {
             Event::SourceCreated { path } => {
                 format!("source-created:{}", path.display())
             }
+            Event::WatchStarted { destination } => {
+                format!("watch-started:{}", destination.display())
+            }
+
+            Event::WatchSourceChanged { source } => {
+                format!("watch-source-changed:{}", source.display())
+            }
         };
         self.events.push(event);
     }

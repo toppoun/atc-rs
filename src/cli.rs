@@ -36,6 +36,7 @@ pub enum Command {
         #[arg(short = 'l', long)]
         language: Option<Language>,
     },
+    Watch,
     Login,
 }
 
