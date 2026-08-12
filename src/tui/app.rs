@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 
@@ -100,7 +101,7 @@ impl WatchApp {
     }
 
     pub fn select_problem(&mut self, index: usize) -> bool {
-        if index >= self.problems.len() {
+        if index >= self.problems.len() || index == self.selected_problem {
             return false;
         }
 
@@ -109,22 +110,22 @@ impl WatchApp {
         true
     }
 
-    pub fn next_problem(&mut self) {
+    pub fn next_problem(&mut self) -> bool {
         if self.problems.is_empty() {
             self.selected_problem = 0;
             self.selected_case = 0;
-            return;
+            return false;
         }
 
         let next = (self.selected_problem + 1) % self.problems.len();
-        self.select_problem(next);
+        self.select_problem(next)
     }
 
-    pub fn previous_problem(&mut self) {
+    pub fn previous_problem(&mut self) -> bool {
         if self.problems.is_empty() {
             self.selected_problem = 0;
             self.selected_case = 0;
-            return;
+            return false;
         }
 
         let previous = if self.selected_problem == 0 {
@@ -132,42 +133,57 @@ impl WatchApp {
         } else {
             self.selected_problem - 1
         };
-        self.select_problem(previous);
+        self.select_problem(previous)
     }
 
-    pub fn next_case(&mut self) {
+    pub fn next_case(&mut self) -> bool {
         let count = self.current_case_count();
 
         if count == 0 {
             self.selected_case = 0;
-            return;
+            return false;
         }
 
-        self.selected_case = (self.selected_case + 1) % count;
+        let next = (self.selected_case + 1) % count;
+        if next == self.selected_case {
+            return false;
+        }
+        self.selected_case = next;
+        true
     }
 
-    pub fn previous_case(&mut self) {
+    pub fn previous_case(&mut self) -> bool {
         let count = self.current_case_count();
 
         if count == 0 {
             self.selected_case = 0;
-            return;
+            return false;
         }
 
-        if self.selected_case == 0 {
-            self.selected_case = count - 1;
+        let previous = if self.selected_case == 0 {
+            count - 1
         } else {
-            self.selected_case -= 1;
+            self.selected_case - 1
+        };
+        if previous == self.selected_case {
+            return false;
         }
+        self.selected_case = previous;
+        true
     }
     pub fn source_changed(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
         if problem >= self.problems.len() {
             return false;
         }
 
-        self.problems[problem].source = Some(SourceState { path, language });
-
-        self.select_problem(problem);
+        let source = SourceState { path, language };
+        debug_assert_eq!(
+            source.path.extension(),
+            Some(OsStr::new(source.language.extension()))
+        );
+        self.problems[problem].source = Some(source);
+        self.selected_problem = problem;
+        self.selected_case = 0;
 
         true
     }
@@ -330,6 +346,18 @@ mod tests {
         assert_eq!(source.path, PathBuf::from("B.cpp"));
         assert_eq!(source.language, Language::Cpp);
 
+        assert_selection_invariant(&app);
+    }
+
+    #[test]
+    fn source_change_on_the_current_problem_still_resets_case() {
+        let mut app = WatchApp::new(&contest(1), vec![3]).unwrap();
+        app.previous_case();
+        assert_eq!(app.selected_case(), 2);
+
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
+
+        assert_eq!(app.selected_case(), 0);
         assert_selection_invariant(&app);
     }
 

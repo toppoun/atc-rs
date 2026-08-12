@@ -1,9 +1,10 @@
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(test)]
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
 
@@ -34,6 +35,10 @@ impl FileWatcher {
     pub fn next_batch(&self) -> io::Result<Vec<PathBuf>> {
         receive_next_batch(&self.rx, DEBOUNCE_DURATION)
     }
+
+    pub fn next_batch_timeout(&self, timeout: Duration) -> io::Result<Option<Vec<PathBuf>>> {
+        receive_next_batch_timeout(&self.rx, DEBOUNCE_DURATION, timeout)
+    }
 }
 
 fn receive_next_batch(
@@ -45,37 +50,98 @@ fn receive_next_batch(
             io::Error::new(io::ErrorKind::BrokenPipe, "filesystem watcher disconnected")
         })?;
 
-        let mut pending = HashSet::new();
-
-        collect_result(first, &mut pending)?;
-
-        loop {
-            match rx.recv_timeout(debounce_duration) {
-                Ok(result) => {
-                    collect_result(result, &mut pending)?;
-                }
-
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    break;
-                }
-
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "filesystem watcher disconnected",
-                    ));
-                }
-            }
-        }
+        let pending = collect_batch_ordered(rx, first, debounce_duration, None)?;
 
         if !pending.is_empty() {
-            let mut paths: Vec<_> = pending.into_iter().collect();
+            let mut paths = pending;
             paths.sort();
             return Ok(paths);
         }
     }
 }
 
+fn receive_next_batch_timeout(
+    rx: &mpsc::Receiver<notify::Result<Event>>,
+    debounce_duration: Duration,
+    timeout: Duration,
+) -> io::Result<Option<Vec<PathBuf>>> {
+    let first = match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "filesystem watcher disconnected",
+            ));
+        }
+    };
+
+    let paths = collect_batch_ordered(
+        rx,
+        first,
+        debounce_duration,
+        Some(Instant::now() + debounce_duration),
+    )?;
+    Ok(Some(paths))
+}
+
+fn collect_batch_ordered(
+    rx: &mpsc::Receiver<notify::Result<Event>>,
+    first: notify::Result<Event>,
+    debounce_duration: Duration,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<PathBuf>> {
+    let mut pending = Vec::new();
+    collect_result_ordered(first, &mut pending)?;
+
+    loop {
+        let wait = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(debounce_duration)
+            .min(debounce_duration);
+        if wait.is_zero() {
+            break;
+        }
+
+        match rx.recv_timeout(wait) {
+            Ok(result) => collect_result_ordered(result, &mut pending)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "filesystem watcher disconnected",
+                ));
+            }
+        }
+    }
+
+    Ok(pending)
+}
+
+fn collect_result_ordered(
+    result: notify::Result<Event>,
+    pending: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let event = result.map_err(io::Error::other)?;
+
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return Ok(());
+    }
+
+    for path in event.paths {
+        if let Some(position) = pending.iter().position(|existing| existing == &path) {
+            pending.remove(position);
+        }
+        pending.push(path);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 fn collect_result(result: notify::Result<Event>, pending: &mut HashSet<PathBuf>) -> io::Result<()> {
     let event = result.map_err(io::Error::other)?;
 
@@ -188,5 +254,34 @@ mod tests {
         let error = receive_next_batch(&rx, Duration::from_millis(1)).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn timeout_wait_returns_none_without_an_event() {
+        let (_tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+        let batch =
+            receive_next_batch_timeout(&rx, Duration::from_millis(1), Duration::ZERO).unwrap();
+
+        assert!(batch.is_none());
+    }
+
+    #[test]
+    fn timeout_wait_preserves_the_order_of_each_paths_last_event() {
+        let (tx, rx) = mpsc::channel();
+        let a = PathBuf::from("A.cpp");
+        let b = PathBuf::from("B.py");
+        tx.send(event(EventKind::Modify(ModifyKind::Any), &b))
+            .unwrap();
+        tx.send(event(EventKind::Create(CreateKind::Any), &a))
+            .unwrap();
+        tx.send(event(EventKind::Modify(ModifyKind::Any), &b))
+            .unwrap();
+
+        let batch = receive_next_batch_timeout(&rx, Duration::from_millis(1), Duration::ZERO)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch, [a, b]);
     }
 }

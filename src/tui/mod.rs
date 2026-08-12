@@ -13,10 +13,12 @@ use ratatui::DefaultTerminal;
 use crate::model::Contest;
 use app::WatchApp;
 
+const MAX_MESSAGES_PER_TICK: usize = 256;
+
 fn handle_messages(app: &mut WatchApp, message_rx: &Receiver<Message>) -> io::Result<bool> {
     let mut changed = false;
 
-    loop {
+    for _ in 0..MAX_MESSAGES_PER_TICK {
         match message_rx.try_recv() {
             Ok(Message::SourceChanged {
                 problem,
@@ -73,10 +75,9 @@ pub fn run(
 
         if event::poll(Duration::from_millis(20))?
             && let Event::Key(key) = event::read()?
+            && handle_key_event(&mut app, key)
         {
-            if handle_key_event(&mut app, key) {
-                dirty = true;
-            }
+            dirty = true;
         }
     }
 
@@ -99,25 +100,13 @@ fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
             true
         }
 
-        KeyCode::Char('h') | KeyCode::Left => {
-            app.previous_problem();
-            true
-        }
+        KeyCode::Char('h') | KeyCode::Left => app.previous_problem(),
 
-        KeyCode::Char('l') | KeyCode::Right => {
-            app.next_problem();
-            true
-        }
+        KeyCode::Char('l') | KeyCode::Right => app.next_problem(),
 
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.next_case();
-            true
-        }
+        KeyCode::Char('j') | KeyCode::Down => app.next_case(),
 
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.previous_case();
-            true
-        }
+        KeyCode::Char('k') | KeyCode::Up => app.previous_case(),
 
         _ => false,
     }
@@ -126,21 +115,32 @@ fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crossterm::event::KeyModifiers;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
 
     fn app() -> WatchApp {
+        app_with_problems(&[3])
+    }
+
+    fn app_with_problems(sample_counts: &[usize]) -> WatchApp {
         WatchApp::new(
             &Contest {
                 contest_id: "abc123".to_string(),
-                problems: vec![Problem {
-                    index: "A".to_string(),
-                    title: "Problem A".to_string(),
-                    task_id: "abc123_a".to_string(),
-                    url: "https://example.invalid/a".to_string(),
-                }],
+                problems: sample_counts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| Problem {
+                        index: char::from(b'A' + index as u8).to_string(),
+                        title: format!("Problem {index}"),
+                        task_id: format!("abc123_{index}"),
+                        url: format!("https://example.invalid/{index}"),
+                    })
+                    .collect(),
             },
-            vec![3],
+            sample_counts.to_vec(),
         )
         .unwrap()
     }
@@ -182,6 +182,146 @@ mod tests {
         handle_key_event(&mut app, key(KeyCode::Up, KeyEventKind::Press));
         assert_eq!(app.selected_case(), 2);
         handle_key_event(&mut app, key(KeyCode::Char('k'), KeyEventKind::Press));
+        assert_eq!(app.selected_case(), 1);
+    }
+
+    #[test]
+    fn unknown_and_no_op_navigation_keys_are_not_dirty() {
+        let mut app = app_with_problems(&[1]);
+
+        assert!(!handle_key_event(
+            &mut app,
+            key(KeyCode::Char('x'), KeyEventKind::Press)
+        ));
+        assert!(!handle_key_event(
+            &mut app,
+            key(KeyCode::Right, KeyEventKind::Press)
+        ));
+        assert!(!handle_key_event(
+            &mut app,
+            key(KeyCode::Down, KeyEventKind::Press)
+        ));
+    }
+
+    #[test]
+    fn source_messages_update_state_and_multiple_messages_use_the_latest_source() {
+        let mut app = app_with_problems(&[3, 2]);
+        app.previous_case();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Message::SourceChanged {
+            problem: 0,
+            path: PathBuf::from("A.cpp"),
+            language: Language::Cpp,
+        })
+        .unwrap();
+        tx.send(Message::SourceChanged {
+            problem: 1,
+            path: PathBuf::from("B.cpp"),
+            language: Language::Cpp,
+        })
+        .unwrap();
+        tx.send(Message::SourceChanged {
+            problem: 1,
+            path: PathBuf::from("B.py"),
+            language: Language::Python,
+        })
+        .unwrap();
+
+        assert!(handle_messages(&mut app, &rx).unwrap());
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(problem.index, "B");
+        assert_eq!(app.selected_case(), 0);
+        let source = problem.source.as_ref().unwrap();
+        assert_eq!(source.path, Path::new("B.py"));
+        assert_eq!(source.language, Language::Python);
+    }
+
+    #[test]
+    fn message_drain_is_bounded_to_keep_input_responsive() {
+        let mut app = app();
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..MAX_MESSAGES_PER_TICK {
+            tx.send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("A.cpp"),
+                language: Language::Cpp,
+            })
+            .unwrap();
+        }
+        tx.send(Message::SourceChanged {
+            problem: 0,
+            path: PathBuf::from("A.py"),
+            language: Language::Python,
+        })
+        .unwrap();
+
+        assert!(handle_messages(&mut app, &rx).unwrap());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .language,
+            Language::Cpp
+        );
+        assert!(handle_messages(&mut app, &rx).unwrap());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .language,
+            Language::Python
+        );
+    }
+
+    #[test]
+    fn watcher_failure_and_disconnected_channel_are_errors() {
+        let mut app = app();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Message::WatcherFailed(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "watch failed",
+        )))
+        .unwrap();
+
+        let error = handle_messages(&mut app, &rx).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "watch failed");
+
+        let (tx, rx) = mpsc::channel::<Message>();
+        drop(tx);
+        let error = handle_messages(&mut app, &rx).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn key_and_source_message_processing_coexist() {
+        let mut app = app_with_problems(&[3, 2]);
+        assert!(handle_key_event(
+            &mut app,
+            key(KeyCode::Down, KeyEventKind::Press)
+        ));
+        assert_eq!(app.selected_case(), 1);
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Message::SourceChanged {
+            problem: 1,
+            path: PathBuf::from("B.py"),
+            language: Language::Python,
+        })
+        .unwrap();
+
+        assert!(handle_messages(&mut app, &rx).unwrap());
+        assert_eq!(app.current_problem().unwrap().index, "B");
+        assert_eq!(app.selected_case(), 0);
+        assert!(handle_key_event(
+            &mut app,
+            key(KeyCode::Down, KeyEventKind::Press)
+        ));
         assert_eq!(app.selected_case(), 1);
     }
 }
