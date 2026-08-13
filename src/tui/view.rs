@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
@@ -15,7 +15,14 @@ const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
 
-pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderInfo {
+    pub max_detail_scroll: u16,
+    pub samples_area: Option<Rect>,
+    pub detail_area: Rect,
+}
+
+pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
 
@@ -139,7 +146,11 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
 
     frame.render_widget(footer, rows[2]);
 
-    max_scroll
+    RenderInfo {
+        max_detail_scroll: max_scroll,
+        samples_area,
+        detail_area,
+    }
 }
 
 fn max_scroll(content_height: usize, viewport_height: usize) -> u16 {

@@ -111,19 +111,23 @@ pub fn run(
 
     let mut dirty = true;
 
+    let mut render_info = view::RenderInfo::default();
+
     while !app.should_quit() {
         if handle_messages(&mut app, &message_rx, &run_tx)? {
             dirty = true;
         }
 
         if dirty {
-            let mut max_detail_scroll = 0;
+            let mut next_render_info = view::RenderInfo::default();
 
             terminal.draw(|frame| {
-                max_detail_scroll = view::render(frame, &app);
+                next_render_info = view::render(frame, &app);
             })?;
 
-            app.clamp_detail_scroll(max_detail_scroll);
+            render_info = next_render_info;
+
+            app.clamp_detail_scroll(render_info.max_detail_scroll);
 
             dirty = false;
         }
@@ -137,7 +141,7 @@ pub fn run(
                 }
 
                 Event::Mouse(mouse) => {
-                    if handle_mouse_event(&mut app, mouse) {
+                    if handle_mouse_event(&mut app, mouse, &render_info) {
                         dirty = true;
                     }
                 }
@@ -187,14 +191,49 @@ fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
     }
 }
 
-fn handle_mouse_event(app: &mut WatchApp, mouse: MouseEvent) -> bool {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_detail_up(DETAIL_SCROLL_LINES),
+fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
 
-        MouseEventKind::ScrollDown => app.scroll_detail_down(DETAIL_SCROLL_LINES),
+fn handle_mouse_event(
+    app: &mut WatchApp,
+    mouse: MouseEvent,
+    render_info: &view::RenderInfo,
+) -> bool {
+    if let Some(samples_area) = render_info.samples_area
+        && contains(samples_area, mouse.column, mouse.row)
+    {
+        return match mouse.kind {
+            MouseEventKind::ScrollUp => app.previous_case(),
 
-        _ => false,
+            MouseEventKind::ScrollDown => app.next_case(),
+
+            _ => false,
+        };
     }
+
+    if contains(render_info.detail_area, mouse.column, mouse.row) {
+        return match mouse.kind {
+            MouseEventKind::ScrollUp => app.scroll_detail_up(DETAIL_SCROLL_LINES),
+
+            MouseEventKind::ScrollDown => {
+                let previous = app.detail_scroll();
+
+                app.scroll_detail_down(DETAIL_SCROLL_LINES);
+
+                app.clamp_detail_scroll(render_info.max_detail_scroll);
+
+                app.detail_scroll() != previous
+            }
+
+            _ => false,
+        };
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -526,32 +565,6 @@ mod tests {
         assert_eq!(run.accepted, 0);
     }
     #[test]
-    fn mouse_wheel_scrolls_detail() {
-        let mut app = app();
-
-        let scroll_down = MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 10,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        };
-
-        let scroll_up = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 10,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        };
-
-        assert!(handle_mouse_event(&mut app, scroll_down));
-        assert_eq!(app.detail_scroll(), 3);
-
-        assert!(handle_mouse_event(&mut app, scroll_down));
-        assert_eq!(app.detail_scroll(), 6);
-
-        assert!(handle_mouse_event(&mut app, scroll_up));
-        assert_eq!(app.detail_scroll(), 3);
-    }
     #[test]
     fn samples_pane_toggles_only_on_key_press() {
         let mut app = app();
@@ -575,5 +588,92 @@ mod tests {
             key(KeyCode::Char('s'), KeyEventKind::Press),
         ));
         assert!(!app.samples_pane_enabled());
+    }
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    #[test]
+    fn mouse_wheel_over_samples_changes_sample() {
+        let mut app = app();
+
+        app.scroll_detail_down(10);
+
+        let info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+        };
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 5, 5),
+            &info,
+        ));
+
+        assert_eq!(app.selected_case(), 1);
+        assert_eq!(app.detail_scroll(), 0);
+    }
+    #[test]
+    fn mouse_wheel_over_detail_scrolls_detail() {
+        let mut app = app();
+
+        let info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+        };
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 30, 5),
+            &info,
+        ));
+
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 3);
+    }
+    #[test]
+    fn mouse_wheel_at_detail_bottom_is_not_dirty() {
+        let mut app = app();
+
+        app.scroll_detail_down(10);
+
+        let info = view::RenderInfo {
+            max_detail_scroll: 10,
+            samples_area: None,
+            detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+        };
+
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 30, 5),
+            &info,
+        ));
+
+        assert_eq!(app.detail_scroll(), 10);
+    }
+    #[test]
+    fn mouse_wheel_outside_content_is_ignored() {
+        let mut app = app();
+
+        let info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: Some(ratatui::layout::Rect::new(0, 5, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 5, 40, 10),
+        };
+
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 5, 1),
+            &info,
+        ));
+
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 0);
     }
 }
