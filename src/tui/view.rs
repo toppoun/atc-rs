@@ -129,6 +129,7 @@ pub(super) fn render(
         viewport_height,
         app.detail_scroll(),
     );
+    detail_layout.stage_count_command(&detail_document);
     let detail = Paragraph::new(detail_viewport.text);
 
     frame.render_widget(detail, detail_area);
@@ -506,6 +507,46 @@ mod tests {
 
         let large = large_compile_error_app();
         assert_eq!(render_info(&large, 80, 30).max_detail_scroll, None);
+    }
+
+    #[test]
+    fn background_count_makes_the_next_large_render_exact() {
+        let app = large_compile_error_app();
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+        let mut info = RenderInfo::default();
+
+        terminal
+            .draw(|frame| info = render(frame, &app, &mut layout))
+            .unwrap();
+        assert_eq!(info.max_detail_scroll, None);
+
+        let Some(crate::tui::detail_layout::DetailCountCommand::Count(request)) =
+            layout.take_count_command()
+        else {
+            panic!("large render must stage background counting");
+        };
+        let mut never_cancel = || false;
+        let chunk_visual_lines = request
+            .line_index
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                &mut never_cancel,
+            )
+            .unwrap();
+        assert!(
+            layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
+                identity: request.identity,
+                chunk_visual_lines,
+            })
+        );
+
+        terminal
+            .draw(|frame| info = render(frame, &app, &mut layout))
+            .unwrap();
+        assert!(info.max_detail_scroll.is_some());
     }
 
     #[test]

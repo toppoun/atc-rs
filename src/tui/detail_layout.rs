@@ -5,9 +5,9 @@ use ratatui::text::{Line, Text};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::detail::DetailTextSource;
+use super::detail::{DetailDocument, DetailSnapshot, DetailTextSource};
 
-const DETAIL_CHUNK_LINES: usize = 256;
+pub(super) const DETAIL_CHUNK_LINES: usize = 256;
 const MATERIALIZED_CHUNK_CACHE_SIZE: usize = 3;
 const LAZY_DETAIL_BYTE_THRESHOLD: usize = 64 * 1024;
 const LAZY_DETAIL_LINE_THRESHOLD: usize = 2048;
@@ -30,6 +30,99 @@ struct LogicalLine {
     end: SegmentCursor,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DetailLineIndex {
+    lines: Vec<LogicalLine>,
+}
+
+impl DetailLineIndex {
+    pub(super) fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(super) fn chunk_count(&self) -> usize {
+        self.lines.len().div_ceil(DETAIL_CHUNK_LINES)
+    }
+
+    pub(super) fn count_chunks(
+        &self,
+        document: &impl DetailTextSource,
+        width: usize,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Option<Vec<usize>> {
+        let mut counts = Vec::with_capacity(self.chunk_count());
+
+        for logical_range in (0..self.lines.len())
+            .step_by(DETAIL_CHUNK_LINES)
+            .map(|start| {
+                start
+                    ..start
+                        .saturating_add(DETAIL_CHUNK_LINES)
+                        .min(self.lines.len())
+            })
+        {
+            if is_cancelled() {
+                return None;
+            }
+
+            let mut visual_lines = 0usize;
+            for logical_index in logical_range {
+                if is_cancelled() {
+                    return None;
+                }
+
+                let fragments = logical_line_fragments(document, self.lines[logical_index]);
+                visual_lines = visual_lines.saturating_add(count_logical_line_fragments(
+                    &fragments,
+                    width,
+                    &mut is_cancelled,
+                )?);
+            }
+
+            counts.push(visual_lines);
+        }
+
+        Some(counts)
+    }
+}
+
+pub(crate) type DetailCountGeneration = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetailCountIdentity {
+    pub(super) generation: DetailCountGeneration,
+    pub(super) revision: u64,
+    pub(super) layout_width: usize,
+    pub(super) segment_lengths: Vec<usize>,
+    pub(super) chunk_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct DetailCountRequest {
+    pub(super) identity: DetailCountIdentity,
+    pub(super) snapshot: DetailSnapshot,
+    pub(super) line_index: DetailLineIndex,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DetailCountResult {
+    pub(super) identity: DetailCountIdentity,
+    pub(super) chunk_visual_lines: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DetailCountCommand {
+    Count(DetailCountRequest),
+    Cancel { generation: DetailCountGeneration },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCountCommand {
+    Count,
+    Cancel,
+}
+
 #[derive(Debug)]
 struct ChunkMeta {
     logical_range: Range<usize>,
@@ -48,9 +141,12 @@ pub(super) struct DetailLayout {
     detail_width: u16,
     mode: Option<LayoutMode>,
     segment_lengths: Vec<usize>,
-    logical_lines: Vec<LogicalLine>,
+    logical_lines: DetailLineIndex,
     chunks: Vec<ChunkMeta>,
     materialized_chunks: VecDeque<MaterializedChunk>,
+    count_generation: DetailCountGeneration,
+    pending_count_command: Option<PendingCountCommand>,
+    ready_count_command: Option<DetailCountCommand>,
 
     #[cfg(test)]
     chunk_layout_operations: usize,
@@ -83,6 +179,59 @@ impl DetailLayout {
         }
     }
 
+    pub(super) fn stage_count_command(&mut self, document: &DetailDocument<'_>) {
+        if self.ready_count_command.is_some() {
+            return;
+        }
+
+        let Some(pending) = self.pending_count_command.take() else {
+            return;
+        };
+
+        self.ready_count_command = Some(match pending {
+            PendingCountCommand::Count => DetailCountCommand::Count(DetailCountRequest {
+                identity: self.count_identity(),
+                snapshot: document.snapshot(),
+                line_index: self.logical_lines.clone(),
+            }),
+            PendingCountCommand::Cancel => DetailCountCommand::Cancel {
+                generation: self.count_generation,
+            },
+        });
+    }
+
+    pub(super) fn take_count_command(&mut self) -> Option<DetailCountCommand> {
+        self.ready_count_command.take()
+    }
+
+    pub(super) fn apply_count_result(&mut self, result: DetailCountResult) -> bool {
+        if self.mode != Some(LayoutMode::Lazy)
+            || result.identity != self.count_identity()
+            || result.chunk_visual_lines.len() != self.chunks.len()
+        {
+            return false;
+        }
+
+        if self
+            .chunks
+            .iter()
+            .zip(&result.chunk_visual_lines)
+            .any(|(chunk, result)| chunk.visual_lines.is_some_and(|known| known != *result))
+        {
+            return false;
+        }
+
+        let mut changed = false;
+        for (chunk, visual_lines) in self.chunks.iter_mut().zip(result.chunk_visual_lines) {
+            if chunk.visual_lines.is_none() {
+                chunk.visual_lines = Some(visual_lines);
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
     fn prepare(&mut self, document: &impl DetailTextSource, revision: u64, detail_width: u16) {
         let segment_lengths = (0..document.segment_count())
             .map(|index| document.segment_text(index).map_or(0, str::len))
@@ -95,6 +244,7 @@ impl DetailLayout {
             return;
         }
 
+        let previous_mode = self.mode;
         let logical_lines = build_logical_line_index(document);
         let raw_bytes = segment_lengths
             .iter()
@@ -130,6 +280,15 @@ impl DetailLayout {
         self.logical_lines = logical_lines;
         self.chunks = chunks;
         self.materialized_chunks.clear();
+        self.count_generation = self.count_generation.wrapping_add(1);
+        self.pending_count_command = match mode {
+            LayoutMode::Lazy => Some(PendingCountCommand::Count),
+            LayoutMode::Eager if previous_mode == Some(LayoutMode::Lazy) => {
+                Some(PendingCountCommand::Cancel)
+            }
+            LayoutMode::Eager => None,
+        };
+        self.ready_count_command = None;
 
         #[cfg(test)]
         {
@@ -264,7 +423,7 @@ impl DetailLayout {
         let mut lines = Vec::new();
 
         for logical_index in logical_range {
-            let logical_line = self.logical_lines[logical_index];
+            let logical_line = self.logical_lines.lines[logical_index];
             let fragments = logical_line_fragments(document, logical_line);
             wrap_logical_line_fragments(&fragments, self.lazy_layout_width(), &mut lines);
         }
@@ -293,6 +452,16 @@ impl DetailLayout {
 
     fn lazy_layout_width(&self) -> usize {
         usize::from(self.detail_width.saturating_sub(1))
+    }
+
+    fn count_identity(&self) -> DetailCountIdentity {
+        DetailCountIdentity {
+            generation: self.count_generation,
+            revision: self.revision.unwrap_or_default(),
+            layout_width: self.lazy_layout_width(),
+            segment_lengths: self.segment_lengths.clone(),
+            chunk_count: self.chunks.len(),
+        }
     }
 
     fn exact_total_height(&self) -> Option<usize> {
@@ -341,7 +510,7 @@ fn eager_viewport(
     }
 }
 
-fn build_logical_line_index(document: &impl DetailTextSource) -> Vec<LogicalLine> {
+fn build_logical_line_index(document: &impl DetailTextSource) -> DetailLineIndex {
     let mut logical_lines = Vec::new();
     let mut start = SegmentCursor {
         segment: 0,
@@ -375,7 +544,9 @@ fn build_logical_line_index(document: &impl DetailTextSource) -> Vec<LogicalLine
         },
     });
 
-    logical_lines
+    DetailLineIndex {
+        lines: logical_lines,
+    }
 }
 
 fn logical_line_fragments(
@@ -461,7 +632,9 @@ fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec
     };
 
     if non_empty.next().is_none() {
-        wrap_logical_line(first, width, lines);
+        wrap_logical_line(first, width, &mut MaterializeSink::new(lines), &mut || {
+            false
+        });
         return;
     }
 
@@ -472,32 +645,130 @@ fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec
         logical_line.push_str(fragment);
     }
 
-    wrap_logical_line(&logical_line, width, lines);
+    wrap_logical_line(
+        &logical_line,
+        width,
+        &mut MaterializeSink::new(lines),
+        &mut || false,
+    );
 }
 
-fn wrap_logical_line(logical_line: &str, width: usize, lines: &mut Vec<Line<'static>>) {
-    if width == 0 || logical_line.is_empty() {
-        lines.push(Line::from(logical_line.to_owned()));
-        return;
+fn count_logical_line_fragments(
+    fragments: &[&str],
+    width: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<usize> {
+    let mut non_empty = fragments
+        .iter()
+        .copied()
+        .filter(|fragment| !fragment.is_empty());
+    let Some(first) = non_empty.next() else {
+        return Some(1);
+    };
+
+    let mut sink = CountSink::default();
+    if non_empty.next().is_none() {
+        return wrap_logical_line(first, width, &mut sink, is_cancelled).then_some(sink.lines);
     }
 
-    let mut current = String::new();
+    // segment境界がlogical lineの途中にある場合だけ、その1行を結合する。
+    let capacity = fragments.iter().map(|fragment| fragment.len()).sum();
+    let mut logical_line = String::with_capacity(capacity);
+    for fragment in fragments {
+        logical_line.push_str(fragment);
+    }
+
+    wrap_logical_line(&logical_line, width, &mut sink, is_cancelled).then_some(sink.lines)
+}
+
+trait WrapSink {
+    fn has_content(&self) -> bool;
+    fn push(&mut self, text: &str);
+    fn emit(&mut self);
+}
+
+struct MaterializeSink<'a> {
+    current: String,
+    lines: &'a mut Vec<Line<'static>>,
+}
+
+impl<'a> MaterializeSink<'a> {
+    fn new(lines: &'a mut Vec<Line<'static>>) -> Self {
+        Self {
+            current: String::new(),
+            lines,
+        }
+    }
+}
+
+impl WrapSink for MaterializeSink<'_> {
+    fn has_content(&self) -> bool {
+        !self.current.is_empty()
+    }
+
+    fn push(&mut self, text: &str) {
+        self.current.push_str(text);
+    }
+
+    fn emit(&mut self) {
+        self.lines
+            .push(Line::from(std::mem::take(&mut self.current)));
+    }
+}
+
+#[derive(Default)]
+struct CountSink {
+    has_content: bool,
+    lines: usize,
+}
+
+impl WrapSink for CountSink {
+    fn has_content(&self) -> bool {
+        self.has_content
+    }
+
+    fn push(&mut self, text: &str) {
+        self.has_content |= !text.is_empty();
+    }
+
+    fn emit(&mut self) {
+        self.lines = self.lines.saturating_add(1);
+        self.has_content = false;
+    }
+}
+
+fn wrap_logical_line(
+    logical_line: &str,
+    width: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    if width == 0 || logical_line.is_empty() {
+        sink.push(logical_line);
+        sink.emit();
+        return true;
+    }
+
     let mut current_width = 0usize;
 
     for token in UnicodeSegmentation::split_word_bounds(logical_line) {
+        if is_cancelled() {
+            return false;
+        }
+
         let token_width = UnicodeWidthStr::width(token);
 
         if token_width <= width {
-            if !current.is_empty() && current_width.saturating_add(token_width) > width {
-                lines.push(Line::from(std::mem::take(&mut current)));
+            if sink.has_content() && current_width.saturating_add(token_width) > width {
+                sink.emit();
                 current_width = 0;
             }
 
-            current.push_str(token);
+            sink.push(token);
             current_width = current_width.saturating_add(token_width);
 
             if current_width == width {
-                lines.push(Line::from(std::mem::take(&mut current)));
+                sink.emit();
                 current_width = 0;
             }
 
@@ -505,31 +776,37 @@ fn wrap_logical_line(logical_line: &str, width: usize, lines: &mut Vec<Line<'sta
         }
 
         if current_width > 0 {
-            lines.push(Line::from(std::mem::take(&mut current)));
+            sink.emit();
             current_width = 0;
         }
 
         for grapheme in UnicodeSegmentation::graphemes(token, true) {
+            if is_cancelled() {
+                return false;
+            }
+
             let grapheme_width = UnicodeWidthStr::width(grapheme);
 
             if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                lines.push(Line::from(std::mem::take(&mut current)));
+                sink.emit();
                 current_width = 0;
             }
 
-            current.push_str(grapheme);
+            sink.push(grapheme);
             current_width = current_width.saturating_add(grapheme_width);
 
             if current_width >= width {
-                lines.push(Line::from(std::mem::take(&mut current)));
+                sink.emit();
                 current_width = 0;
             }
         }
     }
 
-    if !current.is_empty() {
-        lines.push(Line::from(current));
+    if sink.has_content() {
+        sink.emit();
     }
+
+    true
 }
 
 pub(super) fn max_scroll(content_height: usize, viewport_height: usize) -> usize {
@@ -574,6 +851,7 @@ mod tests {
 
     fn indexed_logical_lines(document: &DetailDocument<'_>) -> Vec<String> {
         build_logical_line_index(document)
+            .lines
             .into_iter()
             .map(|line| logical_line_fragments(document, line).concat())
             .collect()
@@ -597,6 +875,34 @@ mod tests {
             }
         }
         raw
+    }
+
+    fn take_count_request(
+        layout: &mut DetailLayout,
+        document: &DetailDocument<'_>,
+    ) -> DetailCountRequest {
+        layout.stage_count_command(document);
+        match layout.take_count_command() {
+            Some(DetailCountCommand::Count(request)) => request,
+            other => panic!("expected detail count request, got {other:?}"),
+        }
+    }
+
+    fn count_result(request: DetailCountRequest) -> DetailCountResult {
+        let mut never_cancel = || false;
+        let chunk_visual_lines = request
+            .line_index
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                &mut never_cancel,
+            )
+            .unwrap();
+
+        DetailCountResult {
+            identity: request.identity,
+            chunk_visual_lines,
+        }
     }
 
     #[test]
@@ -792,6 +1098,7 @@ mod tests {
         assert_eq!(
             indexed_logical_lines(&document),
             build_logical_line_index(&snapshot)
+                .lines
                 .into_iter()
                 .map(|line| logical_line_fragments(&snapshot, line).concat())
                 .collect::<Vec<_>>()
@@ -816,5 +1123,161 @@ mod tests {
                 snapshot_view.effective_scroll
             );
         }
+    }
+
+    #[test]
+    fn background_counts_make_lazy_max_exact_without_materializing_more_chunks() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let initial = layout.viewport(&document, 41, 80, 30, 0);
+        assert_eq!(initial.max_scroll, None);
+        assert_eq!(layout.known_chunk_count(), 1);
+        let request = take_count_request(&mut layout, &document);
+        let result = count_result(request);
+
+        assert!(layout.apply_count_result(result));
+        assert_eq!(layout.known_chunk_count(), layout.chunks.len());
+        assert_eq!(layout.chunk_layout_operations, 1);
+
+        let finished = layout.viewport(&document, 41, 80, 30, 0);
+        assert_eq!(finished.max_scroll, Some(99_971));
+        assert!(finished.max_scroll.unwrap() > usize::from(u16::MAX));
+        assert_eq!(layout.chunk_layout_operations, 1);
+    }
+
+    #[test]
+    fn background_chunk_counts_match_materialized_chunk_counts() {
+        let logical =
+            "ASCII words  supercalifragilisticexpialidocious 日本語 e\u{301} 👩‍💻 \u{200b}\n\n";
+        let raw = logical.repeat(3_000);
+        let segments = ["prefix", raw.as_str(), "trailing\n"];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 8, 14, 20, 0);
+        let result = count_result(take_count_request(&mut layout, &document));
+
+        for chunk_index in 0..layout.chunks.len() {
+            layout.ensure_chunk_materialized(&document, chunk_index);
+        }
+        let materialized_counts = layout
+            .chunks
+            .iter()
+            .map(|chunk| chunk.visual_lines.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(result.chunk_visual_lines, materialized_counts);
+        assert!(layout.materialized_chunks.len() <= MATERIALIZED_CHUNK_CACHE_SIZE);
+    }
+
+    #[test]
+    fn count_result_rejects_stale_identity_and_mismatched_known_counts() {
+        let raw = many_lines(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 7, 80, 20, 0);
+
+        let request = take_count_request(&mut layout, &document);
+        let good = count_result(request);
+
+        for mutate in [
+            |identity: &mut DetailCountIdentity| identity.generation += 1,
+            |identity: &mut DetailCountIdentity| identity.revision += 1,
+            |identity: &mut DetailCountIdentity| identity.layout_width += 1,
+            |identity: &mut DetailCountIdentity| identity.chunk_count += 1,
+        ] {
+            let mut stale = good.clone();
+            mutate(&mut stale.identity);
+            assert!(!layout.apply_count_result(stale));
+            assert_eq!(layout.known_chunk_count(), 1);
+        }
+
+        let mut mismatch = good.clone();
+        mismatch.chunk_visual_lines[0] += 1;
+        assert!(!layout.apply_count_result(mismatch));
+        assert_eq!(layout.known_chunk_count(), 1);
+        assert_eq!(layout.exact_total_height(), None);
+
+        let mut wrong_shape = good;
+        wrong_shape.chunk_visual_lines.pop();
+        assert!(!layout.apply_count_result(wrong_shape));
+        assert_eq!(layout.exact_total_height(), None);
+    }
+
+    #[test]
+    fn count_result_merges_with_chunks_already_known_by_the_viewport() {
+        let raw = many_lines(4_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 3, 80, 20, DETAIL_CHUNK_LINES * 3);
+        assert!(layout.known_chunk_count() >= 4);
+
+        let result = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(result));
+        assert_eq!(layout.exact_total_height(), Some(4_001));
+    }
+
+    #[test]
+    fn count_request_is_staged_once_and_eager_detail_stages_none() {
+        let raw = many_lines(3_000);
+        let large_segments = [raw.as_str()];
+        let large = make_document(&large_segments);
+        let small_segments = ["small"];
+        let small = make_document(&small_segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&large, 1, 80, 20, 0);
+        layout.stage_count_command(&large);
+        assert!(matches!(
+            layout.take_count_command(),
+            Some(DetailCountCommand::Count(_))
+        ));
+        layout.stage_count_command(&large);
+        assert!(layout.take_count_command().is_none());
+
+        layout.viewport(&small, 2, 80, 20, 0);
+        layout.stage_count_command(&small);
+        assert!(matches!(
+            layout.take_count_command(),
+            Some(DetailCountCommand::Cancel { .. })
+        ));
+        layout.stage_count_command(&small);
+        assert!(layout.take_count_command().is_none());
+
+        let mut eager_only = DetailLayout::default();
+        eager_only.viewport(&small, 1, 80, 20, 0);
+        eager_only.stage_count_command(&small);
+        assert!(eager_only.take_count_command().is_none());
+    }
+
+    #[test]
+    fn width_change_supersedes_the_old_result_and_stages_one_new_request() {
+        let raw = many_lines(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 80, 20, 0);
+        let old_result = count_result(take_count_request(&mut layout, &document));
+
+        layout.viewport(&document, 1, 60, 20, 0);
+        let new_request = take_count_request(&mut layout, &document);
+        assert_ne!(
+            old_result.identity.generation,
+            new_request.identity.generation
+        );
+        assert_ne!(
+            old_result.identity.layout_width,
+            new_request.identity.layout_width
+        );
+        assert!(!layout.apply_count_result(old_result));
+
+        let new_result = count_result(new_request);
+        assert!(layout.apply_count_result(new_result));
+        assert!(layout.exact_total_height().is_some());
     }
 }

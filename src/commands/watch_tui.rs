@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::watch_worker::TestWorker;
+use crate::tui::detail_count::DetailCountWorker;
 use crate::tui::message::Message;
 use crate::watcher;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -223,6 +224,27 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
     };
     let run_tx = test_worker.sender();
 
+    let mut detail_count_worker = match DetailCountWorker::start() {
+        Ok(worker) => worker,
+        Err(error) => {
+            drop(message_rx);
+            drop(message_tx);
+
+            test_worker.request_stop();
+            watcher_thread.request_stop();
+
+            let worker_result = test_worker.stop_and_join();
+            let watcher_result = watcher_thread.stop();
+
+            worker_result?;
+            watcher_result?;
+
+            return Err(error.into());
+        }
+    };
+    let detail_count_tx = detail_count_worker.request_sender();
+    let detail_count_rx = detail_count_worker.take_result_receiver();
+
     // watch_tui自身はMessageを送らない。
     //
     // Senderをここに残すとwatcher/workerが両方終了しても
@@ -237,14 +259,17 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
             test_worker.request_stop();
             watcher_thread.request_stop();
+            detail_count_worker.request_stop();
 
             ratatui::restore();
 
             let worker_result = test_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
+            let detail_count_result = detail_count_worker.stop_and_join();
 
             worker_result?;
             watcher_result?;
+            detail_count_result?;
 
             return Err(error.into());
         }
@@ -258,24 +283,36 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
             test_worker.request_stop();
             watcher_thread.request_stop();
+            detail_count_worker.request_stop();
 
             ratatui::restore();
 
             let worker_result = test_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
+            let detail_count_result = detail_count_worker.stop_and_join();
 
             worker_result?;
             watcher_result?;
+            detail_count_result?;
 
             return Err(error.into());
         }
     };
 
-    let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx, run_tx);
+    let result = crate::tui::run(
+        &mut terminal,
+        &contest,
+        sample_counts,
+        message_rx,
+        run_tx,
+        detail_count_tx,
+        detail_count_rx,
+    );
 
     // test実行中だった場合、runnerまでcancelを先に伝える。
     test_worker.request_stop();
     watcher_thread.request_stop();
+    detail_count_worker.request_stop();
 
     // Mouse Captureもterminal状態の一部なので、restore前に戻す。
     // 失敗してもcleanupは最後まで続行する。
@@ -286,10 +323,12 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
     let worker_result = test_worker.stop_and_join();
     let watcher_result = watcher_thread.stop();
+    let detail_count_result = detail_count_worker.stop_and_join();
 
     result?;
     worker_result?;
     watcher_result?;
+    detail_count_result?;
     restore_result?;
     mouse_result?;
 

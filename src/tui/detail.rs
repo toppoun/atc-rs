@@ -61,7 +61,7 @@ impl DetailSnapshotSegment {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(super) struct DetailSnapshot {
+pub(crate) struct DetailSnapshot {
     segments: Vec<DetailSnapshotSegment>,
 }
 
@@ -72,6 +72,15 @@ impl DetailTextSource for DetailSnapshot {
 
     fn segment_text(&self, index: usize) -> Option<&str> {
         self.segments.get(index).map(DetailSnapshotSegment::text)
+    }
+}
+
+#[cfg(test)]
+impl DetailSnapshot {
+    pub(super) fn shares_buffer(&self, expected: &Arc<String>) -> bool {
+        self.segments.iter().any(|segment| {
+            matches!(segment, DetailSnapshotSegment::Shared(shared) if Arc::ptr_eq(shared, expected))
+        })
     }
 }
 
@@ -282,6 +291,18 @@ impl<'a> DetailDocument<'a> {
                 .iter()
                 .map(|text| DetailSegment {
                     text: DetailSegmentText::SharedOwned(Arc::new((*text).to_string())),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_shared_segments(segments: &'a [&'a Arc<String>]) -> Self {
+        Self {
+            segments: segments
+                .iter()
+                .map(|text| DetailSegment {
+                    text: DetailSegmentText::Shared(text),
                 })
                 .collect(),
         }
