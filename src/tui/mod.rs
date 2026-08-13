@@ -1,4 +1,5 @@
 pub mod app;
+mod detail;
 pub mod message;
 pub mod reporter;
 pub mod view;

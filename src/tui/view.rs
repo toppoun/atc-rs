@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
+use super::detail::DetailDocument;
 use crate::language::Language;
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -118,17 +119,17 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     }
 
     // detailは描画前にterminal cell幅でsoft wrapする。
-    let raw_detail_text = detail_text(app);
+    let detail_document = DetailDocument::from_app(app);
     let viewport_height = usize::from(detail_area.height);
 
     // まずdetail幅全部を使ってwrapする。
-    let mut wrapped_detail_text = wrap_detail_text(&raw_detail_text, detail_area.width);
+    let mut wrapped_detail_text = wrap_detail_document(&detail_document, detail_area.width);
 
     let mut max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
 
     if max_detail_scroll > 0 && detail_area.width > 1 {
         wrapped_detail_text =
-            wrap_detail_text(&raw_detail_text, detail_area.width.saturating_sub(1));
+            wrap_detail_document(&detail_document, detail_area.width.saturating_sub(1));
 
         max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
     }
@@ -162,72 +163,115 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     }
 }
 
-fn wrap_detail_text(text: &str, width: u16) -> Text<'static> {
+fn wrap_detail_document(document: &DetailDocument<'_>, width: u16) -> Text<'static> {
     let width = usize::from(width);
     let mut lines = Vec::new();
+    let mut logical_line_fragments = Vec::new();
 
-    for logical_line in text.split('\n') {
-        if width == 0 || logical_line.is_empty() {
-            lines.push(Line::from(logical_line.to_owned()));
-            continue;
+    for segment in document.segments() {
+        let text = segment.text();
+        let mut start = 0;
+
+        for (newline, _) in text.match_indices('\n') {
+            logical_line_fragments.push(&text[start..newline]);
+            wrap_logical_line_fragments(&logical_line_fragments, width, &mut lines);
+            logical_line_fragments.clear();
+            start = newline + 1;
         }
 
-        let mut current = String::new();
-        let mut current_width = 0usize;
+        logical_line_fragments.push(&text[start..]);
+    }
 
-        for token in UnicodeSegmentation::split_word_bounds(logical_line) {
-            let token_width = UnicodeWidthStr::width(token);
+    wrap_logical_line_fragments(&logical_line_fragments, width, &mut lines);
 
-            // token自体が1行に収まる場合。
-            if token_width <= width {
-                if !current.is_empty() && current_width.saturating_add(token_width) > width {
-                    lines.push(Line::from(std::mem::take(&mut current)));
-                    current_width = 0;
-                }
+    Text::from(lines)
+}
 
-                current.push_str(token);
-                current_width = current_width.saturating_add(token_width);
+fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec<Line<'static>>) {
+    let mut non_empty = fragments
+        .iter()
+        .copied()
+        .filter(|fragment| !fragment.is_empty());
+    let Some(first) = non_empty.next() else {
+        lines.push(Line::from(""));
+        return;
+    };
 
-                if current_width == width {
-                    lines.push(Line::from(std::mem::take(&mut current)));
-                    current_width = 0;
-                }
+    if non_empty.next().is_none() {
+        wrap_logical_line(first, width, lines);
+        return;
+    }
 
-                continue;
-            }
+    // 通常のraw outputは1つのfragmentのまま処理される。これはdocumentの
+    // segment境界がlogical lineの途中にある場合だけ使う小さな互換経路。
+    let capacity = fragments.iter().map(|fragment| fragment.len()).sum();
+    let mut logical_line = String::with_capacity(capacity);
+    for fragment in fragments {
+        logical_line.push_str(fragment);
+    }
 
-            // tokenそのものが横幅より長い場合。
-            // まず現在の行を確定する。
-            if current_width > 0 {
+    wrap_logical_line(&logical_line, width, lines);
+}
+
+fn wrap_logical_line(logical_line: &str, width: usize, lines: &mut Vec<Line<'static>>) {
+    if width == 0 || logical_line.is_empty() {
+        lines.push(Line::from(logical_line.to_owned()));
+        return;
+    }
+
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for token in UnicodeSegmentation::split_word_bounds(logical_line) {
+        let token_width = UnicodeWidthStr::width(token);
+
+        // token自体が1行に収まる場合。
+        if token_width <= width {
+            if !current.is_empty() && current_width.saturating_add(token_width) > width {
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current_width = 0;
             }
 
-            // 長すぎるtokenだけgrapheme単位でhard wrapする。
-            for grapheme in UnicodeSegmentation::graphemes(token, true) {
-                let grapheme_width = UnicodeWidthStr::width(grapheme);
+            current.push_str(token);
+            current_width = current_width.saturating_add(token_width);
 
-                if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                    lines.push(Line::from(std::mem::take(&mut current)));
-                    current_width = 0;
-                }
-
-                current.push_str(grapheme);
-                current_width = current_width.saturating_add(grapheme_width);
-
-                if current_width >= width {
-                    lines.push(Line::from(std::mem::take(&mut current)));
-                    current_width = 0;
-                }
+            if current_width == width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
             }
+
+            continue;
         }
 
-        if !current.is_empty() {
-            lines.push(Line::from(current));
+        // tokenそのものが横幅より長い場合。
+        // まず現在の行を確定する。
+        if current_width > 0 {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            current_width = 0;
+        }
+
+        // 長すぎるtokenだけgrapheme単位でhard wrapする。
+        for grapheme in UnicodeSegmentation::graphemes(token, true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+
+            current.push_str(grapheme);
+            current_width = current_width.saturating_add(grapheme_width);
+
+            if current_width >= width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
         }
     }
 
-    Text::from(lines)
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
 }
 
 fn max_scroll(content_height: usize, viewport_height: usize) -> u16 {
@@ -441,152 +485,6 @@ fn compact_elapsed_label(elapsed: Duration) -> String {
     format!("{:.1}ms", elapsed.as_secs_f64() * 1000.0)
 }
 
-fn detail_text(app: &WatchApp) -> String {
-    let Some(problem) = app.current_problem() else {
-        return "No problems".to_string();
-    };
-
-    let run = &problem.run;
-
-    let detail = match run.phase {
-        RunPhase::Idle => "Waiting for a source change...".to_string(),
-
-        RunPhase::Queued => "Queued...".to_string(),
-
-        RunPhase::Compiling => {
-            format!("Compiling {}...", problem.index)
-        }
-
-        RunPhase::CompileError => {
-            let mut text = "Compile Error".to_string();
-
-            if let Some(error) = &run.error {
-                append_section(&mut text, "compiler output", error);
-            }
-
-            text
-        }
-
-        RunPhase::CompileTimedOut => "Compile Timed Out".to_string(),
-
-        RunPhase::NoSamples => "No samples".to_string(),
-
-        RunPhase::Failed => {
-            let mut text = "Run Failed".to_string();
-
-            if let Some(error) = &run.error {
-                append_section(&mut text, "error", error);
-            }
-
-            text
-        }
-
-        RunPhase::Running | RunPhase::Finished => sample_detail(app, problem),
-    };
-
-    format!("{} - {}\n\n{detail}", problem.index, problem.title)
-}
-
-fn sample_detail(app: &WatchApp, problem: &ProblemState) -> String {
-    let total = problem.run.total_cases;
-
-    if total == 0 {
-        return "Running samples...".to_string();
-    }
-
-    let Some(case) = app.selected_case_state() else {
-        return format!(
-            "sample {} / {}\n\nPending...",
-            app.selected_case() + 1,
-            total,
-        );
-    };
-
-    let mut text = format!(
-        "sample {} / {}   {}{}",
-        app.selected_case() + 1,
-        total,
-        verdict_label(case.verdict),
-        elapsed_label(case.elapsed),
-    );
-
-    match case.verdict {
-        CaseVerdict::Pending => {
-            text.push_str("\n\nPending...");
-        }
-
-        CaseVerdict::Accepted => {
-            text.push_str("\n\nAccepted");
-
-            if let Some(stderr) = &case.stderr {
-                append_section(&mut text, "stderr", stderr);
-            }
-        }
-
-        CaseVerdict::WrongAnswer => {
-            append_section(
-                &mut text,
-                "expected",
-                case.expected.as_deref().unwrap_or(""),
-            );
-
-            append_section(&mut text, "actual", case.actual.as_deref().unwrap_or(""));
-
-            if let Some(stderr) = &case.stderr {
-                append_section(&mut text, "stderr", stderr);
-            }
-        }
-
-        CaseVerdict::RuntimeError => {
-            text.push_str("\n\nRuntime Error");
-
-            if let Some(stderr) = &case.stderr {
-                append_section(&mut text, "stderr", stderr);
-            }
-        }
-
-        CaseVerdict::TimedOut => {
-            text.push_str("\n\nTime Limit Exceeded");
-
-            if let Some(stderr) = &case.stderr {
-                append_section(&mut text, "stderr", stderr);
-            }
-        }
-    }
-
-    text
-}
-
-fn verdict_label(verdict: CaseVerdict) -> &'static str {
-    match verdict {
-        CaseVerdict::Pending => "Pending",
-        CaseVerdict::Accepted => "AC",
-        CaseVerdict::WrongAnswer => "WA",
-        CaseVerdict::RuntimeError => "RE",
-        CaseVerdict::TimedOut => "TLE",
-    }
-}
-
-fn elapsed_label(elapsed: Option<Duration>) -> String {
-    let Some(elapsed) = elapsed else {
-        return String::new();
-    };
-
-    format!("   {:.1} ms", elapsed.as_secs_f64() * 1000.0)
-}
-
-fn append_section(text: &mut String, label: &str, content: &str) {
-    text.push_str("\n\n");
-    text.push_str(label);
-    text.push('\n');
-
-    if content.is_empty() {
-        text.push_str("(empty)");
-    } else {
-        text.push_str(content);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +519,12 @@ mod tests {
             .unwrap();
 
         info
+    }
+
+    fn wrap_text(text: &str, width: u16) -> Text<'static> {
+        let segments = [text];
+        let document = DetailDocument::from_borrowed_segments(&segments);
+        wrap_detail_document(&document, width)
     }
 
     #[test]
@@ -699,7 +603,7 @@ mod tests {
     #[test]
     fn detail_wrap_uses_terminal_cell_width() {
         // 全角3文字で6セル。幅6なら1行、4文字目で折り返す。
-        let text = wrap_detail_text("あいうえ", 6);
+        let text = wrap_text("あいうえ", 6);
 
         assert_eq!(text.height(), 2);
         assert_eq!(text_lines(&text), ["あいう", "え"],);
@@ -707,22 +611,22 @@ mod tests {
 
     #[test]
     fn detail_wrap_preserves_explicit_blank_lines() {
-        let text = wrap_detail_text("expected\n\nactual\n", 80);
+        let text = wrap_text("expected\n\nactual\n", 80);
 
         assert_eq!(text_lines(&text), ["expected", "", "actual", ""]);
     }
 
     #[test]
     fn detail_wrap_is_safe_for_zero_and_narrow_widths() {
-        let zero = wrap_detail_text("abc", 0);
+        let zero = wrap_text("abc", 0);
         assert_eq!(zero.height(), 1);
 
         // 1セル幅に全角文字が来てもgraphemeを壊さず1行として扱う。
-        let narrow = wrap_detail_text("あ", 1);
+        let narrow = wrap_text("あ", 1);
         assert_eq!(narrow.height(), 1);
 
         // standaloneのzero-width graphemeがwide graphemeから不要に分離されない。
-        let zero_width = wrap_detail_text("\u{200b}あ", 1);
+        let zero_width = wrap_text("\u{200b}あ", 1);
         assert_eq!(text_lines(&zero_width), ["\u{200b}あ"]);
     }
     fn text_lines(text: &Text<'_>) -> Vec<String> {
@@ -738,21 +642,30 @@ mod tests {
     }
     #[test]
     fn detail_wraps_ascii_at_terminal_width() {
-        let text = wrap_detail_text("123456789", 4);
+        let text = wrap_text("123456789", 4);
 
         assert_eq!(text_lines(&text), ["1234", "5678", "9"],);
     }
     #[test]
     fn detail_wrap_does_not_split_word_when_it_can_move_to_next_line() {
-        let text = wrap_detail_text("56 57 58 59", 7);
+        let text = wrap_text("56 57 58 59", 7);
 
         assert_eq!(text_lines(&text), ["56 57 ", "58 59"],);
     }
 
     #[test]
+    fn detail_segment_boundaries_are_not_implicit_line_or_token_boundaries() {
+        let segments = ["ab", "cd", "\n", "", "\n日本", "語"];
+        let document = DetailDocument::from_borrowed_segments(&segments);
+        let text = wrap_detail_document(&document, 3);
+
+        assert_eq!(text_lines(&text), ["abc", "d", "", "日", "本", "語"]);
+    }
+
+    #[test]
     fn detail_wrap_preserves_whitespace_and_unicode_graphemes() {
         let input = "e\u{301}  👩‍💻 ";
-        let text = wrap_detail_text(input, 2);
+        let text = wrap_text(input, 2);
 
         assert_eq!(text_lines(&text).concat(), input);
         assert!(text_lines(&text).iter().any(|line| line == "👩‍💻"));
@@ -761,8 +674,8 @@ mod tests {
     #[test]
     fn scrollbar_gutter_can_increase_wrapped_height() {
         let input = "1234 5678\nx";
-        let full_width = wrap_detail_text(input, 9);
-        let with_gutter = wrap_detail_text(input, 8);
+        let full_width = wrap_text(input, 9);
+        let with_gutter = wrap_text(input, 8);
 
         assert_eq!(full_width.height(), 2);
         assert_eq!(max_scroll(full_width.height(), 1), 1);
