@@ -532,6 +532,20 @@ mod tests {
         .unwrap()
     }
 
+    fn render_info(app: &WatchApp, width: u16, height: u16) -> RenderInfo {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut info = RenderInfo::default();
+
+        terminal
+            .draw(|frame| {
+                info = render(frame, app);
+            })
+            .unwrap();
+
+        info
+    }
+
     #[test]
     fn max_scroll_has_no_off_by_one_and_saturates_to_u16() {
         assert_eq!(max_scroll(0, 0), 0);
@@ -558,15 +572,50 @@ mod tests {
     #[test]
     fn sample_window_keeps_selected_sample_visible() {
         assert_eq!(sample_window(0, 0, 5), 0..0);
+        assert_eq!(sample_window(10, 5, 0), 0..0);
         assert_eq!(sample_window(10, 0, 5), 0..5);
         assert_eq!(sample_window(10, 2, 5), 0..5);
         assert_eq!(sample_window(10, 5, 5), 3..8);
         assert_eq!(sample_window(10, 9, 5), 5..10);
+        assert_eq!(sample_window(10, 0, 1), 0..1);
+        assert_eq!(sample_window(10, 9, 1), 9..10);
     }
 
     #[test]
     fn sample_window_handles_more_space_than_samples() {
+        assert_eq!(sample_window(1, 0, 1), 0..1);
         assert_eq!(sample_window(3, 0, 10), 0..3);
         assert_eq!(sample_window(3, 2, 10), 0..3);
+    }
+
+    #[test]
+    fn render_info_matches_visible_and_automatically_hidden_samples_layout() {
+        let mut app = app();
+        app.toggle_samples_pane();
+
+        // outer borderを除いた幅が20 + 30のとき、Samplesは固定幅20で表示される。
+        let wide = render_info(&app, 52, 12);
+        let samples = wide.samples_area.expect("samples pane should be visible");
+        assert_eq!(samples.width, SAMPLES_PANE_WIDTH);
+        assert_eq!(samples.x.saturating_add(samples.width), wide.detail_area.x);
+        assert_eq!(samples.y, wide.detail_area.y);
+        assert_eq!(samples.height, wide.detail_area.height);
+        assert_eq!(wide.detail_area.width, MIN_DETAIL_WIDTH);
+
+        // 1列狭くなるとstateはONのまま、描画だけMinimalへ戻る。
+        let narrow = render_info(&app, 51, 12);
+        assert!(narrow.samples_area.is_none());
+        assert_eq!(narrow.detail_area.x, 1);
+        assert_eq!(narrow.detail_area.width, 49);
+        assert!(app.samples_pane_enabled());
+
+        // 再び広げると明示的な再toggleなしで再表示される。
+        assert!(render_info(&app, 52, 12).samples_area.is_some());
+
+        app.toggle_samples_pane();
+        let disabled = render_info(&app, 52, 12);
+        assert!(disabled.samples_area.is_none());
+        assert_eq!(disabled.detail_area.x, 1);
+        assert_eq!(disabled.detail_area.width, 50);
     }
 }

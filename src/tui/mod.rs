@@ -565,7 +565,6 @@ mod tests {
         assert_eq!(run.accepted, 0);
     }
     #[test]
-    #[test]
     fn samples_pane_toggles_only_on_key_press() {
         let mut app = app();
 
@@ -656,6 +655,69 @@ mod tests {
         ));
 
         assert_eq!(app.detail_scroll(), 10);
+    }
+
+    #[test]
+    fn mouse_wheel_at_detail_top_is_not_dirty() {
+        let mut app = app();
+
+        let info = view::RenderInfo {
+            max_detail_scroll: 10,
+            samples_area: None,
+            detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+        };
+
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollUp, 30, 5),
+            &info,
+        ));
+
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn samples_and_detail_rect_boundary_is_half_open() {
+        let info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+        };
+
+        let mut samples_app = app();
+        assert!(handle_mouse_event(
+            &mut samples_app,
+            mouse(MouseEventKind::ScrollDown, 19, 5),
+            &info,
+        ));
+        assert_eq!(samples_app.selected_case(), 1);
+        assert_eq!(samples_app.detail_scroll(), 0);
+
+        let mut detail_app = app();
+        assert!(handle_mouse_event(
+            &mut detail_app,
+            mouse(MouseEventKind::ScrollDown, 20, 5),
+            &info,
+        ));
+        assert_eq!(detail_app.selected_case(), 0);
+        assert_eq!(detail_app.detail_scroll(), 3);
+    }
+
+    #[test]
+    fn samples_wheel_with_one_case_does_not_mark_ui_dirty() {
+        let mut app = app_with_problems(&[1]);
+        let info = view::RenderInfo {
+            max_detail_scroll: 0,
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+        };
+
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 5, 5),
+            &info,
+        ));
+        assert_eq!(app.selected_case(), 0);
     }
     #[test]
     fn mouse_wheel_outside_content_is_ignored() {
