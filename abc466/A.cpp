@@ -30,7 +30,7 @@ int main() {
         cin >> x;
         if(x >= 0) ans = false;  
     }
-    cout << (ans ? "Yes":"Noi") << endl;
+    cout << (ans ? "Yes":"No") << endl;
     std::cerr << "Error message1" << std::endl;
     std::cerr << "Error message2" << std::endl;
     std::cerr << "Error message3" << std::endl;

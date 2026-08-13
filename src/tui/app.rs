@@ -26,6 +26,7 @@ pub struct ProblemState {
 pub struct WatchApp {
     should_quit: bool,
     debug: bool,
+    samples_pane_enabled: bool,
 
     contest_id: String,
     problems: Vec<ProblemState>,
@@ -145,6 +146,7 @@ impl WatchApp {
         Ok(Self {
             should_quit: false,
             debug: false,
+            samples_pane_enabled: false,
             contest_id: contest.contest_id.clone(),
             problems,
             selected_problem: 0,
@@ -160,6 +162,13 @@ impl WatchApp {
 
     pub fn debug_enabled(&self) -> bool {
         self.debug
+    }
+    pub fn samples_pane_enabled(&self) -> bool {
+        self.samples_pane_enabled
+    }
+
+    pub fn toggle_samples_pane(&mut self) {
+        self.samples_pane_enabled = !self.samples_pane_enabled;
     }
 
     pub fn contest_id(&self) -> &str {
@@ -1266,5 +1275,20 @@ mod tests {
         app.queue_run(1).unwrap();
 
         assert_eq!(app.detail_scroll(), 0);
+    }
+    #[test]
+    fn samples_pane_toggle_is_persistent_ui_state() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
+
+        assert!(!app.samples_pane_enabled());
+
+        app.toggle_samples_pane();
+        assert!(app.samples_pane_enabled());
+
+        app.next_problem();
+        assert!(app.samples_pane_enabled());
+
+        app.toggle_samples_pane();
+        assert!(!app.samples_pane_enabled());
     }
 }

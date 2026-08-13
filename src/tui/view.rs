@@ -11,6 +11,10 @@ use ratatui::{
 use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
 use crate::language::Language;
 
+const SAMPLES_PANE_WIDTH: u16 = 20;
+const MIN_DETAIL_WIDTH: u16 = 30;
+const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
+
 pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
     let area = frame.area();
     let current_problem = app.current_problem();
@@ -81,12 +85,34 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
     frame.render_widget(problems, rows[0]);
 
     // 選択中sample / compile error等の詳細
+    let show_samples = app.samples_pane_enabled()
+        && current_problem.is_some_and(|problem| problem.total_cases > 0)
+        && rows[1].width >= MIN_SAMPLES_LAYOUT_WIDTH;
+
+    let (samples_area, detail_area) = if show_samples {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SAMPLES_PANE_WIDTH), Constraint::Min(1)])
+            .split(rows[1]);
+
+        (Some(columns[0]), columns[1])
+    } else {
+        (None, rows[1])
+    };
+
+    if let Some(samples_area) = samples_area {
+        let samples = Paragraph::new(samples_text(app, samples_area.height))
+            .block(Block::default().borders(Borders::RIGHT));
+
+        frame.render_widget(samples, samples_area);
+    }
+
+    // 選択中sample / compile error等の詳細
     let detail_text = Text::raw(detail_text(app));
 
-    // Paragraph has no wrapping, so Text::height is its rendered vertical content height.
+    // Paragraphはwrapしないため、Text::height()がそのまま縦方向のcontent高さ。
     let content_height = detail_text.height();
-
-    let viewport_height = usize::from(rows[1].height);
+    let viewport_height = usize::from(detail_area.height);
 
     let max_scroll = max_scroll(content_height, viewport_height);
 
@@ -94,7 +120,7 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
 
     let detail = Paragraph::new(detail_text).scroll((scroll, 0));
 
-    frame.render_widget(detail, rows[1]);
+    frame.render_widget(detail, detail_area);
 
     if max_scroll > 0 {
         let mut scrollbar_state =
@@ -102,12 +128,14 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
 
-        frame.render_stateful_widget(scrollbar, rows[1], &mut scrollbar_state);
+        frame.render_stateful_widget(scrollbar, detail_area, &mut scrollbar_state);
     }
 
     // まだ実装済みの操作だけ表示する
-    let footer = Paragraph::new("d debug   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit")
-        .block(Block::default().borders(Borders::TOP));
+    let footer = Paragraph::new(
+        "s samples   d debug   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
+    )
+    .block(Block::default().borders(Borders::TOP));
 
     frame.render_widget(footer, rows[2]);
 
@@ -240,6 +268,89 @@ fn problem_style(problem: &ProblemState) -> Style {
 
         RunPhase::Idle | RunPhase::NoSamples => Style::default().fg(Color::DarkGray),
     }
+}
+
+fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
+    let Some(problem) = app.current_problem() else {
+        return Text::default();
+    };
+
+    let total = problem.total_cases;
+
+    let mut lines = vec![
+        Line::styled("Samples", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+    ];
+
+    let visible = usize::from(height.saturating_sub(2));
+
+    let range = sample_window(total, app.selected_case(), visible);
+
+    for index in range {
+        lines.push(sample_line(problem, index, app.selected_case()));
+    }
+
+    Text::from(lines)
+}
+
+fn sample_window(total: usize, selected: usize, visible: usize) -> std::ops::Range<usize> {
+    if total == 0 || visible == 0 {
+        return 0..0;
+    }
+
+    let visible = visible.min(total);
+    let selected = selected.min(total - 1);
+
+    let mut start = selected.saturating_sub(visible / 2);
+
+    if start + visible > total {
+        start = total - visible;
+    }
+
+    start..start + visible
+}
+
+fn sample_line(problem: &ProblemState, index: usize, selected: usize) -> Line<'static> {
+    let case = problem.run.cases.get(index);
+
+    let (verdict, mut style) = match case {
+        Some(case) => match case.verdict {
+            CaseVerdict::Pending => ("·", Style::default().fg(Color::DarkGray)),
+
+            CaseVerdict::Accepted => ("AC", Style::default().fg(Color::Green)),
+
+            CaseVerdict::WrongAnswer => ("WA", Style::default().fg(Color::Red)),
+
+            CaseVerdict::RuntimeError => ("RE", Style::default().fg(Color::Red)),
+
+            CaseVerdict::TimedOut => ("TLE", Style::default().fg(Color::Red)),
+        },
+
+        None => ("·", Style::default().fg(Color::DarkGray)),
+    };
+
+    let marker = if index == selected { ">" } else { " " };
+
+    if index == selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+
+    let elapsed = case
+        .and_then(|case| case.elapsed)
+        .map(compact_elapsed_label)
+        .unwrap_or_default();
+
+    let text = if elapsed.is_empty() {
+        format!("{marker} {:>2}  {verdict}", index + 1)
+    } else {
+        format!("{marker} {:>2}  {:<3}  {elapsed}", index + 1, verdict,)
+    };
+
+    Line::styled(text, style)
+}
+
+fn compact_elapsed_label(elapsed: Duration) -> String {
+    format!("{:.1}ms", elapsed.as_secs_f64() * 1000.0)
 }
 
 fn detail_text(app: &WatchApp) -> String {
@@ -432,5 +543,19 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    #[test]
+    fn sample_window_keeps_selected_sample_visible() {
+        assert_eq!(sample_window(0, 0, 5), 0..0);
+        assert_eq!(sample_window(10, 0, 5), 0..5);
+        assert_eq!(sample_window(10, 2, 5), 0..5);
+        assert_eq!(sample_window(10, 5, 5), 3..8);
+        assert_eq!(sample_window(10, 9, 5), 5..10);
+    }
+
+    #[test]
+    fn sample_window_handles_more_space_than_samples() {
+        assert_eq!(sample_window(3, 0, 10), 0..3);
+        assert_eq!(sample_window(3, 2, 10), 0..3);
     }
 }

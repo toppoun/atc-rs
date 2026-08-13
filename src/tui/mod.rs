@@ -170,6 +170,11 @@ fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
             true
         }
 
+        KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
+            app.toggle_samples_pane();
+            true
+        }
+
         KeyCode::Char('h') | KeyCode::Left => app.previous_problem(),
 
         KeyCode::Char('l') | KeyCode::Right => app.next_problem(),
@@ -546,5 +551,29 @@ mod tests {
 
         assert!(handle_mouse_event(&mut app, scroll_up));
         assert_eq!(app.detail_scroll(), 3);
+    }
+    #[test]
+    fn samples_pane_toggles_only_on_key_press() {
+        let mut app = app();
+
+        assert!(!app.samples_pane_enabled());
+
+        assert!(handle_key_event(
+            &mut app,
+            key(KeyCode::Char('s'), KeyEventKind::Press),
+        ));
+        assert!(app.samples_pane_enabled());
+
+        assert!(!handle_key_event(
+            &mut app,
+            key(KeyCode::Char('s'), KeyEventKind::Repeat),
+        ));
+        assert!(app.samples_pane_enabled());
+
+        assert!(handle_key_event(
+            &mut app,
+            key(KeyCode::Char('s'), KeyEventKind::Press),
+        ));
+        assert!(!app.samples_pane_enabled());
     }
 }
