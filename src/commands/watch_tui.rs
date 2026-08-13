@@ -118,7 +118,10 @@ fn start_watcher(
         .spawn(move || {
             run_watcher_guarded(panic_tx, || {
                 while !thread_shutdown.load(Ordering::Acquire) {
-                    let paths = match file_watcher.next_batch_timeout(WATCHER_POLL_INTERVAL) {
+                    let paths = match file_watcher
+                        .next_batch_timeout_with_cancel(WATCHER_POLL_INTERVAL, &|| {
+                            thread_shutdown.load(Ordering::Acquire)
+                        }) {
                         Ok(Some(paths)) => paths,
                         Ok(None) => continue,
 

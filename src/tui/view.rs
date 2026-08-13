@@ -198,7 +198,7 @@ fn wrap_detail_text(text: &str, width: u16) -> Text<'static> {
 
             // tokenそのものが横幅より長い場合。
             // まず現在の行を確定する。
-            if !current.is_empty() {
+            if current_width > 0 {
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current_width = 0;
             }
@@ -207,7 +207,7 @@ fn wrap_detail_text(text: &str, width: u16) -> Text<'static> {
             for grapheme in UnicodeSegmentation::graphemes(token, true) {
                 let grapheme_width = UnicodeWidthStr::width(grapheme);
 
-                if !current.is_empty() && current_width.saturating_add(grapheme_width) > width {
+                if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
                     lines.push(Line::from(std::mem::take(&mut current)));
                     current_width = 0;
                 }
@@ -707,9 +707,9 @@ mod tests {
 
     #[test]
     fn detail_wrap_preserves_explicit_blank_lines() {
-        let text = wrap_detail_text("expected\n\nactual", 80);
+        let text = wrap_detail_text("expected\n\nactual\n", 80);
 
-        assert_eq!(text.height(), 3);
+        assert_eq!(text_lines(&text), ["expected", "", "actual", ""]);
     }
 
     #[test]
@@ -720,6 +720,10 @@ mod tests {
         // 1セル幅に全角文字が来てもgraphemeを壊さず1行として扱う。
         let narrow = wrap_detail_text("あ", 1);
         assert_eq!(narrow.height(), 1);
+
+        // standaloneのzero-width graphemeがwide graphemeから不要に分離されない。
+        let zero_width = wrap_detail_text("\u{200b}あ", 1);
+        assert_eq!(text_lines(&zero_width), ["\u{200b}あ"]);
     }
     fn text_lines(text: &Text<'_>) -> Vec<String> {
         text.lines
@@ -740,8 +744,29 @@ mod tests {
     }
     #[test]
     fn detail_wrap_does_not_split_word_when_it_can_move_to_next_line() {
-        let text = wrap_detail_text("56 57 58 59", 8);
+        let text = wrap_detail_text("56 57 58 59", 7);
 
         assert_eq!(text_lines(&text), ["56 57 ", "58 59"],);
+    }
+
+    #[test]
+    fn detail_wrap_preserves_whitespace_and_unicode_graphemes() {
+        let input = "e\u{301}  👩‍💻 ";
+        let text = wrap_detail_text(input, 2);
+
+        assert_eq!(text_lines(&text).concat(), input);
+        assert!(text_lines(&text).iter().any(|line| line == "👩‍💻"));
+    }
+
+    #[test]
+    fn scrollbar_gutter_can_increase_wrapped_height() {
+        let input = "1234 5678\nx";
+        let full_width = wrap_detail_text(input, 9);
+        let with_gutter = wrap_detail_text(input, 8);
+
+        assert_eq!(full_width.height(), 2);
+        assert_eq!(max_scroll(full_width.height(), 1), 1);
+        assert_eq!(with_gutter.height(), 3);
+        assert_eq!(max_scroll(with_gutter.height(), 1), 2);
     }
 }

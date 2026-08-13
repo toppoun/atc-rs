@@ -4,6 +4,7 @@ pub mod reporter;
 pub mod view;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -15,7 +16,9 @@ use crate::model::Contest;
 use app::WatchApp;
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
+const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: u16 = 3;
+const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn handle_messages(
     app: &mut WatchApp,
@@ -112,9 +115,37 @@ pub fn run(
     let mut dirty = true;
 
     let mut render_info = view::RenderInfo::default();
+    let mut terminal_events = VecDeque::new();
 
     while !app.should_quit() {
+        if terminal_events.is_empty() {
+            terminal_events = read_terminal_events(Duration::ZERO)?;
+        }
+
+        if contains_quit_event(&terminal_events) {
+            app.quit();
+            break;
+        }
+
+        if take_leading_resizes(&mut terminal_events) {
+            dirty = true;
+        }
+
         if handle_messages(&mut app, &message_rx, &run_tx)? {
+            dirty = true;
+        }
+
+        // message batch処理中にqが到着していれば、重いwrap/再描画より優先する。
+        if terminal_events.is_empty() {
+            terminal_events = read_terminal_events(Duration::ZERO)?;
+        }
+
+        if contains_quit_event(&terminal_events) {
+            app.quit();
+            break;
+        }
+
+        if take_leading_resizes(&mut terminal_events) {
             dirty = true;
         }
 
@@ -132,30 +163,115 @@ pub fn run(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(20))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if handle_key_event(&mut app, key) {
-                        dirty = true;
-                    }
-                }
+        if terminal_events.is_empty() {
+            terminal_events = read_terminal_events(TERMINAL_POLL_INTERVAL)?;
+        }
 
-                Event::Mouse(mouse) => {
-                    if handle_mouse_event(&mut app, mouse, &render_info) {
-                        dirty = true;
-                    }
-                }
+        // qは同じbatch内のresize/mouseより先に扱い、再描画を挟まず終了する。
+        if contains_quit_event(&terminal_events) {
+            app.quit();
+            continue;
+        }
 
-                Event::Resize(_, _) => {
-                    dirty = true;
-                }
-
-                _ => {}
-            }
+        if handle_terminal_events(&mut app, &render_info, &mut terminal_events) {
+            dirty = true;
         }
     }
 
     Ok(())
+}
+
+fn read_terminal_events(wait: Duration) -> io::Result<VecDeque<Event>> {
+    read_terminal_events_with(wait, event::poll, event::read)
+}
+
+fn read_terminal_events_with(
+    wait: Duration,
+    mut poll_event: impl FnMut(Duration) -> io::Result<bool>,
+    mut read_event: impl FnMut() -> io::Result<Event>,
+) -> io::Result<VecDeque<Event>> {
+    let mut events = VecDeque::new();
+
+    if !poll_event(wait)? {
+        return Ok(events);
+    }
+
+    for index in 0..MAX_TERMINAL_EVENTS_PER_TICK {
+        let terminal_event = read_event()?;
+        let should_quit = is_quit_event(&terminal_event);
+        events.push_back(terminal_event);
+
+        if should_quit || index + 1 == MAX_TERMINAL_EVENTS_PER_TICK || !poll_event(Duration::ZERO)?
+        {
+            break;
+        }
+    }
+
+    Ok(events)
+}
+
+fn contains_quit_event(events: &VecDeque<Event>) -> bool {
+    events.iter().any(is_quit_event)
+}
+
+fn is_quit_event(terminal_event: &Event) -> bool {
+    matches!(
+        terminal_event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            kind: KeyEventKind::Press,
+            ..
+        })
+    )
+}
+
+fn take_leading_resizes(events: &mut VecDeque<Event>) -> bool {
+    let mut found = false;
+
+    while matches!(events.front(), Some(Event::Resize(_, _))) {
+        events.pop_front();
+        found = true;
+    }
+
+    found
+}
+
+fn handle_terminal_events(
+    app: &mut WatchApp,
+    render_info: &view::RenderInfo,
+    events: &mut VecDeque<Event>,
+) -> bool {
+    let mut changed = false;
+
+    while let Some(terminal_event) = events.pop_front() {
+        if matches!(terminal_event, Event::Resize(_, _)) {
+            changed = true;
+
+            // 連続resizeは1回の再描画へまとめる。後続mouseは新しいRectが
+            // 描画されてから処理し、古いRenderInfoでhit testしない。
+            while matches!(events.front(), Some(Event::Resize(_, _))) {
+                events.pop_front();
+            }
+            break;
+        }
+
+        changed |= handle_terminal_event(app, terminal_event, render_info);
+    }
+
+    changed
+}
+
+fn handle_terminal_event(
+    app: &mut WatchApp,
+    terminal_event: Event,
+    render_info: &view::RenderInfo,
+) -> bool {
+    match terminal_event {
+        Event::Key(key) => handle_key_event(app, key),
+        Event::Mouse(mouse) => handle_mouse_event(app, mouse, render_info),
+        Event::Resize(_, _) => true,
+        _ => false,
+    }
 }
 
 fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
@@ -242,6 +358,7 @@ mod tests {
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
 
@@ -287,6 +404,92 @@ mod tests {
         assert!(!app.should_quit());
         handle_key_event(&mut app, key(KeyCode::Char('q'), KeyEventKind::Press));
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn queued_quit_is_processed_before_later_events_without_intermediate_draws() {
+        let mut app = app();
+        let events = RefCell::new(VecDeque::from([
+            Event::Resize(80, 24),
+            Event::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            Event::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)),
+        ]));
+        let poll_waits = RefCell::new(Vec::new());
+
+        let queued = read_terminal_events_with(
+            TERMINAL_POLL_INTERVAL,
+            |wait| {
+                poll_waits.borrow_mut().push(wait);
+                Ok(!events.borrow().is_empty())
+            },
+            || {
+                events
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("test event queue is empty"))
+            },
+        )
+        .unwrap();
+
+        assert!(contains_quit_event(&queued));
+        app.quit();
+        assert!(app.should_quit());
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(events.borrow().len(), 1);
+        assert_eq!(
+            poll_waits.into_inner(),
+            [TERMINAL_POLL_INTERVAL, Duration::ZERO]
+        );
+    }
+
+    #[test]
+    fn terminal_event_drain_is_bounded() {
+        let events = RefCell::new(VecDeque::from(vec![
+            Event::Resize(80, 24);
+            MAX_TERMINAL_EVENTS_PER_TICK + 1
+        ]));
+
+        let queued = read_terminal_events_with(
+            Duration::ZERO,
+            |_| Ok(!events.borrow().is_empty()),
+            || {
+                events
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("test event queue is empty"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(queued.len(), MAX_TERMINAL_EVENTS_PER_TICK);
+        assert_eq!(events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn mouse_after_resize_waits_for_new_render_info() {
+        let mut app = app();
+        let old_info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+        };
+        let mut events = VecDeque::from([
+            Event::Resize(100, 40),
+            Event::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)),
+        ]);
+
+        assert!(handle_terminal_events(&mut app, &old_info, &mut events));
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(events.len(), 1);
+
+        let new_info = view::RenderInfo {
+            max_detail_scroll: 20,
+            samples_area: None,
+            detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
+        };
+        assert!(handle_terminal_events(&mut app, &new_info, &mut events));
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 3);
     }
 
     #[test]

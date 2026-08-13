@@ -36,8 +36,12 @@ impl FileWatcher {
         receive_next_batch(&self.rx, DEBOUNCE_DURATION)
     }
 
-    pub fn next_batch_timeout(&self, timeout: Duration) -> io::Result<Option<Vec<PathBuf>>> {
-        receive_next_batch_timeout(&self.rx, DEBOUNCE_DURATION, timeout)
+    pub fn next_batch_timeout_with_cancel(
+        &self,
+        timeout: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Option<Vec<PathBuf>>> {
+        receive_next_batch_timeout_with_cancel(&self.rx, DEBOUNCE_DURATION, timeout, is_cancelled)
     }
 }
 
@@ -60,6 +64,7 @@ fn receive_next_batch(
     }
 }
 
+#[cfg(test)]
 fn receive_next_batch_timeout(
     rx: &mpsc::Receiver<notify::Result<Event>>,
     debounce_duration: Duration,
@@ -83,6 +88,60 @@ fn receive_next_batch_timeout(
         Some(Instant::now() + debounce_duration),
     )?;
     Ok(Some(paths))
+}
+
+fn receive_next_batch_timeout_with_cancel(
+    rx: &mpsc::Receiver<notify::Result<Event>>,
+    debounce_duration: Duration,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<Option<Vec<PathBuf>>> {
+    if is_cancelled() {
+        return Ok(None);
+    }
+
+    let first = match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "filesystem watcher disconnected",
+            ));
+        }
+    };
+
+    let mut pending = Vec::new();
+    collect_result_ordered(first, &mut pending)?;
+
+    let deadline = Instant::now() + debounce_duration;
+    let cancel_poll_interval = if timeout.is_zero() {
+        debounce_duration
+    } else {
+        timeout.min(debounce_duration)
+    };
+
+    loop {
+        if is_cancelled() {
+            return Ok(None);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Some(pending));
+        }
+
+        match rx.recv_timeout(remaining.min(cancel_poll_interval)) {
+            Ok(result) => collect_result_ordered(result, &mut pending)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "filesystem watcher disconnected",
+                ));
+            }
+        }
+    }
 }
 
 fn collect_batch_ordered(
@@ -161,6 +220,7 @@ fn collect_result(result: notify::Result<Event>, pending: &mut HashSet<PathBuf>)
 mod tests {
     use super::*;
     use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind};
+    use std::cell::Cell;
 
     fn event(kind: EventKind, path: &Path) -> notify::Result<Event> {
         Ok(Event::new(kind).add_path(path.to_path_buf()))
@@ -264,6 +324,32 @@ mod tests {
             receive_next_batch_timeout(&rx, Duration::from_millis(1), Duration::ZERO).unwrap();
 
         assert!(batch.is_none());
+    }
+
+    #[test]
+    fn cancellation_interrupts_an_active_debounce_without_returning_a_partial_batch() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(event(
+            EventKind::Modify(ModifyKind::Any),
+            Path::new("A.cpp"),
+        ))
+        .unwrap();
+        let checks = Cell::new(0);
+
+        let batch = receive_next_batch_timeout_with_cancel(
+            &rx,
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 2
+            },
+        )
+        .unwrap();
+
+        assert!(batch.is_none());
+        assert_eq!(checks.get(), 2);
     }
 
     #[test]
