@@ -86,6 +86,7 @@ pub struct RunState {
     pub id: Option<RunId>,
     pub phase: RunPhase,
     pub language: Option<Language>,
+    test_run_started: bool,
 
     pub accepted: usize,
     pub total_cases: usize,
@@ -99,6 +100,7 @@ impl Default for RunState {
             id: None,
             phase: RunPhase::Idle,
             language: None,
+            test_run_started: false,
 
             accepted: 0,
             total_cases: 0,
@@ -321,6 +323,7 @@ impl WatchApp {
             id: Some(run_id),
             phase: RunPhase::Queued,
             language: Some(language),
+            test_run_started: false,
             accepted: 0,
             total_cases,
             error: None,
@@ -362,15 +365,25 @@ impl WatchApp {
         true
     }
     pub fn run_event(&mut self, problem: usize, run_id: RunId, event: TestEvent) -> bool {
+        let updated_total_cases = match &event {
+            TestEvent::TestRunStarted { total_cases } => Some(*total_cases),
+            TestEvent::NoSamples => Some(0),
+            _ => None,
+        };
+
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
         };
 
-        match event {
+        let changed = match event {
             TestEvent::NoSamples
-                if matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
+                if !run.test_run_started
+                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
             {
                 run.phase = RunPhase::NoSamples;
+                run.accepted = 0;
+                run.total_cases = 0;
+                run.cases.clear();
                 true
             }
 
@@ -386,9 +399,11 @@ impl WatchApp {
             }
 
             TestEvent::TestRunStarted { total_cases }
-                if matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
+                if !run.test_run_started
+                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
             {
                 run.phase = RunPhase::Running;
+                run.test_run_started = true;
                 run.accepted = 0;
                 run.total_cases = total_cases;
                 run.cases = vec![CaseState::default(); total_cases];
@@ -398,17 +413,26 @@ impl WatchApp {
             TestEvent::TestRunFinished {
                 accepted,
                 total_cases,
-            } if run.phase == RunPhase::Running => {
+            } if run.phase == RunPhase::Running
+                && run.test_run_started
+                && total_cases == run.cases.len()
+                && accepted <= total_cases =>
+            {
                 run.phase = RunPhase::Finished;
                 run.accepted = accepted;
                 run.total_cases = total_cases;
                 true
             }
 
-            TestEvent::TestCaseAccepted { number, elapsed } if run.phase == RunPhase::Running => {
+            TestEvent::TestCaseAccepted { number, elapsed }
+                if run.phase == RunPhase::Running && run.test_run_started =>
+            {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
+                if case.verdict != CaseVerdict::Pending {
+                    return false;
+                }
 
                 case.verdict = CaseVerdict::Accepted;
                 case.elapsed = Some(elapsed);
@@ -423,10 +447,13 @@ impl WatchApp {
                 expected,
                 actual,
                 elapsed,
-            } if run.phase == RunPhase::Running => {
+            } if run.phase == RunPhase::Running && run.test_run_started => {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
+                if case.verdict != CaseVerdict::Pending {
+                    return false;
+                }
 
                 case.verdict = CaseVerdict::WrongAnswer;
                 case.elapsed = Some(elapsed);
@@ -437,11 +464,14 @@ impl WatchApp {
             }
 
             TestEvent::TestCaseRuntimeError { number, elapsed }
-                if run.phase == RunPhase::Running =>
+                if run.phase == RunPhase::Running && run.test_run_started =>
             {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
+                if case.verdict != CaseVerdict::Pending {
+                    return false;
+                }
 
                 case.verdict = CaseVerdict::RuntimeError;
                 case.elapsed = Some(elapsed);
@@ -451,10 +481,15 @@ impl WatchApp {
                 true
             }
 
-            TestEvent::TestCaseTimedOut { number, elapsed } if run.phase == RunPhase::Running => {
+            TestEvent::TestCaseTimedOut { number, elapsed }
+                if run.phase == RunPhase::Running && run.test_run_started =>
+            {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
+                if case.verdict != CaseVerdict::Pending {
+                    return false;
+                }
 
                 case.verdict = CaseVerdict::TimedOut;
                 case.elapsed = Some(elapsed);
@@ -464,10 +499,15 @@ impl WatchApp {
                 true
             }
 
-            TestEvent::TestCaseStderr { number, stderr } if run.phase == RunPhase::Running => {
+            TestEvent::TestCaseStderr { number, stderr }
+                if run.phase == RunPhase::Running && run.test_run_started =>
+            {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
+                if case.stderr.is_some() {
+                    return false;
+                }
 
                 case.stderr = Some(stderr);
 
@@ -475,7 +515,19 @@ impl WatchApp {
             }
 
             _ => false,
+        };
+
+        if changed && let Some(total_cases) = updated_total_cases {
+            self.problems[problem].total_cases = total_cases;
+            if self.selected_problem == problem
+                && (total_cases == 0 || self.selected_case >= total_cases)
+            {
+                self.selected_case = 0;
+            }
+            self.reset_detail_scroll();
         }
+
+        changed
     }
     pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
         let Some(run) = self.current_run_mut(problem, run_id) else {
@@ -918,9 +970,11 @@ mod tests {
 
     #[test]
     fn no_samples_is_terminal_and_is_not_overwritten_by_completed() {
-        let mut app = WatchApp::new(&contest(1), vec![0]).unwrap();
+        let mut app = WatchApp::new(&contest(1), vec![2]).unwrap();
         app.source_changed(0, PathBuf::from("A.py"), Language::Python);
         let request = app.queue_run(0).unwrap();
+        app.previous_case();
+        app.scroll_detail_down(10);
 
         assert!(app.run_started(0, request.run_id));
         assert!(app.run_event(0, request.run_id, TestEvent::NoSamples));
@@ -930,6 +984,10 @@ mod tests {
         assert_eq!(run.phase, RunPhase::NoSamples);
         assert_eq!(run.accepted, 0);
         assert_eq!(run.total_cases, 0);
+        assert!(run.cases.is_empty());
+        assert_eq!(app.current_problem().unwrap().total_cases, 0);
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 0);
     }
     #[test]
     fn case_events_are_stored_for_sample_detail() {
@@ -974,6 +1032,143 @@ mod tests {
         assert_eq!(case.expected.as_deref(), Some("Yes\n"));
         assert_eq!(case.actual.as_deref(), Some("No\n"));
         assert_eq!(case.stderr.as_deref(), Some("debug: answer = No\n"));
+    }
+
+    #[test]
+    fn stderr_before_verdict_is_preserved_and_duplicate_verdict_does_not_overwrite() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseStderr {
+                number: 1,
+                stderr: "debug first\n".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(4),
+            },
+        ));
+        assert!(!app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                expected: "expected".to_string(),
+                actual: "actual".to_string(),
+                elapsed: Duration::from_millis(5),
+            },
+        ));
+
+        let case = &app.current_problem().unwrap().run.cases[0];
+        assert_eq!(case.verdict, CaseVerdict::Accepted);
+        assert_eq!(case.stderr.as_deref(), Some("debug first\n"));
+        assert!(case.expected.is_none());
+        assert!(case.actual.is_none());
+    }
+
+    #[test]
+    fn duplicate_test_run_started_cannot_clear_case_results() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseTimedOut {
+                number: 1,
+                elapsed: Duration::from_secs(2),
+            },
+        ));
+
+        assert!(!app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert_eq!(
+            app.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::TimedOut
+        );
+    }
+
+    #[test]
+    fn test_run_started_synchronizes_case_navigation_with_the_worker_count() {
+        let mut app = WatchApp::new(&contest(1), vec![3]).unwrap();
+        app.previous_case();
+        app.scroll_detail_down(20);
+        assert_eq!(app.selected_case(), 2);
+
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        app.previous_case();
+        assert_eq!(app.selected_case(), 2);
+        app.scroll_detail_down(20);
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(problem.total_cases, 1);
+        assert_eq!(problem.run.total_cases, 1);
+        assert_eq!(problem.run.cases.len(), 1);
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn case_events_before_test_run_started_or_after_finish_are_ignored() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+
+        let accepted = TestEvent::TestCaseAccepted {
+            number: 1,
+            elapsed: Duration::from_millis(1),
+        };
+        assert!(!app.run_event(0, request.run_id, accepted.clone()));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 0,
+                total_cases: 1,
+            },
+        ));
+        assert!(!app.run_event(0, request.run_id, accepted));
+        assert_eq!(
+            app.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::Pending
+        );
     }
     #[test]
     fn queueing_new_run_clears_previous_case_results() {
@@ -1040,6 +1235,10 @@ mod tests {
 
         assert!(!app.scroll_detail_up(1));
         assert_eq!(app.detail_scroll(), 0);
+
+        assert!(app.scroll_detail_down(u16::MAX));
+        assert_eq!(app.detail_scroll(), u16::MAX);
+        assert!(!app.scroll_detail_down(1));
     }
     #[test]
     fn navigation_and_new_run_reset_detail_scroll() {

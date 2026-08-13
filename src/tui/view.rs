@@ -4,11 +4,11 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use super::app::{CaseState, CaseVerdict, ProblemState, RunPhase, WatchApp};
+use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
 use crate::language::Language;
 
 pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
@@ -81,15 +81,14 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
     frame.render_widget(problems, rows[0]);
 
     // 選択中sample / compile error等の詳細
-    let detail_text = detail_text(app);
+    let detail_text = Text::raw(detail_text(app));
 
-    let content_height = detail_text.lines().count().max(1);
+    // Paragraph has no wrapping, so Text::height is its rendered vertical content height.
+    let content_height = detail_text.height();
 
     let viewport_height = usize::from(rows[1].height);
 
-    let max_scroll = content_height
-        .saturating_sub(viewport_height)
-        .min(usize::from(u16::MAX)) as u16;
+    let max_scroll = max_scroll(content_height, viewport_height);
 
     let scroll = app.detail_scroll().min(max_scroll);
 
@@ -113,6 +112,12 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> u16 {
     frame.render_widget(footer, rows[2]);
 
     max_scroll
+}
+
+fn max_scroll(content_height: usize, viewport_height: usize) -> u16 {
+    content_height
+        .saturating_sub(viewport_height)
+        .min(usize::from(u16::MAX)) as u16
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -244,7 +249,7 @@ fn detail_text(app: &WatchApp) -> String {
 
     let run = &problem.run;
 
-    match run.phase {
+    let detail = match run.phase {
         RunPhase::Idle => "Waiting for a source change...".to_string(),
 
         RunPhase::Queued => "Queued...".to_string(),
@@ -278,7 +283,9 @@ fn detail_text(app: &WatchApp) -> String {
         }
 
         RunPhase::Running | RunPhase::Finished => sample_detail(app, problem),
-    }
+    };
+
+    format!("{} - {}\n\n{detail}", problem.index, problem.title)
 }
 
 fn sample_detail(app: &WatchApp, problem: &ProblemState) -> String {
@@ -378,5 +385,52 @@ fn append_section(text: &mut String, label: &str, content: &str) {
         text.push_str("(empty)");
     } else {
         text.push_str(content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Contest, Problem};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn app() -> WatchApp {
+        WatchApp::new(
+            &Contest {
+                contest_id: "abc123".to_string(),
+                problems: vec![Problem {
+                    index: "A".to_string(),
+                    title: "Problem A".to_string(),
+                    task_id: "abc123_a".to_string(),
+                    url: "https://example.invalid/a".to_string(),
+                }],
+            },
+            vec![1],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn max_scroll_has_no_off_by_one_and_saturates_to_u16() {
+        assert_eq!(max_scroll(0, 0), 0);
+        assert_eq!(max_scroll(3, 3), 0);
+        assert_eq!(max_scroll(4, 3), 1);
+        assert_eq!(max_scroll(10, 3), 7);
+        assert_eq!(max_scroll(usize::MAX, 0), u16::MAX);
+    }
+
+    #[test]
+    fn rendering_extremely_small_terminals_does_not_panic() {
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (5, 3)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let app = app();
+
+            terminal
+                .draw(|frame| {
+                    let _ = render(frame, &app);
+                })
+                .unwrap();
+        }
     }
 }

@@ -29,6 +29,43 @@ fn disable_mouse_capture() -> io::Result<()> {
     crossterm::execute!(stdout, DisableMouseCapture)
 }
 
+struct MouseCaptureGuard {
+    enabled: bool,
+}
+
+impl MouseCaptureGuard {
+    fn enable() -> io::Result<Self> {
+        if let Err(error) = enable_mouse_capture() {
+            // The terminal write may have partially succeeded before returning an error.
+            let _ = disable_mouse_capture();
+            return Err(error);
+        }
+
+        Ok(Self { enabled: true })
+    }
+
+    fn disable(&mut self) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let result = disable_mouse_capture();
+        if result.is_ok() {
+            self.enabled = false;
+        }
+        result
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = disable_mouse_capture();
+            self.enabled = false;
+        }
+    }
+}
+
 struct WatcherThread {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<io::Result<()>>>,
@@ -210,22 +247,26 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
         }
     };
 
-    if let Err(error) = enable_mouse_capture() {
-        drop(message_rx);
+    let mut mouse_capture = match MouseCaptureGuard::enable() {
+        Ok(mouse_capture) => mouse_capture,
 
-        test_worker.request_stop();
-        watcher_thread.request_stop();
+        Err(error) => {
+            drop(message_rx);
 
-        ratatui::restore();
+            test_worker.request_stop();
+            watcher_thread.request_stop();
 
-        let worker_result = test_worker.stop_and_join();
-        let watcher_result = watcher_thread.stop();
+            ratatui::restore();
 
-        worker_result?;
-        watcher_result?;
+            let worker_result = test_worker.stop_and_join();
+            let watcher_result = watcher_thread.stop();
 
-        return Err(error.into());
-    }
+            worker_result?;
+            watcher_result?;
+
+            return Err(error.into());
+        }
+    };
 
     let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx, run_tx);
 
@@ -235,7 +276,7 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
 
     // Mouse Captureもterminal状態の一部なので、restore前に戻す。
     // 失敗してもcleanupは最後まで続行する。
-    let mouse_result = disable_mouse_capture();
+    let mouse_result = mouse_capture.disable();
 
     // joinが予想外に長引いてもterminalは先に復元する。
     let restore_result = ratatui::try_restore();
