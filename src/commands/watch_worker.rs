@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
@@ -21,14 +21,46 @@ const MAX_RUN_REQUESTS_PER_TICK: usize = 64;
 
 pub(super) struct TestWorker {
     request_tx: Sender<RunRequest>,
-    shutdown: Arc<AtomicBool>,
+    control: Arc<WorkerControl>,
     handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+#[derive(Debug, Default)]
+struct WorkerControl {
+    stopping: AtomicBool,
+    lifecycle_gate: Mutex<()>,
+}
+
+impl WorkerControl {
+    fn begin_shutdown(&self) {
+        let _gate = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn while_running<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let _gate = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_stopping() {
+            return None;
+        }
+        Some(action())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestDrain {
     Open,
     Disconnected,
+    Shutdown,
 }
 
 impl TestWorker {
@@ -54,8 +86,8 @@ impl TestWorker {
     ) -> io::Result<Self> {
         let (request_tx, request_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
+        let control = Arc::new(WorkerControl::default());
+        let thread_control = Arc::clone(&control);
         let failure_tx = message_tx.clone();
 
         let handle = thread::Builder::new()
@@ -66,7 +98,7 @@ impl TestWorker {
                         request_rx,
                         completion_rx,
                         completion_tx,
-                        thread_shutdown,
+                        thread_control,
                         message_tx,
                         spawn_attempt,
                     )
@@ -88,7 +120,7 @@ impl TestWorker {
 
         Ok(Self {
             request_tx,
-            shutdown,
+            control,
             handle: Some(handle),
         })
     }
@@ -98,7 +130,7 @@ impl TestWorker {
     }
 
     pub fn request_stop(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.control.begin_shutdown();
     }
 
     fn join(&mut self) -> io::Result<()> {
@@ -129,81 +161,112 @@ fn scheduler_loop(
     request_rx: Receiver<RunRequest>,
     completion_rx: Receiver<AttemptCompletion>,
     completion_tx: Sender<AttemptCompletion>,
-    shutdown: Arc<AtomicBool>,
+    control: Arc<WorkerControl>,
     message_tx: Sender<Message>,
     mut spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>,
 ) -> io::Result<()> {
     let mut scheduler = RunScheduler::default();
     let mut active = None;
 
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            return stop_active(&mut scheduler, active.take());
-        }
-
-        if process_ready_completion(
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scheduler_loop_inner(
+            &request_rx,
             &completion_rx,
+            &completion_tx,
+            &control,
+            &message_tx,
+            &mut spawn_attempt,
             &mut scheduler,
             &mut active,
-            &message_tx,
-            &shutdown,
-        )? {
+        )
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other("test worker scheduler loop panicked")));
+    let cleanup_result = cleanup_active(&mut scheduler, active.take());
+
+    combine_loop_and_cleanup_results(run_result, cleanup_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scheduler_loop_inner(
+    request_rx: &Receiver<RunRequest>,
+    completion_rx: &Receiver<AttemptCompletion>,
+    completion_tx: &Sender<AttemptCompletion>,
+    control: &WorkerControl,
+    message_tx: &Sender<Message>,
+    spawn_attempt: &mut impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>,
+    scheduler: &mut RunScheduler,
+    active: &mut Option<ActiveAttempt>,
+) -> io::Result<()> {
+    loop {
+        if control.is_stopping() {
+            return Ok(());
+        }
+
+        if process_ready_completion(completion_rx, scheduler, active, message_tx, control)? {
             continue;
         }
 
-        if drain_requests(&request_rx, &mut scheduler, active.as_ref())?
-            == RequestDrain::Disconnected
-        {
-            return stop_active(&mut scheduler, active.take());
+        match drain_requests(request_rx, scheduler, active.as_ref(), control)? {
+            RequestDrain::Open => {}
+            RequestDrain::Disconnected | RequestDrain::Shutdown => return Ok(()),
         }
 
         // Requests are bounded above, and completion is checked both before and after the
         // batch. A request flood therefore cannot starve an already-finished attempt.
-        if process_ready_completion(
-            &completion_rx,
-            &mut scheduler,
-            &mut active,
-            &message_tx,
-            &shutdown,
-        )? {
+        if process_ready_completion(completion_rx, scheduler, active, message_tx, control)? {
             continue;
         }
 
-        if shutdown.load(Ordering::Acquire) {
-            return stop_active(&mut scheduler, active.take());
+        if control.is_stopping() {
+            return Ok(());
         }
 
-        if active.is_none()
-            && let Some(request) = scheduler.start_next()
-        {
-            match spawn_attempt(request, completion_tx.clone()) {
-                Ok(attempt) => {
-                    ensure_identity(&scheduler, &attempt)?;
-                    active = Some(attempt);
-                }
-                Err(error) => {
-                    let retired = retire_matching(&mut scheduler, request)?;
-                    if retired.is_latest() {
-                        send_message(
-                            &message_tx,
-                            Message::RunFailed {
-                                run_id: request.run_id,
-                                problem: request.problem,
-                                error: error.to_string(),
-                            },
-                        )?;
+        if active.is_none() {
+            let spawned = control.while_running(|| {
+                scheduler
+                    .start_next()
+                    .map(|request| (request, spawn_attempt(request, completion_tx.clone())))
+            });
+
+            match spawned {
+                None => return Ok(()),
+                Some(None) => {}
+                Some(Some((_request, Ok(attempt)))) => {
+                    if let Err(identity_error) = ensure_identity(scheduler, &attempt) {
+                        attempt.request_cancel();
+                        let cleanup_result = attempt.join().map(|_| ());
+                        return combine_loop_and_cleanup_results(
+                            Err(identity_error),
+                            cleanup_result,
+                        );
                     }
+                    *active = Some(attempt);
+                    continue;
+                }
+                Some(Some((request, Err(error)))) => {
+                    let _retired = retire_matching(scheduler, request)?;
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to spawn physical attempt {}/{}: {error}",
+                            request.problem, request.run_id
+                        ),
+                    ));
                 }
             }
-            continue;
         }
 
         match request_rx.recv_timeout(WORKER_POLL_INTERVAL) {
-            Ok(request) => process_request(&mut scheduler, active.as_ref(), request)?,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return stop_active(&mut scheduler, active.take());
+            Ok(request) => {
+                let Some(result) =
+                    control.while_running(|| process_request(scheduler, active.as_ref(), request))
+                else {
+                    return Ok(());
+                };
+                result?;
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 }
@@ -212,10 +275,18 @@ fn drain_requests(
     request_rx: &Receiver<RunRequest>,
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
+    control: &WorkerControl,
 ) -> io::Result<RequestDrain> {
     for _ in 0..MAX_RUN_REQUESTS_PER_TICK {
         match request_rx.try_recv() {
-            Ok(request) => process_request(scheduler, active, request)?,
+            Ok(request) => {
+                let Some(result) =
+                    control.while_running(|| process_request(scheduler, active, request))
+                else {
+                    return Ok(RequestDrain::Shutdown);
+                };
+                result?;
+            }
             Err(TryRecvError::Empty) => return Ok(RequestDrain::Open),
             Err(TryRecvError::Disconnected) => return Ok(RequestDrain::Disconnected),
         }
@@ -252,11 +323,11 @@ fn process_ready_completion(
     scheduler: &mut RunScheduler,
     active: &mut Option<ActiveAttempt>,
     message_tx: &Sender<Message>,
-    shutdown: &AtomicBool,
+    control: &WorkerControl,
 ) -> io::Result<bool> {
     match completion_rx.try_recv() {
         Ok(completion) => {
-            complete_attempt(completion, scheduler, active, message_tx, shutdown)?;
+            complete_attempt(completion, scheduler, active, message_tx, control)?;
             Ok(true)
         }
         Err(TryRecvError::Disconnected) => {
@@ -278,9 +349,9 @@ fn complete_attempt(
     scheduler: &mut RunScheduler,
     active: &mut Option<ActiveAttempt>,
     message_tx: &Sender<Message>,
-    shutdown: &AtomicBool,
+    control: &WorkerControl,
 ) -> io::Result<()> {
-    let physical = active.take().ok_or_else(|| {
+    let physical = active.as_ref().ok_or_else(|| {
         io::Error::other(format!(
             "completion arrived without a physical attempt: {}/{}",
             completion.problem, completion.run_id
@@ -288,12 +359,13 @@ fn complete_attempt(
     })?;
     let request = physical.request();
     validate_completion(completion, request)?;
-    ensure_identity(scheduler, &physical)?;
+    ensure_identity(scheduler, physical)?;
 
     // Join is authoritative and is the no-late-event boundary. Logical messages and the next
     // spawn are deliberately impossible before this call returns.
+    let physical = active.take().expect("active was checked above");
     let outcome = physical.join()?;
-    finish_joined_attempt(request, outcome, scheduler, message_tx, shutdown)
+    finish_joined_attempt(request, outcome, scheduler, message_tx, control)
 }
 
 fn finish_joined_attempt(
@@ -301,18 +373,14 @@ fn finish_joined_attempt(
     outcome: AttemptOutcome,
     scheduler: &mut RunScheduler,
     message_tx: &Sender<Message>,
-    shutdown: &AtomicBool,
+    control: &WorkerControl,
 ) -> io::Result<()> {
     let retired = retire_matching(scheduler, request)?;
 
-    // request_stop may race with a completion that was already queued. Join first to preserve
-    // the no-late-event boundary, then let shutdown win over every logical terminal/requeue
-    // action. Pending work is discarded when the loop exits.
-    if shutdown.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    match outcome {
+    // Shutdown and logical outcome publication are serialized by the same lifecycle gate.
+    // Whichever obtains it first is the linearization point. Once shutdown wins, no terminal
+    // message or requeue can be published and no next attempt can be spawned.
+    let Some(result) = control.while_running(|| match outcome {
         AttemptOutcome::Completed if retired.is_latest() => send_message(
             message_tx,
             Message::RunCompleted {
@@ -341,21 +409,38 @@ fn finish_joined_attempt(
             Ok(())
         }
         AttemptOutcome::Completed | AttemptOutcome::Failed(_) => Ok(()),
-    }
+    }) else {
+        return Ok(());
+    };
+    result
 }
 
-fn stop_active(scheduler: &mut RunScheduler, active: Option<ActiveAttempt>) -> io::Result<()> {
+fn cleanup_active(scheduler: &mut RunScheduler, active: Option<ActiveAttempt>) -> io::Result<()> {
     if let Some(active) = active {
-        ensure_identity(scheduler, &active)?;
+        let identity_result = ensure_identity(scheduler, &active);
         active.request_cancel();
         let request = active.request();
-        let _outcome = active.join()?;
+        let join_result = active.join().map(|_| ());
+        combine_loop_and_cleanup_results(identity_result, join_result)?;
         let _retired = retire_matching(scheduler, request)?;
     }
 
     // Foreground and pending logical requests are intentionally dropped with the scheduler.
     // Shutdown cancellation never produces RunRequeued or a terminal run message.
     Ok(())
+}
+
+fn combine_loop_and_cleanup_results(
+    run_result: io::Result<()>,
+    cleanup_result: io::Result<()>,
+) -> io::Result<()> {
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(run_error), Err(cleanup_error)) => Err(io::Error::other(format!(
+            "test worker failed: {run_error}; active attempt cleanup also failed: {cleanup_error}"
+        ))),
+    }
 }
 
 fn ensure_identity(scheduler: &RunScheduler, active: &ActiveAttempt) -> io::Result<()> {
@@ -454,6 +539,7 @@ mod tests {
         request_tx: Sender<RunRequest>,
         spawned_rx: Receiver<SpawnedAttempt>,
         message_rx: Receiver<Message>,
+        active_count: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
     }
 
@@ -522,6 +608,7 @@ mod tests {
                 request_tx,
                 spawned_rx,
                 message_rx,
+                active_count,
                 max_active,
             }
         }
@@ -538,6 +625,7 @@ mod tests {
 
         fn stop(self) {
             self.worker.stop_and_join().unwrap();
+            assert_eq!(self.active_count.load(Ordering::Acquire), 0);
         }
     }
 
@@ -624,6 +712,25 @@ mod tests {
         fake.send(0, 2);
         wait_cancel_requested(&first.cancellation);
         first.finish(Finish::Completed);
+
+        let second = fake.spawned();
+        assert_eq!(second.request, request(0, 2));
+        assert_no_logical_message(&fake.message_rx, 1);
+        second.finish(Finish::Completed);
+        messages_until(&fake.message_rx, |message| {
+            matches!(message, Message::RunCompleted { run_id: 2, .. })
+        });
+        fake.stop();
+    }
+
+    #[test]
+    fn obsolete_failure_is_silently_discarded() {
+        let fake = FakeWorker::start();
+        fake.send(0, 1);
+        let first = fake.spawned();
+        fake.send(0, 2);
+        wait_cancel_requested(&first.cancellation);
+        first.finish(Finish::Failed);
 
         let second = fake.spawned();
         assert_eq!(second.request, request(0, 2));
@@ -832,9 +939,10 @@ mod tests {
             tx.send(request(run_id as usize, run_id)).unwrap();
         }
         let mut scheduler = RunScheduler::default();
+        let control = WorkerControl::default();
 
         assert_eq!(
-            drain_requests(&rx, &mut scheduler, None).unwrap(),
+            drain_requests(&rx, &mut scheduler, None, &control).unwrap(),
             RequestDrain::Open
         );
         assert_eq!(rx.try_iter().count(), 5);
@@ -874,7 +982,11 @@ mod tests {
         request_tx.send(request(0, 1)).unwrap();
         let (spawned, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(spawned, request(0, 1));
-        request_tx.send(request(1, 2)).unwrap();
+        for problem in 1..=100 {
+            request_tx
+                .send(request(problem, problem as u64 + 1))
+                .unwrap();
+        }
         wait_cancel_requested(&cancellation);
 
         worker.request_stop();
@@ -890,6 +1002,96 @@ mod tests {
                     | Message::RunFailed { .. }
             )
         }));
+    }
+
+    #[test]
+    fn shutdown_immediately_after_requeue_completion_joins_any_started_next_attempt() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut first_release = Some(release_rx);
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let closure_active = Arc::clone(&active_count);
+        let closure_max = Arc::clone(&max_active);
+        let attempt_messages = message_tx.clone();
+        let mut first = true;
+
+        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+            let is_first = std::mem::replace(&mut first, false);
+            let release_rx = is_first.then(|| first_release.take().unwrap());
+            let spawned_tx = spawned_tx.clone();
+            let active_count = Arc::clone(&closure_active);
+            let max_active = Arc::clone(&closure_max);
+            let attempt_messages = attempt_messages.clone();
+
+            spawn_with(request, completion_tx, move |cancellation| {
+                let current = active_count.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(current, Ordering::AcqRel);
+                let _guard = ActiveCountGuard(active_count);
+                attempt_messages
+                    .send(Message::RunStarted {
+                        run_id: request.run_id,
+                        problem: request.problem,
+                    })
+                    .unwrap();
+                spawned_tx
+                    .send((request, Arc::clone(&cancellation)))
+                    .unwrap();
+
+                if let Some(release_rx) = release_rx {
+                    release_rx.recv().unwrap();
+                } else {
+                    while !cancellation.is_requested() {
+                        thread::yield_now();
+                    }
+                }
+
+                run_attempt(&cancellation, |is_cancelled| {
+                    assert!(is_cancelled());
+                    Err(AppError::from(clean_cancellation_io_error()))
+                })
+            })
+        })
+        .unwrap();
+        let request_tx = worker.sender();
+        request_tx.send(request(0, 1)).unwrap();
+        let (_, first_cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        request_tx.send(request(1, 2)).unwrap();
+        wait_cancel_requested(&first_cancellation);
+        release_tx.send(()).unwrap();
+
+        messages_until(&message_rx, |message| {
+            matches!(message, Message::RunRequeued { run_id: 1, .. })
+        });
+        worker.request_stop();
+        worker.stop_and_join().unwrap();
+
+        assert_eq!(active_count.load(Ordering::Acquire), 0);
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
+        assert!(message_rx.try_iter().all(|message| {
+            !matches!(
+                message,
+                Message::RunRequeued { .. }
+                    | Message::RunCompleted { .. }
+                    | Message::RunFailed { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn shutdown_gate_rejects_requests_spawns_and_outcomes_after_linearization() {
+        let control = WorkerControl::default();
+        let called = AtomicBool::new(false);
+
+        control.begin_shutdown();
+
+        assert!(
+            control
+                .while_running(|| called.store(true, Ordering::Release))
+                .is_none()
+        );
+        assert!(!called.load(Ordering::Acquire));
     }
 
     #[test]
@@ -929,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn attempt_spawn_failure_is_run_failure_and_scheduler_remains_usable() {
+    fn attempt_spawn_failure_stops_the_worker_without_starting_next() {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut fail_first = true;
@@ -950,19 +1152,268 @@ mod tests {
         request_tx.send(request(0, 1)).unwrap();
         assert!(matches!(
             message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Message::RunFailed { run_id: 1, error, .. }
-                if error.contains("fake spawn failure")
+            Message::WorkerFailed(error) if error.to_string().contains("fake spawn failure")
         ));
 
-        request_tx.send(request(1, 2)).unwrap();
-        assert_eq!(
-            spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            request(1, 2)
+        let _ = request_tx.send(request(1, 2));
+        assert!(spawned_rx.try_recv().is_err());
+        assert!(
+            worker
+                .stop_and_join()
+                .unwrap_err()
+                .to_string()
+                .contains("fake spawn failure")
         );
+    }
+
+    #[test]
+    fn request_channel_disconnect_is_shutdown_and_cancels_the_active_attempt() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (message_tx, message_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release_rx = Some(release_rx);
+        let control = Arc::new(WorkerControl::default());
+
+        let handle = thread::spawn({
+            let control = Arc::clone(&control);
+            move || {
+                scheduler_loop(
+                    request_rx,
+                    completion_rx,
+                    completion_tx,
+                    control,
+                    message_tx,
+                    move |request, completion_tx| {
+                        let spawned_tx = spawned_tx.clone();
+                        let finished_tx = finished_tx.clone();
+                        let release_rx = release_rx.take().unwrap();
+                        spawn_with(request, completion_tx, move |cancellation| {
+                            spawned_tx
+                                .send((request, Arc::clone(&cancellation)))
+                                .unwrap();
+                            while !cancellation.is_requested() {
+                                thread::yield_now();
+                            }
+                            release_rx.recv().unwrap();
+                            let outcome = run_attempt(&cancellation, |is_cancelled| {
+                                assert!(is_cancelled());
+                                Err(AppError::from(clean_cancellation_io_error()))
+                            });
+                            finished_tx.send(()).unwrap();
+                            outcome
+                        })
+                    },
+                )
+            }
+        });
+
+        request_tx.send(request(0, 1)).unwrap();
+        let (spawned, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(spawned, request(0, 1));
+        request_tx.send(request(1, 2)).unwrap();
+        wait_cancel_requested(&cancellation);
+        drop(request_tx);
+        release_tx.send(()).unwrap();
+
+        handle.join().unwrap().unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(message_rx.try_iter().all(|message| {
+            !matches!(
+                message,
+                Message::RunRequeued { .. }
+                    | Message::RunCompleted { .. }
+                    | Message::RunFailed { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn message_channel_disconnect_joins_attempt_and_stops_worker() {
+        let (message_tx, message_rx) = mpsc::channel();
+        drop(message_rx);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let attempt_messages = message_tx.clone();
+        let mut worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+            let attempt_messages = attempt_messages.clone();
+            let finished_tx = finished_tx.clone();
+            spawn_with(request, completion_tx, move |cancellation| {
+                let outcome = run_attempt(&cancellation, |_| {
+                    attempt_messages
+                        .send(Message::RunStarted {
+                            run_id: request.run_id,
+                            problem: request.problem,
+                        })
+                        .map_err(|_| {
+                            AppError::from(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "fake message receiver disconnected",
+                            ))
+                        })
+                });
+                finished_tx.send(()).unwrap();
+                outcome
+            })
+        })
+        .unwrap();
+        worker.sender().send(request(0, 1)).unwrap();
+
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let error = worker.join().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn scheduler_helper_panic_is_reported_and_stops_without_next_spawn() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let worker =
+            TestWorker::start_with(message_tx, |_, _| panic!("fake scheduler helper panic"))
+                .unwrap();
+        let request_tx = worker.sender();
+        request_tx.send(request(0, 1)).unwrap();
+        let _ = request_tx.send(request(1, 2));
+
         assert!(matches!(
             message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Message::RunCompleted { run_id: 2, .. }
+            Message::WorkerFailed(error)
+                if error.to_string().contains("scheduler loop panicked")
         ));
-        worker.stop_and_join().unwrap();
+        assert!(
+            worker
+                .stop_and_join()
+                .unwrap_err()
+                .to_string()
+                .contains("scheduler loop panicked")
+        );
+    }
+
+    #[test]
+    fn spawned_identity_mismatch_explicitly_cancels_and_joins_attempt() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = TestWorker::start_with(message_tx, move |_, completion_tx| {
+            let physical = request(1, 99);
+            let finished_tx = finished_tx.clone();
+            spawn_with(physical, completion_tx, move |cancellation| {
+                while !cancellation.is_requested() {
+                    thread::yield_now();
+                }
+                let outcome = run_attempt(&cancellation, |is_cancelled| {
+                    assert!(is_cancelled());
+                    Err(AppError::from(clean_cancellation_io_error()))
+                });
+                finished_tx.send(()).unwrap();
+                outcome
+            })
+        })
+        .unwrap();
+        worker.sender().send(request(0, 1)).unwrap();
+
+        assert!(matches!(
+            message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Message::WorkerFailed(error) if error.to_string().contains("identity mismatch")
+        ));
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            worker
+                .stop_and_join()
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+    }
+
+    #[test]
+    fn wrong_or_unexpected_completion_is_rejected_before_joining_outcome() {
+        let mut scheduler = RunScheduler::default();
+        scheduler.request_arrived(request(0, 1));
+        let logical = scheduler.start_next().unwrap();
+        let (completion_tx, _completion_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let physical = spawn_with(logical, completion_tx, move |cancellation| {
+            while !cancellation.is_requested() {
+                thread::yield_now();
+            }
+            let outcome = run_attempt(&cancellation, |is_cancelled| {
+                assert!(is_cancelled());
+                Err(AppError::from(clean_cancellation_io_error()))
+            });
+            finished_tx.send(()).unwrap();
+            outcome
+        })
+        .unwrap();
+        let mut active = Some(physical);
+        let (message_tx, _message_rx) = mpsc::channel();
+        let control = WorkerControl::default();
+
+        let error = complete_attempt(
+            AttemptCompletion {
+                problem: 7,
+                run_id: 8,
+            },
+            &mut scheduler,
+            &mut active,
+            &message_tx,
+            &control,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("completion identity mismatch"));
+        assert!(active.is_some());
+        cleanup_active(&mut scheduler, active.take()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut no_active = None;
+        let error = complete_attempt(
+            AttemptCompletion {
+                problem: 0,
+                run_id: 1,
+            },
+            &mut scheduler,
+            &mut no_active,
+            &message_tx,
+            &control,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("without a physical attempt"));
+    }
+
+    #[test]
+    fn disconnected_completion_receiver_is_an_error_when_active_is_present() {
+        let mut scheduler = RunScheduler::default();
+        scheduler.request_arrived(request(0, 1));
+        let logical = scheduler.start_next().unwrap();
+        let (attempt_completion_tx, _attempt_completion_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let physical = spawn_with(logical, attempt_completion_tx, move |cancellation| {
+            while !cancellation.is_requested() {
+                thread::yield_now();
+            }
+            let outcome = run_attempt(&cancellation, |is_cancelled| {
+                assert!(is_cancelled());
+                Err(AppError::from(clean_cancellation_io_error()))
+            });
+            finished_tx.send(()).unwrap();
+            outcome
+        })
+        .unwrap();
+        let mut active = Some(physical);
+        let (disconnected_tx, disconnected_rx) = mpsc::channel();
+        drop(disconnected_tx);
+        let (message_tx, _message_rx) = mpsc::channel();
+        let control = WorkerControl::default();
+
+        let error = process_ready_completion(
+            &disconnected_rx,
+            &mut scheduler,
+            &mut active,
+            &message_tx,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        cleanup_active(&mut scheduler, active.take()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 }
