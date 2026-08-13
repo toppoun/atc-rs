@@ -18,7 +18,7 @@ use app::WatchApp;
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
-const DETAIL_SCROLL_LINES: u16 = 3;
+const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Result<()> {

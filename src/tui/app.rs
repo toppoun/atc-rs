@@ -34,7 +34,7 @@ pub struct WatchApp {
     selected_problem: usize,
     selected_case: usize,
 
-    detail_scroll: u16,
+    detail_scroll: usize,
 
     next_run_id: RunId,
 }
@@ -192,11 +192,11 @@ impl WatchApp {
         }
     }
 
-    pub fn detail_scroll(&self) -> u16 {
+    pub fn detail_scroll(&self) -> usize {
         self.detail_scroll
     }
 
-    pub fn scroll_detail_up(&mut self, lines: u16) -> bool {
+    pub fn scroll_detail_up(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
 
         self.detail_scroll = self.detail_scroll.saturating_sub(lines);
@@ -204,7 +204,7 @@ impl WatchApp {
         self.detail_scroll != previous
     }
 
-    pub fn scroll_detail_down(&mut self, lines: u16) -> bool {
+    pub fn scroll_detail_down(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
 
         self.detail_scroll = self.detail_scroll.saturating_add(lines);
@@ -212,7 +212,7 @@ impl WatchApp {
         self.detail_scroll != previous
     }
 
-    pub fn clamp_detail_scroll(&mut self, max: u16) {
+    pub fn clamp_detail_scroll(&mut self, max: usize) {
         self.detail_scroll = self.detail_scroll.min(max);
     }
 
@@ -1261,8 +1261,11 @@ mod tests {
         assert!(!app.scroll_detail_up(1));
         assert_eq!(app.detail_scroll(), 0);
 
-        assert!(app.scroll_detail_down(u16::MAX));
-        assert_eq!(app.detail_scroll(), u16::MAX);
+        assert!(app.scroll_detail_down(100_000));
+        assert_eq!(app.detail_scroll(), 100_000);
+
+        assert!(app.scroll_detail_down(usize::MAX));
+        assert_eq!(app.detail_scroll(), usize::MAX);
         assert!(!app.scroll_detail_down(1));
     }
     #[test]

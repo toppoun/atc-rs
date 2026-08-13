@@ -21,7 +21,7 @@ const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderInfo {
-    pub max_detail_scroll: u16,
+    pub max_detail_scroll: usize,
     pub samples_area: Option<Rect>,
     pub detail_area: Rect,
 }
@@ -135,14 +135,15 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     }
 
     let scroll = app.detail_scroll().min(max_detail_scroll);
+    let viewport_detail_text = viewport_text(wrapped_detail_text, scroll, viewport_height);
 
-    let detail = Paragraph::new(wrapped_detail_text).scroll((scroll, 0));
+    let detail = Paragraph::new(viewport_detail_text);
 
     frame.render_widget(detail, detail_area);
 
     if max_detail_scroll > 0 {
-        let mut scrollbar_state =
-            ScrollbarState::new(usize::from(max_detail_scroll) + 1).position(usize::from(scroll));
+        let (content_length, position) = scrollbar_metrics(max_detail_scroll, scroll);
+        let mut scrollbar_state = ScrollbarState::new(content_length).position(position);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
 
@@ -274,10 +275,27 @@ fn wrap_logical_line(logical_line: &str, width: usize, lines: &mut Vec<Line<'sta
     }
 }
 
-fn max_scroll(content_height: usize, viewport_height: usize) -> u16 {
-    content_height
-        .saturating_sub(viewport_height)
-        .min(usize::from(u16::MAX)) as u16
+fn max_scroll(content_height: usize, viewport_height: usize) -> usize {
+    content_height.saturating_sub(viewport_height)
+}
+
+fn viewport_text(
+    wrapped_text: Text<'static>,
+    absolute_scroll: usize,
+    viewport_height: usize,
+) -> Text<'static> {
+    Text::from(
+        wrapped_text
+            .lines
+            .into_iter()
+            .skip(absolute_scroll)
+            .take(viewport_height)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn scrollbar_metrics(max_scroll: usize, scroll: usize) -> (usize, usize) {
+    (max_scroll.saturating_add(1), scroll.min(max_scroll))
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -528,12 +546,69 @@ mod tests {
     }
 
     #[test]
-    fn max_scroll_has_no_off_by_one_and_saturates_to_u16() {
+    fn max_scroll_has_no_off_by_one_and_is_not_truncated_to_u16() {
         assert_eq!(max_scroll(0, 0), 0);
         assert_eq!(max_scroll(3, 3), 0);
         assert_eq!(max_scroll(4, 3), 1);
         assert_eq!(max_scroll(10, 3), 7);
-        assert_eq!(max_scroll(usize::MAX, 0), u16::MAX);
+        assert_eq!(max_scroll(100_000, 30), 99_970);
+        assert_eq!(max_scroll(usize::MAX, 0), usize::MAX);
+    }
+
+    #[test]
+    fn viewport_text_extracts_top_middle_and_bottom_without_cloning_the_document() {
+        fn visual_lines(count: usize) -> Text<'static> {
+            Text::from(
+                (0..count)
+                    .map(|line| Line::from(format!("line-{line}")))
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        assert_eq!(
+            text_lines(&viewport_text(visual_lines(10), 0, 3)),
+            ["line-0", "line-1", "line-2"]
+        );
+        assert_eq!(
+            text_lines(&viewport_text(visual_lines(10), 4, 3)),
+            ["line-4", "line-5", "line-6"]
+        );
+        assert_eq!(
+            text_lines(&viewport_text(visual_lines(10), 7, 3)),
+            ["line-7", "line-8", "line-9"]
+        );
+    }
+
+    #[test]
+    fn viewport_text_handles_zero_height_and_scroll_past_the_end() {
+        let lines = Text::from(vec![Line::from("a"), Line::from("b")]);
+        assert!(text_lines(&viewport_text(lines, 0, 0)).is_empty());
+
+        let lines = Text::from(vec![Line::from("a"), Line::from("b")]);
+        assert!(text_lines(&viewport_text(lines, 10, 1)).is_empty());
+    }
+
+    #[test]
+    fn scrollbar_metrics_preserve_large_absolute_positions() {
+        assert_eq!(scrollbar_metrics(99_970, 0), (99_971, 0));
+        assert_eq!(scrollbar_metrics(99_970, 70_000), (99_971, 70_000));
+        assert_eq!(scrollbar_metrics(99_970, 100_000), (99_971, 99_970));
+        assert_eq!(
+            scrollbar_metrics(usize::MAX, usize::MAX),
+            (usize::MAX, usize::MAX)
+        );
+    }
+
+    #[test]
+    fn rendered_max_clamps_an_absolute_scroll_that_is_past_the_new_bottom() {
+        let mut app = app();
+        app.scroll_detail_down(100_000);
+
+        let info = render_info(&app, 20, 7);
+        assert!(info.max_detail_scroll < 100_000);
+
+        app.clamp_detail_scroll(info.max_detail_scroll);
+        assert_eq!(app.detail_scroll(), info.max_detail_scroll);
     }
 
     #[test]
