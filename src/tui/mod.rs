@@ -1010,6 +1010,29 @@ mod tests {
         assert_eq!(request.language, Language::Cpp);
         assert!(!request.debug);
     }
+
+    #[test]
+    fn rerun_uses_only_the_selected_problems_confirmed_source() {
+        let mut app = app_with_problems(&[1, 1]);
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        app.source_changed(1, PathBuf::from("B.py"), Language::Python);
+        assert!(app.select_problem(0));
+
+        let (run_tx, run_rx) = mpsc::channel();
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('r'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        let request = run_rx.try_recv().unwrap();
+        assert_eq!(request.problem, 0);
+        assert_eq!(request.language, Language::Cpp);
+    }
+
     #[test]
     fn rerun_key_without_source_is_no_op() {
         let mut app = app();
@@ -1026,6 +1049,65 @@ mod tests {
 
         assert!(run_rx.try_recv().is_err());
     }
+
+    #[test]
+    fn debug_and_rerun_repeat_do_not_change_state_or_queue_requests() {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        let first = run_rx.try_recv().unwrap();
+        assert!(first.debug);
+
+        assert!(
+            !handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Repeat),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(
+            !handle_key_event(
+                &mut app,
+                key(KeyCode::Char('r'), KeyEventKind::Repeat),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        assert!(app.debug_enabled());
+        assert_eq!(app.current_problem().unwrap().run.id, Some(first.run_id));
+        assert!(run_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rerun_request_channel_disconnect_is_a_fatal_error() {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let (run_tx, run_rx) = mpsc::channel();
+        drop(run_rx);
+        let mut events = VecDeque::from([Event::Key(key(KeyCode::Char('r'), KeyEventKind::Press))]);
+
+        let error =
+            handle_terminal_events(&mut app, &view::RenderInfo::default(), &mut events, &run_tx)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error.to_string(),
+            "test worker request channel disconnected"
+        );
+    }
+
     #[test]
     fn debug_toggle_reruns_cpp_with_new_debug_state() {
         let mut app = app();
@@ -1084,5 +1166,82 @@ mod tests {
 
         assert!(app.debug_enabled());
         assert!(run_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn save_debug_rerun_and_save_keep_monotonic_run_ids_and_latest_state() {
+        let mut app = app();
+        let (message_tx, message_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        message_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("A.cpp"),
+                language: Language::Cpp,
+            })
+            .unwrap();
+        assert!(handle_messages(&mut app, &message_rx, &run_tx).unwrap());
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('r'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        message_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("A.py"),
+                language: Language::Python,
+            })
+            .unwrap();
+        assert!(handle_messages(&mut app, &message_rx, &run_tx).unwrap());
+
+        let requests: Vec<_> = run_rx.try_iter().collect();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.run_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| (request.language, request.debug))
+                .collect::<Vec<_>>(),
+            [
+                (Language::Cpp, false),
+                (Language::Cpp, true),
+                (Language::Cpp, true),
+                (Language::Python, false),
+            ]
+        );
+
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.id, Some(4));
+        assert_eq!(run.phase, app::RunPhase::Queued);
+        assert_eq!(run.language, Some(Language::Python));
+        assert!(app.debug_enabled());
+
+        assert!(!app.run_failed(0, 3, "stale failure".to_string()));
+        assert_eq!(app.current_problem().unwrap().run.id, Some(4));
+        assert_eq!(
+            app.current_problem().unwrap().run.phase,
+            app::RunPhase::Queued
+        );
     }
 }
