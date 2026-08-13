@@ -10,6 +10,14 @@ use crate::attempt::{clean_cancellation_io_error, io_error_is_clean_cancellation
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionCheckpoint {
+    ChildSpawned,
+    CancelObserved,
+    ChildReaped,
+    PipeThreadsJoined,
+}
+
 #[derive(Debug)]
 pub enum ExecutionOutcome {
     Exited(ExitStatus),
@@ -117,6 +125,17 @@ pub fn execute_with_cancel(
     timeout: Duration,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ExecutionResult, io::Error> {
+    execute_with_cancel_observer(program, args, input, timeout, is_cancelled, &|_| {})
+}
+
+pub(crate) fn execute_with_cancel_observer(
+    program: &Path,
+    args: &[OsString],
+    input: &str,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+    observer: &dyn Fn(ExecutionCheckpoint),
+) -> Result<ExecutionResult, io::Error> {
     if is_cancelled() {
         return Err(clean_cancellation_io_error());
     }
@@ -141,7 +160,9 @@ pub fn execute_with_cancel(
     let input = input.as_bytes().to_vec();
     let stdin_handle = thread::spawn(move || write_input(stdin, &input));
 
-    let outcome_result = wait_for_child(&mut child, started, timeout, is_cancelled);
+    observer(ExecutionCheckpoint::ChildSpawned);
+
+    let outcome_result = wait_for_child(&mut child, started, timeout, is_cancelled, observer);
 
     let elapsed = started.elapsed();
 
@@ -150,6 +171,7 @@ pub fn execute_with_cancel(
     let stdin_result = join_worker(stdin_handle, "stdin writer");
     let stdout_result = join_worker(stdout_handle, "stdout reader");
     let stderr_result = join_worker(stderr_handle, "stderr reader");
+    observer(ExecutionCheckpoint::PipeThreadsJoined);
 
     let outcome = match outcome_result {
         Ok(outcome) => outcome,
@@ -182,10 +204,16 @@ fn wait_for_child(
     started: Instant,
     timeout: Duration,
     is_cancelled: &dyn Fn() -> bool,
+    observer: &dyn Fn(ExecutionCheckpoint),
 ) -> io::Result<ExecutionOutcome> {
     loop {
         if is_cancelled() {
-            return cancellation_result(child.terminate_and_wait());
+            observer(ExecutionCheckpoint::CancelObserved);
+            let cleanup = child.terminate_and_wait();
+            if cleanup.is_ok() {
+                observer(ExecutionCheckpoint::ChildReaped);
+            }
+            return cancellation_result(cleanup);
         }
 
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -496,6 +524,42 @@ mod tests {
         let mut input = Vec::new();
         io::stdin().read_to_end(&mut input).unwrap();
         println!("input-bytes={}", input.len());
+    }
+
+    fn write_continuously(mut stdout: bool, mut stderr: bool) {
+        let block = vec![b'x'; 64 * 1024];
+        let mut stdout_handle = io::stdout().lock();
+        let mut stderr_handle = io::stderr().lock();
+
+        loop {
+            if stdout && stdout_handle.write_all(&block).is_err() {
+                stdout = false;
+            }
+            if stderr && stderr_handle.write_all(&block).is_err() {
+                stderr = false;
+            }
+            if !stdout && !stderr {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by cancellation stress tests"]
+    fn continuous_stdout_helper() {
+        write_continuously(true, false);
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by cancellation stress tests"]
+    fn continuous_stderr_helper() {
+        write_continuously(false, true);
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by cancellation stress tests"]
+    fn continuous_stdout_stderr_helper() {
+        write_continuously(true, true);
     }
 
     #[test]

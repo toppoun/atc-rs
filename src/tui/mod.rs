@@ -1410,4 +1410,64 @@ mod tests {
             app::RunPhase::Queued
         );
     }
+
+    #[test]
+    fn rapid_save_debug_and_rerun_requests_keep_monotonic_latest_state() {
+        let mut app = app();
+        let (message_tx, message_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        for operation in 0..300 {
+            match operation % 3 {
+                0 => {
+                    message_tx
+                        .send(Message::SourceChanged {
+                            problem: 0,
+                            path: PathBuf::from("A.cpp"),
+                            language: Language::Cpp,
+                        })
+                        .unwrap();
+                    assert!(handle_messages(&mut app, &message_rx, &run_tx).unwrap());
+                }
+                1 => assert!(
+                    handle_key_event(
+                        &mut app,
+                        key(KeyCode::Char('d'), KeyEventKind::Press),
+                        &run_tx,
+                    )
+                    .unwrap()
+                ),
+                _ => assert!(
+                    handle_key_event(
+                        &mut app,
+                        key(KeyCode::Char('r'), KeyEventKind::Press),
+                        &run_tx,
+                    )
+                    .unwrap()
+                ),
+            }
+        }
+
+        let requests: Vec<_> = run_rx.try_iter().collect();
+        assert_eq!(requests.len(), 300);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.run_id)
+                .collect::<Vec<_>>(),
+            (1..=300).collect::<Vec<_>>()
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.problem == 0 && request.language == Language::Cpp })
+        );
+
+        let latest = requests.last().unwrap();
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.id, Some(latest.run_id));
+        assert_eq!(run.phase, app::RunPhase::Queued);
+        assert_eq!(run.language, Some(latest.language));
+        assert_eq!(latest.debug, app.debug_enabled());
+    }
 }

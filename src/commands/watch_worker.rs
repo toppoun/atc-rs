@@ -1416,4 +1416,214 @@ mod tests {
         cleanup_active(&mut scheduler, active.take()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
+
+    #[test]
+    fn thousand_rapid_requests_keep_one_physical_attempt_and_only_complete_latest_runs() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let allow_completion = Arc::new(AtomicBool::new(false));
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let closure_allow = Arc::clone(&allow_completion);
+        let closure_active = Arc::clone(&active_count);
+        let closure_max = Arc::clone(&max_active);
+        let attempt_messages = message_tx.clone();
+
+        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+            let spawned_tx = spawned_tx.clone();
+            let allow_completion = Arc::clone(&closure_allow);
+            let active_count = Arc::clone(&closure_active);
+            let max_active = Arc::clone(&closure_max);
+            let attempt_messages = attempt_messages.clone();
+            spawn_with(request, completion_tx, move |cancellation| {
+                let current = active_count.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(current, Ordering::AcqRel);
+                let _guard = ActiveCountGuard(active_count);
+                attempt_messages
+                    .send(Message::RunStarted {
+                        run_id: request.run_id,
+                        problem: request.problem,
+                    })
+                    .unwrap();
+                spawned_tx.send(request).unwrap();
+
+                while !cancellation.is_requested() && !allow_completion.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+
+                if cancellation.is_requested() {
+                    run_attempt(&cancellation, |is_cancelled| {
+                        assert!(is_cancelled());
+                        Err(AppError::from(clean_cancellation_io_error()))
+                    })
+                } else {
+                    run_attempt(&cancellation, |_| Ok(()))
+                }
+            })
+        })
+        .unwrap();
+        let request_tx = worker.sender();
+        request_tx.send(request(0, 1)).unwrap();
+        spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut latest = std::collections::HashMap::new();
+        for run_id in 2..=1_001 {
+            let problem = (run_id as usize) % 3;
+            let request = RunRequest {
+                run_id,
+                problem,
+                language: if run_id % 5 == 0 {
+                    Language::Python
+                } else {
+                    Language::Cpp
+                },
+                debug: run_id % 2 == 0 && run_id % 5 != 0,
+            };
+            latest.insert(problem, request);
+            request_tx.send(request).unwrap();
+        }
+        let sentinel = RunRequest {
+            run_id: 1_002,
+            problem: 3,
+            language: Language::Cpp,
+            debug: true,
+        };
+        latest.insert(sentinel.problem, sentinel);
+        request_tx.send(sentinel).unwrap();
+
+        loop {
+            let spawned = spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if spawned == sentinel {
+                break;
+            }
+        }
+        allow_completion.store(true, Ordering::Release);
+
+        let expected: std::collections::HashSet<_> =
+            latest.values().map(|request| request.run_id).collect();
+        let mut completed = std::collections::HashSet::new();
+        while completed.len() < expected.len() {
+            match message_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Message::RunCompleted { run_id, .. } => {
+                    assert!(expected.contains(&run_id));
+                    assert!(completed.insert(run_id));
+                }
+                Message::RunFailed { run_id, error, .. } => {
+                    panic!("unexpected failure for {run_id}: {error}")
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(completed, expected);
+        worker.stop_and_join().unwrap();
+        assert_eq!(active_count.load(Ordering::Acquire), 0);
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn repeated_preemption_outcomes_and_worker_lifecycles_do_not_leak_attempts() {
+        for iteration in 0..30 {
+            let fake = FakeWorker::start();
+            let a_run = iteration * 10 + 1;
+            let b_run = iteration * 10 + 2;
+            fake.send(0, a_run);
+            let a = fake.spawned();
+            fake.send(1, b_run);
+            wait_cancel_requested(&a.cancellation);
+
+            match iteration % 3 {
+                0 => {
+                    a.finish(Finish::Cancelled);
+                    let b = fake.spawned();
+                    assert_eq!(b.request, request(1, b_run));
+                    b.finish(Finish::Completed);
+                    let a_again = fake.spawned();
+                    assert_eq!(a_again.request, request(0, a_run));
+                    a_again.finish(Finish::Completed);
+                    messages_until(
+                        &fake.message_rx,
+                        |message| matches!(message, Message::RunCompleted { run_id, .. } if *run_id == a_run),
+                    );
+                }
+                1 => {
+                    a.finish(Finish::Completed);
+                    let b = fake.spawned();
+                    b.finish(Finish::Completed);
+                    messages_until(
+                        &fake.message_rx,
+                        |message| matches!(message, Message::RunCompleted { run_id, .. } if *run_id == b_run),
+                    );
+                }
+                _ => {
+                    a.finish(Finish::Failed);
+                    let b = fake.spawned();
+                    b.finish(Finish::Completed);
+                    messages_until(
+                        &fake.message_rx,
+                        |message| matches!(message, Message::RunCompleted { run_id, .. } if *run_id == b_run),
+                    );
+                }
+            }
+
+            assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
+            fake.stop();
+        }
+    }
+
+    #[test]
+    fn repeated_shutdown_during_preemption_never_starts_pending_work() {
+        for iteration in 0..30 {
+            let (message_tx, message_rx) = mpsc::channel();
+            let (spawned_tx, spawned_rx) = mpsc::channel();
+            let active_count = Arc::new(AtomicUsize::new(0));
+            let release_cancelled_attempt = Arc::new(AtomicBool::new(false));
+            let closure_active = Arc::clone(&active_count);
+            let closure_release = Arc::clone(&release_cancelled_attempt);
+            let mut worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+                let spawned_tx = spawned_tx.clone();
+                let active_count = Arc::clone(&closure_active);
+                let release_cancelled_attempt = Arc::clone(&closure_release);
+                spawn_with(request, completion_tx, move |cancellation| {
+                    active_count.fetch_add(1, Ordering::AcqRel);
+                    let _guard = ActiveCountGuard(active_count);
+                    spawned_tx
+                        .send((request, Arc::clone(&cancellation)))
+                        .unwrap();
+                    while !cancellation.is_requested() {
+                        thread::yield_now();
+                    }
+                    while !release_cancelled_attempt.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    run_attempt(&cancellation, |is_cancelled| {
+                        assert!(is_cancelled());
+                        Err(AppError::from(clean_cancellation_io_error()))
+                    })
+                })
+            })
+            .unwrap();
+            let request_tx = worker.sender();
+            request_tx.send(request(0, iteration * 10 + 1)).unwrap();
+            let (_, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            request_tx.send(request(1, iteration * 10 + 2)).unwrap();
+            request_tx.send(request(2, iteration * 10 + 3)).unwrap();
+            wait_cancel_requested(&cancellation);
+
+            worker.request_stop();
+            release_cancelled_attempt.store(true, Ordering::Release);
+            worker.join().unwrap();
+
+            assert_eq!(active_count.load(Ordering::Acquire), 0);
+            assert!(spawned_rx.try_recv().is_err());
+            assert!(message_rx.try_iter().all(|message| {
+                !matches!(
+                    message,
+                    Message::RunRequeued { .. }
+                        | Message::RunCompleted { .. }
+                        | Message::RunFailed { .. }
+                )
+            }));
+        }
+    }
 }

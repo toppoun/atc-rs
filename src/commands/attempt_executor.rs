@@ -207,9 +207,12 @@ mod tests {
     use super::*;
     use crate::attempt::{clean_cancellation_io_error, io_error_is_clean_cancellation};
     use crate::language::Language;
+    use crate::runner::{self, ExecutionCheckpoint};
     use crate::tui::message::TestEvent;
     use crate::ui::{Event, Reporter};
-    use std::sync::mpsc;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     fn request() -> RunRequest {
         RunRequest {
@@ -462,5 +465,118 @@ mod tests {
 
         assert_send::<ActiveAttempt>();
         assert_send::<AttemptCompletion>();
+    }
+
+    #[derive(Debug)]
+    struct CancelMeasurement {
+        observe: Duration,
+        reap: Duration,
+        readers: Duration,
+        join: Duration,
+    }
+
+    fn runner_helper_args(name: &str) -> Vec<OsString> {
+        vec![
+            OsString::from("--exact"),
+            OsString::from(format!("runner::tests::{name}")),
+            OsString::from("--ignored"),
+            OsString::from("--nocapture"),
+        ]
+    }
+
+    fn cancel_continuous_output_attempt(
+        helper: &'static str,
+        output_time: Duration,
+    ) -> CancelMeasurement {
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let attempt_checkpoints = Arc::clone(&checkpoints);
+
+        let active = spawn_with(request(), completion_tx, move |cancellation| {
+            run_attempt(&cancellation, |is_cancelled| {
+                runner::execute_with_cancel_observer(
+                    &std::env::current_exe().unwrap(),
+                    &runner_helper_args(helper),
+                    "",
+                    Duration::from_secs(30),
+                    is_cancelled,
+                    &|checkpoint| {
+                        attempt_checkpoints
+                            .lock()
+                            .unwrap()
+                            .push((checkpoint, Instant::now()));
+                        if checkpoint == ExecutionCheckpoint::ChildSpawned {
+                            let _ = spawned_tx.send(());
+                        }
+                    },
+                )
+                .map(|_| ())
+                .map_err(AppError::from)
+            })
+        })
+        .unwrap();
+
+        spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(output_time);
+        let cancel_requested = Instant::now();
+        active.request_cancel();
+        completion_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let outcome = active.join().unwrap();
+        let joined = Instant::now();
+        assert!(matches!(outcome, AttemptOutcome::Cancelled));
+
+        let checkpoints = checkpoints.lock().unwrap();
+        let at = |target| {
+            checkpoints
+                .iter()
+                .find_map(|(checkpoint, at)| (*checkpoint == target).then_some(*at))
+                .unwrap()
+        };
+        let observed = at(ExecutionCheckpoint::CancelObserved);
+        let reaped = at(ExecutionCheckpoint::ChildReaped);
+        let readers = at(ExecutionCheckpoint::PipeThreadsJoined);
+        assert!(cancel_requested <= observed);
+        assert!(observed <= reaped);
+        assert!(reaped <= readers);
+        assert!(readers <= joined);
+
+        CancelMeasurement {
+            observe: observed.duration_since(cancel_requested),
+            reap: reaped.duration_since(cancel_requested),
+            readers: readers.duration_since(cancel_requested),
+            join: joined.duration_since(cancel_requested),
+        }
+    }
+
+    #[test]
+    fn continuous_stdout_and_stderr_cancel_and_join_without_hanging() {
+        for helper in [
+            "continuous_stdout_helper",
+            "continuous_stderr_helper",
+            "continuous_stdout_stderr_helper",
+        ] {
+            let measurement = cancel_continuous_output_attempt(helper, Duration::from_millis(20));
+            assert!(measurement.join < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual cancellation latency measurement"]
+    fn measure_continuous_output_cancel_to_attempt_join() {
+        for helper in [
+            "continuous_stdout_helper",
+            "continuous_stderr_helper",
+            "continuous_stdout_stderr_helper",
+        ] {
+            for iteration in 1..=5 {
+                let measurement =
+                    cancel_continuous_output_attempt(helper, Duration::from_millis(50));
+                eprintln!(
+                    "{helper} #{iteration}: observe={:?}, reap={:?}, readers={:?}, join={:?}",
+                    measurement.observe, measurement.reap, measurement.readers, measurement.join
+                );
+            }
+        }
     }
 }
