@@ -120,7 +120,7 @@ impl Drop for ActiveAttempt {
     }
 }
 
-fn spawn_with(
+pub(super) fn spawn_with(
     request: RunRequest,
     completion_tx: Sender<AttemptCompletion>,
     run: impl FnOnce(Arc<AttemptCancellation>) -> AttemptOutcome + Send + 'static,
@@ -135,13 +135,20 @@ fn spawn_with(
     let handle = thread::Builder::new()
         .name(format!("atc-watch-attempt-{}", request.run_id))
         .spawn(move || {
-            let outcome = run(thread_cancellation);
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(thread_cancellation)));
 
             // The notification only says that an outcome is ready. JoinHandle remains the
             // authoritative owner of that outcome and joining establishes the no-late-event
-            // boundary. A disconnected receiver must not make the attempt panic.
+            // boundary. It is sent for panics too, so the scheduler can always follow the same
+            // completion -> identity check -> join ordering. A disconnected receiver must not
+            // replace the attempt's outcome or panic payload.
             let _ = completion_tx.send(completion);
-            outcome
+
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         })?;
 
     Ok(ActiveAttempt {
@@ -422,8 +429,10 @@ mod tests {
 
     #[test]
     fn thread_panic_is_reported_by_join_instead_of_completed() {
-        let (completion_tx, _completion_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
         let active = spawn_with(request(), completion_tx, |_| panic!("attempt panic")).unwrap();
+
+        assert_eq!(completion_rx.recv().unwrap().run_id, request().run_id);
 
         let error = active.join().unwrap_err();
 

@@ -82,7 +82,6 @@ pub enum Message {
 
     // The sender must emit this only after the old physical attempt has stopped sending events
     // and its thread has been joined. The same logical run_id is then safe to start again.
-    #[allow(dead_code)] // S3 adds the receiving contract; the production sender is added in S4.
     RunRequeued {
         run_id: RunId,
         problem: usize,

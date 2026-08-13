@@ -27,6 +27,16 @@ pub(super) struct RetiredActive {
     requeue_eligible: bool,
 }
 
+impl RetiredActive {
+    pub(super) fn request(&self) -> RunRequest {
+        self.request
+    }
+
+    pub(super) fn is_latest(&self) -> bool {
+        self.requeue_eligible
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RunScheduler {
     active: Option<ActiveRequest>,
@@ -36,6 +46,10 @@ pub(super) struct RunScheduler {
 }
 
 impl RunScheduler {
+    pub(super) fn active_request(&self) -> Option<RunRequest> {
+        self.active.as_ref().map(|active| active.request)
+    }
+
     pub(super) fn request_arrived(&mut self, request: RunRequest) -> RequestArrival {
         if self
             .latest_seen
