@@ -1,3 +1,7 @@
+// S4-Aでphysical attempt実行機構だけを実装する。
+// production worker/schedulerへの接続はS4-Bで行う。
+#[cfg_attr(not(test), allow(dead_code))]
+mod attempt_executor;
 mod create;
 mod new;
 mod refresh;
