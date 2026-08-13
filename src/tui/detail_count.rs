@@ -297,6 +297,24 @@ mod tests {
     }
 
     #[test]
+    fn giant_single_line_background_count_matches_the_eager_reference() {
+        let raw =
+            Arc::new("word 日本語 e\u{301} 👩‍💻 \u{200b} abcdefghijklmnopqrstuvwxyz ".repeat(4_000));
+        let owners = Arc::strong_count(&raw);
+        let request = request(&raw, 1, 24);
+        let layout_width = request.identity.layout_width;
+        let reference_height =
+            wrap_detail_document(&request.snapshot, u16::try_from(layout_width).unwrap()).height();
+
+        assert_eq!(request.identity.chunk_count, 1);
+        assert!(request.snapshot.shares_buffer(&raw));
+        let result = count_request(request, &mut || false).unwrap();
+
+        assert_eq!(result.chunk_visual_lines, [reference_height]);
+        assert_eq!(Arc::strong_count(&raw), owners);
+    }
+
+    #[test]
     fn waiting_requests_are_latest_wins() {
         let raw = Arc::new("line\n".repeat(3_000));
         let (request_tx, request_rx) = mpsc::channel();
