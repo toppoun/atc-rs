@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::mpsc::Sender;
 
 use crate::ui::{Event, Reporter};
@@ -8,6 +9,7 @@ pub struct ChannelReporter {
     run_id: RunId,
     problem: usize,
     tx: Sender<Message>,
+    send_error: Option<io::Error>,
 }
 
 impl ChannelReporter {
@@ -16,15 +18,37 @@ impl ChannelReporter {
             run_id,
             problem,
             tx,
+            send_error: None,
         }
     }
 
-    fn send(&self, event: TestEvent) {
-        let _ = self.tx.send(Message::RunEvent {
-            run_id: self.run_id,
-            problem: self.problem,
-            event,
-        });
+    fn send(&mut self, event: TestEvent) {
+        if self.send_error.is_some() {
+            return;
+        }
+
+        if self
+            .tx
+            .send(Message::RunEvent {
+                run_id: self.run_id,
+                problem: self.problem,
+                event,
+            })
+            .is_err()
+        {
+            self.send_error = Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI message receiver disconnected",
+            ));
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        match self.send_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -110,6 +134,8 @@ impl Reporter for ChannelReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
+    use crate::error::AppError;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -267,6 +293,25 @@ mod tests {
                 event: TestEvent::CompileTimedOut { elapsed },
                 ..
             } if elapsed == Duration::from_secs(3)
+        ));
+    }
+
+    #[test]
+    fn disconnected_channel_can_be_normalized_as_an_attempt_failure() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let mut reporter = ChannelReporter::new(1, 0, tx);
+        let cancellation = AttemptCancellation::new();
+
+        let outcome = run_attempt(&cancellation, |_| {
+            reporter.report(Event::NoSamples { problem_index: "A" });
+            reporter.finish().map_err(AppError::from)
+        });
+
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::Failed(AppError::Io(ref error))
+                if error.kind() == io::ErrorKind::BrokenPipe
         ));
     }
 }

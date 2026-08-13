@@ -2,6 +2,10 @@ use clap::Parser;
 use std::process::ExitCode;
 
 mod atcoder;
+// S2でphysical attemptのcancel/outcome境界だけを実装する。
+// production workerへの接続は後続段階で行う。
+#[cfg_attr(not(test), allow(dead_code))]
+mod attempt;
 mod cli;
 mod commands;
 mod comparator;

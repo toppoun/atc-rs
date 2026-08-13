@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitStatus};
 
+use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
 use crate::ui::NullReporter;
 
 fn fixture_root() -> PathBuf {
@@ -622,14 +623,17 @@ fn recoverable_case_results_do_not_stop_later_samples() {
     ]);
     let mut reporter = RecordingReporter::default();
 
-    run_test_cases(
-        "A",
-        &samples,
-        |_| Ok(results.pop_front().unwrap()),
-        &mut reporter,
-    )
-    .unwrap();
+    let cancellation = AttemptCancellation::new();
+    let outcome = run_attempt(&cancellation, |_| {
+        run_test_cases(
+            "A",
+            &samples,
+            |_| Ok(results.pop_front().unwrap()),
+            &mut reporter,
+        )
+    });
 
+    assert!(matches!(outcome, AttemptOutcome::Completed));
     assert!(results.is_empty());
     assert_eq!(
         reporter.events,

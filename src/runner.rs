@@ -6,6 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+use crate::attempt::{clean_cancellation_io_error, io_error_is_clean_cancellation};
+
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
@@ -116,10 +118,7 @@ pub fn execute_with_cancel(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ExecutionResult, io::Error> {
     if is_cancelled() {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "process execution cancelled",
-        ));
+        return Err(clean_cancellation_io_error());
     }
 
     let child = Command::new(program)
@@ -152,7 +151,18 @@ pub fn execute_with_cancel(
     let stdout_result = join_worker(stdout_handle, "stdout reader");
     let stderr_result = join_worker(stderr_handle, "stderr reader");
 
-    let outcome = outcome_result?;
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(error) if io_error_is_clean_cancellation(&error) => {
+            // clean cancellationはpipe threadも正常にjoinできた場合だけ返す。
+            // reader/writer側の失敗をCancelledとして握りつぶさない。
+            stdin_result?;
+            stdout_result?;
+            stderr_result?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
 
     stdin_result?;
 
@@ -175,12 +185,7 @@ fn wait_for_child(
 ) -> io::Result<ExecutionOutcome> {
     loop {
         if is_cancelled() {
-            let cleanup = child.terminate_and_wait();
-
-            let cancelled =
-                io::Error::new(io::ErrorKind::Interrupted, "process execution cancelled");
-
-            return Err(with_cleanup_error(cancelled, cleanup.err()));
+            return cancellation_result(child.terminate_and_wait());
         }
 
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -206,6 +211,16 @@ fn wait_for_child(
                 return Err(with_cleanup_error(error, cleanup.err()));
             }
         }
+    }
+}
+
+fn cancellation_result(cleanup: io::Result<()>) -> io::Result<ExecutionOutcome> {
+    match cleanup {
+        Ok(()) => Err(clean_cancellation_io_error()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("process cancellation cleanup failed: {error}"),
+        )),
     }
 }
 
@@ -321,6 +336,8 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
+    use crate::error::AppError;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -525,6 +542,7 @@ mod tests {
         trigger.join().unwrap();
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(io_error_is_clean_cancellation(&error));
 
         assert!(started.elapsed() < Duration::from_secs(5));
 
@@ -557,5 +575,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(io_error_is_clean_cancellation(&error));
+    }
+
+    #[test]
+    fn cancellation_cleanup_failure_is_not_a_clean_cancellation() {
+        let cancellation = AttemptCancellation::new();
+        cancellation.request();
+
+        let outcome = run_attempt(&cancellation, |is_cancelled| {
+            assert!(is_cancelled());
+            cancellation_result(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cannot reap child",
+            )))
+            .map(|_| ())
+            .map_err(AppError::from)
+        });
+
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::Failed(AppError::Io(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && error.to_string().contains("cannot reap child")
+                    && !io_error_is_clean_cancellation(error)
+        ));
     }
 }
