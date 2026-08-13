@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::message::{RunId, RunRequest, TestEvent};
@@ -66,9 +67,9 @@ pub enum CaseVerdict {
 pub struct CaseState {
     pub verdict: CaseVerdict,
     pub elapsed: Option<Duration>,
-    pub expected: Option<String>,
-    pub actual: Option<String>,
-    pub stderr: Option<String>,
+    pub expected: Option<Arc<String>>,
+    pub actual: Option<Arc<String>>,
+    pub stderr: Option<Arc<String>>,
 }
 
 impl Default for CaseState {
@@ -92,7 +93,7 @@ pub struct RunState {
 
     pub accepted: usize,
     pub total_cases: usize,
-    pub error: Option<String>,
+    pub error: Option<Arc<String>>,
     pub cases: Vec<CaseState>,
 }
 
@@ -448,7 +449,7 @@ impl WatchApp {
 
             TestEvent::CompileFailed { stderr } if run.phase == RunPhase::Compiling => {
                 run.phase = RunPhase::CompileError;
-                run.error = Some(stderr);
+                run.error = Some(Arc::new(stderr));
                 true
             }
 
@@ -516,8 +517,8 @@ impl WatchApp {
 
                 case.verdict = CaseVerdict::WrongAnswer;
                 case.elapsed = Some(elapsed);
-                case.expected = Some(expected);
-                case.actual = Some(actual);
+                case.expected = Some(Arc::new(expected));
+                case.actual = Some(Arc::new(actual));
 
                 true
             }
@@ -568,7 +569,7 @@ impl WatchApp {
                     return false;
                 }
 
-                case.stderr = Some(stderr);
+                case.stderr = Some(Arc::new(stderr));
 
                 true
             }
@@ -632,7 +633,7 @@ impl WatchApp {
         }
 
         run.phase = RunPhase::Failed;
-        run.error = Some(error);
+        run.error = Some(Arc::new(error));
 
         if affects_current_detail {
             self.invalidate_detail();
@@ -997,7 +998,10 @@ mod tests {
 
         assert_eq!(run.phase, RunPhase::CompileError);
 
-        assert_eq!(run.error.as_deref(), Some("compile error"));
+        assert_eq!(
+            run.error.as_ref().map(|text| text.as_str()),
+            Some("compile error")
+        );
     }
 
     #[test]
@@ -1040,7 +1044,10 @@ mod tests {
 
         let run = &app.current_problem().unwrap().run;
         assert_eq!(run.phase, RunPhase::Failed);
-        assert_eq!(run.error.as_deref(), Some("runner failed"));
+        assert_eq!(
+            run.error.as_ref().map(|text| text.as_str()),
+            Some("runner failed")
+        );
     }
 
     #[test]
@@ -1104,9 +1111,102 @@ mod tests {
 
         assert_eq!(case.verdict, CaseVerdict::WrongAnswer);
         assert_eq!(case.elapsed, Some(Duration::from_millis(6)));
-        assert_eq!(case.expected.as_deref(), Some("Yes\n"));
-        assert_eq!(case.actual.as_deref(), Some("No\n"));
-        assert_eq!(case.stderr.as_deref(), Some("debug: answer = No\n"));
+        assert_eq!(
+            case.expected.as_ref().map(|text| text.as_str()),
+            Some("Yes\n")
+        );
+        assert_eq!(case.actual.as_ref().map(|text| text.as_str()), Some("No\n"));
+        assert_eq!(
+            case.stderr.as_ref().map(|text| text.as_str()),
+            Some("debug: answer = No\n")
+        );
+    }
+
+    #[test]
+    fn event_strings_move_into_shared_raw_state_without_copying_their_buffers() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+
+        let expected = "expected ".repeat(10_000);
+        let actual = "actual ".repeat(10_000);
+        let stderr = "stderr ".repeat(10_000);
+        let expected_ptr = expected.as_ptr();
+        let actual_ptr = actual.as_ptr();
+        let stderr_ptr = stderr.as_ptr();
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                expected,
+                actual,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseStderr { number: 1, stderr },
+        ));
+
+        let case = &app.current_problem().unwrap().run.cases[0];
+        let expected: &Arc<String> = case.expected.as_ref().unwrap();
+        let actual: &Arc<String> = case.actual.as_ref().unwrap();
+        let stderr: &Arc<String> = case.stderr.as_ref().unwrap();
+        assert_eq!(expected.as_ptr(), expected_ptr);
+        assert_eq!(actual.as_ptr(), actual_ptr);
+        assert_eq!(stderr.as_ptr(), stderr_ptr);
+
+        let mut compile_app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        compile_app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let compile = compile_app.queue_run(0).unwrap();
+        assert!(compile_app.run_started(0, compile.run_id));
+        let compiler_output = "compiler output ".repeat(10_000);
+        let compiler_output_ptr = compiler_output.as_ptr();
+        assert!(compile_app.run_event(
+            0,
+            compile.run_id,
+            TestEvent::CompileFailed {
+                stderr: compiler_output,
+            },
+        ));
+        assert_eq!(
+            compile_app
+                .current_problem()
+                .unwrap()
+                .run
+                .error
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            compiler_output_ptr
+        );
+
+        let mut failed_app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        failed_app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let failed = failed_app.queue_run(0).unwrap();
+        let error = "run error ".repeat(10_000);
+        let error_ptr = error.as_ptr();
+        assert!(failed_app.run_failed(0, failed.run_id, error));
+        assert_eq!(
+            failed_app
+                .current_problem()
+                .unwrap()
+                .run
+                .error
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            error_ptr
+        );
     }
 
     #[test]
@@ -1150,7 +1250,10 @@ mod tests {
 
         let case = &app.current_problem().unwrap().run.cases[0];
         assert_eq!(case.verdict, CaseVerdict::Accepted);
-        assert_eq!(case.stderr.as_deref(), Some("debug first\n"));
+        assert_eq!(
+            case.stderr.as_ref().map(|text| text.as_str()),
+            Some("debug first\n")
+        );
         assert!(case.expected.is_none());
         assert!(case.actual.is_none());
     }

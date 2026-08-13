@@ -5,7 +5,7 @@ use ratatui::text::{Line, Text};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::detail::DetailDocument;
+use super::detail::DetailTextSource;
 
 const DETAIL_CHUNK_LINES: usize = 256;
 const MATERIALIZED_CHUNK_CACHE_SIZE: usize = 3;
@@ -67,7 +67,7 @@ pub(super) struct DetailViewport {
 impl DetailLayout {
     pub(super) fn viewport(
         &mut self,
-        document: &DetailDocument<'_>,
+        document: &impl DetailTextSource,
         revision: u64,
         detail_width: u16,
         viewport_height: usize,
@@ -83,10 +83,9 @@ impl DetailLayout {
         }
     }
 
-    fn prepare(&mut self, document: &DetailDocument<'_>, revision: u64, detail_width: u16) {
-        let segment_lengths = document
-            .segments()
-            .map(|segment| segment.text().len())
+    fn prepare(&mut self, document: &impl DetailTextSource, revision: u64, detail_width: u16) {
+        let segment_lengths = (0..document.segment_count())
+            .map(|index| document.segment_text(index).map_or(0, str::len))
             .collect::<Vec<_>>();
 
         if self.revision == Some(revision)
@@ -141,7 +140,7 @@ impl DetailLayout {
 
     fn lazy_viewport(
         &mut self,
-        document: &DetailDocument<'_>,
+        document: &impl DetailTextSource,
         viewport_height: usize,
         requested_scroll: usize,
     ) -> DetailViewport {
@@ -187,7 +186,7 @@ impl DetailLayout {
 
     fn materialize_viewport(
         &mut self,
-        document: &DetailDocument<'_>,
+        document: &impl DetailTextSource,
         absolute_scroll: usize,
         viewport_height: usize,
     ) -> Vec<Line<'static>> {
@@ -223,7 +222,7 @@ impl DetailLayout {
 
     fn locate_visual_offset(
         &mut self,
-        document: &DetailDocument<'_>,
+        document: &impl DetailTextSource,
         visual_offset: usize,
     ) -> Option<(usize, usize)> {
         let mut prefix = 0usize;
@@ -247,7 +246,7 @@ impl DetailLayout {
         None
     }
 
-    fn ensure_chunk_materialized(&mut self, document: &DetailDocument<'_>, chunk_index: usize) {
+    fn ensure_chunk_materialized(&mut self, document: &impl DetailTextSource, chunk_index: usize) {
         if let Some(position) = self
             .materialized_chunks
             .iter()
@@ -320,7 +319,7 @@ impl DetailLayout {
 }
 
 fn eager_viewport(
-    document: &DetailDocument<'_>,
+    document: &impl DetailTextSource,
     detail_width: u16,
     viewport_height: usize,
     requested_scroll: usize,
@@ -342,15 +341,18 @@ fn eager_viewport(
     }
 }
 
-fn build_logical_line_index(document: &DetailDocument<'_>) -> Vec<LogicalLine> {
+fn build_logical_line_index(document: &impl DetailTextSource) -> Vec<LogicalLine> {
     let mut logical_lines = Vec::new();
     let mut start = SegmentCursor {
         segment: 0,
         offset: 0,
     };
 
-    for (segment_index, segment) in document.segments().enumerate() {
-        for (newline, _) in segment.text().match_indices('\n') {
+    for segment_index in 0..document.segment_count() {
+        let text = document
+            .segment_text(segment_index)
+            .expect("detail segment index must exist");
+        for (newline, _) in text.match_indices('\n') {
             logical_lines.push(LogicalLine {
                 start,
                 end: SegmentCursor {
@@ -376,10 +378,10 @@ fn build_logical_line_index(document: &DetailDocument<'_>) -> Vec<LogicalLine> {
     logical_lines
 }
 
-fn logical_line_fragments<'a>(
-    document: &'a DetailDocument<'_>,
+fn logical_line_fragments(
+    document: &impl DetailTextSource,
     logical_line: LogicalLine,
-) -> Vec<&'a str> {
+) -> Vec<&str> {
     let segment_count = document.segment_count();
     if logical_line.start.segment >= segment_count {
         return Vec::new();
@@ -422,13 +424,15 @@ fn logical_line_fragments<'a>(
     fragments
 }
 
-pub(super) fn wrap_detail_document(document: &DetailDocument<'_>, width: u16) -> Text<'static> {
+pub(super) fn wrap_detail_document(document: &impl DetailTextSource, width: u16) -> Text<'static> {
     let width = usize::from(width);
     let mut lines = Vec::new();
     let mut logical_line_fragments = Vec::new();
 
-    for segment in document.segments() {
-        let text = segment.text();
+    for segment_index in 0..document.segment_count() {
+        let text = document
+            .segment_text(segment_index)
+            .expect("detail segment index must exist");
         let mut start = 0;
 
         for (newline, _) in text.match_indices('\n') {
@@ -550,6 +554,7 @@ pub(super) fn viewport_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::detail::DetailDocument;
 
     fn make_document<'a>(segments: &'a [&'a str]) -> DetailDocument<'a> {
         DetailDocument::from_borrowed_segments(segments)
@@ -775,5 +780,41 @@ mod tests {
 
         assert_eq!(text_lines(&viewport.text), text_lines(&reference)[..40]);
         assert_eq!(layout.known_chunk_count(), 1);
+    }
+
+    #[test]
+    fn document_and_owned_snapshot_use_the_same_index_and_wrap_engine() {
+        let raw = "日本語 e\u{301} 👩‍💻 long-token-abcdefghijklmnop\n".repeat(3_000);
+        let segments = ["prefix", "\n", raw.as_str(), "trailing\n\n"];
+        let document = make_document(&segments);
+        let snapshot = document.snapshot();
+
+        assert_eq!(
+            indexed_logical_lines(&document),
+            build_logical_line_index(&snapshot)
+                .into_iter()
+                .map(|line| logical_line_fragments(&snapshot, line).concat())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            text_lines(&wrap_detail_document(&document, 17)),
+            text_lines(&wrap_detail_document(&snapshot, 17))
+        );
+
+        let mut document_layout = DetailLayout::default();
+        let mut snapshot_layout = DetailLayout::default();
+        for scroll in [0, 250, 2_000] {
+            let document_view = document_layout.viewport(&document, 1, 18, 30, scroll);
+            let snapshot_view = snapshot_layout.viewport(&snapshot, 1, 18, 30, scroll);
+            assert_eq!(
+                text_lines(&document_view.text),
+                text_lines(&snapshot_view.text)
+            );
+            assert_eq!(document_view.max_scroll, snapshot_view.max_scroll);
+            assert_eq!(
+                document_view.effective_scroll,
+                snapshot_view.effective_scroll
+            );
+        }
     }
 }

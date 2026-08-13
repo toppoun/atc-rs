@@ -1,16 +1,77 @@
-use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
 
 #[derive(Debug)]
 pub(super) struct DetailSegment<'a> {
-    text: Cow<'a, str>,
+    text: DetailSegmentText<'a>,
+}
+
+#[derive(Debug)]
+enum DetailSegmentText<'a> {
+    Static(&'static str),
+    Owned(String),
+    Shared(&'a Arc<String>),
+    #[cfg(test)]
+    SharedOwned(Arc<String>),
+}
+
+impl DetailSegmentText<'_> {
+    fn text(&self) -> &str {
+        match self {
+            Self::Static(text) => text,
+            Self::Owned(text) => text,
+            Self::Shared(text) => text.as_str(),
+            #[cfg(test)]
+            Self::SharedOwned(text) => text.as_str(),
+        }
+    }
 }
 
 impl DetailSegment<'_> {
     pub(super) fn text(&self) -> &str {
-        &self.text
+        self.text.text()
+    }
+}
+
+pub(super) trait DetailTextSource {
+    fn segment_count(&self) -> usize;
+    fn segment_text(&self, index: usize) -> Option<&str>;
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum DetailSnapshotSegment {
+    Static(&'static str),
+    Owned(String),
+    Shared(Arc<String>),
+}
+
+impl DetailSnapshotSegment {
+    #[allow(dead_code)]
+    fn text(&self) -> &str {
+        match self {
+            Self::Static(text) => text,
+            Self::Owned(text) => text.as_str(),
+            Self::Shared(text) => text.as_str(),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(super) struct DetailSnapshot {
+    segments: Vec<DetailSnapshotSegment>,
+}
+
+impl DetailTextSource for DetailSnapshot {
+    fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn segment_text(&self, index: usize) -> Option<&str> {
+        self.segments.get(index).map(DetailSnapshotSegment::text)
     }
 }
 
@@ -33,16 +94,30 @@ impl<'a> DetailDocument<'a> {
         document
     }
 
+    #[cfg(test)]
     pub(super) fn segments(&self) -> impl Iterator<Item = &DetailSegment<'a>> {
         self.segments.iter()
     }
 
-    pub(super) fn segment_text(&self, index: usize) -> Option<&str> {
-        self.segments.get(index).map(DetailSegment::text)
-    }
-
-    pub(super) fn segment_count(&self) -> usize {
-        self.segments.len()
+    #[allow(dead_code)]
+    pub(super) fn snapshot(&self) -> DetailSnapshot {
+        DetailSnapshot {
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| match &segment.text {
+                    DetailSegmentText::Static(text) => DetailSnapshotSegment::Static(text),
+                    DetailSegmentText::Owned(text) => DetailSnapshotSegment::Owned(text.clone()),
+                    DetailSegmentText::Shared(text) => {
+                        DetailSnapshotSegment::Shared(Arc::clone(text))
+                    }
+                    #[cfg(test)]
+                    DetailSegmentText::SharedOwned(text) => {
+                        DetailSnapshotSegment::Shared(Arc::clone(text))
+                    }
+                })
+                .collect(),
+        }
     }
 
     fn push_problem_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
@@ -64,8 +139,8 @@ impl<'a> DetailDocument<'a> {
             RunPhase::CompileError => {
                 self.push_static("Compile Error");
 
-                if let Some(error) = run.error.as_deref() {
-                    self.push_section("compiler output", error);
+                if let Some(error) = run.error.as_ref() {
+                    self.push_shared_section("compiler output", error);
                 }
             }
 
@@ -80,8 +155,8 @@ impl<'a> DetailDocument<'a> {
             RunPhase::Failed => {
                 self.push_static("Run Failed");
 
-                if let Some(error) = run.error.as_deref() {
-                    self.push_section("error", error);
+                if let Some(error) = run.error.as_ref() {
+                    self.push_shared_section("error", error);
                 }
             }
 
@@ -124,39 +199,53 @@ impl<'a> DetailDocument<'a> {
             CaseVerdict::Accepted => {
                 self.push_static("\n\nAccepted");
 
-                if let Some(stderr) = case.stderr.as_deref() {
-                    self.push_section("stderr", stderr);
+                if let Some(stderr) = case.stderr.as_ref() {
+                    self.push_shared_section("stderr", stderr);
                 }
             }
 
             CaseVerdict::WrongAnswer => {
-                self.push_section("expected", case.expected.as_deref().unwrap_or(""));
-                self.push_section("actual", case.actual.as_deref().unwrap_or(""));
+                self.push_optional_shared_section("expected", case.expected.as_ref());
+                self.push_optional_shared_section("actual", case.actual.as_ref());
 
-                if let Some(stderr) = case.stderr.as_deref() {
-                    self.push_section("stderr", stderr);
+                if let Some(stderr) = case.stderr.as_ref() {
+                    self.push_shared_section("stderr", stderr);
                 }
             }
 
             CaseVerdict::RuntimeError => {
                 self.push_static("\n\nRuntime Error");
 
-                if let Some(stderr) = case.stderr.as_deref() {
-                    self.push_section("stderr", stderr);
+                if let Some(stderr) = case.stderr.as_ref() {
+                    self.push_shared_section("stderr", stderr);
                 }
             }
 
             CaseVerdict::TimedOut => {
                 self.push_static("\n\nTime Limit Exceeded");
 
-                if let Some(stderr) = case.stderr.as_deref() {
-                    self.push_section("stderr", stderr);
+                if let Some(stderr) = case.stderr.as_ref() {
+                    self.push_shared_section("stderr", stderr);
                 }
             }
         }
     }
 
-    fn push_section(&mut self, label: &'static str, content: &'a str) {
+    fn push_optional_shared_section(
+        &mut self,
+        label: &'static str,
+        content: Option<&'a Arc<String>>,
+    ) {
+        if let Some(content) = content {
+            self.push_shared_section(label, content);
+        } else {
+            self.push_static("\n\n");
+            self.push_static(label);
+            self.push_static("\n(empty)");
+        }
+    }
+
+    fn push_shared_section(&mut self, label: &'static str, content: &'a Arc<String>) {
         self.push_static("\n\n");
         self.push_static(label);
         self.push_static("\n");
@@ -164,25 +253,25 @@ impl<'a> DetailDocument<'a> {
         if content.is_empty() {
             self.push_static("(empty)");
         } else {
-            self.push_borrowed(content);
+            self.push_shared(content);
         }
     }
 
     fn push_static(&mut self, text: &'static str) {
         self.segments.push(DetailSegment {
-            text: Cow::Borrowed(text),
+            text: DetailSegmentText::Static(text),
         });
     }
 
-    fn push_borrowed(&mut self, text: &'a str) {
+    fn push_shared(&mut self, text: &'a Arc<String>) {
         self.segments.push(DetailSegment {
-            text: Cow::Borrowed(text),
+            text: DetailSegmentText::Shared(text),
         });
     }
 
     fn push_owned(&mut self, text: String) {
         self.segments.push(DetailSegment {
-            text: Cow::Owned(text),
+            text: DetailSegmentText::Owned(text),
         });
     }
 
@@ -192,10 +281,20 @@ impl<'a> DetailDocument<'a> {
             segments: segments
                 .iter()
                 .map(|text| DetailSegment {
-                    text: Cow::Borrowed(*text),
+                    text: DetailSegmentText::SharedOwned(Arc::new((*text).to_string())),
                 })
                 .collect(),
         }
+    }
+}
+
+impl DetailTextSource for DetailDocument<'_> {
+    fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn segment_text(&self, index: usize) -> Option<&str> {
+        self.segments.get(index).map(DetailSegment::text)
     }
 }
 
@@ -258,8 +357,40 @@ mod tests {
         (app, request.run_id)
     }
 
+    fn source_text(source: &impl DetailTextSource) -> String {
+        (0..source.segment_count())
+            .map(|index| source.segment_text(index).unwrap())
+            .collect()
+    }
+
     fn document_text(document: &DetailDocument<'_>) -> String {
-        document.segments().map(DetailSegment::text).collect()
+        source_text(document)
+    }
+
+    fn assert_snapshot_matches(document: &DetailDocument<'_>) {
+        let snapshot = document.snapshot();
+        assert_eq!(snapshot.segment_count(), document.segment_count());
+        assert_eq!(source_text(&snapshot), source_text(document));
+
+        for index in 0..document.segment_count() {
+            assert_eq!(snapshot.segment_text(index), document.segment_text(index));
+        }
+    }
+
+    fn assert_snapshot_shares(document: &DetailDocument<'_>, state: &Arc<String>) {
+        let owners = Arc::strong_count(state);
+        let snapshot = document.snapshot();
+        let shared = snapshot
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                DetailSnapshotSegment::Shared(shared) if Arc::ptr_eq(shared, state) => Some(shared),
+                _ => None,
+            })
+            .expect("snapshot must share the raw state Arc");
+
+        assert_eq!(shared.as_ptr(), state.as_ptr());
+        assert_eq!(Arc::strong_count(state), owners + 1);
     }
 
     #[test]
@@ -300,6 +431,7 @@ mod tests {
                 "\n\nstderr\n debug \n\n",
             )
         );
+        assert_snapshot_matches(&document);
 
         for (raw, pointer) in [
             (expected, expected_ptr),
@@ -311,7 +443,7 @@ mod tests {
                 .find(|segment| segment.text().as_ptr() == pointer)
                 .expect("raw output must remain a document segment");
             assert_eq!(segment.text(), raw);
-            assert!(matches!(segment.text, Cow::Borrowed(_)));
+            assert!(matches!(segment.text, DetailSegmentText::Shared(_)));
         }
     }
 
@@ -343,6 +475,7 @@ mod tests {
                 "\n\nstderr\nruntime stderr\n",
             )
         );
+        assert_snapshot_matches(&DetailDocument::from_app(&runtime_app));
 
         let (mut timed_out_app, run_id) = running_app();
         assert!(timed_out_app.run_event(
@@ -361,6 +494,7 @@ mod tests {
                 "\n\nTime Limit Exceeded",
             )
         );
+        assert_snapshot_matches(&DetailDocument::from_app(&timed_out_app));
     }
 
     #[test]
@@ -381,6 +515,7 @@ mod tests {
                 "\n\ncompiler output\ncompiler output\n\n",
             )
         );
+        assert_snapshot_matches(&DetailDocument::from_app(&compile_app));
 
         let compile_error = compile_app
             .current_problem()
@@ -394,7 +529,17 @@ mod tests {
             .segments()
             .find(|segment| segment.text().as_ptr() == compile_error.as_ptr())
             .expect("compiler output must remain borrowed");
-        assert!(matches!(compile_segment.text, Cow::Borrowed(_)));
+        assert!(matches!(compile_segment.text, DetailSegmentText::Shared(_)));
+        assert_snapshot_shares(
+            &compile_document,
+            compile_app
+                .current_problem()
+                .unwrap()
+                .run
+                .error
+                .as_ref()
+                .unwrap(),
+        );
 
         let (mut accepted_app, run_id) = running_app();
         assert!(accepted_app.run_event(
@@ -422,6 +567,7 @@ mod tests {
                 "\n\nstderr\naccepted stderr",
             )
         );
+        assert_snapshot_matches(&DetailDocument::from_app(&accepted_app));
     }
 
     #[test]
@@ -435,11 +581,16 @@ mod tests {
             document_text(&document),
             "A - Problem A\n\nRun Failed\n\nerror\nfatal runner error\n"
         );
+        assert_snapshot_matches(&document);
         let error_segment = document
             .segments()
             .find(|segment| segment.text().as_ptr() == error.as_ptr())
             .expect("run error must remain borrowed");
-        assert!(matches!(error_segment.text, Cow::Borrowed(_)));
+        assert!(matches!(error_segment.text, DetailSegmentText::Shared(_)));
+        assert_snapshot_shares(
+            &document,
+            app.current_problem().unwrap().run.error.as_ref().unwrap(),
+        );
     }
 
     #[test]
@@ -465,5 +616,77 @@ mod tests {
                 "\n\nactual\n(empty)",
             )
         );
+        assert_snapshot_matches(&DetailDocument::from_app(&app));
+    }
+
+    #[test]
+    fn snapshot_shares_raw_arc_buffers_and_remains_send_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<DetailSnapshot>();
+
+        let (mut app, run_id) = running_app();
+        let expected = "expected ".repeat(10_000);
+        let actual = "actual ".repeat(10_000);
+        let stderr = "stderr ".repeat(10_000);
+        let expected_buffer = expected.as_ptr();
+        let actual_buffer = actual.as_ptr();
+        let stderr_buffer = stderr.as_ptr();
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                expected,
+                actual,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(0, run_id, TestEvent::TestCaseStderr { number: 1, stderr },));
+
+        let case = &app.current_problem().unwrap().run.cases[0];
+        let states = [
+            (case.expected.as_ref().unwrap(), expected_buffer),
+            (case.actual.as_ref().unwrap(), actual_buffer),
+            (case.stderr.as_ref().unwrap(), stderr_buffer),
+        ];
+        let owners_before_snapshot = states.map(|(state, _)| Arc::strong_count(state));
+        let document = DetailDocument::from_app(&app);
+        for ((state, buffer), owners) in states.iter().zip(owners_before_snapshot) {
+            assert_eq!(state.as_ptr(), *buffer);
+            let document_shared = document
+                .segments()
+                .find_map(|segment| match &segment.text {
+                    DetailSegmentText::Shared(shared) if Arc::ptr_eq(shared, state) => {
+                        Some(*shared)
+                    }
+                    _ => None,
+                })
+                .expect("document must borrow the state Arc");
+            assert_eq!(document_shared.as_ptr(), *buffer);
+            assert_eq!(Arc::strong_count(state), owners);
+        }
+
+        let snapshot = document.snapshot();
+        for ((state, buffer), owners) in states.iter().zip(owners_before_snapshot) {
+            let snapshot_shared = snapshot
+                .segments
+                .iter()
+                .find_map(|segment| match segment {
+                    DetailSnapshotSegment::Shared(shared) if Arc::ptr_eq(shared, state) => {
+                        Some(shared)
+                    }
+                    _ => None,
+                })
+                .expect("snapshot must clone the state Arc");
+            assert_eq!(snapshot_shared.as_ptr(), *buffer);
+            assert_eq!(Arc::strong_count(state), owners + 1);
+        }
+
+        drop(snapshot);
+        for ((state, buffer), owners) in states.iter().zip(owners_before_snapshot) {
+            assert_eq!(Arc::strong_count(state), owners);
+            assert_eq!(state.as_ptr(), *buffer);
+            assert!(!state.is_empty());
+        }
     }
 }
