@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use message::{Message, RunRequest};
 use ratatui::DefaultTerminal;
 
@@ -15,6 +15,7 @@ use crate::model::Contest;
 use app::WatchApp;
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
+const DETAIL_SCROLL_LINES: u16 = 3;
 
 fn handle_messages(
     app: &mut WatchApp,
@@ -116,18 +117,37 @@ pub fn run(
         }
 
         if dirty {
+            let mut max_detail_scroll = 0;
+
             terminal.draw(|frame| {
-                view::render(frame, &app);
+                max_detail_scroll = view::render(frame, &app);
             })?;
+
+            app.clamp_detail_scroll(max_detail_scroll);
 
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(20))?
-            && let Event::Key(key) = event::read()?
-            && handle_key_event(&mut app, key)
-        {
-            dirty = true;
+        if event::poll(Duration::from_millis(20))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key_event(&mut app, key) {
+                        dirty = true;
+                    }
+                }
+
+                Event::Mouse(mouse) => {
+                    if handle_mouse_event(&mut app, mouse) {
+                        dirty = true;
+                    }
+                }
+
+                Event::Resize(_, _) => {
+                    dirty = true;
+                }
+
+                _ => {}
+            }
         }
     }
 
@@ -162,12 +182,22 @@ fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_mouse_event(app: &mut WatchApp, mouse: MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_detail_up(DETAIL_SCROLL_LINES),
+
+        MouseEventKind::ScrollDown => app.scroll_detail_down(DETAIL_SCROLL_LINES),
+
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
 
@@ -489,5 +519,32 @@ mod tests {
         assert_eq!(run.phase, app::RunPhase::Queued);
         assert_eq!(run.language, Some(Language::Python));
         assert_eq!(run.accepted, 0);
+    }
+    #[test]
+    fn mouse_wheel_scrolls_detail() {
+        let mut app = app();
+
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(handle_mouse_event(&mut app, scroll_down));
+        assert_eq!(app.detail_scroll(), 3);
+
+        assert!(handle_mouse_event(&mut app, scroll_down));
+        assert_eq!(app.detail_scroll(), 6);
+
+        assert!(handle_mouse_event(&mut app, scroll_up));
+        assert_eq!(app.detail_scroll(), 3);
     }
 }

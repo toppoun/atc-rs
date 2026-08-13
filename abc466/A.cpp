@@ -22,6 +22,29 @@ using ll = long long;
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
+    int n;
+    cin >> n;
+    bool ans = true;
+    for(int i = 0; i < n; i++){
+        int x;
+        cin >> x;
+        if(x >= 0) ans = false;  
+    }
+    cout << (ans ? "Yes":"Noi") << endl;
+    std::cerr << "Error message1" << std::endl;
+    std::cerr << "Error message2" << std::endl;
+    std::cerr << "Error message3" << std::endl;
+    std::cerr << "Error message4" << std::endl;
+    std::cerr << "Error message5" << std::endl;
+    std::cerr << "Error message6" << std::endl;
+    std::cerr << "Error message7" << std::endl;
+    std::cerr << "Error message8" << std::endl;
+    std::cerr << "Error message9" << std::endl;
+    std::cerr << "Error message10" << std::endl;
+    std::cerr << "Error message11" << std::endl;
+    std::cerr << "Error message12" << std::endl;
+    std::cerr << "Error message13" << std::endl;
+    std::cerr << "Error message14" << std::endl;
 
     return 0;
 }

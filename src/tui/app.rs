@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::message::{RunId, RunRequest, TestEvent};
 use crate::language::Language;
@@ -32,6 +33,8 @@ pub struct WatchApp {
     selected_problem: usize,
     selected_case: usize,
 
+    detail_scroll: u16,
+
     next_run_id: RunId,
 }
 
@@ -48,6 +51,36 @@ pub enum RunPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseVerdict {
+    Pending,
+    Accepted,
+    WrongAnswer,
+    RuntimeError,
+    TimedOut,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseState {
+    pub verdict: CaseVerdict,
+    pub elapsed: Option<Duration>,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub stderr: Option<String>,
+}
+
+impl Default for CaseState {
+    fn default() -> Self {
+        Self {
+            verdict: CaseVerdict::Pending,
+            elapsed: None,
+            expected: None,
+            actual: None,
+            stderr: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RunState {
     pub id: Option<RunId>,
@@ -57,6 +90,7 @@ pub struct RunState {
     pub accepted: usize,
     pub total_cases: usize,
     pub error: Option<String>,
+    pub cases: Vec<CaseState>,
 }
 
 impl Default for RunState {
@@ -69,8 +103,15 @@ impl Default for RunState {
             accepted: 0,
             total_cases: 0,
             error: None,
+
+            cases: Vec::new(),
         }
     }
+}
+
+fn case_mut(run: &mut RunState, number: usize) -> Option<&mut CaseState> {
+    let index = number.checked_sub(1)?;
+    run.cases.get_mut(index)
 }
 
 impl WatchApp {
@@ -106,6 +147,7 @@ impl WatchApp {
             problems,
             selected_problem: 0,
             selected_case: 0,
+            detail_scroll: 0,
             next_run_id: 1,
         })
     }
@@ -130,6 +172,34 @@ impl WatchApp {
         self.selected_case
     }
 
+    pub fn detail_scroll(&self) -> u16 {
+        self.detail_scroll
+    }
+
+    pub fn scroll_detail_up(&mut self, lines: u16) -> bool {
+        let previous = self.detail_scroll;
+
+        self.detail_scroll = self.detail_scroll.saturating_sub(lines);
+
+        self.detail_scroll != previous
+    }
+
+    pub fn scroll_detail_down(&mut self, lines: u16) -> bool {
+        let previous = self.detail_scroll;
+
+        self.detail_scroll = self.detail_scroll.saturating_add(lines);
+
+        self.detail_scroll != previous
+    }
+
+    pub fn clamp_detail_scroll(&mut self, max: u16) {
+        self.detail_scroll = self.detail_scroll.min(max);
+    }
+
+    fn reset_detail_scroll(&mut self) {
+        self.detail_scroll = 0;
+    }
+
     fn current_case_count(&self) -> usize {
         self.current_problem()
             .map(|problem| problem.total_cases)
@@ -151,6 +221,7 @@ impl WatchApp {
 
         self.selected_problem = index;
         self.selected_case = 0;
+        self.reset_detail_scroll();
         true
     }
 
@@ -193,6 +264,7 @@ impl WatchApp {
             return false;
         }
         self.selected_case = next;
+        self.reset_detail_scroll();
         true
     }
 
@@ -213,6 +285,7 @@ impl WatchApp {
             return false;
         }
         self.selected_case = previous;
+        self.reset_detail_scroll();
         true
     }
     pub fn source_changed(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
@@ -228,14 +301,16 @@ impl WatchApp {
         self.problems[problem].source = Some(source);
         self.selected_problem = problem;
         self.selected_case = 0;
+        self.reset_detail_scroll();
 
         true
     }
-
     pub fn queue_run(&mut self, problem: usize) -> Option<RunRequest> {
-        let source = self.problems.get(problem)?.source.as_ref()?;
+        let problem_state = self.problems.get(problem)?;
+        let source = problem_state.source.as_ref()?;
 
         let language = source.language;
+        let total_cases = problem_state.total_cases;
 
         let debug = self.debug && language == Language::Cpp;
 
@@ -247,9 +322,12 @@ impl WatchApp {
             phase: RunPhase::Queued,
             language: Some(language),
             accepted: 0,
-            total_cases: 0,
+            total_cases,
             error: None,
+            cases: vec![CaseState::default(); total_cases],
         };
+
+        self.reset_detail_scroll();
 
         Some(RunRequest {
             run_id,
@@ -313,6 +391,7 @@ impl WatchApp {
                 run.phase = RunPhase::Running;
                 run.accepted = 0;
                 run.total_cases = total_cases;
+                run.cases = vec![CaseState::default(); total_cases];
                 true
             }
 
@@ -326,15 +405,73 @@ impl WatchApp {
                 true
             }
 
-            TestEvent::TestCaseAccepted { .. }
-            | TestEvent::TestCaseWrongAnswer { .. }
-            | TestEvent::TestCaseRuntimeError { .. }
-            | TestEvent::TestCaseTimedOut { .. }
-            | TestEvent::TestCaseStderr { .. }
+            TestEvent::TestCaseAccepted { number, elapsed } if run.phase == RunPhase::Running => {
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                case.verdict = CaseVerdict::Accepted;
+                case.elapsed = Some(elapsed);
+                case.expected = None;
+                case.actual = None;
+
+                true
+            }
+
+            TestEvent::TestCaseWrongAnswer {
+                number,
+                expected,
+                actual,
+                elapsed,
+            } if run.phase == RunPhase::Running => {
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                case.verdict = CaseVerdict::WrongAnswer;
+                case.elapsed = Some(elapsed);
+                case.expected = Some(expected);
+                case.actual = Some(actual);
+
+                true
+            }
+
+            TestEvent::TestCaseRuntimeError { number, elapsed }
                 if run.phase == RunPhase::Running =>
             {
-                // Phase 5でCaseStateへ保存する。
-                false
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                case.verdict = CaseVerdict::RuntimeError;
+                case.elapsed = Some(elapsed);
+                case.expected = None;
+                case.actual = None;
+
+                true
+            }
+
+            TestEvent::TestCaseTimedOut { number, elapsed } if run.phase == RunPhase::Running => {
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                case.verdict = CaseVerdict::TimedOut;
+                case.elapsed = Some(elapsed);
+                case.expected = None;
+                case.actual = None;
+
+                true
+            }
+
+            TestEvent::TestCaseStderr { number, stderr } if run.phase == RunPhase::Running => {
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                case.stderr = Some(stderr);
+
+                true
             }
 
             _ => false,
@@ -375,6 +512,13 @@ impl WatchApp {
         run.error = Some(error);
 
         true
+    }
+    pub fn problems(&self) -> &[ProblemState] {
+        &self.problems
+    }
+
+    pub fn selected_case_state(&self) -> Option<&CaseState> {
+        self.current_problem()?.run.cases.get(self.selected_case)
     }
 }
 
@@ -786,5 +930,142 @@ mod tests {
         assert_eq!(run.phase, RunPhase::NoSamples);
         assert_eq!(run.accepted, 0);
         assert_eq!(run.total_cases, 0);
+    }
+    #[test]
+    fn case_events_are_stored_for_sample_detail() {
+        let mut app = WatchApp::new(&contest(1), vec![3]).unwrap();
+
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+
+        let request = app.queue_run(0).unwrap();
+
+        assert!(app.run_started(0, request.run_id));
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 3 },
+        ));
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 2,
+                expected: "Yes\n".to_string(),
+                actual: "No\n".to_string(),
+                elapsed: Duration::from_millis(6),
+            },
+        ));
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseStderr {
+                number: 2,
+                stderr: "debug: answer = No\n".to_string(),
+            },
+        ));
+
+        let case = &app.current_problem().unwrap().run.cases[1];
+
+        assert_eq!(case.verdict, CaseVerdict::WrongAnswer);
+        assert_eq!(case.elapsed, Some(Duration::from_millis(6)));
+        assert_eq!(case.expected.as_deref(), Some("Yes\n"));
+        assert_eq!(case.actual.as_deref(), Some("No\n"));
+        assert_eq!(case.stderr.as_deref(), Some("debug: answer = No\n"));
+    }
+    #[test]
+    fn queueing_new_run_clears_previous_case_results() {
+        let mut app = WatchApp::new(&contest(1), vec![2]).unwrap();
+
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+
+        let first = app.queue_run(0).unwrap();
+
+        app.run_started(0, first.run_id);
+
+        app.run_event(
+            0,
+            first.run_id,
+            TestEvent::TestRunStarted { total_cases: 2 },
+        );
+
+        app.run_event(
+            0,
+            first.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                expected: "Yes\n".to_string(),
+                actual: "No\n".to_string(),
+                elapsed: Duration::from_millis(5),
+            },
+        );
+
+        assert_eq!(
+            app.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::WrongAnswer
+        );
+
+        let second = app.queue_run(0).unwrap();
+
+        let run = &app.current_problem().unwrap().run;
+
+        assert_eq!(run.id, Some(second.run_id));
+        assert_eq!(run.cases.len(), 2);
+
+        assert!(
+            run.cases
+                .iter()
+                .all(|case| case.verdict == CaseVerdict::Pending)
+        );
+    }
+    #[test]
+    fn detail_scroll_moves_and_saturates_at_zero() {
+        let mut app = WatchApp::new(&contest(1), vec![3]).unwrap();
+
+        assert_eq!(app.detail_scroll(), 0);
+
+        assert!(app.scroll_detail_down(3));
+        assert_eq!(app.detail_scroll(), 3);
+
+        assert!(app.scroll_detail_down(4));
+        assert_eq!(app.detail_scroll(), 7);
+
+        assert!(app.scroll_detail_up(2));
+        assert_eq!(app.detail_scroll(), 5);
+
+        assert!(app.scroll_detail_up(100));
+        assert_eq!(app.detail_scroll(), 0);
+
+        assert!(!app.scroll_detail_up(1));
+        assert_eq!(app.detail_scroll(), 0);
+    }
+    #[test]
+    fn navigation_and_new_run_reset_detail_scroll() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
+
+        app.scroll_detail_down(10);
+        assert_eq!(app.detail_scroll(), 10);
+
+        assert!(app.next_case());
+        assert_eq!(app.detail_scroll(), 0);
+
+        app.scroll_detail_down(10);
+
+        assert!(app.next_problem());
+        assert_eq!(app.detail_scroll(), 0);
+
+        app.scroll_detail_down(10);
+
+        app.source_changed(1, PathBuf::from("B.cpp"), Language::Cpp);
+
+        assert_eq!(app.detail_scroll(), 0);
+
+        app.scroll_detail_down(10);
+
+        app.queue_run(1).unwrap();
+
+        assert_eq!(app.detail_scroll(), 0);
     }
 }

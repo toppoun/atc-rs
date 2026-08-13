@@ -13,10 +13,21 @@ use std::time::Duration;
 use super::watch_worker::TestWorker;
 use crate::tui::message::Message;
 use crate::watcher;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 
 use super::watch_source::{build_watched_sources, resolve_watched_source};
 
 const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+fn enable_mouse_capture() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, EnableMouseCapture)
+}
+
+fn disable_mouse_capture() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, DisableMouseCapture)
+}
 
 struct WatcherThread {
     shutdown: Arc<AtomicBool>,
@@ -199,11 +210,32 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
         }
     };
 
+    if let Err(error) = enable_mouse_capture() {
+        drop(message_rx);
+
+        test_worker.request_stop();
+        watcher_thread.request_stop();
+
+        ratatui::restore();
+
+        let worker_result = test_worker.stop_and_join();
+        let watcher_result = watcher_thread.stop();
+
+        worker_result?;
+        watcher_result?;
+
+        return Err(error.into());
+    }
+
     let result = crate::tui::run(&mut terminal, &contest, sample_counts, message_rx, run_tx);
 
     // test実行中だった場合、runnerまでcancelを先に伝える。
     test_worker.request_stop();
     watcher_thread.request_stop();
+
+    // Mouse Captureもterminal状態の一部なので、restore前に戻す。
+    // 失敗してもcleanupは最後まで続行する。
+    let mouse_result = disable_mouse_capture();
 
     // joinが予想外に長引いてもterminalは先に復元する。
     let restore_result = ratatui::try_restore();
@@ -215,6 +247,7 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
     worker_result?;
     watcher_result?;
     restore_result?;
+    mouse_result?;
 
     Ok(())
 }
