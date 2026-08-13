@@ -10,10 +10,8 @@ use ratatui::{
 
 use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
 use super::detail::DetailDocument;
+use super::detail_layout::DetailLayout;
 use crate::language::Language;
-
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
@@ -21,12 +19,16 @@ const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderInfo {
-    pub max_detail_scroll: usize,
+    pub max_detail_scroll: Option<usize>,
     pub samples_area: Option<Rect>,
     pub detail_area: Rect,
 }
 
-pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
+pub(super) fn render(
+    frame: &mut Frame,
+    app: &WatchApp,
+    detail_layout: &mut DetailLayout,
+) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
 
@@ -118,31 +120,24 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
         frame.render_widget(samples, samples_area);
     }
 
-    // detailは描画前にterminal cell幅でsoft wrapする。
     let detail_document = DetailDocument::from_app(app);
     let viewport_height = usize::from(detail_area.height);
-
-    // まずdetail幅全部を使ってwrapする。
-    let mut wrapped_detail_text = wrap_detail_document(&detail_document, detail_area.width);
-
-    let mut max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
-
-    if max_detail_scroll > 0 && detail_area.width > 1 {
-        wrapped_detail_text =
-            wrap_detail_document(&detail_document, detail_area.width.saturating_sub(1));
-
-        max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
-    }
-
-    let scroll = app.detail_scroll().min(max_detail_scroll);
-    let viewport_detail_text = viewport_text(wrapped_detail_text, scroll, viewport_height);
-
-    let detail = Paragraph::new(viewport_detail_text);
+    let detail_viewport = detail_layout.viewport(
+        &detail_document,
+        app.detail_revision(),
+        detail_area.width,
+        viewport_height,
+        app.detail_scroll(),
+    );
+    let detail = Paragraph::new(detail_viewport.text);
 
     frame.render_widget(detail, detail_area);
 
-    if max_detail_scroll > 0 {
-        let (content_length, position) = scrollbar_metrics(max_detail_scroll, scroll);
+    if let Some(max_detail_scroll) = detail_viewport.max_scroll
+        && max_detail_scroll > 0
+    {
+        let (content_length, position) =
+            scrollbar_metrics(max_detail_scroll, detail_viewport.effective_scroll);
         let mut scrollbar_state = ScrollbarState::new(content_length).position(position);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -158,140 +153,10 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     frame.render_widget(footer, rows[2]);
 
     RenderInfo {
-        max_detail_scroll,
+        max_detail_scroll: detail_viewport.max_scroll,
         samples_area,
         detail_area,
     }
-}
-
-fn wrap_detail_document(document: &DetailDocument<'_>, width: u16) -> Text<'static> {
-    let width = usize::from(width);
-    let mut lines = Vec::new();
-    let mut logical_line_fragments = Vec::new();
-
-    for segment in document.segments() {
-        let text = segment.text();
-        let mut start = 0;
-
-        for (newline, _) in text.match_indices('\n') {
-            logical_line_fragments.push(&text[start..newline]);
-            wrap_logical_line_fragments(&logical_line_fragments, width, &mut lines);
-            logical_line_fragments.clear();
-            start = newline + 1;
-        }
-
-        logical_line_fragments.push(&text[start..]);
-    }
-
-    wrap_logical_line_fragments(&logical_line_fragments, width, &mut lines);
-
-    Text::from(lines)
-}
-
-fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec<Line<'static>>) {
-    let mut non_empty = fragments
-        .iter()
-        .copied()
-        .filter(|fragment| !fragment.is_empty());
-    let Some(first) = non_empty.next() else {
-        lines.push(Line::from(""));
-        return;
-    };
-
-    if non_empty.next().is_none() {
-        wrap_logical_line(first, width, lines);
-        return;
-    }
-
-    // 通常のraw outputは1つのfragmentのまま処理される。これはdocumentの
-    // segment境界がlogical lineの途中にある場合だけ使う小さな互換経路。
-    let capacity = fragments.iter().map(|fragment| fragment.len()).sum();
-    let mut logical_line = String::with_capacity(capacity);
-    for fragment in fragments {
-        logical_line.push_str(fragment);
-    }
-
-    wrap_logical_line(&logical_line, width, lines);
-}
-
-fn wrap_logical_line(logical_line: &str, width: usize, lines: &mut Vec<Line<'static>>) {
-    if width == 0 || logical_line.is_empty() {
-        lines.push(Line::from(logical_line.to_owned()));
-        return;
-    }
-
-    let mut current = String::new();
-    let mut current_width = 0usize;
-
-    for token in UnicodeSegmentation::split_word_bounds(logical_line) {
-        let token_width = UnicodeWidthStr::width(token);
-
-        // token自体が1行に収まる場合。
-        if token_width <= width {
-            if !current.is_empty() && current_width.saturating_add(token_width) > width {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-            }
-
-            current.push_str(token);
-            current_width = current_width.saturating_add(token_width);
-
-            if current_width == width {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-            }
-
-            continue;
-        }
-
-        // tokenそのものが横幅より長い場合。
-        // まず現在の行を確定する。
-        if current_width > 0 {
-            lines.push(Line::from(std::mem::take(&mut current)));
-            current_width = 0;
-        }
-
-        // 長すぎるtokenだけgrapheme単位でhard wrapする。
-        for grapheme in UnicodeSegmentation::graphemes(token, true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-
-            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-            }
-
-            current.push_str(grapheme);
-            current_width = current_width.saturating_add(grapheme_width);
-
-            if current_width >= width {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        lines.push(Line::from(current));
-    }
-}
-
-fn max_scroll(content_height: usize, viewport_height: usize) -> usize {
-    content_height.saturating_sub(viewport_height)
-}
-
-fn viewport_text(
-    wrapped_text: Text<'static>,
-    absolute_scroll: usize,
-    viewport_height: usize,
-) -> Text<'static> {
-    Text::from(
-        wrapped_text
-            .lines
-            .into_iter()
-            .skip(absolute_scroll)
-            .take(viewport_height)
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn scrollbar_metrics(max_scroll: usize, scroll: usize) -> (usize, usize) {
@@ -506,8 +371,12 @@ fn compact_elapsed_label(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::Language;
     use crate::model::{Contest, Problem};
+    use crate::tui::detail_layout::{max_scroll, viewport_text, wrap_detail_document};
+    use crate::tui::message::TestEvent;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::path::PathBuf;
 
     fn app() -> WatchApp {
         WatchApp::new(
@@ -529,14 +398,33 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut info = RenderInfo::default();
+        let mut detail_layout = DetailLayout::default();
 
         terminal
             .draw(|frame| {
-                info = render(frame, app);
+                info = render(frame, app, &mut detail_layout);
             })
             .unwrap();
 
         info
+    }
+
+    fn large_compile_error_app() -> WatchApp {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+
+        let mut output = String::new();
+        for line in 0..3_000 {
+            output.push_str(&format!("compiler-line-{line}\n"));
+        }
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::CompileFailed { stderr: output },
+        ));
+        app
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {
@@ -605,10 +493,19 @@ mod tests {
         app.scroll_detail_down(100_000);
 
         let info = render_info(&app, 20, 7);
-        assert!(info.max_detail_scroll < 100_000);
+        let max_detail_scroll = info.max_detail_scroll.unwrap();
+        assert!(max_detail_scroll < 100_000);
 
-        app.clamp_detail_scroll(info.max_detail_scroll);
-        assert_eq!(app.detail_scroll(), info.max_detail_scroll);
+        app.clamp_detail_scroll(max_detail_scroll);
+        assert_eq!(app.detail_scroll(), max_detail_scroll);
+    }
+
+    #[test]
+    fn large_initial_render_reports_unknown_max_while_small_render_is_exact() {
+        assert!(render_info(&app(), 80, 30).max_detail_scroll.is_some());
+
+        let large = large_compile_error_app();
+        assert_eq!(render_info(&large, 80, 30).max_detail_scroll, None);
     }
 
     #[test]
@@ -617,10 +514,11 @@ mod tests {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             let app = app();
+            let mut detail_layout = DetailLayout::default();
 
             terminal
                 .draw(|frame| {
-                    let _ = render(frame, &app);
+                    let _ = render(frame, &app, &mut detail_layout);
                 })
                 .unwrap();
         }

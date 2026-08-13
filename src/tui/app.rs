@@ -35,6 +35,7 @@ pub struct WatchApp {
     selected_case: usize,
 
     detail_scroll: usize,
+    detail_revision: u64,
 
     next_run_id: RunId,
 }
@@ -152,6 +153,7 @@ impl WatchApp {
             selected_problem: 0,
             selected_case: 0,
             detail_scroll: 0,
+            detail_revision: 0,
             next_run_id: 1,
         })
     }
@@ -196,6 +198,10 @@ impl WatchApp {
         self.detail_scroll
     }
 
+    pub(super) fn detail_revision(&self) -> u64 {
+        self.detail_revision
+    }
+
     pub fn scroll_detail_up(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
 
@@ -218,6 +224,10 @@ impl WatchApp {
 
     fn reset_detail_scroll(&mut self) {
         self.detail_scroll = 0;
+    }
+
+    fn invalidate_detail(&mut self) {
+        self.detail_revision = self.detail_revision.wrapping_add(1);
     }
 
     fn current_case_count(&self) -> usize {
@@ -249,6 +259,7 @@ impl WatchApp {
         self.selected_problem = index;
         self.selected_case = 0;
         self.reset_detail_scroll();
+        self.invalidate_detail();
         true
     }
 
@@ -292,6 +303,7 @@ impl WatchApp {
         }
         self.selected_case = next;
         self.reset_detail_scroll();
+        self.invalidate_detail();
         true
     }
 
@@ -313,6 +325,7 @@ impl WatchApp {
         }
         self.selected_case = previous;
         self.reset_detail_scroll();
+        self.invalidate_detail();
         true
     }
     pub fn source_changed(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
@@ -329,6 +342,7 @@ impl WatchApp {
         self.selected_problem = problem;
         self.selected_case = 0;
         self.reset_detail_scroll();
+        self.invalidate_detail();
 
         true
     }
@@ -356,6 +370,9 @@ impl WatchApp {
         };
 
         self.reset_detail_scroll();
+        if self.selected_problem == problem {
+            self.invalidate_detail();
+        }
 
         Some(RunRequest {
             run_id,
@@ -374,6 +391,7 @@ impl WatchApp {
         Some(run)
     }
     pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
+        let affects_current_detail = self.selected_problem == problem;
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
         };
@@ -387,9 +405,25 @@ impl WatchApp {
             _ => RunPhase::Running,
         };
 
+        if affects_current_detail {
+            self.invalidate_detail();
+        }
+
         true
     }
     pub fn run_event(&mut self, problem: usize, run_id: RunId, event: TestEvent) -> bool {
+        let affects_current_detail = self.selected_problem == problem
+            && match &event {
+                TestEvent::TestCaseAccepted { number, .. }
+                | TestEvent::TestCaseWrongAnswer { number, .. }
+                | TestEvent::TestCaseRuntimeError { number, .. }
+                | TestEvent::TestCaseTimedOut { number, .. }
+                | TestEvent::TestCaseStderr { number, .. } => {
+                    number.checked_sub(1) == Some(self.selected_case)
+                }
+                _ => true,
+            };
+
         let updated_total_cases = match &event {
             TestEvent::TestRunStarted { total_cases } => Some(*total_cases),
             TestEvent::NoSamples => Some(0),
@@ -552,14 +586,19 @@ impl WatchApp {
             self.reset_detail_scroll();
         }
 
+        if changed && affects_current_detail {
+            self.invalidate_detail();
+        }
+
         changed
     }
     pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
+        let affects_current_detail = self.selected_problem == problem;
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
         };
 
-        match run.phase {
+        let changed = match run.phase {
             RunPhase::Queued | RunPhase::Compiling | RunPhase::Running => {
                 run.phase = RunPhase::Finished;
                 true
@@ -571,9 +610,16 @@ impl WatchApp {
             | RunPhase::CompileTimedOut
             | RunPhase::NoSamples
             | RunPhase::Failed => false,
+        };
+
+        if changed && affects_current_detail {
+            self.invalidate_detail();
         }
+
+        changed
     }
     pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
+        let affects_current_detail = self.selected_problem == problem;
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
         };
@@ -587,6 +633,10 @@ impl WatchApp {
 
         run.phase = RunPhase::Failed;
         run.error = Some(error);
+
+        if affects_current_detail {
+            self.invalidate_detail();
+        }
 
         true
     }
@@ -1294,6 +1344,91 @@ mod tests {
         app.queue_run(1).unwrap();
 
         assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn detail_revision_tracks_visible_detail_changes_but_not_scroll_or_background_cases() {
+        let mut app = WatchApp::new(&contest(2), vec![2, 1]).unwrap();
+        let initial = app.detail_revision();
+
+        app.scroll_detail_down(10);
+        app.toggle_samples_pane();
+        app.toggle_debug();
+        assert_eq!(app.detail_revision(), initial);
+
+        app.source_changed(1, PathBuf::from("B.py"), Language::Python);
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let selected_revision = app.detail_revision();
+        assert!(selected_revision > initial);
+
+        let background = app.queue_run(1).unwrap();
+        assert_eq!(app.detail_revision(), selected_revision);
+        assert!(app.run_started(1, background.run_id));
+        assert!(app.run_event(
+            1,
+            background.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            1,
+            background.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert_eq!(app.detail_revision(), selected_revision);
+
+        let selected = app.queue_run(0).unwrap();
+        let queued_revision = app.detail_revision();
+        assert!(queued_revision > selected_revision);
+        assert!(app.run_started(0, selected.run_id));
+        let started_revision = app.detail_revision();
+        assert!(started_revision > queued_revision);
+        assert!(app.run_event(
+            0,
+            selected.run_id,
+            TestEvent::TestRunStarted { total_cases: 2 },
+        ));
+        let test_revision = app.detail_revision();
+        assert!(test_revision > started_revision);
+
+        assert!(app.run_event(
+            0,
+            selected.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 2,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert_eq!(app.detail_revision(), test_revision);
+
+        assert!(app.run_event(
+            0,
+            selected.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.detail_revision() > test_revision);
+
+        let case_revision = app.detail_revision();
+        assert!(app.next_case());
+        assert!(app.detail_revision() > case_revision);
+
+        let problem_revision = app.detail_revision();
+        assert!(app.next_problem());
+        assert!(app.detail_revision() > problem_revision);
+
+        let failed_revision = app.detail_revision();
+        assert!(app.run_failed(1, background.run_id, "failed".to_string()));
+        assert!(app.detail_revision() > failed_revision);
+
+        let completed = app.queue_run(1).unwrap();
+        let queued_revision = app.detail_revision();
+        assert!(app.run_completed(1, completed.run_id));
+        assert!(app.detail_revision() > queued_revision);
     }
     #[test]
     fn samples_pane_toggle_is_persistent_ui_state() {

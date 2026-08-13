@@ -1,5 +1,6 @@
 pub mod app;
 mod detail;
+mod detail_layout;
 pub mod message;
 pub mod reporter;
 pub mod view;
@@ -131,6 +132,7 @@ pub fn run(
     let mut dirty = true;
 
     let mut render_info = view::RenderInfo::default();
+    let mut detail_layout = detail_layout::DetailLayout::default();
     let mut terminal_events = VecDeque::new();
 
     while !app.should_quit() {
@@ -169,12 +171,14 @@ pub fn run(
             let mut next_render_info = view::RenderInfo::default();
 
             terminal.draw(|frame| {
-                next_render_info = view::render(frame, &app);
+                next_render_info = view::render(frame, &app, &mut detail_layout);
             })?;
 
             render_info = next_render_info;
 
-            app.clamp_detail_scroll(render_info.max_detail_scroll);
+            if let Some(max_detail_scroll) = render_info.max_detail_scroll {
+                app.clamp_detail_scroll(max_detail_scroll);
+            }
 
             dirty = false;
         }
@@ -380,7 +384,9 @@ fn handle_mouse_event(
 
                 app.scroll_detail_down(DETAIL_SCROLL_LINES);
 
-                app.clamp_detail_scroll(render_info.max_detail_scroll);
+                if let Some(max_detail_scroll) = render_info.max_detail_scroll {
+                    app.clamp_detail_scroll(max_detail_scroll);
+                }
 
                 app.detail_scroll() != previous
             }
@@ -517,7 +523,7 @@ mod tests {
         let (run_tx, _run_rx) = mpsc::channel();
 
         let old_info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
@@ -533,7 +539,7 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         let new_info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
         };
@@ -853,7 +859,7 @@ mod tests {
         app.scroll_detail_down(10);
 
         let info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
@@ -872,7 +878,7 @@ mod tests {
         let mut app = app();
 
         let info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
@@ -886,6 +892,23 @@ mod tests {
         assert_eq!(app.selected_case(), 0);
         assert_eq!(app.detail_scroll(), 3);
     }
+
+    #[test]
+    fn mouse_wheel_does_not_clamp_while_lazy_max_is_unknown() {
+        let mut app = app();
+        let info = view::RenderInfo {
+            max_detail_scroll: None,
+            samples_area: None,
+            detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+        };
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 30, 5),
+            &info,
+        ));
+        assert_eq!(app.detail_scroll(), DETAIL_SCROLL_LINES);
+    }
     #[test]
     fn mouse_wheel_at_detail_bottom_is_not_dirty() {
         let mut app = app();
@@ -893,7 +916,7 @@ mod tests {
         app.scroll_detail_down(10);
 
         let info = view::RenderInfo {
-            max_detail_scroll: 10,
+            max_detail_scroll: Some(10),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
         };
@@ -912,7 +935,7 @@ mod tests {
         let mut app = app();
 
         let info = view::RenderInfo {
-            max_detail_scroll: 10,
+            max_detail_scroll: Some(10),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
         };
@@ -929,7 +952,7 @@ mod tests {
     #[test]
     fn samples_and_detail_rect_boundary_is_half_open() {
         let info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
@@ -957,7 +980,7 @@ mod tests {
     fn samples_wheel_with_one_case_does_not_mark_ui_dirty() {
         let mut app = app_with_problems(&[1]);
         let info = view::RenderInfo {
-            max_detail_scroll: 0,
+            max_detail_scroll: Some(0),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
@@ -974,7 +997,7 @@ mod tests {
         let mut app = app();
 
         let info = view::RenderInfo {
-            max_detail_scroll: 20,
+            max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 5, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 5, 40, 10),
         };

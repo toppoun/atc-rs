@@ -37,6 +37,14 @@ impl<'a> DetailDocument<'a> {
         self.segments.iter()
     }
 
+    pub(super) fn segment_text(&self, index: usize) -> Option<&str> {
+        self.segments.get(index).map(DetailSegment::text)
+    }
+
+    pub(super) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     fn push_problem_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
 
