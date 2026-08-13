@@ -149,7 +149,7 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     }
 
     let footer = Paragraph::new(
-        "s samples   d debug   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
+        "s samples   d debug   r rerun   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
     )
     .block(Block::default().borders(Borders::TOP));
 

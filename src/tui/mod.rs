@@ -20,6 +20,29 @@ const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: u16 = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Result<()> {
+    run_tx.send(request).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "test worker request channel disconnected",
+        )
+    })
+}
+
+fn queue_problem_run(
+    app: &mut WatchApp,
+    problem: usize,
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
+    let Some(request) = app.queue_run(problem) else {
+        return Ok(false);
+    };
+
+    send_run_request(run_tx, request)?;
+
+    Ok(true)
+}
+
 fn handle_messages(
     app: &mut WatchApp,
     message_rx: &Receiver<Message>,
@@ -36,15 +59,7 @@ fn handle_messages(
             }) => {
                 if app.source_changed(problem, path, language) {
                     changed = true;
-
-                    if let Some(request) = app.queue_run(problem) {
-                        run_tx.send(request).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "test worker request channel disconnected",
-                            )
-                        })?;
-                    }
+                    queue_problem_run(app, problem, run_tx)?;
                 }
             }
 
@@ -173,7 +188,7 @@ pub fn run(
             continue;
         }
 
-        if handle_terminal_events(&mut app, &render_info, &mut terminal_events) {
+        if handle_terminal_events(&mut app, &render_info, &mut terminal_events, &run_tx)? {
             dirty = true;
         }
     }
@@ -240,7 +255,8 @@ fn handle_terminal_events(
     app: &mut WatchApp,
     render_info: &view::RenderInfo,
     events: &mut VecDeque<Event>,
-) -> bool {
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
     let mut changed = false;
 
     while let Some(terminal_event) = events.pop_front() {
@@ -255,55 +271,78 @@ fn handle_terminal_events(
             break;
         }
 
-        changed |= handle_terminal_event(app, terminal_event, render_info);
+        changed |= handle_terminal_event(app, terminal_event, render_info, run_tx)?;
     }
 
-    changed
+    Ok(changed)
 }
 
 fn handle_terminal_event(
     app: &mut WatchApp,
     terminal_event: Event,
     render_info: &view::RenderInfo,
-) -> bool {
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
     match terminal_event {
-        Event::Key(key) => handle_key_event(app, key),
-        Event::Mouse(mouse) => handle_mouse_event(app, mouse, render_info),
-        Event::Resize(_, _) => true,
-        _ => false,
+        Event::Key(key) => handle_key_event(app, key, run_tx),
+
+        Event::Mouse(mouse) => Ok(handle_mouse_event(app, mouse, render_info)),
+
+        Event::Resize(_, _) => Ok(true),
+
+        _ => Ok(false),
     }
 }
 
-fn handle_key_event(app: &mut WatchApp, key: KeyEvent) -> bool {
+fn handle_key_event(
+    app: &mut WatchApp,
+    key: KeyEvent,
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return false;
+        return Ok(false);
     }
 
     match key.code {
         KeyCode::Char('q') if key.kind == KeyEventKind::Press => {
             app.quit();
-            true
+            Ok(true)
         }
 
         KeyCode::Char('d') if key.kind == KeyEventKind::Press => {
             app.toggle_debug();
-            true
+
+            if app.current_source_language() == Some(crate::language::Language::Cpp)
+                && let Some(problem) = app.selected_problem()
+            {
+                queue_problem_run(app, problem, run_tx)?;
+            }
+
+            Ok(true)
+        }
+
+        KeyCode::Char('r') if key.kind == KeyEventKind::Press => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+
+            queue_problem_run(app, problem, run_tx)
         }
 
         KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
             app.toggle_samples_pane();
-            true
+            Ok(true)
         }
 
-        KeyCode::Char('h') | KeyCode::Left => app.previous_problem(),
+        KeyCode::Char('h') | KeyCode::Left => Ok(app.previous_problem()),
 
-        KeyCode::Char('l') | KeyCode::Right => app.next_problem(),
+        KeyCode::Char('l') | KeyCode::Right => Ok(app.next_problem()),
 
-        KeyCode::Char('j') | KeyCode::Down => app.next_case(),
+        KeyCode::Char('j') | KeyCode::Down => Ok(app.next_case()),
 
-        KeyCode::Char('k') | KeyCode::Up => app.previous_case(),
+        KeyCode::Char('k') | KeyCode::Up => Ok(app.previous_case()),
 
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -390,19 +429,25 @@ mod tests {
         KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
     }
 
+    fn handle_key(app: &mut WatchApp, code: KeyCode, kind: KeyEventKind) -> bool {
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        handle_key_event(app, key(code, kind), &run_tx).unwrap()
+    }
+
     #[test]
     fn press_and_repeat_are_handled_but_release_is_ignored() {
         let mut app = app();
 
-        handle_key_event(&mut app, key(KeyCode::Char('j'), KeyEventKind::Press));
+        handle_key(&mut app, KeyCode::Char('j'), KeyEventKind::Press);
         assert_eq!(app.selected_case(), 1);
 
-        handle_key_event(&mut app, key(KeyCode::Down, KeyEventKind::Repeat));
+        handle_key(&mut app, KeyCode::Down, KeyEventKind::Repeat);
         assert_eq!(app.selected_case(), 2);
 
-        handle_key_event(&mut app, key(KeyCode::Char('q'), KeyEventKind::Release));
+        handle_key(&mut app, KeyCode::Char('q'), KeyEventKind::Release);
         assert!(!app.should_quit());
-        handle_key_event(&mut app, key(KeyCode::Char('q'), KeyEventKind::Press));
+        handle_key(&mut app, KeyCode::Char('q'), KeyEventKind::Press);
         assert!(app.should_quit());
     }
 
@@ -468,17 +513,21 @@ mod tests {
     #[test]
     fn mouse_after_resize_waits_for_new_render_info() {
         let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+
         let old_info = view::RenderInfo {
             max_detail_scroll: 20,
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
         };
+
         let mut events = VecDeque::from([
             Event::Resize(100, 40),
             Event::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)),
         ]);
 
-        assert!(handle_terminal_events(&mut app, &old_info, &mut events));
+        assert!(handle_terminal_events(&mut app, &old_info, &mut events, &run_tx,).unwrap());
+
         assert_eq!(app.selected_case(), 0);
         assert_eq!(events.len(), 1);
 
@@ -487,7 +536,9 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
         };
-        assert!(handle_terminal_events(&mut app, &new_info, &mut events));
+
+        assert!(handle_terminal_events(&mut app, &new_info, &mut events, &run_tx,).unwrap());
+
         assert_eq!(app.selected_case(), 0);
         assert_eq!(app.detail_scroll(), 3);
     }
@@ -496,9 +547,9 @@ mod tests {
     fn repeat_does_not_toggle_debug_repeatedly() {
         let mut app = app();
 
-        handle_key_event(&mut app, key(KeyCode::Char('d'), KeyEventKind::Press));
+        handle_key(&mut app, KeyCode::Char('d'), KeyEventKind::Press);
         assert!(app.debug_enabled());
-        handle_key_event(&mut app, key(KeyCode::Char('d'), KeyEventKind::Repeat));
+        handle_key(&mut app, KeyCode::Char('d'), KeyEventKind::Repeat);
         assert!(app.debug_enabled());
     }
 
@@ -506,9 +557,9 @@ mod tests {
     fn up_and_k_move_to_the_previous_case() {
         let mut app = app();
 
-        handle_key_event(&mut app, key(KeyCode::Up, KeyEventKind::Press));
+        handle_key(&mut app, KeyCode::Up, KeyEventKind::Press);
         assert_eq!(app.selected_case(), 2);
-        handle_key_event(&mut app, key(KeyCode::Char('k'), KeyEventKind::Press));
+        handle_key(&mut app, KeyCode::Char('k'), KeyEventKind::Press);
         assert_eq!(app.selected_case(), 1);
     }
 
@@ -516,18 +567,13 @@ mod tests {
     fn unknown_and_no_op_navigation_keys_are_not_dirty() {
         let mut app = app_with_problems(&[1]);
 
-        assert!(!handle_key_event(
+        assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('x'), KeyEventKind::Press)
+            KeyCode::Char('x'),
+            KeyEventKind::Press
         ));
-        assert!(!handle_key_event(
-            &mut app,
-            key(KeyCode::Right, KeyEventKind::Press)
-        ));
-        assert!(!handle_key_event(
-            &mut app,
-            key(KeyCode::Down, KeyEventKind::Press)
-        ));
+        assert!(!handle_key(&mut app, KeyCode::Right, KeyEventKind::Press));
+        assert!(!handle_key(&mut app, KeyCode::Down, KeyEventKind::Press));
     }
 
     #[test]
@@ -678,14 +724,12 @@ mod tests {
     fn key_and_source_message_processing_coexist() {
         let mut app = app_with_problems(&[3, 2]);
 
-        assert!(handle_key_event(
-            &mut app,
-            key(KeyCode::Down, KeyEventKind::Press)
-        ));
-        assert_eq!(app.selected_case(), 1);
-
         let (tx, rx) = mpsc::channel();
         let (run_tx, run_rx) = mpsc::channel();
+        assert!(
+            handle_key_event(&mut app, key(KeyCode::Down, KeyEventKind::Press), &run_tx,).unwrap()
+        );
+        assert_eq!(app.selected_case(), 1);
 
         tx.send(Message::SourceChanged {
             problem: 1,
@@ -708,10 +752,9 @@ mod tests {
         assert!(!request.debug);
 
         // Message処理後もkeyboard操作できる
-        assert!(handle_key_event(
-            &mut app,
-            key(KeyCode::Down, KeyEventKind::Press)
-        ));
+        assert!(
+            handle_key_event(&mut app, key(KeyCode::Down, KeyEventKind::Press), &run_tx,).unwrap()
+        );
         assert_eq!(app.selected_case(), 1);
     }
 
@@ -773,22 +816,25 @@ mod tests {
 
         assert!(!app.samples_pane_enabled());
 
-        assert!(handle_key_event(
+        assert!(handle_key(
             &mut app,
-            key(KeyCode::Char('s'), KeyEventKind::Press),
-        ));
+            KeyCode::Char('s'),
+            KeyEventKind::Press
+        ),);
         assert!(app.samples_pane_enabled());
 
-        assert!(!handle_key_event(
+        assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('s'), KeyEventKind::Repeat),
-        ));
+            KeyCode::Char('s'),
+            KeyEventKind::Repeat
+        ),);
         assert!(app.samples_pane_enabled());
 
-        assert!(handle_key_event(
+        assert!(handle_key(
             &mut app,
-            key(KeyCode::Char('s'), KeyEventKind::Press),
-        ));
+            KeyCode::Char('s'),
+            KeyEventKind::Press
+        ),);
         assert!(!app.samples_pane_enabled());
     }
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -940,5 +986,103 @@ mod tests {
 
         assert_eq!(app.selected_case(), 0);
         assert_eq!(app.detail_scroll(), 0);
+    }
+    #[test]
+    fn rerun_key_queues_current_source() {
+        let mut app = app();
+
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('r'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        let request = run_rx.try_recv().unwrap();
+
+        assert_eq!(request.problem, 0);
+        assert_eq!(request.language, Language::Cpp);
+        assert!(!request.debug);
+    }
+    #[test]
+    fn rerun_key_without_source_is_no_op() {
+        let mut app = app();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            !handle_key_event(
+                &mut app,
+                key(KeyCode::Char('r'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        assert!(run_rx.try_recv().is_err());
+    }
+    #[test]
+    fn debug_toggle_reruns_cpp_with_new_debug_state() {
+        let mut app = app();
+
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        assert!(app.debug_enabled());
+
+        let request = run_rx.try_recv().unwrap();
+
+        assert_eq!(request.problem, 0);
+        assert_eq!(request.language, Language::Cpp);
+        assert!(request.debug);
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        assert!(!app.debug_enabled());
+
+        let request = run_rx.try_recv().unwrap();
+        assert!(!request.debug);
+    }
+    #[test]
+    fn debug_toggle_does_not_rerun_python() {
+        let mut app = app();
+
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('d'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        assert!(app.debug_enabled());
+        assert!(run_rx.try_recv().is_err());
     }
 }

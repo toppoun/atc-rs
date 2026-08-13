@@ -184,6 +184,14 @@ impl WatchApp {
         self.selected_case
     }
 
+    pub fn selected_problem(&self) -> Option<usize> {
+        if self.problems.is_empty() {
+            None
+        } else {
+            Some(self.selected_problem)
+        }
+    }
+
     pub fn detail_scroll(&self) -> u16 {
         self.detail_scroll
     }
@@ -224,6 +232,13 @@ impl WatchApp {
 
     pub fn toggle_debug(&mut self) {
         self.debug = !self.debug;
+    }
+
+    pub fn current_source_language(&self) -> Option<Language> {
+        self.current_problem()?
+            .source
+            .as_ref()
+            .map(|source| source.language)
     }
 
     pub fn select_problem(&mut self, index: usize) -> bool {
@@ -1291,5 +1306,15 @@ mod tests {
 
         app.toggle_samples_pane();
         assert!(!app.samples_pane_enabled());
+    }
+    #[test]
+    fn selected_problem_returns_current_problem_index() {
+        let mut app = WatchApp::new(&contest(2), vec![1, 1]).unwrap();
+
+        assert_eq!(app.selected_problem(), Some(0));
+
+        app.next_problem();
+
+        assert_eq!(app.selected_problem(), Some(1));
     }
 }
