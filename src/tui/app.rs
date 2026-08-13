@@ -412,6 +412,42 @@ impl WatchApp {
 
         true
     }
+    pub fn run_requeued(&mut self, problem: usize, run_id: RunId) -> bool {
+        let affects_current_detail = self.selected_problem == problem;
+        let Some(total_cases) = self
+            .problems
+            .get(problem)
+            .map(|problem| problem.total_cases)
+        else {
+            return false;
+        };
+        let Some(run) = self.current_run_mut(problem, run_id) else {
+            return false;
+        };
+
+        if !matches!(run.phase, RunPhase::Compiling | RunPhase::Running) {
+            return false;
+        }
+
+        // run_id/language are logical-request state and survive preemption. Everything below is
+        // physical-attempt state and must be fresh before the same logical run starts again.
+        run.phase = RunPhase::Queued;
+        run.test_run_started = false;
+        run.accepted = 0;
+        run.total_cases = total_cases;
+        run.error = None;
+        run.cases = vec![CaseState::default(); total_cases];
+
+        if affects_current_detail {
+            if total_cases == 0 || self.selected_case >= total_cases {
+                self.selected_case = 0;
+            }
+            self.reset_detail_scroll();
+            self.invalidate_detail();
+        }
+
+        true
+    }
     pub fn run_event(&mut self, problem: usize, run_id: RunId, event: TestEvent) -> bool {
         let affects_current_detail = self.selected_problem == problem
             && match &event {
@@ -654,6 +690,7 @@ impl WatchApp {
 mod tests {
     use super::*;
     use crate::model::Problem;
+    use crate::tui::detail::DetailDocument;
 
     fn contest(problem_count: usize) -> Contest {
         Contest {
@@ -683,6 +720,20 @@ mod tests {
         } else {
             assert!(app.selected_case < total_cases);
         }
+    }
+
+    fn queued_cpp_app(total_cases: usize) -> (WatchApp, RunId) {
+        let mut app = WatchApp::new(&contest(1), vec![total_cases]).unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
+        let request = app.queue_run(0).unwrap();
+        (app, request.run_id)
+    }
+
+    fn detail_text(app: &WatchApp) -> String {
+        DetailDocument::from_app(app)
+            .segments()
+            .map(|segment| segment.text())
+            .collect()
     }
 
     #[test]
@@ -1557,5 +1608,184 @@ mod tests {
         app.next_problem();
 
         assert_eq!(app.selected_problem(), Some(1));
+    }
+
+    #[test]
+    fn compiling_run_can_be_requeued_without_changing_logical_identity() {
+        let (mut app, run_id) = queued_cpp_app(3);
+        assert!(app.run_started(0, run_id));
+        assert_eq!(app.problems[0].run.phase, RunPhase::Compiling);
+
+        assert!(app.run_requeued(0, run_id));
+
+        let run = &app.problems[0].run;
+        assert_eq!(run.id, Some(run_id));
+        assert_eq!(run.language, Some(Language::Cpp));
+        assert_eq!(run.phase, RunPhase::Queued);
+        assert!(!run.test_run_started);
+        assert_eq!(run.total_cases, 3);
+        assert_eq!(run.cases.len(), 3);
+        assert!(
+            run.cases
+                .iter()
+                .all(|case| case.verdict == CaseVerdict::Pending)
+        );
+    }
+
+    #[test]
+    fn running_run_can_restart_with_the_same_run_id_after_requeue() {
+        let (mut app, run_id) = queued_cpp_app(2);
+        assert!(app.run_started(0, run_id));
+        assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 2 },));
+        assert_eq!(app.problems[0].run.phase, RunPhase::Running);
+
+        assert!(app.run_requeued(0, run_id));
+        assert!(app.run_started(0, run_id));
+        assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 2 },));
+
+        let run = &app.problems[0].run;
+        assert_eq!(run.id, Some(run_id));
+        assert_eq!(run.phase, RunPhase::Running);
+        assert!(run.test_run_started);
+    }
+
+    #[test]
+    fn requeue_clears_all_partial_attempt_state_and_invalidates_selected_detail() {
+        let (mut app, run_id) = queued_cpp_app(2);
+        assert!(app.run_started(0, run_id));
+        assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 2 },));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 2,
+                expected: "expected\n".to_string(),
+                actual: "actual\n".to_string(),
+                elapsed: Duration::from_millis(2),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseStderr {
+                number: 2,
+                stderr: "old stderr\n".to_string(),
+            },
+        ));
+        app.problems[0].run.accepted = 1;
+        app.problems[0].run.error = Some(Arc::new("old error".to_string()));
+        assert!(app.next_case());
+        assert!(app.scroll_detail_down(50_000));
+        let revision = app.detail_revision();
+        assert!(detail_text(&app).contains("actual\n"));
+
+        assert!(app.run_requeued(0, run_id));
+
+        let run = &app.problems[0].run;
+        assert_eq!(run.phase, RunPhase::Queued);
+        assert!(!run.test_run_started);
+        assert_eq!(run.accepted, 0);
+        assert!(run.error.is_none());
+        assert_eq!(run.total_cases, 2);
+        assert!(run.cases.iter().all(|case| {
+            case.verdict == CaseVerdict::Pending
+                && case.elapsed.is_none()
+                && case.expected.is_none()
+                && case.actual.is_none()
+                && case.stderr.is_none()
+        }));
+        assert_eq!(app.selected_case(), 1);
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(app.detail_revision() > revision);
+        let detail = detail_text(&app);
+        assert!(detail.contains("Queued..."));
+        assert!(!detail.contains("actual\n"));
+        assert!(!detail.contains("old stderr\n"));
+    }
+
+    #[test]
+    fn stale_requeue_cannot_overwrite_a_newer_logical_run() {
+        let (mut app, stale_id) = queued_cpp_app(2);
+        assert!(app.run_started(0, stale_id));
+        let current = app.queue_run(0).unwrap();
+        let revision = app.detail_revision();
+
+        assert!(!app.run_requeued(0, stale_id));
+
+        let run = &app.problems[0].run;
+        assert_eq!(run.id, Some(current.run_id));
+        assert_eq!(run.phase, RunPhase::Queued);
+        assert_eq!(run.language, Some(current.language));
+        assert_eq!(app.detail_revision(), revision);
+    }
+
+    #[test]
+    fn terminal_runs_cannot_be_requeued() {
+        for phase in [
+            RunPhase::Finished,
+            RunPhase::CompileError,
+            RunPhase::CompileTimedOut,
+            RunPhase::NoSamples,
+            RunPhase::Failed,
+        ] {
+            let (mut app, run_id) = queued_cpp_app(1);
+            app.problems[0].run.phase = phase;
+            app.problems[0].run.accepted = 1;
+            let revision = app.detail_revision();
+
+            assert!(!app.run_requeued(0, run_id), "phase {phase:?}");
+            assert_eq!(app.problems[0].run.phase, phase);
+            assert_eq!(app.problems[0].run.accepted, 1);
+            assert_eq!(app.detail_revision(), revision);
+        }
+    }
+
+    #[test]
+    fn requeueing_nonselected_problem_does_not_change_selected_presentation_state() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 2]).unwrap();
+        assert!(app.source_changed(1, PathBuf::from("B.py"), Language::Python));
+        let request = app.queue_run(1).unwrap();
+        assert!(app.run_started(1, request.run_id));
+        assert!(app.run_event(
+            1,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 2 },
+        ));
+        assert!(app.select_problem(0));
+        assert!(app.next_case());
+        assert!(app.scroll_detail_down(77));
+        let revision = app.detail_revision();
+
+        assert!(app.run_requeued(1, request.run_id));
+
+        assert_eq!(app.problems[1].run.phase, RunPhase::Queued);
+        assert_eq!(app.selected_problem(), Some(0));
+        assert_eq!(app.selected_case(), 1);
+        assert_eq!(app.detail_scroll(), 77);
+        assert_eq!(app.detail_revision(), revision);
+    }
+
+    #[test]
+    fn selected_case_is_clamped_to_current_problem_sample_count_on_requeue() {
+        let (mut app, run_id) = queued_cpp_app(3);
+        assert!(app.run_started(0, run_id));
+        assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 3 },));
+        app.selected_case = 2;
+        app.problems[0].total_cases = 1;
+
+        assert!(app.run_requeued(0, run_id));
+
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.problems[0].run.total_cases, 1);
+        assert_eq!(app.problems[0].run.cases.len(), 1);
+        assert_selection_invariant(&app);
     }
 }

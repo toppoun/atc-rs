@@ -92,6 +92,12 @@ fn handle_messages(
                 }
             }
 
+            Ok(Message::RunRequeued { run_id, problem }) => {
+                if app.run_requeued(problem, run_id) {
+                    changed = true;
+                }
+            }
+
             Ok(Message::RunEvent {
                 run_id,
                 problem,
@@ -916,6 +922,42 @@ mod tests {
         assert_eq!(run.phase, app::RunPhase::Queued);
         assert_eq!(run.language, Some(Language::Python));
         assert_eq!(run.accepted, 0);
+    }
+
+    #[test]
+    fn run_requeued_message_updates_state_and_only_marks_real_changes_dirty() {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+
+        let (tx, rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+        tx.send(Message::RunRequeued {
+            run_id: request.run_id,
+            problem: 0,
+        })
+        .unwrap();
+
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+        assert_eq!(
+            app.current_problem().unwrap().run.phase,
+            app::RunPhase::Queued
+        );
+
+        let current = app.queue_run(0).unwrap();
+        tx.send(Message::RunRequeued {
+            run_id: request.run_id,
+            problem: 0,
+        })
+        .unwrap();
+
+        assert!(!handle_messages(&mut app, &rx, &run_tx).unwrap());
+        assert_eq!(app.current_problem().unwrap().run.id, Some(current.run_id));
+        assert_eq!(
+            app.current_problem().unwrap().run.phase,
+            app::RunPhase::Queued
+        );
     }
     #[test]
     fn samples_pane_toggles_only_on_key_press() {
