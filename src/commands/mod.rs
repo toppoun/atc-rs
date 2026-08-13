@@ -1,6 +1,9 @@
 mod create;
 mod new;
 mod refresh;
+// S1ではpolicyだけを実装し、production workerへの接続は後続段階で行う。
+#[cfg_attr(not(test), allow(dead_code))]
+mod run_scheduler;
 mod test;
 mod watch;
 mod watch_source;
