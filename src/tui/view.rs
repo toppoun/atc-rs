@@ -11,6 +11,9 @@ use ratatui::{
 use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
 use crate::language::Language;
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
@@ -114,31 +117,37 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
         frame.render_widget(samples, samples_area);
     }
 
-    // 選択中sample / compile error等の詳細
-    let detail_text = Text::raw(detail_text(app));
-
-    // Paragraphはwrapしないため、Text::height()がそのまま縦方向のcontent高さ。
-    let content_height = detail_text.height();
+    // detailは描画前にterminal cell幅でsoft wrapする。
+    let raw_detail_text = detail_text(app);
     let viewport_height = usize::from(detail_area.height);
 
-    let max_scroll = max_scroll(content_height, viewport_height);
+    // まずdetail幅全部を使ってwrapする。
+    let mut wrapped_detail_text = wrap_detail_text(&raw_detail_text, detail_area.width);
 
-    let scroll = app.detail_scroll().min(max_scroll);
+    let mut max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
 
-    let detail = Paragraph::new(detail_text).scroll((scroll, 0));
+    if max_detail_scroll > 0 && detail_area.width > 1 {
+        wrapped_detail_text =
+            wrap_detail_text(&raw_detail_text, detail_area.width.saturating_sub(1));
+
+        max_detail_scroll = max_scroll(wrapped_detail_text.height(), viewport_height);
+    }
+
+    let scroll = app.detail_scroll().min(max_detail_scroll);
+
+    let detail = Paragraph::new(wrapped_detail_text).scroll((scroll, 0));
 
     frame.render_widget(detail, detail_area);
 
-    if max_scroll > 0 {
+    if max_detail_scroll > 0 {
         let mut scrollbar_state =
-            ScrollbarState::new(usize::from(max_scroll) + 1).position(usize::from(scroll));
+            ScrollbarState::new(usize::from(max_detail_scroll) + 1).position(usize::from(scroll));
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
 
         frame.render_stateful_widget(scrollbar, detail_area, &mut scrollbar_state);
     }
 
-    // まだ実装済みの操作だけ表示する
     let footer = Paragraph::new(
         "s samples   d debug   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
     )
@@ -147,10 +156,78 @@ pub fn render(frame: &mut Frame, app: &WatchApp) -> RenderInfo {
     frame.render_widget(footer, rows[2]);
 
     RenderInfo {
-        max_detail_scroll: max_scroll,
+        max_detail_scroll,
         samples_area,
         detail_area,
     }
+}
+
+fn wrap_detail_text(text: &str, width: u16) -> Text<'static> {
+    let width = usize::from(width);
+    let mut lines = Vec::new();
+
+    for logical_line in text.split('\n') {
+        if width == 0 || logical_line.is_empty() {
+            lines.push(Line::from(logical_line.to_owned()));
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+
+        for token in UnicodeSegmentation::split_word_bounds(logical_line) {
+            let token_width = UnicodeWidthStr::width(token);
+
+            // token自体が1行に収まる場合。
+            if token_width <= width {
+                if !current.is_empty() && current_width.saturating_add(token_width) > width {
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+
+                current.push_str(token);
+                current_width = current_width.saturating_add(token_width);
+
+                if current_width == width {
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+
+                continue;
+            }
+
+            // tokenそのものが横幅より長い場合。
+            // まず現在の行を確定する。
+            if !current.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+
+            // 長すぎるtokenだけgrapheme単位でhard wrapする。
+            for grapheme in UnicodeSegmentation::graphemes(token, true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+                if !current.is_empty() && current_width.saturating_add(grapheme_width) > width {
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+
+                current.push_str(grapheme);
+                current_width = current_width.saturating_add(grapheme_width);
+
+                if current_width >= width {
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            lines.push(Line::from(current));
+        }
+    }
+
+    Text::from(lines)
 }
 
 fn max_scroll(content_height: usize, viewport_height: usize) -> u16 {
@@ -617,5 +694,54 @@ mod tests {
         assert!(disabled.samples_area.is_none());
         assert_eq!(disabled.detail_area.x, 1);
         assert_eq!(disabled.detail_area.width, 50);
+    }
+
+    #[test]
+    fn detail_wrap_uses_terminal_cell_width() {
+        // 全角3文字で6セル。幅6なら1行、4文字目で折り返す。
+        let text = wrap_detail_text("あいうえ", 6);
+
+        assert_eq!(text.height(), 2);
+        assert_eq!(text_lines(&text), ["あいう", "え"],);
+    }
+
+    #[test]
+    fn detail_wrap_preserves_explicit_blank_lines() {
+        let text = wrap_detail_text("expected\n\nactual", 80);
+
+        assert_eq!(text.height(), 3);
+    }
+
+    #[test]
+    fn detail_wrap_is_safe_for_zero_and_narrow_widths() {
+        let zero = wrap_detail_text("abc", 0);
+        assert_eq!(zero.height(), 1);
+
+        // 1セル幅に全角文字が来てもgraphemeを壊さず1行として扱う。
+        let narrow = wrap_detail_text("あ", 1);
+        assert_eq!(narrow.height(), 1);
+    }
+    fn text_lines(text: &Text<'_>) -> Vec<String> {
+        text.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+    #[test]
+    fn detail_wraps_ascii_at_terminal_width() {
+        let text = wrap_detail_text("123456789", 4);
+
+        assert_eq!(text_lines(&text), ["1234", "5678", "9"],);
+    }
+    #[test]
+    fn detail_wrap_does_not_split_word_when_it_can_move_to_next_line() {
+        let text = wrap_detail_text("56 57 58 59", 8);
+
+        assert_eq!(text_lines(&text), ["56 57 ", "58 59"],);
     }
 }

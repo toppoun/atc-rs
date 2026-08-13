@@ -96,6 +96,8 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
  "wait-timeout",
 ]
 

@@ -169,6 +169,7 @@ impl WatchApp {
 
     pub fn toggle_samples_pane(&mut self) {
         self.samples_pane_enabled = !self.samples_pane_enabled;
+        self.reset_detail_scroll();
     }
 
     pub fn contest_id(&self) -> &str {

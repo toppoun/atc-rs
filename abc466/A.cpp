@@ -30,6 +30,12 @@ int main() {
         cin >> x;
         if(x >= 0) ans = false;  
     }
+    for(int i = 0; i < 100; i++){
+        cout << i << " ";
+    }
+    for(int i = 0; i < 100; i++){
+        cout << i;
+    }
     cout << (ans ? "Yes":"No") << endl;
     std::cerr << "Error message1" << std::endl;
     std::cerr << "Error message2" << std::endl;
