@@ -982,6 +982,31 @@ fn wrap_giant_logical_line_page(
     sink: &mut impl WrapSink,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<GiantWrapProgress> {
+    let window_bytes = row_budget
+        .saturating_mul(width.max(1))
+        .saturating_mul(4)
+        .saturating_add(16)
+        .max(GIANT_LINE_WINDOW_MIN_BYTES);
+    wrap_giant_logical_line_page_with_window_bytes(
+        fragments,
+        width,
+        start_raw_offset,
+        row_budget,
+        window_bytes,
+        sink,
+        is_cancelled,
+    )
+}
+
+fn wrap_giant_logical_line_page_with_window_bytes(
+    fragments: &[&str],
+    width: usize,
+    start_raw_offset: usize,
+    row_budget: usize,
+    initial_window_bytes: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<GiantWrapProgress> {
     let total_bytes = fragments
         .iter()
         .map(|fragment| fragment.len())
@@ -1011,18 +1036,15 @@ fn wrap_giant_logical_line_page(
     let mut raw_offset = start_raw_offset.min(total_bytes);
     let mut rows = 0usize;
     let mut scanned_bytes = 0usize;
-    let estimated_bytes = row_budget
-        .saturating_mul(width.max(1))
-        .saturating_mul(4)
-        .saturating_add(16);
-    let mut window_bytes = GIANT_LINE_WINDOW_MIN_BYTES.max(estimated_bytes);
+    let mut window_bytes = initial_window_bytes.max(1);
 
     loop {
         if is_cancelled() {
             return None;
         }
 
-        let window = logical_line_window(fragments, raw_offset, window_bytes);
+        let (window, inspected_bytes) =
+            logical_line_window(fragments, raw_offset, window_bytes, width);
         let reaches_end = raw_offset.saturating_add(window.len()) >= total_bytes;
         let remaining_rows = row_budget.saturating_sub(rows);
         let progress = wrap_logical_line_window(
@@ -1033,7 +1055,9 @@ fn wrap_giant_logical_line_page(
             remaining_rows,
             reaches_end,
         )?;
-        scanned_bytes = scanned_bytes.saturating_add(progress.scanned_bytes);
+        scanned_bytes = scanned_bytes
+            .saturating_add(inspected_bytes)
+            .saturating_add(progress.scanned_bytes);
         rows = rows.saturating_add(progress.rows);
         raw_offset = raw_offset.saturating_add(progress.next_offset);
 
@@ -1054,7 +1078,7 @@ fn wrap_giant_logical_line_page(
             });
         }
         if progress.rows > 0 {
-            window_bytes = GIANT_LINE_WINDOW_MIN_BYTES.max(estimated_bytes);
+            window_bytes = initial_window_bytes.max(1);
             continue;
         }
         if reaches_end || window.is_empty() {
@@ -1068,6 +1092,83 @@ fn wrap_giant_logical_line_page(
 }
 
 fn logical_line_window<'a>(
+    fragments: &[&'a str],
+    raw_offset: usize,
+    max_bytes: usize,
+    width: usize,
+) -> (Cow<'a, str>, usize) {
+    let total_bytes = fragments
+        .iter()
+        .map(|fragment| fragment.len())
+        .fold(0usize, usize::saturating_add);
+    let remaining_bytes = total_bytes.saturating_sub(raw_offset);
+    let target_bytes = max_bytes.max(1).min(remaining_bytes);
+    let mut probe_bytes = target_bytes.saturating_add(64).min(remaining_bytes);
+
+    loop {
+        let window = raw_logical_line_window(fragments, raw_offset, probe_bytes);
+        let inspected_bytes = window.len();
+        if window.len() >= remaining_bytes {
+            return (window, inspected_bytes);
+        }
+
+        let (grapheme_boundary, token_boundary) =
+            next_safe_window_boundaries(window.as_ref(), target_bytes);
+
+        if let Some(boundary) = token_boundary {
+            return (truncate_window(window, boundary), inspected_bytes);
+        }
+
+        // A storage window must not become an artificial soft-wrap boundary. If the
+        // token crossing the target is already wider than a visual row, however,
+        // the full token is necessarily oversized and the eager path hard-wraps it.
+        // In that case any complete grapheme boundary is a safe resume point.
+        let trailing_token_is_oversized =
+            UnicodeSegmentation::split_word_bound_indices(window.as_ref())
+                .next_back()
+                .is_some_and(|(offset, token)| {
+                    offset < target_bytes && UnicodeWidthStr::width(token) > width
+                });
+        if trailing_token_is_oversized && let Some(boundary) = grapheme_boundary {
+            return (truncate_window(window, boundary), inspected_bytes);
+        }
+
+        // The target is still inside a short/incomplete token or an incomplete
+        // grapheme. Grow only the lookahead until its semantic boundary is known.
+        let next_probe = probe_bytes.saturating_mul(2).min(remaining_bytes);
+        if next_probe == probe_bytes {
+            return (window, inspected_bytes);
+        }
+        probe_bytes = next_probe;
+    }
+}
+
+fn next_safe_window_boundaries(text: &str, target: usize) -> (Option<usize>, Option<usize>) {
+    let mut grapheme_boundaries = UnicodeSegmentation::grapheme_indices(text, true)
+        .map(|(offset, _)| offset)
+        .filter(|offset| *offset >= target && *offset > 0)
+        .peekable();
+    let first_grapheme = grapheme_boundaries.peek().copied();
+
+    for token_boundary in UnicodeSegmentation::split_word_bound_indices(text)
+        .map(|(offset, _)| offset)
+        .filter(|offset| *offset >= target && *offset > 0)
+    {
+        while grapheme_boundaries
+            .peek()
+            .is_some_and(|boundary| *boundary < token_boundary)
+        {
+            grapheme_boundaries.next();
+        }
+        if grapheme_boundaries.peek().copied() == Some(token_boundary) {
+            return (first_grapheme, Some(token_boundary));
+        }
+    }
+
+    (first_grapheme, None)
+}
+
+fn raw_logical_line_window<'a>(
     fragments: &[&'a str],
     raw_offset: usize,
     max_bytes: usize,
@@ -1110,6 +1211,16 @@ fn logical_line_window<'a>(
                 joined.push_str(piece);
             }
             Cow::Owned(joined)
+        }
+    }
+}
+
+fn truncate_window(window: Cow<'_, str>, end: usize) -> Cow<'_, str> {
+    match window {
+        Cow::Borrowed(text) => Cow::Borrowed(&text[..end]),
+        Cow::Owned(mut text) => {
+            text.truncate(end);
+            Cow::Owned(text)
         }
     }
 }
@@ -1457,6 +1568,74 @@ mod tests {
         }
     }
 
+    fn streaming_fragment_lines(
+        fragments: &[&str],
+        width: usize,
+        page_rows: usize,
+        initial_window_bytes: usize,
+    ) -> Vec<String> {
+        let mut raw_offset = 0usize;
+        let mut lines = Vec::new();
+        loop {
+            let mut page = Vec::new();
+            let progress = wrap_giant_logical_line_page_with_window_bytes(
+                fragments,
+                width,
+                raw_offset,
+                page_rows,
+                initial_window_bytes,
+                &mut MaterializeSink::new(&mut page),
+                &mut || false,
+            )
+            .unwrap();
+            lines.extend(page.into_iter().map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            }));
+            raw_offset = progress.next_raw_offset;
+            if progress.finished {
+                return lines;
+            }
+            assert!(progress.rows > 0);
+        }
+    }
+
+    fn eager_fragment_lines(fragments: &[&str], width: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        wrap_logical_line_fragments(fragments, width, &mut lines);
+        text_lines(&Text::from(lines))
+    }
+
+    fn assert_streaming_matches_eager(
+        fragments: &[&str],
+        width: usize,
+        page_rows: usize,
+        window_bytes: &[usize],
+    ) {
+        let reference = eager_fragment_lines(fragments, width);
+        for &window_bytes in window_bytes {
+            assert_eq!(
+                streaming_fragment_lines(fragments, width, page_rows, window_bytes),
+                reference,
+                "width={width}, rows={page_rows}, window={window_bytes}"
+            );
+        }
+    }
+
+    fn is_grapheme_boundary(text: &str, offset: usize) -> bool {
+        offset == text.len()
+            || UnicodeSegmentation::grapheme_indices(text, true)
+                .any(|(boundary, _)| boundary == offset)
+    }
+
+    fn is_token_boundary(text: &str, offset: usize) -> bool {
+        offset == text.len()
+            || UnicodeSegmentation::split_word_bound_indices(text)
+                .any(|(boundary, _)| boundary == offset)
+    }
+
     #[test]
     fn logical_line_index_preserves_empty_and_trailing_lines() {
         for (raw, expected) in [
@@ -1521,6 +1700,162 @@ mod tests {
     }
 
     #[test]
+    fn unicode_window_edges_match_eager_reference() {
+        let raw = [
+            "👩‍💻",
+            "👨‍👩‍👧‍👦",
+            "e\u{301}\u{323}",
+            "✈\u{fe0f}",
+            "👍🏽",
+            "🇯🇵",
+            "abcdefghijklmnopqrstuvwxyz",
+            " 日本語token 👩‍💻token e\u{301}\u{323}token ",
+        ]
+        .concat()
+        .repeat(40);
+        let fragments = [raw.as_str()];
+
+        for width in [3, 5, 9, 13] {
+            let reference = eager_fragment_lines(&fragments, width);
+            for page_rows in [1, 2, 3, 7] {
+                for window_bytes in 1..=96 {
+                    assert_eq!(
+                        streaming_fragment_lines(&fragments, width, page_rows, window_bytes,),
+                        reference,
+                        "width={width}, rows={page_rows}, window={window_bytes}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zwj_and_long_zwj_window_edges_match_eager_reference() {
+        for cluster in ["👩‍💻", "👨‍👩‍👧‍👦"] {
+            let raw = format!("{cluster} developer {cluster} family ").repeat(12);
+            let fragments = [raw.as_str()];
+            let internal_edges = raw
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .filter(|offset| *offset > 0 && *offset < cluster.len())
+                .filter(|offset| !is_grapheme_boundary(&raw, *offset))
+                .collect::<Vec<_>>();
+
+            assert!(!internal_edges.is_empty());
+            assert_streaming_matches_eager(&fragments, 7, 2, &internal_edges);
+        }
+    }
+
+    #[test]
+    fn combining_window_edges_match_eager_reference() {
+        let cluster = "e\u{301}\u{323}\u{300}";
+        let raw = format!("{cluster}combine {cluster}marks ").repeat(16);
+        let fragments = [raw.as_str()];
+        let base_mark_edge = "e".len();
+        let mark_mark_edge = "e\u{301}".len();
+
+        assert!(!is_grapheme_boundary(&raw, base_mark_edge));
+        assert!(!is_grapheme_boundary(&raw, mark_mark_edge));
+        assert_streaming_matches_eager(&fragments, 6, 2, &[base_mark_edge, mark_mark_edge]);
+    }
+
+    #[test]
+    fn variation_modifier_and_regional_indicator_edges_match_eager_reference() {
+        for (cluster, edge) in [
+            ("✈\u{fe0f}", "✈".len()),
+            ("👍🏽", "👍".len()),
+            ("🇯🇵", "🇯".len()),
+        ] {
+            let raw = format!("{cluster}token {cluster} next ").repeat(16);
+            let fragments = [raw.as_str()];
+
+            assert!(!is_grapheme_boundary(&raw, edge));
+            assert_streaming_matches_eager(&fragments, 5, 1, &[edge]);
+        }
+    }
+
+    #[test]
+    fn ascii_and_unicode_token_window_edges_do_not_become_soft_wrap_boundaries() {
+        let raw = "ab abcdefghijkl 日本語token 👩‍💻token e\u{301}\u{323}token xyz ".repeat(20);
+        let fragments = [raw.as_str()];
+        let ascii_edge = raw.find("abcdefghijkl").unwrap() + 5;
+        let unicode_edge = raw.find("日本語token").unwrap() + "日本語".len() + 2;
+
+        assert!(is_grapheme_boundary(&raw, ascii_edge));
+        assert!(!is_token_boundary(&raw, ascii_edge));
+        assert!(is_grapheme_boundary(&raw, unicode_edge));
+        assert!(!is_token_boundary(&raw, unicode_edge));
+        assert_streaming_matches_eager(&fragments, 7, 3, &[ascii_edge, unicode_edge]);
+    }
+
+    #[test]
+    fn oversized_unicode_token_resumes_across_window_and_page_boundaries() {
+        let grapheme = "e\u{301}\u{323}";
+        let raw = grapheme.repeat(400);
+        let fragments = [raw.as_str()];
+        let internal_grapheme_edge = "e".len();
+
+        assert!(!is_grapheme_boundary(&raw, internal_grapheme_edge));
+        assert_streaming_matches_eager(
+            &fragments,
+            5,
+            1,
+            &[1, 2, 3, 5, 8, 13, 21, internal_grapheme_edge],
+        );
+    }
+
+    #[test]
+    fn segment_and_window_edges_inside_graphemes_match_concatenated_reference() {
+        let first = "abc👩‍";
+        let second = "💻def e\u{301}";
+        let third = "\u{323}ghi 🇯";
+        let fourth = "🇵jkl ";
+        let fragments = [first, second, third, fourth];
+        let joined = fragments.concat().repeat(20);
+        let repeated_fragments = fragments
+            .iter()
+            .cycle()
+            .take(fragments.len() * 20)
+            .copied()
+            .collect::<Vec<_>>();
+        let reference_fragments = [joined.as_str()];
+
+        assert_eq!(
+            streaming_fragment_lines(&repeated_fragments, 6, 2, 5),
+            eager_fragment_lines(&reference_fragments, 6)
+        );
+    }
+
+    #[test]
+    fn unicode_giant_foreground_background_and_eager_counts_agree() {
+        let raw = "👩‍💻token e\u{301}\u{323}token 🇯🇵 日本語 abcdefghijkl ".repeat(2_000);
+        assert!(raw.len() >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        let fragments = [raw.as_str()];
+        let eager = eager_fragment_lines(&fragments, 11);
+        let streaming = streaming_fragment_lines(&fragments, 11, 7, 17);
+        let background = count_giant_logical_line_fragments(&fragments, 11, &mut || false)
+            .expect("background count must complete");
+
+        assert_eq!(streaming, eager);
+        assert_eq!(background, eager.len());
+    }
+
+    #[test]
+    fn unicode_window_lookahead_keeps_initial_giant_viewport_bounded() {
+        let raw = "👩‍💻token e\u{301}\u{323}token 🇯🇵 日本語 ".repeat(40_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 41, 30, 0);
+
+        assert_eq!(viewport.text.height(), 30);
+        assert_eq!(layout.giant_page_layout_operations, 1);
+        assert!(layout.giant_scanned_bytes < raw.len() / 10);
+        assert!(layout.materialized_giant_visual_line_count() <= GIANT_LINE_PAGE_ROWS);
+    }
+
+    #[test]
     fn giant_no_space_token_hard_wraps_without_scanning_the_whole_token() {
         let raw = "a".repeat(2 * 1024 * 1024);
         let segments = [raw.as_str()];
@@ -1545,10 +1880,13 @@ mod tests {
         let raw = "0123456789 ".repeat(100_000);
         let fragments = [raw.as_str()];
 
-        let window = logical_line_window(&fragments, 1_000, 4_096);
+        let (window, inspected_bytes) = logical_line_window(&fragments, 1_000, 4_096, 80);
 
         assert!(matches!(window, Cow::Borrowed(_)));
-        assert_eq!(window.len(), 4_096);
+        assert!(inspected_bytes <= 4_160);
+        assert!((4_096..=4_160).contains(&window.len()));
+        assert!(is_grapheme_boundary(&raw[1_000..], window.len()));
+        assert!(is_token_boundary(&raw[1_000..], window.len()));
         assert_eq!(window.as_ptr(), raw[1_000..].as_ptr());
     }
 
