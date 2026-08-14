@@ -131,15 +131,17 @@ fn count_request(
         return None;
     }
 
-    let chunk_visual_lines = request.structure.count_chunks(
+    let count = request.structure.count_chunks(
         &request.snapshot,
         request.identity.layout_width,
+        request.anchor,
         is_cancelled,
     )?;
 
     Some(DetailCountResult {
         identity: request.identity,
-        chunk_visual_lines,
+        chunk_visual_lines: count.chunk_visual_lines,
+        anchor_visual_row: count.anchor_visual_row,
     })
 }
 
@@ -282,8 +284,8 @@ mod tests {
     use super::*;
     use crate::tui::detail::DetailDocument;
     use crate::tui::detail_layout::{
-        DetailAnalysisCommand, DetailAnalysisResult, DetailCountRequest, DetailLayout,
-        wrap_detail_document,
+        ContentAnchor, DetailAnalysisCommand, DetailAnalysisResult, DetailCountRequest,
+        DetailLayout, RawOffset, wrap_detail_document,
     };
     use std::sync::Mutex;
 
@@ -321,8 +323,25 @@ mod tests {
     fn synthetic_result(request: DetailCountRequest) -> DetailCountResult {
         DetailCountResult {
             chunk_visual_lines: vec![1; request.identity.chunk_count],
+            anchor_visual_row: None,
             identity: request.identity,
         }
+    }
+
+    #[test]
+    fn count_request_resolves_an_anchor_in_the_same_background_pass() {
+        let raw = Arc::new("abcdefghij".repeat(10_000));
+        let mut request = request(&raw, 1, 6);
+        assert_eq!(request.identity.layout_width, 5);
+        request.anchor = Some(ContentAnchor {
+            unit_index: 0,
+            raw_position: RawOffset(5),
+        });
+
+        let result = count_request(request, &mut || false).unwrap();
+
+        assert_eq!(result.anchor_visual_row, Some(1));
+        assert_eq!(result.chunk_visual_lines, [20_000]);
     }
 
     #[test]
@@ -343,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn count_request_shares_raw_buffer_and_returns_only_chunk_counts() {
+    fn count_request_shares_raw_buffer_and_returns_only_count_metadata() {
         let raw = Arc::new("line\n".repeat(100_000));
         let owners = Arc::strong_count(&raw);
         let request = request(&raw, 1, 80);
@@ -354,6 +373,7 @@ mod tests {
         let result = count_request(request, &mut || false).unwrap();
         assert_eq!(result.chunk_visual_lines.len(), result.identity.chunk_count);
         assert_eq!(result.chunk_visual_lines.iter().sum::<usize>(), 100_001);
+        assert_eq!(result.anchor_visual_row, None);
         assert_eq!(Arc::strong_count(&raw), owners);
     }
 

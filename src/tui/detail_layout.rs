@@ -33,7 +33,7 @@ enum LayoutMode {
 // Byte position in the virtual concatenation of all detail segments. Segment
 // boundaries contribute no bytes and are not logical-line boundaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct RawOffset(usize);
+pub(super) struct RawOffset(pub(super) usize);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DetailRawMap {
@@ -666,49 +666,90 @@ impl DetailDocumentStructure {
         &self,
         document: &impl DetailTextSource,
         width: usize,
+        anchor: Option<ContentAnchor>,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<DetailCountComputation> {
         debug_assert!(self.complete);
+        if anchor.is_some_and(|anchor| anchor.unit_index >= self.units.len()) {
+            return None;
+        }
         let mut counts = Vec::with_capacity(self.chunk_count());
+        let mut visual_prefix = 0usize;
+        let mut anchor_visual_row = None;
 
-        for unit in &self.units {
+        for (unit_index, unit) in self.units.iter().enumerate() {
             if is_cancelled() {
                 return None;
             }
 
-            let visual_lines = match unit {
+            let target_raw_position = anchor
+                .filter(|anchor| anchor.unit_index == unit_index)
+                .map(|anchor| anchor.raw_position);
+            let unit_count = match unit {
                 StructuralUnit::Normal(block) => {
                     let text = self.raw_map.bounded_text(document, block.raw_range.clone());
-                    let mut sink = CountSink::default();
-                    if !wrap_normal_block(
+                    let mut sink = CountSink::new(target_raw_position);
+                    if !wrap_normal_block_at(
                         &text,
                         block.logical_line_count,
                         width,
+                        block.raw_range.start.0,
                         &mut sink,
                         &mut is_cancelled,
                     ) {
                         return None;
                     }
-                    sink.lines
+                    sink.into_unit_count()
                 }
                 StructuralUnit::Giant(line) => {
                     let end = line
                         .raw_end
                         .expect("background count requires a closed giant line");
                     let fragments = self.raw_map.fragments(document, line.raw_start..end);
-                    count_giant_logical_line_fragments(&fragments, width, &mut is_cancelled)?
+                    count_giant_logical_line_fragments(
+                        &fragments,
+                        width,
+                        line.raw_start,
+                        target_raw_position,
+                        &mut is_cancelled,
+                    )?
                 }
             };
 
-            counts.push(visual_lines);
+            if target_raw_position.is_some() {
+                let local_row = unit_count.anchor_local_row?;
+                anchor_visual_row = Some(visual_prefix.saturating_add(local_row));
+            }
+            counts.push(unit_count.visual_lines);
+            visual_prefix = visual_prefix.saturating_add(unit_count.visual_lines);
         }
 
-        Some(counts)
+        if anchor.is_some() && anchor_visual_row.is_none() {
+            return None;
+        }
+
+        Some(DetailCountComputation {
+            chunk_visual_lines: counts,
+            anchor_visual_row,
+        })
     }
 }
 
 pub(crate) type DetailDocumentGeneration = u64;
 pub(crate) type DetailLayoutGeneration = u64;
+
+/// A width-independent position in one structural unit of a specific detail
+/// document. It is normally created from a materialized visual row's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContentAnchor {
+    pub(super) unit_index: usize,
+    pub(super) raw_position: RawOffset,
+}
+
+pub(super) struct DetailCountComputation {
+    pub(super) chunk_visual_lines: Vec<usize>,
+    pub(super) anchor_visual_row: Option<usize>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetailDocumentIdentity {
@@ -744,12 +785,14 @@ pub(crate) struct DetailCountRequest {
     pub(super) identity: DetailCountIdentity,
     pub(super) snapshot: DetailSnapshot,
     pub(super) structure: Arc<DetailDocumentStructure>,
+    pub(super) anchor: Option<ContentAnchor>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetailCountResult {
     pub(super) identity: DetailCountIdentity,
     pub(super) chunk_visual_lines: Vec<usize>,
+    pub(super) anchor_visual_row: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -903,6 +946,7 @@ impl DetailLayout {
                     identity: self.count_identity(),
                     snapshot: document.snapshot(),
                     structure,
+                    anchor: None,
                 })
             }
             PendingAnalysisCommand::Cancel => DetailAnalysisCommand::Cancel {
@@ -929,6 +973,10 @@ impl DetailLayout {
         {
             return false;
         }
+
+        // E2-B computes this together with exact counts, but E2-C will be the
+        // first step that reconciles it with scroll state.
+        let _ = result.anchor_visual_row;
 
         if self
             .chunks
@@ -1843,6 +1891,7 @@ fn visit_normal_block_lines(
     visited == logical_line_count
 }
 
+#[cfg(test)]
 fn wrap_normal_block(
     text: &str,
     logical_line_count: usize,
@@ -1935,28 +1984,30 @@ fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec
 fn count_giant_logical_line_fragments(
     fragments: &[&str],
     width: usize,
+    raw_offset_base: RawOffset,
+    anchor_position: Option<RawOffset>,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Option<usize> {
-    let mut total_rows = 0usize;
+) -> Option<UnitVisualCount> {
     let mut raw_offset = 0usize;
+    let mut sink = CountSink::new(anchor_position);
 
     loop {
-        let mut sink = CountSink::default();
-        let progress = wrap_giant_logical_line_page(
+        let rows_before = sink.lines;
+        let progress = wrap_giant_logical_line_page_at(
             fragments,
             width,
             raw_offset,
+            raw_offset_base.0,
             GIANT_LINE_PAGE_ROWS,
             &mut sink,
             is_cancelled,
         )?;
         let _ = progress.scanned_bytes;
-        debug_assert_eq!(sink.lines, progress.rows);
-        total_rows = total_rows.saturating_add(progress.rows);
+        debug_assert_eq!(sink.lines.saturating_sub(rows_before), progress.rows);
         raw_offset = progress.next_raw_offset;
 
         if progress.finished {
-            return Some(total_rows);
+            return Some(sink.into_unit_count());
         }
         if progress.rows == 0 {
             return None;
@@ -2186,10 +2237,11 @@ struct DocumentGiantWindow<'a> {
     discovered_end: Option<GiantLineEnd>,
 }
 
-fn wrap_giant_logical_line_page(
+fn wrap_giant_logical_line_page_at(
     fragments: &[&str],
     width: usize,
     start_raw_offset: usize,
+    raw_offset_base: usize,
     row_budget: usize,
     sink: &mut impl WrapSink,
     is_cancelled: &mut impl FnMut() -> bool,
@@ -2199,10 +2251,13 @@ fn wrap_giant_logical_line_page(
         .saturating_mul(4)
         .saturating_add(16)
         .max(GIANT_LINE_WINDOW_MIN_BYTES);
-    wrap_giant_logical_line_page_with_window_bytes(
+    wrap_giant_logical_line_page_with_window_bytes_at(
         fragments,
         width,
-        start_raw_offset,
+        GiantRawCursor {
+            line_offset: start_raw_offset,
+            document_base: raw_offset_base,
+        },
         row_budget,
         window_bytes,
         sink,
@@ -2210,10 +2265,34 @@ fn wrap_giant_logical_line_page(
     )
 }
 
+#[cfg(test)]
 fn wrap_giant_logical_line_page_with_window_bytes(
     fragments: &[&str],
     width: usize,
     start_raw_offset: usize,
+    row_budget: usize,
+    initial_window_bytes: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<GiantWrapProgress> {
+    wrap_giant_logical_line_page_with_window_bytes_at(
+        fragments,
+        width,
+        GiantRawCursor {
+            line_offset: start_raw_offset,
+            document_base: 0,
+        },
+        row_budget,
+        initial_window_bytes,
+        sink,
+        is_cancelled,
+    )
+}
+
+fn wrap_giant_logical_line_page_with_window_bytes_at(
+    fragments: &[&str],
+    width: usize,
+    raw_cursor: GiantRawCursor,
     row_budget: usize,
     initial_window_bytes: usize,
     sink: &mut impl WrapSink,
@@ -2225,7 +2304,7 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         .fold(0usize, usize::saturating_add);
 
     if width == 0 {
-        if start_raw_offset >= total_bytes {
+        if raw_cursor.line_offset >= total_bytes {
             return Some(GiantWrapProgress {
                 rows: 0,
                 next_raw_offset: total_bytes,
@@ -2236,7 +2315,12 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         for fragment in fragments {
             sink.push(fragment);
         }
-        sink.emit(start_raw_offset..total_bytes);
+        sink.emit(
+            raw_cursor
+                .document_base
+                .saturating_add(raw_cursor.line_offset)
+                ..raw_cursor.document_base.saturating_add(total_bytes),
+        );
         return Some(GiantWrapProgress {
             rows: 1,
             next_raw_offset: total_bytes,
@@ -2245,7 +2329,7 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         });
     }
 
-    let mut raw_offset = start_raw_offset.min(total_bytes);
+    let mut raw_offset = raw_cursor.line_offset.min(total_bytes);
     let mut rows = 0usize;
     let mut scanned_bytes = 0usize;
     let mut window_bytes = initial_window_bytes.max(1);
@@ -2262,7 +2346,7 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         let progress = wrap_logical_line_window(
             window.as_ref(),
             width,
-            raw_offset,
+            raw_cursor.document_base.saturating_add(raw_offset),
             sink,
             is_cancelled,
             remaining_rows,
@@ -2517,10 +2601,40 @@ impl WrapSink for ProvenanceMaterializeSink<'_> {
     }
 }
 
-#[derive(Default)]
 struct CountSink {
     has_content: bool,
     lines: usize,
+    anchor_position: Option<RawOffset>,
+    anchor_local_row: Option<usize>,
+}
+
+struct UnitVisualCount {
+    visual_lines: usize,
+    anchor_local_row: Option<usize>,
+}
+
+impl CountSink {
+    fn new(anchor_position: Option<RawOffset>) -> Self {
+        Self {
+            has_content: false,
+            lines: 0,
+            anchor_position,
+            anchor_local_row: None,
+        }
+    }
+
+    fn into_unit_count(self) -> UnitVisualCount {
+        UnitVisualCount {
+            visual_lines: self.lines,
+            anchor_local_row: self.anchor_local_row,
+        }
+    }
+}
+
+impl Default for CountSink {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl WrapSink for CountSink {
@@ -2532,7 +2646,17 @@ impl WrapSink for CountSink {
         self.has_content |= !text.is_empty();
     }
 
-    fn emit(&mut self, _raw_range: Range<usize>) {
+    fn emit(&mut self, raw_range: Range<usize>) {
+        if self.anchor_local_row.is_none()
+            && let Some(anchor) = self.anchor_position
+            && (raw_range.start == anchor.0
+                || (raw_range.start < anchor.0 && anchor.0 < raw_range.end))
+        {
+            // A previous row ending at the anchor does not match because the
+            // interval end is exclusive. The row starting there therefore
+            // wins exact-boundary ties. This also covers zero-length rows.
+            self.anchor_local_row = Some(self.lines);
+        }
         self.lines = self.lines.saturating_add(1);
         self.has_content = false;
     }
@@ -2556,6 +2680,12 @@ struct GiantWrapProgress {
     next_raw_offset: usize,
     finished: bool,
     scanned_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GiantRawCursor {
+    line_offset: usize,
+    document_base: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3046,10 +3176,12 @@ mod tests {
         document: &DetailDocument<'_>,
     ) -> DetailCountRequest {
         layout.stage_analysis_command(document);
-        match layout.take_analysis_command() {
+        let request = match layout.take_analysis_command() {
             Some(DetailAnalysisCommand::Count(request)) => request,
             other => panic!("expected detail count request, got {other:?}"),
-        }
+        };
+        assert_eq!(request.anchor, None);
+        request
     }
 
     fn take_structure_request(
@@ -3073,19 +3205,55 @@ mod tests {
 
     fn count_result(request: DetailCountRequest) -> DetailCountResult {
         let mut never_cancel = || false;
-        let chunk_visual_lines = request
+        let count = request
             .structure
             .count_chunks(
                 &request.snapshot,
                 request.identity.layout_width,
+                request.anchor,
                 &mut never_cancel,
             )
             .unwrap();
 
         DetailCountResult {
             identity: request.identity,
-            chunk_visual_lines,
+            chunk_visual_lines: count.chunk_visual_lines,
+            anchor_visual_row: count.anchor_visual_row,
         }
+    }
+
+    fn count_request_for_test(
+        document: &DetailDocument<'_>,
+        structure: Arc<DetailDocumentStructure>,
+        width: usize,
+        anchor: Option<ContentAnchor>,
+    ) -> DetailCountRequest {
+        let segment_lengths = (0..document.segment_count())
+            .map(|index| document.segment_text(index).map_or(0, str::len))
+            .collect::<Vec<_>>();
+        DetailCountRequest {
+            identity: DetailCountIdentity {
+                document_generation: 1,
+                layout_generation: 1,
+                revision: 1,
+                layout_width: width,
+                segment_lengths,
+                chunk_count: structure.chunk_count(),
+            },
+            snapshot: document.snapshot(),
+            structure,
+            anchor,
+        }
+    }
+
+    fn reference_anchor_visual_row(
+        rows: &[MaterializedRow],
+        raw_position: RawOffset,
+    ) -> Option<usize> {
+        rows.iter().position(|row| {
+            row.raw_range.start == raw_position
+                || (row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+        })
     }
 
     fn streaming_fragment_lines(
@@ -3660,6 +3828,143 @@ mod tests {
     }
 
     #[test]
+    fn normal_anchor_resolution_is_exact_across_first_middle_and_later_units() {
+        let raw = many_varied_lines(900);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let structure = Arc::new(build_document_structure(&document));
+        assert!(structure.units.len() >= 3);
+        let old_width = 9usize;
+        let target_width = 17usize;
+        let old_rows = materialize_complete_structure_rows(&document, &structure, old_width);
+        let old_counts = structure
+            .count_chunks(&document, old_width, None, || false)
+            .unwrap()
+            .chunk_visual_lines;
+        let target_rows = materialize_complete_structure_rows(&document, &structure, target_width);
+        let target_counts = structure
+            .count_chunks(&document, target_width, None, || false)
+            .unwrap()
+            .chunk_visual_lines;
+
+        for unit_index in [0, structure.units.len() / 2, structure.units.len() - 1] {
+            let old_prefix = old_counts[..unit_index].iter().sum::<usize>();
+            let local_old_row = 7.min(old_counts[unit_index].saturating_sub(1));
+            let raw_position = old_rows[old_prefix + local_old_row].raw_range.start;
+            let anchor = ContentAnchor {
+                unit_index,
+                raw_position,
+            };
+            let result = count_result(count_request_for_test(
+                &document,
+                Arc::clone(&structure),
+                target_width,
+                Some(anchor),
+            ));
+            let expected = reference_anchor_visual_row(&target_rows, raw_position).unwrap();
+            let target_prefix = target_counts[..unit_index].iter().sum::<usize>();
+
+            assert_eq!(result.anchor_visual_row, Some(expected));
+            assert!(expected >= target_prefix);
+            assert!(expected < target_prefix + target_counts[unit_index]);
+            assert_eq!(result.chunk_visual_lines, target_counts);
+        }
+    }
+
+    #[test]
+    fn anchor_boundary_prefers_next_row_and_an_interior_anchor_uses_containing_row() {
+        let segments = ["abcdefghij"];
+        let document = make_document(&segments);
+        let structure = Arc::new(build_document_structure(&document));
+        let anchor = ContentAnchor {
+            unit_index: 0,
+            raw_position: RawOffset(5),
+        };
+
+        let same_width = count_result(count_request_for_test(
+            &document,
+            Arc::clone(&structure),
+            5,
+            Some(anchor),
+        ));
+        assert_eq!(same_width.anchor_visual_row, Some(1));
+
+        let wider = count_result(count_request_for_test(
+            &document,
+            structure,
+            8,
+            Some(anchor),
+        ));
+        assert_eq!(wider.anchor_visual_row, Some(0));
+    }
+
+    #[test]
+    fn empty_row_anchors_resolve_to_their_distinct_visual_rows() {
+        for (raw, anchors) in [
+            ("", vec![(0, 0)]),
+            ("\n", vec![(0, 0), (1, 1)]),
+            ("\n\n", vec![(0, 0), (1, 1), (2, 2)]),
+            ("abc\n", vec![(0, 0), (4, 1)]),
+        ] {
+            let segments = [raw];
+            let document = make_document(&segments);
+            let structure = Arc::new(build_document_structure(&document));
+
+            for (raw_position, expected_row) in anchors {
+                let result = count_result(count_request_for_test(
+                    &document,
+                    Arc::clone(&structure),
+                    80,
+                    Some(ContentAnchor {
+                        unit_index: 0,
+                        raw_position: RawOffset(raw_position),
+                    }),
+                ));
+                assert_eq!(
+                    result.anchor_visual_row,
+                    Some(expected_row),
+                    "raw={raw:?}, anchor={raw_position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_anchor_produces_no_exact_count_computation() {
+        let segments = ["abc\ndef"];
+        let document = make_document(&segments);
+        let structure = build_document_structure(&document);
+
+        assert!(
+            structure
+                .count_chunks(
+                    &document,
+                    80,
+                    Some(ContentAnchor {
+                        unit_index: structure.units.len(),
+                        raw_position: RawOffset(0),
+                    }),
+                    || false,
+                )
+                .is_none()
+        );
+        assert!(
+            structure
+                .count_chunks(
+                    &document,
+                    80,
+                    Some(ContentAnchor {
+                        unit_index: 0,
+                        raw_position: RawOffset(3),
+                    }),
+                    || false,
+                )
+                .is_none(),
+            "a newline delimiter is not visual-row content"
+        );
+    }
+
+    #[test]
     fn builder_can_pause_with_a_known_open_giant_line() {
         let raw = format!(
             "{}\ntail",
@@ -4063,11 +4368,12 @@ mod tests {
         let fragments = [raw.as_str()];
         let eager = eager_fragment_lines(&fragments, 11);
         let streaming = streaming_fragment_lines(&fragments, 11, 7, 17);
-        let background = count_giant_logical_line_fragments(&fragments, 11, &mut || false)
-            .expect("background count must complete");
+        let background =
+            count_giant_logical_line_fragments(&fragments, 11, RawOffset(0), None, &mut || false)
+                .expect("background count must complete");
 
         assert_eq!(streaming, eager);
-        assert_eq!(background, eager.len());
+        assert_eq!(background.visual_lines, eager.len());
     }
 
     #[test]
@@ -4239,6 +4545,125 @@ mod tests {
     }
 
     #[test]
+    fn deep_giant_anchor_resolves_during_the_single_exact_count_pass() {
+        let giant = "0123456789 ".repeat(12_000);
+        let raw = format!("header\n{giant}");
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let structure = Arc::new(build_document_structure(&document));
+        let giant_unit = 1usize;
+        assert!(matches!(
+            structure.units[giant_unit],
+            StructuralUnit::Giant(_)
+        ));
+
+        let old_width = 11usize;
+        let target_width = 17usize;
+        let old_rows = materialize_complete_structure_rows(&document, &structure, old_width);
+        let old_counts = structure
+            .count_chunks(&document, old_width, None, || false)
+            .unwrap()
+            .chunk_visual_lines;
+        let old_prefix = old_counts[..giant_unit].iter().sum::<usize>();
+        let raw_position = old_rows[old_prefix + 1_000].raw_range.start;
+        let target_rows = materialize_complete_structure_rows(&document, &structure, target_width);
+        let expected = reference_anchor_visual_row(&target_rows, raw_position).unwrap();
+
+        let result = count_result(count_request_for_test(
+            &document,
+            structure,
+            target_width,
+            Some(ContentAnchor {
+                unit_index: giant_unit,
+                raw_position,
+            }),
+        ));
+
+        assert_eq!(result.anchor_visual_row, Some(expected));
+        let target_prefix = result.chunk_visual_lines[..giant_unit]
+            .iter()
+            .sum::<usize>();
+        assert_eq!(target_prefix, 1);
+        assert!(expected.saturating_sub(target_prefix) > GIANT_LINE_PAGE_ROWS);
+    }
+
+    #[test]
+    fn giant_unicode_row_starts_resolve_at_another_width() {
+        let unit = concat!(
+            "👩‍💻 ",
+            "👨‍👩‍👧‍👦 ",
+            "e\u{301}\u{327} ",
+            "👍🏽 ",
+            "🇯🇵 ",
+            "日本語token ",
+            "abcdefghijklmnopqrstuvwxyz "
+        );
+        let raw = unit.repeat(1_000);
+        assert!(raw.len() >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let structure = Arc::new(build_document_structure(&document));
+        let old_rows = materialize_complete_structure_rows(&document, &structure, 7);
+        let target_rows = materialize_complete_structure_rows(&document, &structure, 13);
+        let mut anchors = Vec::new();
+
+        for needle in ["👩‍💻", "👨‍👩‍👧‍👦", "e\u{301}", "👍🏽", "🇯🇵", "日本語token", "abcdef"]
+        {
+            let byte = raw.find(needle).unwrap();
+            let row = old_rows
+                .iter()
+                .find(|row| row.raw_range.start.0 <= byte && byte < row.raw_range.end.0)
+                .unwrap();
+            if !anchors.contains(&row.raw_range.start) {
+                anchors.push(row.raw_range.start);
+            }
+        }
+
+        for raw_position in anchors {
+            assert!(raw.is_char_boundary(raw_position.0));
+            let expected = reference_anchor_visual_row(&target_rows, raw_position).unwrap();
+            let result = count_result(count_request_for_test(
+                &document,
+                Arc::clone(&structure),
+                13,
+                Some(ContentAnchor {
+                    unit_index: 0,
+                    raw_position,
+                }),
+            ));
+            assert_eq!(result.anchor_visual_row, Some(expected));
+        }
+    }
+
+    #[test]
+    fn anchor_resolution_uses_global_raw_positions_across_segment_boundaries() {
+        let first = "a".repeat(1_005);
+        let second = "a".repeat(70_000);
+        let segments = [first.as_str(), second.as_str()];
+        let document = make_document(&segments);
+        let structure = Arc::new(build_document_structure(&document));
+        let old_rows = materialize_complete_structure_rows(&document, &structure, 11);
+        let raw_position = old_rows[92].raw_range.start;
+        assert_eq!(raw_position, RawOffset(1_012));
+        let target_rows = materialize_complete_structure_rows(&document, &structure, 17);
+        let expected = reference_anchor_visual_row(&target_rows, raw_position).unwrap();
+        assert_eq!(expected, 59);
+        assert!(target_rows[expected].raw_range.start.0 < first.len());
+        assert!(target_rows[expected].raw_range.end.0 > first.len());
+
+        let result = count_result(count_request_for_test(
+            &document,
+            structure,
+            17,
+            Some(ContentAnchor {
+                unit_index: 0,
+                raw_position,
+            }),
+        ));
+        assert_eq!(result.anchor_visual_row, Some(expected));
+    }
+
+    #[test]
     fn sequential_giant_line_scroll_reuses_pages_and_keeps_the_cache_bounded() {
         let raw = "0123456789 ".repeat(200_000);
         let segments = [raw.as_str()];
@@ -4380,6 +4805,33 @@ mod tests {
         layout.viewport(&document, 1, 80, 20, 300);
         assert!(layout.materialized_giant_pages.len() <= GIANT_LINE_PAGE_CACHE_SIZE);
         assert!(layout.giant_checkpoint_count() > 1);
+    }
+
+    #[test]
+    fn anchored_old_width_count_result_is_rejected_with_its_resolution() {
+        let raw = "abcdefghij ".repeat(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 40, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
+        let mut request = take_count_request(&mut layout, &document);
+        request.anchor = Some(ContentAnchor {
+            unit_index: 0,
+            raw_position: RawOffset(0),
+        });
+        let stale = count_result(request);
+        assert_eq!(stale.anchor_visual_row, Some(0));
+
+        layout.prepare(&document, 1, 80);
+        assert!(!layout.apply_count_result(stale));
+        assert!(
+            layout
+                .chunks
+                .iter()
+                .any(|chunk| chunk.visual_lines.is_none())
+        );
     }
 
     #[test]
@@ -5059,10 +5511,11 @@ mod tests {
 
         layout.viewport(&large, 1, 80, 20, 0);
         layout.stage_analysis_command(&large);
-        assert!(matches!(
-            layout.take_analysis_command(),
-            Some(DetailAnalysisCommand::Count(_))
-        ));
+        let Some(DetailAnalysisCommand::Count(request)) = layout.take_analysis_command() else {
+            panic!("large detail must stage exact count");
+        };
+        assert_eq!(request.anchor, None);
+        assert_eq!(count_result(request).anchor_visual_row, None);
         layout.stage_analysis_command(&large);
         assert!(layout.take_analysis_command().is_none());
 

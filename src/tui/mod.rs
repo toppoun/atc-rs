@@ -809,17 +809,19 @@ mod tests {
             panic!("large detail must request background counting");
         };
         let mut never_cancel = || false;
-        let counts = request
+        let count = request
             .structure
             .count_chunks(
                 &request.snapshot,
                 request.identity.layout_width,
+                request.anchor,
                 &mut never_cancel,
             )
             .unwrap();
         let result = detail_layout::DetailAnalysisResult::Count(detail_layout::DetailCountResult {
             identity: request.identity,
-            chunk_visual_lines: counts,
+            chunk_visual_lines: count.chunk_visual_lines,
+            anchor_visual_row: count.anchor_visual_row,
         });
         let (tx, rx) = mpsc::channel();
         for _ in 0..=MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK {

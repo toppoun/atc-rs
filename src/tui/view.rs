@@ -532,18 +532,20 @@ mod tests {
             panic!("large render must stage background counting");
         };
         let mut never_cancel = || false;
-        let chunk_visual_lines = request
+        let count = request
             .structure
             .count_chunks(
                 &request.snapshot,
                 request.identity.layout_width,
+                request.anchor,
                 &mut never_cancel,
             )
             .unwrap();
         assert!(
             layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
                 identity: request.identity,
-                chunk_visual_lines,
+                chunk_visual_lines: count.chunk_visual_lines,
+                anchor_visual_row: count.anchor_visual_row,
             })
         );
 
