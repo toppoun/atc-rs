@@ -522,6 +522,10 @@ mod tests {
             .unwrap();
         assert_eq!(info.max_detail_scroll, None);
 
+        let document = DetailDocument::from_app(&app);
+        layout.complete_structure_for_test(&document);
+        layout.stage_count_command(&document);
+
         let Some(crate::tui::detail_layout::DetailCountCommand::Count(request)) =
             layout.take_count_command()
         else {

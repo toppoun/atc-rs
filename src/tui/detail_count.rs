@@ -227,6 +227,7 @@ mod tests {
         let document = DetailDocument::from_shared_segments(&segments);
         let mut layout = DetailLayout::default();
         layout.viewport(&document, generation, width, 20, 0);
+        layout.complete_structure_for_test(&document);
         layout.stage_count_command(&document);
 
         let Some(DetailCountCommand::Count(mut request)) = layout.take_count_command() else {

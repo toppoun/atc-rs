@@ -13,6 +13,10 @@ pub(super) const DETAIL_CHUNK_LINES: usize = 256;
 const MATERIALIZED_CHUNK_CACHE_SIZE: usize = 3;
 const GIANT_LOGICAL_LINE_BYTE_THRESHOLD: usize = 64 * 1024;
 const NORMAL_BLOCK_MAX_RAW_BYTES: usize = GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
+// One demand-driven advance can cross one maximum-sized normal line and then
+// reach the boundary that publishes its containing block. The builder still
+// stops earlier as soon as it publishes a structural unit.
+const FOREGROUND_STRUCTURE_SCAN_BUDGET: usize = 2 * GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 const GIANT_LINE_PAGE_ROWS: usize = 128;
 const GIANT_LINE_PAGE_CACHE_SIZE: usize = 3;
 const GIANT_LINE_WINDOW_MIN_BYTES: usize = 4 * 1024;
@@ -196,6 +200,88 @@ impl DetailRawMap {
         );
         Some((start_segment, start, end_segment, end))
     }
+
+    fn is_char_boundary(
+        &self,
+        document: &(impl DetailTextSource + ?Sized),
+        offset: RawOffset,
+    ) -> bool {
+        if offset == self.total_len {
+            return true;
+        }
+        self.segment_position(offset)
+            .is_some_and(|(segment, local)| {
+                document
+                    .segment_text(segment)
+                    .is_some_and(|text| text.is_char_boundary(local))
+            })
+    }
+
+    fn line_probe<'a>(
+        &self,
+        document: &'a (impl DetailTextSource + ?Sized),
+        start: RawOffset,
+        known_end: Option<RawOffset>,
+        max_bytes: usize,
+    ) -> RawLineProbe<'a> {
+        assert!(start <= self.total_len);
+        if let Some(end) = known_end {
+            assert!(start <= end && end <= self.total_len);
+        }
+
+        let hard_end = known_end.unwrap_or(self.total_len);
+        let mut end = RawOffset(start.0.saturating_add(max_bytes.max(1)).min(hard_end.0));
+        while end > start && !self.is_char_boundary(document, end) {
+            end.0 -= 1;
+        }
+        if end == start && end < hard_end {
+            while end < hard_end {
+                end.0 += 1;
+                if self.is_char_boundary(document, end) {
+                    break;
+                }
+            }
+        }
+
+        let inspected_bytes = end.0.saturating_sub(start.0);
+        let text = self.bounded_text(document, start..end);
+        if known_end.is_none()
+            && let Some(newline) = text.as_bytes().iter().position(|byte| *byte == b'\n')
+        {
+            let content_end = RawOffset(start.0.saturating_add(newline));
+            return RawLineProbe {
+                text: truncate_window(text, newline),
+                inspected_bytes,
+                reaches_end: true,
+                discovered_end: Some(GiantLineEnd {
+                    content_end,
+                    next_line_start: RawOffset(content_end.0.saturating_add(1)),
+                    eof: false,
+                }),
+            };
+        }
+
+        let reaches_end = end == hard_end;
+        let discovered_end =
+            (known_end.is_none() && end == self.total_len).then_some(GiantLineEnd {
+                content_end: self.total_len,
+                next_line_start: self.total_len,
+                eof: true,
+            });
+        RawLineProbe {
+            text,
+            inspected_bytes,
+            reaches_end,
+            discovered_end,
+        }
+    }
+}
+
+struct RawLineProbe<'a> {
+    text: Cow<'a, str>,
+    inspected_bytes: usize,
+    reaches_end: bool,
+    discovered_end: Option<GiantLineEnd>,
 }
 
 // A normal block owns all newline delimiters after its represented lines. Its
@@ -211,7 +297,8 @@ struct NormalBlock {
 // part of the unit and is never passed to the E1 wrapping engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GiantLineUnit {
-    raw_range: Range<RawOffset>,
+    raw_start: RawOffset,
+    raw_end: Option<RawOffset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +318,7 @@ pub(crate) struct DetailDocumentStructure {
     raw_map: DetailRawMap,
     logical_line_count: usize,
     units: Vec<StructuralUnit>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,49 +333,79 @@ struct DetailIndexAdvance {
     finished: bool,
 }
 
-struct IncrementalDetailIndexBuilder<'a, D: DetailTextSource + ?Sized> {
-    document: &'a D,
-    raw_map: DetailRawMap,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GiantLineEnd {
+    content_end: RawOffset,
+    next_line_start: RawOffset,
+    eof: bool,
+}
+
+#[derive(Debug)]
+struct IncrementalDetailIndexBuilder {
+    structure: DetailDocumentStructure,
     scan_position: RawOffset,
     current_line_start: RawOffset,
     current_line_kind: InProgressLineKind,
     pending_normal_start: RawOffset,
     pending_normal_line_count: usize,
     logical_line_count: usize,
-    units: Vec<StructuralUnit>,
     finished: bool,
 }
 
-impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
-    fn new(document: &'a D) -> Self {
+impl IncrementalDetailIndexBuilder {
+    fn new(document: &(impl DetailTextSource + ?Sized)) -> Self {
         Self {
-            document,
-            raw_map: DetailRawMap::new(document),
+            structure: DetailDocumentStructure {
+                raw_map: DetailRawMap::new(document),
+                logical_line_count: 0,
+                units: Vec::new(),
+                complete: false,
+            },
             scan_position: RawOffset::default(),
             current_line_start: RawOffset::default(),
             current_line_kind: InProgressLineKind::Normal,
             pending_normal_start: RawOffset::default(),
             pending_normal_line_count: 0,
             logical_line_count: 0,
-            units: Vec::new(),
             finished: false,
         }
     }
 
-    fn advance(&mut self, byte_budget: usize) -> DetailIndexAdvance {
+    fn advance(
+        &mut self,
+        document: &(impl DetailTextSource + ?Sized),
+        byte_budget: usize,
+    ) -> DetailIndexAdvance {
+        self.assert_document_identity(document);
         if self.finished {
             return DetailIndexAdvance {
                 scanned_bytes: 0,
                 finished: true,
             };
         }
+        if self.current_line_kind == InProgressLineKind::Giant {
+            return DetailIndexAdvance {
+                scanned_bytes: 0,
+                finished: false,
+            };
+        }
 
         let mut scanned_bytes = 0usize;
-        while scanned_bytes < byte_budget && self.scan_position < self.raw_map.total_len() {
-            let available = self.raw_map.bytes_from(self.document, self.scan_position);
+        let initial_units = self.structure.units.len();
+        while scanned_bytes < byte_budget && self.scan_position < self.structure.raw_map.total_len()
+        {
+            let available = self
+                .structure
+                .raw_map
+                .bytes_from(document, self.scan_position);
             debug_assert!(!available.is_empty());
             let remaining_budget = byte_budget.saturating_sub(scanned_bytes);
-            let scan_len = available.len().min(remaining_budget);
+            let bytes_until_giant = GIANT_LOGICAL_LINE_BYTE_THRESHOLD.saturating_sub(
+                self.scan_position
+                    .0
+                    .saturating_sub(self.current_line_start.0),
+            );
+            let scan_len = available.len().min(remaining_budget).min(bytes_until_giant);
             // The frontier may stop inside a UTF-8 code point. Structural
             // discovery only looks for ASCII newline bytes; published unit
             // ranges are created solely at newline/EOF boundaries.
@@ -306,11 +424,19 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
             } else {
                 self.scan_position = RawOffset(self.scan_position.0.saturating_add(scan_len));
                 scanned_bytes = scanned_bytes.saturating_add(scan_len);
-                self.update_current_line_kind();
+                self.publish_open_giant_if_known();
+            }
+
+            if self.structure.units.len() > initial_units
+                || self.current_line_kind == InProgressLineKind::Giant
+            {
+                break;
             }
         }
 
-        if self.scan_position == self.raw_map.total_len() {
+        if self.scan_position == self.structure.raw_map.total_len()
+            && self.current_line_kind != InProgressLineKind::Giant
+        {
             self.finish_at_eof();
         }
 
@@ -320,10 +446,17 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
         }
     }
 
-    fn build_to_end(mut self) -> DetailDocumentStructure {
+    fn build_to_end(
+        mut self,
+        document: &(impl DetailTextSource + ?Sized),
+    ) -> DetailDocumentStructure {
         while !self.finished {
-            let progress = self.advance(usize::MAX);
-            debug_assert!(progress.finished || progress.scanned_bytes > 0);
+            let progress = self.advance(document, usize::MAX);
+            if self.current_line_kind == InProgressLineKind::Giant {
+                self.resolve_open_giant_by_scanning(document);
+            } else {
+                debug_assert!(progress.finished || progress.scanned_bytes > 0);
+            }
         }
         self.into_structure()
     }
@@ -333,11 +466,11 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
             self.finished,
             "detail structure may only be taken after the document is complete"
         );
-        DetailDocumentStructure {
-            raw_map: self.raw_map,
-            logical_line_count: self.logical_line_count,
-            units: self.units,
-        }
+        self.structure
+    }
+
+    fn structure(&self) -> &DetailDocumentStructure {
+        &self.structure
     }
 
     #[cfg(test)]
@@ -345,7 +478,7 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
         !self.finished && self.current_line_kind == InProgressLineKind::Giant
     }
 
-    fn update_current_line_kind(&mut self) {
+    fn publish_open_giant_if_known(&mut self) {
         // This state is intentionally retained before the line end is known.
         // A later phase can publish an open giant unit without changing the
         // closed DetailDocumentStructure produced by build_to_end().
@@ -355,24 +488,27 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
             .saturating_sub(self.current_line_start.0)
             >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD
         {
+            self.flush_pending_normal(self.current_line_start);
             self.current_line_kind = InProgressLineKind::Giant;
+            self.logical_line_count = self.logical_line_count.saturating_add(1);
+            self.structure.logical_line_count = self.logical_line_count;
+            self.structure
+                .units
+                .push(StructuralUnit::Giant(GiantLineUnit {
+                    raw_start: self.current_line_start,
+                    raw_end: None,
+                }));
         }
     }
 
     fn finish_current_line(&mut self, content_end: RawOffset, next_line_start: RawOffset) {
-        let giant_line = self.current_line_kind == InProgressLineKind::Giant
-            || content_end.0.saturating_sub(self.current_line_start.0)
-                >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
+        debug_assert_eq!(self.current_line_kind, InProgressLineKind::Normal);
+        debug_assert!(
+            content_end.0.saturating_sub(self.current_line_start.0)
+                < GIANT_LOGICAL_LINE_BYTE_THRESHOLD
+        );
         self.logical_line_count = self.logical_line_count.saturating_add(1);
-
-        if giant_line {
-            self.flush_pending_normal(self.current_line_start);
-            self.units.push(StructuralUnit::Giant(GiantLineUnit {
-                raw_range: self.current_line_start..content_end,
-            }));
-            self.pending_normal_start = next_line_start;
-            return;
-        }
+        self.structure.logical_line_count = self.logical_line_count;
 
         let candidate_raw_bytes = next_line_start
             .0
@@ -392,10 +528,12 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
             debug_assert!(
                 end.0.saturating_sub(self.pending_normal_start.0) <= NORMAL_BLOCK_MAX_RAW_BYTES
             );
-            self.units.push(StructuralUnit::Normal(NormalBlock {
-                raw_range: self.pending_normal_start..end,
-                logical_line_count: self.pending_normal_line_count,
-            }));
+            self.structure
+                .units
+                .push(StructuralUnit::Normal(NormalBlock {
+                    raw_range: self.pending_normal_start..end,
+                    logical_line_count: self.pending_normal_line_count,
+                }));
         }
         self.pending_normal_start = end;
         self.pending_normal_line_count = 0;
@@ -406,10 +544,68 @@ impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
             return;
         }
 
-        let eof = self.raw_map.total_len();
+        let eof = self.structure.raw_map.total_len();
         self.finish_current_line(eof, eof);
         self.flush_pending_normal(eof);
+        self.structure.complete = true;
         self.finished = true;
+    }
+
+    fn resolve_open_giant(&mut self, end: GiantLineEnd) {
+        assert_eq!(self.current_line_kind, InProgressLineKind::Giant);
+        assert!(end.content_end >= self.scan_position);
+        assert!(end.next_line_start >= end.content_end);
+        assert!(end.next_line_start <= self.structure.raw_map.total_len());
+        let Some(StructuralUnit::Giant(line)) = self.structure.units.last_mut() else {
+            panic!("open giant must be the last published structural unit");
+        };
+        assert_eq!(line.raw_start, self.current_line_start);
+        assert!(line.raw_end.is_none());
+        line.raw_end = Some(end.content_end);
+
+        self.scan_position = end.next_line_start;
+        if end.eof {
+            assert_eq!(end.content_end, self.structure.raw_map.total_len());
+            self.structure.complete = true;
+            self.finished = true;
+            return;
+        }
+
+        self.current_line_start = end.next_line_start;
+        self.pending_normal_start = end.next_line_start;
+        self.current_line_kind = InProgressLineKind::Normal;
+    }
+
+    fn resolve_open_giant_by_scanning(&mut self, document: &(impl DetailTextSource + ?Sized)) {
+        self.assert_document_identity(document);
+        let mut position = self.scan_position;
+        while position < self.structure.raw_map.total_len() {
+            let available = self.structure.raw_map.bytes_from(document, position);
+            if let Some(relative) = available.iter().position(|byte| *byte == b'\n') {
+                let content_end = RawOffset(position.0.saturating_add(relative));
+                self.resolve_open_giant(GiantLineEnd {
+                    content_end,
+                    next_line_start: RawOffset(content_end.0.saturating_add(1)),
+                    eof: false,
+                });
+                return;
+            }
+            position = RawOffset(position.0.saturating_add(available.len()));
+        }
+        let eof = self.structure.raw_map.total_len();
+        self.resolve_open_giant(GiantLineEnd {
+            content_end: eof,
+            next_line_start: eof,
+            eof: true,
+        });
+    }
+
+    fn assert_document_identity(&self, document: &(impl DetailTextSource + ?Sized)) {
+        assert_eq!(
+            self.structure.raw_map,
+            DetailRawMap::new(document),
+            "detail structure builder used with a different document shape"
+        );
     }
 }
 
@@ -428,6 +624,7 @@ impl DetailDocumentStructure {
         width: usize,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Option<Vec<usize>> {
+        debug_assert!(self.complete);
         let mut counts = Vec::with_capacity(self.chunk_count());
 
         for unit in &self.units {
@@ -451,7 +648,10 @@ impl DetailDocumentStructure {
                     sink.lines
                 }
                 StructuralUnit::Giant(line) => {
-                    let fragments = self.raw_map.fragments(document, line.raw_range.clone());
+                    let end = line
+                        .raw_end
+                        .expect("background count requires a closed giant line");
+                    let fragments = self.raw_map.fragments(document, line.raw_start..end);
                     count_giant_logical_line_fragments(&fragments, width, &mut is_cancelled)?
                 }
             };
@@ -501,6 +701,12 @@ enum PendingCountCommand {
 }
 
 #[derive(Debug)]
+enum DetailStructureState {
+    Building(IncrementalDetailIndexBuilder),
+    Complete(Arc<DetailDocumentStructure>),
+}
+
+#[derive(Debug)]
 struct ChunkMeta {
     unit_index: usize,
     visual_lines: Option<usize>,
@@ -516,7 +722,7 @@ struct MaterializedChunk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WrapCheckpoint {
     visual_row: usize,
-    raw_offset: usize,
+    raw_position: RawOffset,
 }
 
 #[derive(Debug)]
@@ -532,7 +738,7 @@ pub(super) struct DetailLayout {
     detail_width: u16,
     mode: Option<LayoutMode>,
     segment_lengths: Vec<usize>,
-    document_structure: Arc<DetailDocumentStructure>,
+    structure_state: Option<DetailStructureState>,
     chunks: Vec<ChunkMeta>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
@@ -550,6 +756,8 @@ pub(super) struct DetailLayout {
     invalidations: usize,
     #[cfg(test)]
     document_structure_builds: usize,
+    #[cfg(test)]
+    foreground_structural_scanned_bytes: usize,
 }
 
 pub(super) struct DetailViewport {
@@ -587,11 +795,23 @@ impl DetailLayout {
         };
 
         self.ready_count_command = Some(match pending {
-            PendingCountCommand::Count => DetailCountCommand::Count(DetailCountRequest {
-                identity: self.count_identity(),
-                snapshot: document.snapshot(),
-                structure: Arc::clone(&self.document_structure),
-            }),
+            PendingCountCommand::Count => {
+                let structure = match self
+                    .structure_state
+                    .as_ref()
+                    .expect("detail structure state must exist")
+                {
+                    DetailStructureState::Complete(structure) => Arc::clone(structure),
+                    DetailStructureState::Building(_) => {
+                        panic!("incomplete detail structure cannot stage exact count")
+                    }
+                };
+                DetailCountCommand::Count(DetailCountRequest {
+                    identity: self.count_identity(),
+                    snapshot: document.snapshot(),
+                    structure,
+                })
+            }
             PendingCountCommand::Cancel => DetailCountCommand::Cancel {
                 generation: self.count_generation,
             },
@@ -644,19 +864,25 @@ impl DetailLayout {
 
         let previous_mode = self.mode;
         if document_changed {
-            let document_structure = Arc::new(build_document_structure(document));
-            let raw_bytes = document_structure.raw_map.total_len().0;
-            let mode = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD
-                || document_structure.len() >= LAZY_DETAIL_LINE_THRESHOLD
-            {
-                LayoutMode::Lazy
+            let raw_bytes = segment_lengths.iter().copied().sum::<usize>();
+            let (structure_state, mode) = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD {
+                (
+                    DetailStructureState::Building(IncrementalDetailIndexBuilder::new(document)),
+                    LayoutMode::Lazy,
+                )
             } else {
-                LayoutMode::Eager
+                let structure = Arc::new(build_document_structure(document));
+                let mode = if structure.len() >= LAZY_DETAIL_LINE_THRESHOLD {
+                    LayoutMode::Lazy
+                } else {
+                    LayoutMode::Eager
+                };
+                (DetailStructureState::Complete(structure), mode)
             };
 
             self.revision = Some(revision);
             self.segment_lengths = segment_lengths;
-            self.document_structure = document_structure;
+            self.structure_state = Some(structure_state);
             self.mode = Some(mode);
 
             #[cfg(test)]
@@ -667,31 +893,19 @@ impl DetailLayout {
 
         self.detail_width = detail_width;
         self.chunks = match self.mode.expect("detail layout must have a document") {
-            LayoutMode::Lazy => self
-                .document_structure
-                .units
-                .iter()
-                .enumerate()
-                .map(|(unit_index, unit)| ChunkMeta {
-                    unit_index,
-                    visual_lines: None,
-                    checkpoints: if unit.is_giant() {
-                        vec![WrapCheckpoint {
-                            visual_row: 0,
-                            raw_offset: 0,
-                        }]
-                    } else {
-                        Vec::new()
-                    },
-                })
-                .collect(),
+            LayoutMode::Lazy => Vec::new(),
             LayoutMode::Eager => Vec::new(),
         };
+        self.append_discovered_chunks();
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
         self.count_generation = self.count_generation.wrapping_add(1);
         self.pending_count_command = match self.mode.expect("detail layout must have a mode") {
-            LayoutMode::Lazy => Some(PendingCountCommand::Count),
+            LayoutMode::Lazy if self.structure_is_complete() => Some(PendingCountCommand::Count),
+            LayoutMode::Lazy if previous_mode == Some(LayoutMode::Lazy) => {
+                Some(PendingCountCommand::Cancel)
+            }
+            LayoutMode::Lazy => None,
             LayoutMode::Eager if previous_mode == Some(LayoutMode::Lazy) => {
                 Some(PendingCountCommand::Cancel)
             }
@@ -705,6 +919,139 @@ impl DetailLayout {
             self.giant_scanned_bytes = 0;
             self.giant_page_layout_operations = 0;
             self.invalidations = self.invalidations.saturating_add(1);
+            if document_changed {
+                self.foreground_structural_scanned_bytes = 0;
+            }
+        }
+    }
+
+    fn structure(&self) -> &DetailDocumentStructure {
+        match self
+            .structure_state
+            .as_ref()
+            .expect("detail structure state must exist")
+        {
+            DetailStructureState::Building(builder) => builder.structure(),
+            DetailStructureState::Complete(structure) => structure,
+        }
+    }
+
+    fn structure_is_complete(&self) -> bool {
+        matches!(
+            self.structure_state,
+            Some(DetailStructureState::Complete(_))
+        )
+    }
+
+    fn append_discovered_chunks(&mut self) {
+        if self.mode != Some(LayoutMode::Lazy) {
+            return;
+        }
+
+        let new_chunks = self.structure().units[self.chunks.len()..]
+            .iter()
+            .enumerate()
+            .map(|(offset, unit)| {
+                let unit_index = self.chunks.len().saturating_add(offset);
+                let checkpoints = match unit {
+                    StructuralUnit::Giant(line) => vec![WrapCheckpoint {
+                        visual_row: 0,
+                        raw_position: line.raw_start,
+                    }],
+                    StructuralUnit::Normal(_) => Vec::new(),
+                };
+                ChunkMeta {
+                    unit_index,
+                    visual_lines: None,
+                    checkpoints,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.chunks.extend(new_chunks);
+    }
+
+    fn advance_structure(
+        &mut self,
+        document: &impl DetailTextSource,
+        structural_budget: &mut usize,
+    ) -> bool {
+        if *structural_budget == 0 {
+            return false;
+        }
+        let Some(DetailStructureState::Building(builder)) = self.structure_state.as_mut() else {
+            return false;
+        };
+        let old_units = builder.structure().units.len();
+        let progress = builder.advance(document, *structural_budget);
+        *structural_budget = structural_budget.saturating_sub(progress.scanned_bytes);
+
+        #[cfg(not(test))]
+        let _ = progress.scanned_bytes;
+
+        #[cfg(test)]
+        {
+            self.foreground_structural_scanned_bytes = self
+                .foreground_structural_scanned_bytes
+                .saturating_add(progress.scanned_bytes);
+        }
+
+        let appended = builder.structure().units.len() > old_units;
+        let finished = builder.finished;
+        self.append_discovered_chunks();
+
+        if finished {
+            self.promote_finished_structure();
+        }
+
+        appended || finished
+    }
+
+    fn resolve_open_giant(&mut self, end: GiantLineEnd) {
+        let Some(DetailStructureState::Building(builder)) = self.structure_state.as_mut() else {
+            return;
+        };
+        builder.resolve_open_giant(end);
+        if builder.finished {
+            self.promote_finished_structure();
+        }
+    }
+
+    fn promote_finished_structure(&mut self) {
+        let state = self
+            .structure_state
+            .take()
+            .expect("finished detail builder state must exist");
+        let DetailStructureState::Building(builder) = state else {
+            unreachable!("only a building structure can become complete");
+        };
+        assert!(builder.finished);
+        self.structure_state = Some(DetailStructureState::Complete(Arc::new(
+            builder.into_structure(),
+        )));
+        self.pending_count_command = Some(PendingCountCommand::Count);
+    }
+
+    #[cfg(test)]
+    pub(super) fn complete_structure_for_test(&mut self, document: &DetailDocument<'_>) {
+        while !self.structure_is_complete() {
+            let builder = match self.structure_state.as_mut().unwrap() {
+                DetailStructureState::Building(builder) => builder,
+                DetailStructureState::Complete(_) => unreachable!(),
+            };
+            if builder.current_line_is_known_giant() {
+                builder.resolve_open_giant_by_scanning(document);
+            } else {
+                builder.advance(document, FOREGROUND_STRUCTURE_SCAN_BUDGET);
+            }
+            self.append_discovered_chunks();
+            if matches!(
+                self.structure_state.as_ref(),
+                Some(DetailStructureState::Building(
+                    IncrementalDetailIndexBuilder { finished: true, .. }
+                ))
+            ) {
+                self.promote_finished_structure();
+            }
         }
     }
 
@@ -714,6 +1061,7 @@ impl DetailLayout {
         viewport_height: usize,
         requested_scroll: usize,
     ) -> DetailViewport {
+        let mut structural_budget = FOREGROUND_STRUCTURE_SCAN_BUDGET;
         if viewport_height == 0 {
             let max_scroll = self
                 .exact_total_height()
@@ -730,7 +1078,12 @@ impl DetailLayout {
         }
 
         let mut effective_scroll = requested_scroll;
-        let mut lines = self.materialize_viewport(document, effective_scroll, viewport_height);
+        let mut lines = self.materialize_viewport(
+            document,
+            effective_scroll,
+            viewport_height,
+            &mut structural_budget,
+        );
 
         let mut exact_max = self
             .exact_total_height()
@@ -740,7 +1093,12 @@ impl DetailLayout {
             let clamped = requested_scroll.min(max);
             if clamped != effective_scroll {
                 effective_scroll = clamped;
-                lines = self.materialize_viewport(document, effective_scroll, viewport_height);
+                lines = self.materialize_viewport(
+                    document,
+                    effective_scroll,
+                    viewport_height,
+                    &mut structural_budget,
+                );
                 exact_max = self
                     .exact_total_height()
                     .map(|height| max_scroll(height, viewport_height));
@@ -759,16 +1117,23 @@ impl DetailLayout {
         document: &impl DetailTextSource,
         absolute_scroll: usize,
         viewport_height: usize,
+        structural_budget: &mut usize,
     ) -> Vec<Line<'static>> {
         let Some((mut chunk_index, mut offset_in_chunk)) =
-            self.locate_visual_offset(document, absolute_scroll)
+            self.locate_visual_offset(document, absolute_scroll, structural_budget)
         else {
             return Vec::new();
         };
 
         let mut viewport = Vec::with_capacity(viewport_height);
 
-        while viewport.len() < viewport_height && chunk_index < self.chunks.len() {
+        while viewport.len() < viewport_height {
+            if chunk_index >= self.chunks.len() {
+                if self.advance_structure(document, structural_budget) {
+                    continue;
+                }
+                break;
+            }
             let remaining = viewport_height.saturating_sub(viewport.len());
             if self.chunk_is_giant(chunk_index) {
                 self.append_giant_viewport(
@@ -804,34 +1169,39 @@ impl DetailLayout {
         &mut self,
         document: &impl DetailTextSource,
         visual_offset: usize,
+        structural_budget: &mut usize,
     ) -> Option<(usize, usize)> {
-        let mut prefix = 0usize;
+        loop {
+            let mut prefix = 0usize;
 
-        for chunk_index in 0..self.chunks.len() {
-            let local_offset = visual_offset.saturating_sub(prefix);
-            if self.chunk_is_giant(chunk_index)
-                && self.chunks[chunk_index].visual_lines.is_none()
-                && self.ensure_giant_page(document, chunk_index, local_offset)
-            {
-                return Some((chunk_index, local_offset));
+            for chunk_index in 0..self.chunks.len() {
+                let local_offset = visual_offset.saturating_sub(prefix);
+                if self.chunk_is_giant(chunk_index)
+                    && self.chunks[chunk_index].visual_lines.is_none()
+                    && self.ensure_giant_page(document, chunk_index, local_offset)
+                {
+                    return Some((chunk_index, local_offset));
+                }
+
+                if self.chunks[chunk_index].visual_lines.is_none() {
+                    self.ensure_chunk_materialized(document, chunk_index);
+                }
+                let visual_lines = self.chunks[chunk_index]
+                    .visual_lines
+                    .expect("known detail chunk must have a visual line count");
+                let end = prefix.saturating_add(visual_lines);
+
+                if visual_offset < end {
+                    return Some((chunk_index, visual_offset.saturating_sub(prefix)));
+                }
+
+                prefix = end;
             }
 
-            if self.chunks[chunk_index].visual_lines.is_none() {
-                self.ensure_chunk_materialized(document, chunk_index);
+            if !self.advance_structure(document, structural_budget) {
+                return None;
             }
-            let visual_lines = self.chunks[chunk_index]
-                .visual_lines
-                .expect("known detail chunk must have a visual line count");
-            let end = prefix.saturating_add(visual_lines);
-
-            if visual_offset < end {
-                return Some((chunk_index, visual_offset.saturating_sub(prefix)));
-            }
-
-            prefix = end;
         }
-
-        None
     }
 
     fn ensure_chunk_materialized(&mut self, document: &impl DetailTextSource, chunk_index: usize) {
@@ -850,11 +1220,11 @@ impl DetailLayout {
         }
 
         let unit_index = self.chunks[chunk_index].unit_index;
-        let StructuralUnit::Normal(block) = &self.document_structure.units[unit_index] else {
+        let StructuralUnit::Normal(block) = &self.structure().units[unit_index] else {
             unreachable!("normal detail chunk must reference a normal structural unit");
         };
         let text = self
-            .document_structure
+            .structure()
             .raw_map
             .bounded_text(document, block.raw_range.clone());
         let mut lines = Vec::new();
@@ -951,18 +1321,22 @@ impl DetailLayout {
             }
 
             let unit_index = self.chunks[chunk_index].unit_index;
-            let StructuralUnit::Giant(line) = &self.document_structure.units[unit_index] else {
+            let StructuralUnit::Giant(line) = &self.structure().units[unit_index] else {
                 unreachable!("giant detail chunk must reference a giant structural unit");
             };
-            let fragments = self
-                .document_structure
-                .raw_map
-                .fragments(document, line.raw_range.clone());
+            let raw_start = line.raw_start;
+            let raw_end = line.raw_end;
+            let source = DocumentGiantSource {
+                document,
+                raw_map: &self.structure().raw_map,
+                raw_start,
+                known_end: raw_end,
+            };
             let mut sink_lines = Vec::new();
-            let progress = wrap_giant_logical_line_page(
-                &fragments,
+            let progress = wrap_document_giant_line_page(
+                &source,
+                checkpoint.raw_position,
                 self.lazy_layout_width(),
-                checkpoint.raw_offset,
                 GIANT_LINE_PAGE_ROWS,
                 &mut MaterializeSink::new(&mut sink_lines),
                 &mut || false,
@@ -981,9 +1355,15 @@ impl DetailLayout {
                     self.giant_page_layout_operations.saturating_add(1);
             }
 
+            if raw_end.is_none()
+                && let Some(discovered_end) = progress.discovered_end
+            {
+                self.resolve_open_giant(discovered_end);
+            }
+
             let next_checkpoint = WrapCheckpoint {
                 visual_row: checkpoint.visual_row.saturating_add(progress.rows),
-                raw_offset: progress.next_raw_offset,
+                raw_position: progress.next_raw_position,
             };
 
             if next_checkpoint.visual_row > checkpoint.visual_row {
@@ -1050,7 +1430,7 @@ impl DetailLayout {
 
     fn chunk_is_giant(&self, chunk_index: usize) -> bool {
         let unit_index = self.chunks[chunk_index].unit_index;
-        self.document_structure.units[unit_index].is_giant()
+        self.structure().units[unit_index].is_giant()
     }
 
     fn count_identity(&self) -> DetailCountIdentity {
@@ -1064,6 +1444,9 @@ impl DetailLayout {
     }
 
     fn exact_total_height(&self) -> Option<usize> {
+        if !self.structure_is_complete() {
+            return None;
+        }
         self.chunks.iter().try_fold(0usize, |total, chunk| {
             chunk.visual_lines.map(|lines| total.saturating_add(lines))
         })
@@ -1126,7 +1509,7 @@ fn eager_viewport(
 }
 
 fn build_document_structure(document: &impl DetailTextSource) -> DetailDocumentStructure {
-    IncrementalDetailIndexBuilder::new(document).build_to_end()
+    IncrementalDetailIndexBuilder::new(document).build_to_end(document)
 }
 
 fn visit_normal_block_lines(
@@ -1244,6 +1627,7 @@ fn count_giant_logical_line_fragments(
             &mut sink,
             is_cancelled,
         )?;
+        let _ = progress.scanned_bytes;
         debug_assert_eq!(sink.lines, progress.rows);
         total_rows = total_rows.saturating_add(progress.rows);
         raw_offset = progress.next_raw_offset;
@@ -1255,6 +1639,227 @@ fn count_giant_logical_line_fragments(
             return None;
         }
     }
+}
+
+struct DocumentGiantSource<'a> {
+    document: &'a dyn DetailTextSource,
+    raw_map: &'a DetailRawMap,
+    raw_start: RawOffset,
+    known_end: Option<RawOffset>,
+}
+
+fn wrap_document_giant_line_page(
+    source: &DocumentGiantSource<'_>,
+    start_raw_position: RawOffset,
+    width: usize,
+    row_budget: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<DocumentGiantWrapProgress> {
+    let window_bytes = row_budget
+        .saturating_mul(width.max(1))
+        .saturating_mul(4)
+        .saturating_add(16)
+        .max(GIANT_LINE_WINDOW_MIN_BYTES);
+    wrap_document_giant_line_page_with_window_bytes(
+        source,
+        start_raw_position,
+        width,
+        row_budget,
+        window_bytes,
+        sink,
+        is_cancelled,
+    )
+}
+
+fn wrap_document_giant_line_page_with_window_bytes(
+    source: &DocumentGiantSource<'_>,
+    start_raw_position: RawOffset,
+    width: usize,
+    row_budget: usize,
+    initial_window_bytes: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<DocumentGiantWrapProgress> {
+    let hard_end = source.known_end.unwrap_or(source.raw_map.total_len());
+    assert!(source.raw_start <= start_raw_position && start_raw_position <= hard_end);
+
+    if width == 0 {
+        let probe = source.raw_map.line_probe(
+            source.document,
+            start_raw_position,
+            source.known_end,
+            hard_end.0.saturating_sub(start_raw_position.0),
+        );
+        if start_raw_position >= hard_end || probe.text.is_empty() {
+            return Some(DocumentGiantWrapProgress {
+                rows: 0,
+                next_raw_position: hard_end,
+                finished: true,
+                scanned_bytes: probe.inspected_bytes,
+                discovered_end: probe.discovered_end,
+            });
+        }
+        sink.push(&probe.text);
+        sink.emit();
+        let next_raw_position = RawOffset(start_raw_position.0.saturating_add(probe.text.len()));
+        return Some(DocumentGiantWrapProgress {
+            rows: 1,
+            next_raw_position,
+            finished: probe.reaches_end,
+            scanned_bytes: probe.inspected_bytes,
+            discovered_end: probe.discovered_end,
+        });
+    }
+
+    let mut raw_position = start_raw_position;
+    let mut rows = 0usize;
+    let mut scanned_bytes = 0usize;
+    let mut window_bytes = initial_window_bytes.max(1);
+    let mut discovered_end = None;
+
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+
+        let window = document_giant_line_window(
+            source.document,
+            source.raw_map,
+            raw_position,
+            source.known_end,
+            window_bytes,
+            width,
+        );
+        discovered_end = discovered_end.or(window.discovered_end);
+        if window.reaches_end && window.text.is_empty() {
+            return Some(DocumentGiantWrapProgress {
+                rows,
+                next_raw_position: raw_position,
+                finished: true,
+                scanned_bytes: scanned_bytes.saturating_add(window.inspected_bytes),
+                discovered_end,
+            });
+        }
+        let remaining_rows = row_budget.saturating_sub(rows);
+        let progress = wrap_logical_line_window(
+            window.text.as_ref(),
+            width,
+            sink,
+            is_cancelled,
+            remaining_rows,
+            window.reaches_end,
+        )?;
+        scanned_bytes = scanned_bytes
+            .saturating_add(window.inspected_bytes)
+            .saturating_add(progress.scanned_bytes);
+        rows = rows.saturating_add(progress.rows);
+        raw_position = RawOffset(raw_position.0.saturating_add(progress.next_offset));
+
+        if progress.finished {
+            return Some(DocumentGiantWrapProgress {
+                rows,
+                next_raw_position: raw_position,
+                finished: true,
+                scanned_bytes,
+                discovered_end,
+            });
+        }
+        if rows >= row_budget {
+            return Some(DocumentGiantWrapProgress {
+                rows,
+                next_raw_position: raw_position,
+                finished: false,
+                scanned_bytes,
+                discovered_end,
+            });
+        }
+        if progress.rows > 0 {
+            window_bytes = initial_window_bytes.max(1);
+            continue;
+        }
+        if window.reaches_end || window.text.is_empty() {
+            return None;
+        }
+
+        window_bytes = window_bytes.saturating_mul(2).min(
+            source
+                .known_end
+                .unwrap_or(source.raw_map.total_len())
+                .0
+                .saturating_sub(raw_position.0),
+        );
+    }
+}
+
+fn document_giant_line_window<'a>(
+    document: &'a (impl DetailTextSource + ?Sized),
+    raw_map: &DetailRawMap,
+    raw_position: RawOffset,
+    known_end: Option<RawOffset>,
+    max_bytes: usize,
+    width: usize,
+) -> DocumentGiantWindow<'a> {
+    let hard_end = known_end.unwrap_or(raw_map.total_len());
+    let remaining_bytes = hard_end.0.saturating_sub(raw_position.0);
+    let target_bytes = max_bytes.max(1).min(remaining_bytes);
+    let mut probe_bytes = target_bytes.saturating_add(64).min(remaining_bytes);
+
+    loop {
+        let probe = raw_map.line_probe(document, raw_position, known_end, probe_bytes);
+        if probe.reaches_end {
+            return DocumentGiantWindow {
+                text: probe.text,
+                inspected_bytes: probe.inspected_bytes,
+                reaches_end: true,
+                discovered_end: probe.discovered_end,
+            };
+        }
+
+        let (grapheme_boundary, token_boundary) =
+            next_safe_window_boundaries(probe.text.as_ref(), target_bytes);
+        if let Some(boundary) = token_boundary {
+            return DocumentGiantWindow {
+                text: truncate_window(probe.text, boundary),
+                inspected_bytes: probe.inspected_bytes,
+                reaches_end: false,
+                discovered_end: None,
+            };
+        }
+
+        let trailing_token_is_oversized =
+            UnicodeSegmentation::split_word_bound_indices(probe.text.as_ref())
+                .next_back()
+                .is_some_and(|(offset, token)| {
+                    offset < target_bytes && UnicodeWidthStr::width(token) > width
+                });
+        if trailing_token_is_oversized && let Some(boundary) = grapheme_boundary {
+            return DocumentGiantWindow {
+                text: truncate_window(probe.text, boundary),
+                inspected_bytes: probe.inspected_bytes,
+                reaches_end: false,
+                discovered_end: None,
+            };
+        }
+
+        let next_probe = probe_bytes.saturating_mul(2).min(remaining_bytes);
+        if next_probe == probe_bytes {
+            return DocumentGiantWindow {
+                text: probe.text,
+                inspected_bytes: probe.inspected_bytes,
+                reaches_end: probe.reaches_end,
+                discovered_end: probe.discovered_end,
+            };
+        }
+        probe_bytes = next_probe;
+    }
+}
+
+struct DocumentGiantWindow<'a> {
+    text: Cow<'a, str>,
+    inspected_bytes: usize,
+    reaches_end: bool,
+    discovered_end: Option<GiantLineEnd>,
 }
 
 fn wrap_giant_logical_line_page(
@@ -1589,6 +2194,15 @@ struct GiantWrapProgress {
     scanned_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DocumentGiantWrapProgress {
+    rows: usize,
+    next_raw_position: RawOffset,
+    finished: bool,
+    scanned_bytes: usize,
+    discovered_end: Option<GiantLineEnd>,
+}
+
 fn wrap_logical_line(
     logical_line: &str,
     width: usize,
@@ -1783,6 +2397,42 @@ mod tests {
         DetailDocument::from_borrowed_segments(segments)
     }
 
+    fn completed_structure(layout: &DetailLayout) -> &Arc<DetailDocumentStructure> {
+        match layout.structure_state.as_ref().unwrap() {
+            DetailStructureState::Complete(structure) => structure,
+            DetailStructureState::Building(_) => panic!("detail structure is still incomplete"),
+        }
+    }
+
+    fn building_frontier(layout: &DetailLayout) -> RawOffset {
+        match layout.structure_state.as_ref().unwrap() {
+            DetailStructureState::Building(builder) => builder.scan_position,
+            DetailStructureState::Complete(_) => panic!("detail structure is already complete"),
+        }
+    }
+
+    fn complete_structure_via_foreground(layout: &mut DetailLayout, document: &DetailDocument<'_>) {
+        while !layout.structure_is_complete() {
+            if let Some(chunk_index) = layout.chunks.len().checked_sub(1)
+                && layout.chunk_is_giant(chunk_index)
+                && matches!(
+                    &layout.structure().units[layout.chunks[chunk_index].unit_index],
+                    StructuralUnit::Giant(GiantLineUnit { raw_end: None, .. })
+                )
+            {
+                let next_row = layout.chunks[chunk_index]
+                    .checkpoints
+                    .last()
+                    .unwrap()
+                    .visual_row;
+                assert!(layout.ensure_giant_page(document, chunk_index, next_row));
+                continue;
+            }
+            let mut budget = FOREGROUND_STRUCTURE_SCAN_BUDGET;
+            assert!(layout.advance_structure(document, &mut budget));
+        }
+    }
+
     fn text_lines(text: &Text<'_>) -> Vec<String> {
         text.lines
             .iter()
@@ -1820,12 +2470,15 @@ mod tests {
                         },
                     ));
                 }
-                StructuralUnit::Giant(line) => lines.push(
-                    structure
-                        .raw_map
-                        .bounded_text(document, line.raw_range.clone())
-                        .into_owned(),
-                ),
+                StructuralUnit::Giant(line) => {
+                    let end = line.raw_end.expect("test structure must be complete");
+                    lines.push(
+                        structure
+                            .raw_map
+                            .bounded_text(document, line.raw_start..end)
+                            .into_owned(),
+                    );
+                }
             }
         }
         lines
@@ -1852,9 +2505,8 @@ mod tests {
                     ));
                 }
                 StructuralUnit::Giant(line) => {
-                    let fragments = structure
-                        .raw_map
-                        .fragments(document, line.raw_range.clone());
+                    let end = line.raw_end.expect("test structure must be complete");
+                    let fragments = structure.raw_map.fragments(document, line.raw_start..end);
                     wrap_logical_line_fragments(&fragments, width, &mut lines);
                 }
             }
@@ -1870,7 +2522,11 @@ mod tests {
                 StructuralUnit::Normal(block) => {
                     (block.raw_range.clone(), block.logical_line_count, false)
                 }
-                StructuralUnit::Giant(line) => (line.raw_range.clone(), 1, true),
+                StructuralUnit::Giant(line) => (
+                    line.raw_start..line.raw_end.expect("test structure must be complete"),
+                    1,
+                    true,
+                ),
             })
             .collect()
     }
@@ -1885,8 +2541,12 @@ mod tests {
         let mut builder = IncrementalDetailIndexBuilder::new(document);
         let mut budget_index = 0usize;
         while !builder.finished {
+            if builder.current_line_is_known_giant() {
+                builder.resolve_open_giant_by_scanning(document);
+                continue;
+            }
             let budget = budgets[budget_index % budgets.len()];
-            let progress = builder.advance(budget);
+            let progress = builder.advance(document, budget);
             assert!(progress.scanned_bytes <= budget);
             assert!(progress.finished || progress.scanned_bytes > 0);
             budget_index = budget_index.saturating_add(1);
@@ -1895,7 +2555,7 @@ mod tests {
     }
 
     fn assert_pause_patterns_match_build_to_end(document: &DetailDocument<'_>) {
-        let reference = IncrementalDetailIndexBuilder::new(document).build_to_end();
+        let reference = IncrementalDetailIndexBuilder::new(document).build_to_end(document);
         let budgets = [
             1,
             2,
@@ -2104,7 +2764,7 @@ mod tests {
     fn resumable_builder_preserves_exact_lines_across_segment_boundaries() {
         let segments = ["ab\n", "", "日本", "語", "\n"];
         let document = make_document(&segments);
-        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
 
         assert_eq!(
             structure_logical_lines(&document, &structure),
@@ -2126,7 +2786,7 @@ mod tests {
             let raw = "a".repeat(len);
             let segments = [raw.as_str()];
             let document = make_document(&segments);
-            let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+            let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
             assert_eq!(
                 unit_signature(&structure),
                 [(RawOffset(0)..RawOffset(len), 1, giant)],
@@ -2137,7 +2797,7 @@ mod tests {
         let normal_lines = "x\n".repeat(DETAIL_CHUNK_LINES * 2);
         let segments = [normal_lines.as_str()];
         let document = make_document(&segments);
-        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
         assert_eq!(
             unit_signature(&structure),
             [
@@ -2151,7 +2811,7 @@ mod tests {
         let mixed = format!("normal\n{giant}\ntail");
         let segments = [mixed.as_str()];
         let document = make_document(&segments);
-        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
         assert_eq!(
             structure_logical_lines(&document, &structure),
             ["normal", giant.as_str(), "tail"]
@@ -2169,7 +2829,7 @@ mod tests {
         let at_eof = format!("normal\n{giant}");
         let segments = [at_eof.as_str()];
         let document = make_document(&segments);
-        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let structure = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
         assert_eq!(structure.logical_line_count, 2);
         assert_eq!(
             structure
@@ -2350,10 +3010,10 @@ mod tests {
         assert!(!raw.is_char_boundary(GIANT_LOGICAL_LINE_BYTE_THRESHOLD));
         let segments = [raw.as_str()];
         let document = make_document(&segments);
-        let reference = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let reference = IncrementalDetailIndexBuilder::new(&document).build_to_end(&document);
         let mut builder = IncrementalDetailIndexBuilder::new(&document);
 
-        let progress = builder.advance(GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        let progress = builder.advance(&document, GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
 
         assert_eq!(progress.scanned_bytes, GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
         assert!(!progress.finished);
@@ -2362,11 +3022,17 @@ mod tests {
             builder.scan_position,
             RawOffset(GIANT_LOGICAL_LINE_BYTE_THRESHOLD)
         );
-        assert_eq!(builder.logical_line_count, 0);
-        assert!(builder.units.is_empty());
+        assert_eq!(builder.logical_line_count, 1);
+        assert!(matches!(
+            builder.structure.units.as_slice(),
+            [StructuralUnit::Giant(GiantLineUnit { raw_end: None, .. })]
+        ));
 
+        let blocked = builder.advance(&document, 7);
+        assert_eq!(blocked.scanned_bytes, 0);
+        builder.resolve_open_giant_by_scanning(&document);
         while !builder.finished {
-            let resumed = builder.advance(7);
+            let resumed = builder.advance(&document, 7);
             assert!(resumed.finished || resumed.scanned_bytes > 0);
         }
         assert_eq!(builder.into_structure(), reference);
@@ -2384,9 +3050,66 @@ mod tests {
         assert_eq!(viewport.max_scroll, None);
         assert_eq!(viewport.text.height(), 30);
         assert_eq!(layout.known_chunk_count(), 1);
-        assert!(layout.chunks.len() > 300);
+        assert!(!layout.structure_is_complete());
+        assert!(layout.chunks.len() <= 2);
+        assert!(layout.foreground_structural_scanned_bytes <= FOREGROUND_STRUCTURE_SCAN_BUDGET);
+        assert!(layout.foreground_structural_scanned_bytes < raw.len() / 10);
         assert!(layout.materialized_visual_line_count() <= DETAIL_CHUNK_LINES);
         assert_eq!(layout.chunk_layout_operations, 1);
+        assert_eq!(
+            text_lines(&viewport.text),
+            text_lines(&wrap_detail_document(&document, 79))[..30]
+        );
+    }
+
+    #[test]
+    fn repeated_same_viewport_does_not_advance_partial_structure() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 80, 30, 0);
+        let frontier = building_frontier(&layout);
+        let scanned = layout.foreground_structural_scanned_bytes;
+        let units = layout.chunks.len();
+        let operations = layout.chunk_layout_operations;
+
+        for _ in 0..5 {
+            layout.viewport(&document, 1, 80, 30, 0);
+        }
+
+        assert_eq!(building_frontier(&layout), frontier);
+        assert_eq!(layout.foreground_structural_scanned_bytes, scanned);
+        assert_eq!(layout.chunks.len(), units);
+        assert_eq!(layout.chunk_layout_operations, operations);
+    }
+
+    #[test]
+    fn sequential_scroll_appends_normal_units_without_rebuilding_existing_chunks() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let reference = text_lines(&wrap_detail_document(&document, 79));
+        let mut layout = DetailLayout::default();
+
+        let first = layout.viewport(&document, 1, 80, 20, 0);
+        assert_eq!(text_lines(&first.text), reference[..20]);
+        let first_frontier = building_frontier(&layout);
+        let first_unit_count = layout.chunks.len();
+        let first_operations = layout.chunk_layout_operations;
+
+        let second_scroll = DETAIL_CHUNK_LINES + 5;
+        let second = layout.viewport(&document, 1, 80, 20, second_scroll);
+        assert_eq!(
+            text_lines(&second.text),
+            reference[second_scroll..second_scroll + 20]
+        );
+        assert!(building_frontier(&layout) > first_frontier);
+        assert!(layout.chunks.len() > first_unit_count);
+        assert_eq!(layout.chunk_layout_operations, first_operations + 1);
+        assert!(layout.foreground_structural_scanned_bytes <= 2 * FOREGROUND_STRUCTURE_SCAN_BUDGET);
+        assert!(!layout.structure_is_complete());
     }
 
     #[test]
@@ -2406,6 +3129,146 @@ mod tests {
         assert!(layout.giant_scanned_bytes < raw.len() / 10);
         assert_eq!(layout.materialized_giant_visual_line_count(), 128);
         assert_eq!(layout.giant_checkpoint_count(), 2);
+        assert!(!layout.structure_is_complete());
+        assert_eq!(
+            layout.foreground_structural_scanned_bytes,
+            GIANT_LOGICAL_LINE_BYTE_THRESHOLD
+        );
+        let StructuralUnit::Giant(line) = &layout.structure().units[0] else {
+            panic!("initial unit must be an open giant")
+        };
+        assert_eq!(line.raw_start, RawOffset(0));
+        assert_eq!(line.raw_end, None);
+        assert_eq!(layout.chunks[0].checkpoints[0].raw_position, RawOffset(0));
+    }
+
+    #[test]
+    fn e1_closes_open_giant_and_builder_resumes_without_rescanning_its_interior() {
+        let prefix = "header\n";
+        let giant = "0123456789 ".repeat(12_000);
+        let tail = "tail-one\ntail-two";
+        let raw = format!("{prefix}{giant}\n{tail}");
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let reference = build_document_structure(&document);
+        let giant_visual_rows = eager_fragment_lines(&[giant.as_str()], 39).len();
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 40, 20, 0);
+        layout.viewport(&document, 1, 40, 20, 1);
+        let giant_chunk = 1;
+        assert!(matches!(
+            &layout.structure().units[giant_chunk],
+            StructuralUnit::Giant(GiantLineUnit { raw_end: None, .. })
+        ));
+
+        while layout.chunks[giant_chunk].visual_lines.is_none() {
+            let next_row = layout.chunks[giant_chunk]
+                .checkpoints
+                .last()
+                .unwrap()
+                .visual_row;
+            assert!(layout.ensure_giant_page(&document, giant_chunk, next_row));
+        }
+
+        let giant_end = RawOffset(prefix.len() + giant.len());
+        assert!(matches!(
+            &layout.structure().units[giant_chunk],
+            StructuralUnit::Giant(GiantLineUnit {
+                raw_end: Some(end),
+                ..
+            }) if *end == giant_end
+        ));
+        let structural_scan_before_tail = layout.foreground_structural_scanned_bytes;
+        assert!(structural_scan_before_tail <= prefix.len() + GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+
+        let tail_scroll = 1 + giant_visual_rows;
+        let tail_view = layout.viewport(&document, 1, 40, 2, tail_scroll);
+        assert_eq!(text_lines(&tail_view.text), ["tail-one", "tail-two"]);
+        assert!(layout.structure_is_complete());
+        assert_eq!(layout.structure(), &reference);
+        assert!(
+            layout
+                .foreground_structural_scanned_bytes
+                .saturating_sub(structural_scan_before_tail)
+                <= tail.len()
+        );
+    }
+
+    #[test]
+    fn unresolved_open_giant_survives_width_changes_without_structural_rescan() {
+        let prefix = "prefix\n";
+        let giant = "👩‍💻token e\u{301}\u{323}token 日本語 ".repeat(20_000);
+        let raw = format!("{prefix}{giant}");
+        let segments = [
+            "prefix\n👩‍",
+            "💻token ",
+            &raw[prefix.len() + "👩‍💻token ".len()..],
+        ];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 120, 20, 1);
+        let frontier = building_frontier(&layout);
+        let scanned = layout.foreground_structural_scanned_bytes;
+        let StructuralUnit::Giant(line) = &layout.structure().units[1] else {
+            panic!("second unit must be giant")
+        };
+        let raw_start = line.raw_start;
+        assert_eq!(line.raw_end, None);
+        assert!(layout.chunks[1].checkpoints.len() > 1);
+
+        for width in [80u16, 120] {
+            layout.prepare(&document, 1, width);
+            assert_eq!(layout.chunks[1].checkpoints.len(), 1);
+            assert!(layout.materialized_giant_pages.is_empty());
+            assert_eq!(layout.chunks[1].checkpoints[0].raw_position, raw_start);
+            assert_eq!(building_frontier(&layout), frontier);
+            assert_eq!(layout.foreground_structural_scanned_bytes, scanned);
+
+            let viewport = layout.viewport(&document, 1, width, 20, 1);
+            let reference = text_lines(&wrap_detail_document(&document, width - 1));
+            assert_eq!(text_lines(&viewport.text), reference[1..21]);
+            assert_eq!(building_frontier(&layout), frontier);
+            assert_eq!(layout.foreground_structural_scanned_bytes, scanned);
+            assert_eq!(layout.chunks[1].checkpoints[0].raw_position, raw_start);
+            assert!(matches!(
+                &layout.structure().units[1],
+                StructuralUnit::Giant(GiantLineUnit { raw_end: None, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn open_giant_frontier_inside_utf8_and_segmented_grapheme_wraps_correctly() {
+        let rest = "界".repeat(80_000);
+        let segments = ["👩‍", "💻", rest.as_str()];
+        let document = make_document(&segments);
+        let joined = segments.concat();
+        assert!(!joined.is_char_boundary(GIANT_LOGICAL_LINE_BYTE_THRESHOLD));
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 37, 25, 0);
+        let reference = text_lines(&wrap_detail_document(&document, 36));
+
+        assert_eq!(text_lines(&viewport.text), reference[..25]);
+        assert_eq!(
+            building_frontier(&layout),
+            RawOffset(GIANT_LOGICAL_LINE_BYTE_THRESHOLD)
+        );
+        assert!(matches!(
+            layout.structure().units.as_slice(),
+            [StructuralUnit::Giant(GiantLineUnit {
+                raw_start: RawOffset(0),
+                raw_end: None,
+            })]
+        ));
+        assert!(
+            layout.giant_scanned_bytes <= GIANT_LOGICAL_LINE_BYTE_THRESHOLD / 2,
+            "scanned={} raw={}",
+            layout.giant_scanned_bytes,
+            joined.len()
+        );
     }
 
     #[test]
@@ -2715,14 +3578,16 @@ mod tests {
 
         let initial = layout.viewport(&document, 7, detail_width, height, 0);
         assert_eq!(initial.max_scroll, None);
+        assert!(!layout.structure_is_complete());
+        complete_structure_via_foreground(&mut layout, &document);
         let page_operations = layout.giant_page_layout_operations;
         let result = count_result(take_count_request(&mut layout, &document));
         assert_eq!(result.chunk_visual_lines, [reference_height]);
         assert!(layout.apply_count_result(result));
+        assert_eq!(layout.giant_page_layout_operations, page_operations);
 
         let exact = layout.viewport(&document, 7, detail_width, height, 0);
         assert_eq!(exact.max_scroll, Some(reference_height - height));
-        assert_eq!(layout.giant_page_layout_operations, page_operations);
     }
 
     #[test]
@@ -2733,12 +3598,16 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.viewport(&document, 1, 120, 20, 300);
-        let document_structure = Arc::clone(&layout.document_structure);
+        complete_structure_via_foreground(&mut layout, &document);
+        let document_structure = Arc::clone(completed_structure(&layout));
         let stale = count_result(take_count_request(&mut layout, &document));
         assert!(layout.giant_checkpoint_count() > 1);
 
         layout.prepare(&document, 1, 80);
-        assert!(Arc::ptr_eq(&document_structure, &layout.document_structure));
+        assert!(Arc::ptr_eq(
+            &document_structure,
+            completed_structure(&layout)
+        ));
         assert_eq!(layout.document_structure_builds, 1);
         assert_eq!(layout.giant_checkpoint_count(), 1);
         assert!(layout.materialized_giant_pages.is_empty());
@@ -2845,6 +3714,11 @@ mod tests {
         let document = make_document(&segments);
         let mut layout = DetailLayout::default();
 
+        let initial = layout.viewport(&document, 1, 80, 30, usize::MAX);
+        assert_eq!(initial.max_scroll, None);
+        complete_structure_via_foreground(&mut layout, &document);
+        let result = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(result));
         let viewport = layout.viewport(&document, 1, 80, 30, usize::MAX);
 
         assert_eq!(viewport.max_scroll, Some(69_971));
@@ -2919,12 +3793,15 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.viewport(&document, 1, 120, 20, 0);
-        let document_structure = Arc::clone(&layout.document_structure);
+        let document_structure = Arc::clone(completed_structure(&layout));
         assert_eq!(layout.known_chunk_count(), 1);
         assert!(!layout.materialized_chunks.is_empty());
         for width in [80, 100, 120] {
             layout.prepare(&document, 1, width);
-            assert!(Arc::ptr_eq(&document_structure, &layout.document_structure));
+            assert!(Arc::ptr_eq(
+                &document_structure,
+                completed_structure(&layout)
+            ));
             assert_eq!(layout.known_chunk_count(), 0);
             assert!(layout.materialized_chunks.is_empty());
         }
@@ -2942,14 +3819,14 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.prepare(&first, 1, 120);
-        let old_structure = Arc::clone(&layout.document_structure);
+        let old_structure = Arc::clone(completed_structure(&layout));
         layout.prepare(&first, 1, 80);
-        assert!(Arc::ptr_eq(&old_structure, &layout.document_structure));
+        assert!(Arc::ptr_eq(&old_structure, completed_structure(&layout)));
 
         layout.prepare(&second, 2, 80);
-        assert!(!Arc::ptr_eq(&old_structure, &layout.document_structure));
+        assert!(!Arc::ptr_eq(&old_structure, completed_structure(&layout)));
         assert_eq!(layout.document_structure_builds, 2);
-        assert_eq!(layout.document_structure.logical_line_count, 2);
+        assert_eq!(layout.structure().logical_line_count, 2);
     }
 
     #[test]
@@ -2963,13 +3840,13 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.prepare(&single_segment, 1, 80);
-        let old_structure = Arc::clone(&layout.document_structure);
+        let old_structure = Arc::clone(completed_structure(&layout));
         layout.prepare(&split_segments, 1, 80);
 
-        assert!(!Arc::ptr_eq(&old_structure, &layout.document_structure));
+        assert!(!Arc::ptr_eq(&old_structure, completed_structure(&layout)));
         assert_eq!(layout.document_structure_builds, 2);
         assert_eq!(
-            layout.document_structure.logical_line_count,
+            layout.structure().logical_line_count,
             old_structure.logical_line_count
         );
     }
@@ -2981,15 +3858,19 @@ mod tests {
         let document = make_document(&segments);
         let mut layout = DetailLayout::default();
 
-        layout.prepare(&document, 1, 120);
-        let document_structure = Arc::clone(&layout.document_structure);
+        layout.viewport(&document, 1, 120, 20, 0);
+        let frontier = building_frontier(&layout);
+        let discovered_units = layout.structure().units.len();
+        let discovered_lines = layout.structure().logical_line_count;
         for width in [80, 100, 120] {
             layout.prepare(&document, 1, width);
+            assert_eq!(building_frontier(&layout), frontier);
+            assert_eq!(layout.structure().units.len(), discovered_units);
         }
 
-        assert!(Arc::ptr_eq(&document_structure, &layout.document_structure));
         assert_eq!(layout.document_structure_builds, 1);
-        assert_eq!(layout.document_structure.logical_line_count, 100_001);
+        assert_eq!(layout.structure().logical_line_count, discovered_lines);
+        assert!(!layout.structure_is_complete());
     }
 
     #[test]
@@ -3072,6 +3953,7 @@ mod tests {
         let initial = layout.viewport(&document, 41, 80, 30, 0);
         assert_eq!(initial.max_scroll, None);
         assert_eq!(layout.known_chunk_count(), 1);
+        complete_structure_via_foreground(&mut layout, &document);
         let request = take_count_request(&mut layout, &document);
         let result = count_result(request);
 
@@ -3086,6 +3968,33 @@ mod tests {
     }
 
     #[test]
+    fn partial_structure_stages_no_count_until_foreground_reaches_eof() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let initial = layout.viewport(&document, 23, 80, 30, 0);
+        assert_eq!(initial.max_scroll, None);
+        assert!(!layout.structure_is_complete());
+        layout.stage_count_command(&document);
+        assert!(layout.take_count_command().is_none());
+
+        complete_structure_via_foreground(&mut layout, &document);
+        layout.stage_count_command(&document);
+        let request = match layout.take_count_command() {
+            Some(DetailCountCommand::Count(request)) => request,
+            other => panic!("completed structure must stage exact count, got {other:?}"),
+        };
+        let result = count_result(request);
+        assert!(layout.apply_count_result(result));
+        assert_eq!(
+            layout.viewport(&document, 23, 80, 30, 0).max_scroll,
+            Some(99_971)
+        );
+    }
+
+    #[test]
     fn background_chunk_counts_match_materialized_chunk_counts() {
         let logical =
             "ASCII words  supercalifragilisticexpialidocious 日本語 e\u{301} 👩‍💻 \u{200b}\n\n";
@@ -3094,6 +4003,7 @@ mod tests {
         let document = make_document(&segments);
         let mut layout = DetailLayout::default();
         layout.viewport(&document, 8, 14, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
         let result = count_result(take_count_request(&mut layout, &document));
 
         for chunk_index in 0..layout.chunks.len() {
@@ -3119,6 +4029,7 @@ mod tests {
         let document = make_document(&segments);
         let mut layout = DetailLayout::default();
         layout.viewport(&document, 19, 21, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
         let background = count_result(take_count_request(&mut layout, &document));
 
         for chunk_index in 0..layout.chunks.len() {
@@ -3148,14 +4059,14 @@ mod tests {
         );
         assert!(
             layout
-                .document_structure
+                .structure()
                 .units
                 .iter()
                 .any(StructuralUnit::is_giant)
         );
         assert!(
             layout
-                .document_structure
+                .structure()
                 .units
                 .iter()
                 .any(|unit| matches!(unit, StructuralUnit::Normal(_)))
@@ -3254,12 +4165,18 @@ mod tests {
         layout.viewport(&document, 1, 80, 20, 0);
         let old_request = take_count_request(&mut layout, &document);
         let document_structure = Arc::clone(&old_request.structure);
-        assert!(Arc::ptr_eq(&document_structure, &layout.document_structure));
+        assert!(Arc::ptr_eq(
+            &document_structure,
+            completed_structure(&layout)
+        ));
         let old_result = count_result(old_request);
 
         layout.viewport(&document, 1, 60, 20, 0);
         let new_request = take_count_request(&mut layout, &document);
-        assert!(Arc::ptr_eq(&document_structure, &layout.document_structure));
+        assert!(Arc::ptr_eq(
+            &document_structure,
+            completed_structure(&layout)
+        ));
         assert!(Arc::ptr_eq(&document_structure, &new_request.structure));
         assert_eq!(layout.document_structure_builds, 1);
         assert_ne!(
