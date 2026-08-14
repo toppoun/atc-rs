@@ -121,6 +121,7 @@ fn count_request(
     request: DetailCountRequest,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Option<DetailCountResult> {
+    let anchor = request.anchor;
     let segment_lengths = (0..request.snapshot.segment_count())
         .map(|index| request.snapshot.segment_text(index).map_or(0, str::len))
         .collect::<Vec<_>>();
@@ -141,7 +142,9 @@ fn count_request(
     Some(DetailCountResult {
         identity: request.identity,
         chunk_visual_lines: count.chunk_visual_lines,
+        anchor,
         anchor_visual_row: count.anchor_visual_row,
+        anchor_row_raw_start: count.anchor_row_raw_start,
     })
 }
 
@@ -323,7 +326,9 @@ mod tests {
     fn synthetic_result(request: DetailCountRequest) -> DetailCountResult {
         DetailCountResult {
             chunk_visual_lines: vec![1; request.identity.chunk_count],
+            anchor: request.anchor,
             anchor_visual_row: None,
+            anchor_row_raw_start: None,
             identity: request.identity,
         }
     }

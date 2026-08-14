@@ -410,6 +410,71 @@ mod tests {
         info
     }
 
+    fn render_with_layout(
+        terminal: &mut Terminal<TestBackend>,
+        app: &WatchApp,
+        detail_layout: &mut DetailLayout,
+    ) -> RenderInfo {
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, app, detail_layout))
+            .unwrap();
+        info
+    }
+
+    fn apply_ready_count(layout: &mut DetailLayout, document: &DetailDocument<'_>) {
+        layout.stage_analysis_command(document);
+        let request = match layout
+            .take_analysis_command()
+            .expect("expected detail analysis")
+        {
+            crate::tui::detail_layout::DetailAnalysisCommand::Count(request) => request,
+            crate::tui::detail_layout::DetailAnalysisCommand::BuildStructure(request) => {
+                let structure = crate::tui::detail_layout::build_document_structure_cancellable(
+                    &request.snapshot,
+                    || false,
+                )
+                .unwrap();
+                assert!(layout.apply_analysis_result(
+                    crate::tui::detail_layout::DetailAnalysisResult::StructureReady(
+                        crate::tui::detail_layout::DetailStructureResult {
+                            identity: request.identity,
+                            structure,
+                        },
+                    ),
+                ));
+                layout.stage_analysis_command(document);
+                let Some(crate::tui::detail_layout::DetailAnalysisCommand::Count(request)) =
+                    layout.take_analysis_command()
+                else {
+                    panic!("completed structure must stage count");
+                };
+                request
+            }
+            _ => panic!("expected staged detail count"),
+        };
+        let anchor = request.anchor;
+        let mut never_cancel = || false;
+        let count = request
+            .structure
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                anchor,
+                &mut never_cancel,
+            )
+            .unwrap();
+        assert!(
+            layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
+                identity: request.identity,
+                chunk_visual_lines: count.chunk_visual_lines,
+                anchor,
+                anchor_visual_row: count.anchor_visual_row,
+                anchor_row_raw_start: count.anchor_row_raw_start,
+            })
+        );
+    }
+
     fn large_compile_error_app() -> WatchApp {
         let mut app = app();
         app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
@@ -545,7 +610,9 @@ mod tests {
             layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
                 identity: request.identity,
                 chunk_visual_lines: count.chunk_visual_lines,
+                anchor: request.anchor,
                 anchor_visual_row: count.anchor_visual_row,
+                anchor_row_raw_start: count.anchor_row_raw_start,
             })
         );
 
@@ -618,6 +685,72 @@ mod tests {
         assert!(disabled.samples_area.is_none());
         assert_eq!(disabled.detail_area.x, 1);
         assert_eq!(disabled.detail_area.width, 50);
+    }
+
+    #[test]
+    fn samples_pane_width_changes_preserve_detail_anchor_and_reconcile_scroll() {
+        let mut app = large_compile_error_app();
+        app.scroll_detail_down(300);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+
+        let disabled = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(disabled.samples_area.is_none());
+        {
+            let document = DetailDocument::from_app(&app);
+            apply_ready_count(&mut layout, &document);
+        }
+        render_with_layout(&mut terminal, &app, &mut layout);
+        let disabled_anchor = layout.last_top_anchor_for_test().unwrap();
+        let baseline_scroll = app.detail_scroll();
+
+        app.toggle_samples_pane();
+        assert_eq!(app.detail_scroll(), baseline_scroll);
+        let enabled = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(enabled.samples_area.is_some());
+        assert!(enabled.detail_area.width < disabled.detail_area.width);
+        assert!(layout.has_pending_width_anchor_for_test());
+
+        let document = DetailDocument::from_app(&app);
+        layout.stage_analysis_command(&document);
+        let Some(crate::tui::detail_layout::DetailAnalysisCommand::Count(request)) =
+            layout.take_analysis_command()
+        else {
+            panic!("samples-pane width change must stage anchored count");
+        };
+        assert_eq!(request.anchor, Some(disabled_anchor));
+        let anchor = request.anchor;
+        let mut never_cancel = || false;
+        let count = request
+            .structure
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                anchor,
+                &mut never_cancel,
+            )
+            .unwrap();
+        assert!(
+            layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
+                identity: request.identity,
+                chunk_visual_lines: count.chunk_visual_lines,
+                anchor,
+                anchor_visual_row: count.anchor_visual_row,
+                anchor_row_raw_start: count.anchor_row_raw_start,
+            })
+        );
+        let correction = layout.take_scroll_reconciliation().unwrap();
+        app.reconcile_detail_scroll(correction);
+        render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(!layout.has_pending_width_anchor_for_test());
+
+        let reconciled_scroll = app.detail_scroll();
+        app.toggle_samples_pane();
+        assert_eq!(app.detail_scroll(), reconciled_scroll);
+        let disabled_again = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(disabled_again.samples_area.is_none());
+        assert!(layout.has_pending_width_anchor_for_test());
     }
 
     #[test]

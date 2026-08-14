@@ -312,6 +312,13 @@ impl StructuralUnit {
     fn is_giant(&self) -> bool {
         matches!(self, Self::Giant(_))
     }
+
+    fn raw_start(&self) -> RawOffset {
+        match self {
+            Self::Normal(block) => block.raw_range.start,
+            Self::Giant(line) => line.raw_start,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -676,6 +683,7 @@ impl DetailDocumentStructure {
         let mut counts = Vec::with_capacity(self.chunk_count());
         let mut visual_prefix = 0usize;
         let mut anchor_visual_row = None;
+        let mut anchor_row_raw_start = None;
 
         for (unit_index, unit) in self.units.iter().enumerate() {
             if is_cancelled() {
@@ -719,6 +727,7 @@ impl DetailDocumentStructure {
             if target_raw_position.is_some() {
                 let local_row = unit_count.anchor_local_row?;
                 anchor_visual_row = Some(visual_prefix.saturating_add(local_row));
+                anchor_row_raw_start = unit_count.anchor_row_raw_start;
             }
             counts.push(unit_count.visual_lines);
             visual_prefix = visual_prefix.saturating_add(unit_count.visual_lines);
@@ -731,6 +740,7 @@ impl DetailDocumentStructure {
         Some(DetailCountComputation {
             chunk_visual_lines: counts,
             anchor_visual_row,
+            anchor_row_raw_start,
         })
     }
 }
@@ -749,6 +759,7 @@ pub(super) struct ContentAnchor {
 pub(super) struct DetailCountComputation {
     pub(super) chunk_visual_lines: Vec<usize>,
     pub(super) anchor_visual_row: Option<usize>,
+    pub(super) anchor_row_raw_start: Option<RawOffset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -792,7 +803,9 @@ pub(crate) struct DetailCountRequest {
 pub(crate) struct DetailCountResult {
     pub(super) identity: DetailCountIdentity,
     pub(super) chunk_visual_lines: Vec<usize>,
+    pub(super) anchor: Option<ContentAnchor>,
     pub(super) anchor_visual_row: Option<usize>,
+    pub(super) anchor_row_raw_start: Option<RawOffset>,
 }
 
 #[derive(Debug)]
@@ -861,6 +874,26 @@ struct MaterializedGiantPage {
 }
 
 #[derive(Debug, Default)]
+struct MaterializedViewport {
+    lines: Vec<Line<'static>>,
+    top_anchor: Option<ContentAnchor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingWidthAnchor {
+    anchor: ContentAnchor,
+    baseline_requested_scroll: usize,
+    layout_generation: DetailLayoutGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollReconciliation {
+    absolute_row: usize,
+    baseline_requested_scroll: usize,
+    layout_generation: DetailLayoutGeneration,
+}
+
+#[derive(Debug, Default)]
 pub(super) struct DetailLayout {
     revision: Option<u64>,
     detail_width: u16,
@@ -871,6 +904,12 @@ pub(super) struct DetailLayout {
     materialized_eager_rows: Vec<MaterializedRow>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
+    // The provenance of the first row actually emitted by the most recent
+    // non-empty viewport for this document. Empty/zero-height viewports keep
+    // the last known value; a document identity change clears it.
+    last_top_anchor: Option<ContentAnchor>,
+    pending_width_anchor: Option<PendingWidthAnchor>,
+    pending_scroll_reconciliation: Option<ScrollReconciliation>,
     document_generation: DetailDocumentGeneration,
     layout_generation: DetailLayoutGeneration,
     pending_analysis_command: Option<PendingAnalysisCommand>,
@@ -905,7 +944,8 @@ impl DetailLayout {
         viewport_height: usize,
         requested_scroll: usize,
     ) -> DetailViewport {
-        self.prepare(document, revision, detail_width);
+        self.prepare(document, revision, detail_width, requested_scroll);
+        self.cancel_width_anchor_for_explicit_scroll(requested_scroll);
 
         match self.mode.expect("detail layout must be prepared") {
             LayoutMode::Eager => {
@@ -946,7 +986,10 @@ impl DetailLayout {
                     identity: self.count_identity(),
                     snapshot: document.snapshot(),
                     structure,
-                    anchor: None,
+                    anchor: self
+                        .pending_width_anchor
+                        .filter(|pending| pending.layout_generation == self.layout_generation)
+                        .map(|pending| pending.anchor),
                 })
             }
             PendingAnalysisCommand::Cancel => DetailAnalysisCommand::Cancel {
@@ -957,6 +1000,12 @@ impl DetailLayout {
 
     pub(super) fn take_analysis_command(&mut self) -> Option<DetailAnalysisCommand> {
         self.ready_analysis_command.take()
+    }
+
+    pub(super) fn take_scroll_reconciliation(&mut self) -> Option<usize> {
+        self.pending_scroll_reconciliation
+            .take()
+            .map(|reconciliation| reconciliation.absolute_row)
     }
 
     pub(super) fn apply_analysis_result(&mut self, result: DetailAnalysisResult) -> bool {
@@ -974,10 +1023,6 @@ impl DetailLayout {
             return false;
         }
 
-        // E2-B computes this together with exact counts, but E2-C will be the
-        // first step that reconciles it with scroll state.
-        let _ = result.anchor_visual_row;
-
         if self
             .chunks
             .iter()
@@ -987,12 +1032,90 @@ impl DetailLayout {
             return false;
         }
 
+        let pending_resolution = if let Some(pending) = self.pending_width_anchor
+            && pending.layout_generation == result.identity.layout_generation
+            && result.anchor == Some(pending.anchor)
+        {
+            let (Some(anchor_visual_row), Some(anchor_row_raw_start)) =
+                (result.anchor_visual_row, result.anchor_row_raw_start)
+            else {
+                return false;
+            };
+            let Some(chunk_index) = self
+                .chunks
+                .iter()
+                .position(|chunk| chunk.unit_index == pending.anchor.unit_index)
+            else {
+                return false;
+            };
+            let visual_prefix = result.chunk_visual_lines[..chunk_index]
+                .iter()
+                .fold(0usize, |total, lines| total.saturating_add(*lines));
+            let Some(local_visual_row) = anchor_visual_row.checked_sub(visual_prefix) else {
+                return false;
+            };
+            if local_visual_row >= result.chunk_visual_lines[chunk_index]
+                || anchor_row_raw_start > pending.anchor.raw_position
+            {
+                return false;
+            }
+            if self.chunk_is_giant(chunk_index)
+                && let Some(existing) = self.chunks[chunk_index]
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.visual_row == local_visual_row)
+                && existing.raw_position != anchor_row_raw_start
+            {
+                return false;
+            }
+            Some((
+                pending,
+                anchor_visual_row,
+                chunk_index,
+                local_visual_row,
+                anchor_row_raw_start,
+            ))
+        } else {
+            None
+        };
+
         let mut changed = false;
         for (chunk, visual_lines) in self.chunks.iter_mut().zip(result.chunk_visual_lines) {
             if chunk.visual_lines.is_none() {
                 chunk.visual_lines = Some(visual_lines);
                 changed = true;
             }
+        }
+
+        if let Some((
+            pending,
+            anchor_visual_row,
+            chunk_index,
+            local_visual_row,
+            anchor_row_raw_start,
+        )) = pending_resolution
+        {
+            if self.chunk_is_giant(chunk_index)
+                && !self.chunks[chunk_index]
+                    .checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint.visual_row == local_visual_row)
+            {
+                self.chunks[chunk_index].checkpoints.push(WrapCheckpoint {
+                    visual_row: local_visual_row,
+                    raw_position: anchor_row_raw_start,
+                });
+                self.chunks[chunk_index]
+                    .checkpoints
+                    .sort_unstable_by_key(|checkpoint| checkpoint.visual_row);
+            }
+            self.pending_width_anchor = None;
+            self.pending_scroll_reconciliation = Some(ScrollReconciliation {
+                absolute_row: anchor_visual_row,
+                baseline_requested_scroll: pending.baseline_requested_scroll,
+                layout_generation: pending.layout_generation,
+            });
+            changed = true;
         }
 
         changed
@@ -1031,7 +1154,13 @@ impl DetailLayout {
         true
     }
 
-    fn prepare(&mut self, document: &impl DetailTextSource, revision: u64, detail_width: u16) {
+    fn prepare(
+        &mut self,
+        document: &impl DetailTextSource,
+        revision: u64,
+        detail_width: u16,
+        requested_scroll: usize,
+    ) {
         let segment_lengths = (0..document.segment_count())
             .map(|index| document.segment_text(index).map_or(0, str::len))
             .collect::<Vec<_>>();
@@ -1043,6 +1172,10 @@ impl DetailLayout {
             return;
         }
 
+        let width_anchor = (!document_changed && width_changed)
+            .then_some(self.last_top_anchor)
+            .flatten();
+
         let previous_mode = self.mode;
         let preserve_pending_build = !document_changed
             && matches!(
@@ -1050,6 +1183,9 @@ impl DetailLayout {
                 Some(DetailStructureState::Building(_))
             );
         if document_changed {
+            self.last_top_anchor = None;
+            self.pending_width_anchor = None;
+            self.pending_scroll_reconciliation = None;
             let raw_bytes = segment_lengths.iter().copied().sum::<usize>();
             let (structure_state, mode) = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD {
                 (
@@ -1088,6 +1224,14 @@ impl DetailLayout {
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        if width_changed && !document_changed {
+            self.pending_scroll_reconciliation = None;
+            self.pending_width_anchor = width_anchor.map(|anchor| PendingWidthAnchor {
+                anchor,
+                baseline_requested_scroll: requested_scroll,
+                layout_generation: self.layout_generation,
+            });
+        }
 
         if !preserve_pending_build {
             self.pending_analysis_command = if document_changed {
@@ -1122,6 +1266,26 @@ impl DetailLayout {
             if document_changed {
                 self.foreground_structural_scanned_bytes = 0;
             }
+        }
+    }
+
+    fn cancel_width_anchor_for_explicit_scroll(&mut self, requested_scroll: usize) {
+        let pending_was_cancelled = self.pending_width_anchor.is_some_and(|pending| {
+            pending.layout_generation == self.layout_generation
+                && pending.baseline_requested_scroll != requested_scroll
+        });
+        if pending_was_cancelled {
+            self.pending_width_anchor = None;
+        }
+
+        let reconciliation_was_cancelled =
+            self.pending_scroll_reconciliation
+                .is_some_and(|reconciliation| {
+                    reconciliation.layout_generation == self.layout_generation
+                        && reconciliation.baseline_requested_scroll != requested_scroll
+                });
+        if reconciliation_was_cancelled {
+            self.pending_scroll_reconciliation = None;
         }
     }
 
@@ -1277,8 +1441,28 @@ impl DetailLayout {
             };
         }
 
+        if let Some(pending) = self
+            .pending_width_anchor
+            .filter(|pending| pending.layout_generation == self.layout_generation)
+            && let Some(materialized) = self.materialize_anchored_lazy_viewport(
+                document,
+                pending.anchor,
+                viewport_height,
+                &mut structural_budget,
+            )
+        {
+            if let Some(top_anchor) = materialized.top_anchor {
+                self.last_top_anchor = Some(top_anchor);
+            }
+            return DetailViewport {
+                text: Text::from(materialized.lines),
+                max_scroll: None,
+                effective_scroll: requested_scroll,
+            };
+        }
+
         let mut effective_scroll = requested_scroll;
-        let mut lines = self.materialize_viewport(
+        let mut materialized = self.materialize_viewport(
             document,
             effective_scroll,
             viewport_height,
@@ -1293,7 +1477,7 @@ impl DetailLayout {
             let clamped = requested_scroll.min(max);
             if clamped != effective_scroll {
                 effective_scroll = clamped;
-                lines = self.materialize_viewport(
+                materialized = self.materialize_viewport(
                     document,
                     effective_scroll,
                     viewport_height,
@@ -1305,8 +1489,12 @@ impl DetailLayout {
             }
         }
 
+        if let Some(top_anchor) = materialized.top_anchor {
+            self.last_top_anchor = Some(top_anchor);
+        }
+
         DetailViewport {
-            text: Text::from(lines),
+            text: Text::from(materialized.lines),
             max_scroll: exact_max,
             effective_scroll,
         }
@@ -1336,7 +1524,36 @@ impl DetailLayout {
         }
 
         let effective_scroll = requested_scroll.min(exact_max);
+        let pending = self
+            .pending_width_anchor
+            .filter(|pending| pending.layout_generation == self.layout_generation);
+        let anchored_row = (viewport_height > 0)
+            .then(|| pending.and_then(|pending| self.resolve_eager_anchor(&rows, pending.anchor)))
+            .flatten();
+        let effective_scroll = anchored_row.unwrap_or(effective_scroll).min(exact_max);
+        if let (Some(pending), Some(anchor_visual_row)) = (pending, anchored_row) {
+            self.pending_width_anchor = None;
+            self.pending_scroll_reconciliation = Some(ScrollReconciliation {
+                absolute_row: anchor_visual_row,
+                baseline_requested_scroll: pending.baseline_requested_scroll,
+                layout_generation: pending.layout_generation,
+            });
+        }
         self.materialized_eager_rows = rows;
+        let top_anchor = if viewport_height == 0 {
+            None
+        } else {
+            self.materialized_eager_rows
+                .get(effective_scroll)
+                .map(|row| row.raw_range.start)
+                .and_then(|raw_position| {
+                    self.unit_index_for_row_start(raw_position)
+                        .map(|unit_index| ContentAnchor {
+                            unit_index,
+                            raw_position,
+                        })
+                })
+        };
         let text = Text::from(
             self.materialized_eager_rows
                 .iter()
@@ -1345,6 +1562,9 @@ impl DetailLayout {
                 .map(|row| row.line.clone())
                 .collect::<Vec<_>>(),
         );
+        if let Some(top_anchor) = top_anchor {
+            self.last_top_anchor = Some(top_anchor);
+        }
 
         DetailViewport {
             text,
@@ -1359,30 +1579,70 @@ impl DetailLayout {
         absolute_scroll: usize,
         viewport_height: usize,
         structural_budget: &mut usize,
-    ) -> Vec<Line<'static>> {
-        let Some((mut chunk_index, mut offset_in_chunk)) =
+    ) -> MaterializedViewport {
+        let Some((chunk_index, offset_in_chunk)) =
             self.locate_visual_offset(document, absolute_scroll, structural_budget)
         else {
-            return Vec::new();
+            return MaterializedViewport::default();
         };
 
-        let mut viewport = Vec::with_capacity(viewport_height);
+        self.materialize_from_chunk(
+            document,
+            chunk_index,
+            offset_in_chunk,
+            viewport_height,
+            structural_budget,
+        )
+    }
 
-        while viewport.len() < viewport_height {
+    fn materialize_from_chunk(
+        &mut self,
+        document: &impl DetailTextSource,
+        chunk_index: usize,
+        offset_in_chunk: usize,
+        viewport_height: usize,
+        structural_budget: &mut usize,
+    ) -> MaterializedViewport {
+        let mut viewport = MaterializedViewport {
+            lines: Vec::with_capacity(viewport_height),
+            top_anchor: None,
+        };
+
+        self.append_viewport_from_chunk(
+            document,
+            chunk_index,
+            offset_in_chunk,
+            viewport_height,
+            structural_budget,
+            &mut viewport,
+        );
+        viewport
+    }
+
+    fn append_viewport_from_chunk(
+        &mut self,
+        document: &impl DetailTextSource,
+        mut chunk_index: usize,
+        mut offset_in_chunk: usize,
+        viewport_height: usize,
+        structural_budget: &mut usize,
+        viewport: &mut MaterializedViewport,
+    ) {
+        while viewport.lines.len() < viewport_height {
             if chunk_index >= self.chunks.len() {
                 if self.advance_structure(document, structural_budget) {
                     continue;
                 }
                 break;
             }
-            let remaining = viewport_height.saturating_sub(viewport.len());
+            let remaining = viewport_height.saturating_sub(viewport.lines.len());
             if self.chunk_is_giant(chunk_index) {
                 self.append_giant_viewport(
                     document,
                     chunk_index,
                     offset_in_chunk,
                     remaining,
-                    &mut viewport,
+                    viewport,
                 );
             } else {
                 self.ensure_chunk_materialized(document, chunk_index);
@@ -1396,7 +1656,16 @@ impl DetailLayout {
                     .saturating_add(remaining)
                     .min(chunk_lines.rows.len());
 
-                viewport.extend(
+                if viewport.top_anchor.is_none()
+                    && let Some(row) = chunk_lines.rows.get(offset_in_chunk)
+                    && offset_in_chunk < end
+                {
+                    viewport.top_anchor = Some(ContentAnchor {
+                        unit_index: self.chunks[chunk_index].unit_index,
+                        raw_position: row.raw_range.start,
+                    });
+                }
+                viewport.lines.extend(
                     chunk_lines.rows[offset_in_chunk..end]
                         .iter()
                         .map(|row| row.line.clone()),
@@ -1405,6 +1674,111 @@ impl DetailLayout {
 
             chunk_index = chunk_index.saturating_add(1);
             offset_in_chunk = 0;
+        }
+    }
+
+    fn materialize_anchored_lazy_viewport(
+        &mut self,
+        document: &impl DetailTextSource,
+        anchor: ContentAnchor,
+        viewport_height: usize,
+        structural_budget: &mut usize,
+    ) -> Option<MaterializedViewport> {
+        let chunk_index = self
+            .chunks
+            .iter()
+            .position(|chunk| chunk.unit_index == anchor.unit_index)?;
+
+        match self.structure().units.get(anchor.unit_index)?.clone() {
+            StructuralUnit::Normal(_) => {
+                self.ensure_chunk_materialized(document, chunk_index);
+                let row_index = self
+                    .materialized_chunks
+                    .iter()
+                    .find(|chunk| chunk.index == chunk_index)
+                    .and_then(|chunk| row_index_for_anchor(&chunk.rows, anchor.raw_position))?;
+                Some(self.materialize_from_chunk(
+                    document,
+                    chunk_index,
+                    row_index,
+                    viewport_height,
+                    structural_budget,
+                ))
+            }
+            StructuralUnit::Giant(line) => Some(self.materialize_anchored_giant_viewport(
+                document,
+                chunk_index,
+                anchor.raw_position,
+                line,
+                viewport_height,
+                structural_budget,
+            )),
+        }
+    }
+
+    fn materialize_anchored_giant_viewport(
+        &mut self,
+        document: &impl DetailTextSource,
+        chunk_index: usize,
+        raw_position: RawOffset,
+        line: GiantLineUnit,
+        viewport_height: usize,
+        structural_budget: &mut usize,
+    ) -> MaterializedViewport {
+        let progress;
+        let mut rows = Vec::with_capacity(viewport_height);
+        {
+            let source = DocumentGiantSource {
+                document,
+                raw_map: &self.structure().raw_map,
+                raw_start: line.raw_start,
+                known_end: line.raw_end,
+            };
+            progress = wrap_document_giant_line_page(
+                &source,
+                raw_position,
+                self.lazy_layout_width(),
+                viewport_height,
+                &mut ProvenanceMaterializeSink::new(&mut rows),
+                &mut || false,
+            )
+            .expect("foreground anchored giant detail layout is not cancellable");
+        }
+
+        #[cfg(not(test))]
+        let _ = progress.scanned_bytes;
+
+        #[cfg(test)]
+        {
+            self.giant_scanned_bytes = self
+                .giant_scanned_bytes
+                .saturating_add(progress.scanned_bytes);
+        }
+
+        if line.raw_end.is_none()
+            && let Some(discovered_end) = progress.discovered_end
+        {
+            self.resolve_open_giant(discovered_end);
+        }
+
+        let top_anchor = rows.first().map(|row| ContentAnchor {
+            unit_index: self.chunks[chunk_index].unit_index,
+            raw_position: row.raw_range.start,
+        });
+        let mut viewport = MaterializedViewport {
+            lines: rows.into_iter().map(|row| row.line).collect(),
+            top_anchor,
+        };
+
+        if progress.finished && viewport.lines.len() < viewport_height {
+            self.append_viewport_from_chunk(
+                document,
+                chunk_index.saturating_add(1),
+                0,
+                viewport_height,
+                structural_budget,
+                &mut viewport,
+            );
         }
 
         viewport
@@ -1511,11 +1885,11 @@ impl DetailLayout {
         chunk_index: usize,
         mut visual_row: usize,
         row_count: usize,
-        viewport: &mut Vec<Line<'static>>,
+        viewport: &mut MaterializedViewport,
     ) {
-        let target_len = viewport.len().saturating_add(row_count);
+        let target_len = viewport.lines.len().saturating_add(row_count);
 
-        while viewport.len() < target_len
+        while viewport.lines.len() < target_len
             && self.ensure_giant_page(document, chunk_index, visual_row)
         {
             let page = self
@@ -1528,9 +1902,18 @@ impl DetailLayout {
                 })
                 .expect("requested giant detail row must be materialized");
             let page_offset = visual_row.saturating_sub(page.start_row);
-            let remaining = target_len.saturating_sub(viewport.len());
+            let remaining = target_len.saturating_sub(viewport.lines.len());
             let end = page_offset.saturating_add(remaining).min(page.rows.len());
-            viewport.extend(
+            if viewport.top_anchor.is_none()
+                && let Some(row) = page.rows.get(page_offset)
+                && page_offset < end
+            {
+                viewport.top_anchor = Some(ContentAnchor {
+                    unit_index: self.chunks[chunk_index].unit_index,
+                    raw_position: row.raw_range.start,
+                });
+            }
+            viewport.lines.extend(
                 page.rows[page_offset..end]
                     .iter()
                     .map(|row| row.line.clone()),
@@ -1683,6 +2066,32 @@ impl DetailLayout {
         self.structure().units[unit_index].is_giant()
     }
 
+    fn unit_index_for_row_start(&self, raw_position: RawOffset) -> Option<usize> {
+        if raw_position > self.structure().raw_map.total_len() {
+            return None;
+        }
+
+        // A real materialized row start belongs to the last structural unit
+        // whose start is not after it. This makes an ordinary shared boundary
+        // select the following unit. At EOF it also selects the final normal
+        // block that owns a trailing zero-length logical row.
+        self.structure()
+            .units
+            .iter()
+            .rposition(|unit| unit.raw_start() <= raw_position)
+    }
+
+    fn resolve_eager_anchor(
+        &self,
+        rows: &[MaterializedRow],
+        anchor: ContentAnchor,
+    ) -> Option<usize> {
+        rows.iter().position(|row| {
+            self.unit_index_for_row_start(row.raw_range.start) == Some(anchor.unit_index)
+                && row_matches_anchor(row, anchor.raw_position)
+        })
+    }
+
     fn document_identity(&self) -> DetailDocumentIdentity {
         DetailDocumentIdentity {
             generation: self.document_generation,
@@ -1742,6 +2151,26 @@ impl DetailLayout {
             .map(|chunk| chunk.checkpoints.len())
             .sum()
     }
+
+    #[cfg(test)]
+    pub(super) fn last_top_anchor_for_test(&self) -> Option<ContentAnchor> {
+        self.last_top_anchor
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_pending_width_anchor_for_test(&self) -> bool {
+        self.pending_width_anchor.is_some()
+    }
+}
+
+fn row_matches_anchor(row: &MaterializedRow, raw_position: RawOffset) -> bool {
+    row.raw_range.start == raw_position
+        || (row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+}
+
+fn row_index_for_anchor(rows: &[MaterializedRow], raw_position: RawOffset) -> Option<usize> {
+    rows.iter()
+        .position(|row| row_matches_anchor(row, raw_position))
 }
 
 fn materialize_complete_structure_rows(
@@ -2606,11 +3035,13 @@ struct CountSink {
     lines: usize,
     anchor_position: Option<RawOffset>,
     anchor_local_row: Option<usize>,
+    anchor_row_raw_start: Option<RawOffset>,
 }
 
 struct UnitVisualCount {
     visual_lines: usize,
     anchor_local_row: Option<usize>,
+    anchor_row_raw_start: Option<RawOffset>,
 }
 
 impl CountSink {
@@ -2620,6 +3051,7 @@ impl CountSink {
             lines: 0,
             anchor_position,
             anchor_local_row: None,
+            anchor_row_raw_start: None,
         }
     }
 
@@ -2627,6 +3059,7 @@ impl CountSink {
         UnitVisualCount {
             visual_lines: self.lines,
             anchor_local_row: self.anchor_local_row,
+            anchor_row_raw_start: self.anchor_row_raw_start,
         }
     }
 }
@@ -2656,6 +3089,7 @@ impl WrapSink for CountSink {
             // interval end is exclusive. The row starting there therefore
             // wins exact-boundary ties. This also covers zero-length rows.
             self.anchor_local_row = Some(self.lines);
+            self.anchor_row_raw_start = Some(RawOffset(raw_range.start));
         }
         self.lines = self.lines.saturating_add(1);
         self.has_content = false;
@@ -3176,12 +3610,10 @@ mod tests {
         document: &DetailDocument<'_>,
     ) -> DetailCountRequest {
         layout.stage_analysis_command(document);
-        let request = match layout.take_analysis_command() {
+        match layout.take_analysis_command() {
             Some(DetailAnalysisCommand::Count(request)) => request,
             other => panic!("expected detail count request, got {other:?}"),
-        };
-        assert_eq!(request.anchor, None);
-        request
+        }
     }
 
     fn take_structure_request(
@@ -3204,6 +3636,7 @@ mod tests {
     }
 
     fn count_result(request: DetailCountRequest) -> DetailCountResult {
+        let anchor = request.anchor;
         let mut never_cancel = || false;
         let count = request
             .structure
@@ -3218,7 +3651,9 @@ mod tests {
         DetailCountResult {
             identity: request.identity,
             chunk_visual_lines: count.chunk_visual_lines,
+            anchor,
             anchor_visual_row: count.anchor_visual_row,
+            anchor_row_raw_start: count.anchor_row_raw_start,
         }
     }
 
@@ -3696,6 +4131,523 @@ mod tests {
                 RawOffset(2)..RawOffset(2),
             ]
         );
+    }
+
+    #[test]
+    fn lazy_normal_viewport_records_the_first_actually_emitted_row_anchor() {
+        let raw = many_lines(4_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let scroll = 37;
+        let viewport = layout.viewport(&document, 1, 80, 20, scroll);
+        let chunk = layout
+            .materialized_chunks
+            .iter()
+            .find(|chunk| chunk.index == 0)
+            .unwrap();
+        let first_row = &chunk.rows[scroll];
+
+        assert_eq!(viewport.effective_scroll, scroll);
+        assert_eq!(
+            text_lines(&viewport.text)[0],
+            materialized_row_text(first_row)
+        );
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: layout.chunks[0].unit_index,
+                raw_position: first_row.raw_range.start,
+            })
+        );
+    }
+
+    #[test]
+    fn lazy_giant_viewport_uses_actual_page_row_provenance_for_the_anchor() {
+        let raw = "abcdefghij ".repeat(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        for scroll in [
+            0,
+            7,
+            GIANT_LINE_PAGE_ROWS + 5,
+            2 * GIANT_LINE_PAGE_ROWS + 11,
+        ] {
+            let viewport = layout.viewport(&document, 1, 12, 5, scroll);
+            let page = layout
+                .materialized_giant_pages
+                .iter()
+                .find(|page| {
+                    page.chunk_index == 0
+                        && page.start_row <= scroll
+                        && scroll < page.start_row.saturating_add(page.rows.len())
+                })
+                .unwrap();
+            let first_row = &page.rows[scroll - page.start_row];
+
+            assert_eq!(
+                text_lines(&viewport.text)[0],
+                materialized_row_text(first_row)
+            );
+            assert_eq!(
+                layout.last_top_anchor,
+                Some(ContentAnchor {
+                    unit_index: layout.chunks[0].unit_index,
+                    raw_position: first_row.raw_range.start,
+                }),
+                "scroll={scroll}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_anchor_selects_the_next_normal_unit_at_a_structural_boundary() {
+        let raw = "x\n".repeat(DETAIL_CHUNK_LINES + 1);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 80, 1, DETAIL_CHUNK_LINES);
+        assert_eq!(layout.mode, Some(LayoutMode::Eager));
+        assert_eq!(layout.structure().units.len(), 2);
+        let first_row = &layout.materialized_eager_rows[DETAIL_CHUNK_LINES];
+        assert_eq!(
+            first_row.raw_range.start,
+            layout.structure().units[1].raw_start()
+        );
+        assert_eq!(
+            text_lines(&viewport.text)[0],
+            materialized_row_text(first_row)
+        );
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: 1,
+                raw_position: first_row.raw_range.start,
+            })
+        );
+    }
+
+    #[test]
+    fn lazy_top_anchor_crosses_from_one_normal_chunk_to_the_next() {
+        let raw = "x\n".repeat(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 80, 3, DETAIL_CHUNK_LINES);
+        assert_eq!(layout.mode, Some(LayoutMode::Lazy));
+        let second_chunk = layout
+            .materialized_chunks
+            .iter()
+            .find(|chunk| chunk.index == 1)
+            .unwrap();
+        let first_row = &second_chunk.rows[0];
+
+        assert_eq!(
+            text_lines(&viewport.text)[0],
+            materialized_row_text(first_row)
+        );
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: layout.chunks[1].unit_index,
+                raw_position: first_row.raw_range.start,
+            })
+        );
+    }
+
+    #[test]
+    fn clamped_eager_and_lazy_viewports_record_the_effective_top_row() {
+        let eager_segments = ["a\nb\nc\n"];
+        let eager_document = make_document(&eager_segments);
+        let mut eager = DetailLayout::default();
+        let eager_viewport = eager.viewport(&eager_document, 1, 80, 2, usize::MAX);
+        let eager_row = &eager.materialized_eager_rows[eager_viewport.effective_scroll];
+
+        assert_eq!(
+            eager_viewport.effective_scroll,
+            eager_viewport.max_scroll.unwrap()
+        );
+        assert_eq!(
+            eager.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: eager
+                    .unit_index_for_row_start(eager_row.raw_range.start)
+                    .unwrap(),
+                raw_position: eager_row.raw_range.start,
+            })
+        );
+
+        let lazy_raw = many_lines(3_000);
+        let lazy_segments = [lazy_raw.as_str()];
+        let lazy_document = make_document(&lazy_segments);
+        let mut lazy = DetailLayout::default();
+        lazy.viewport(&lazy_document, 1, 80, 30, 0);
+        let result = count_result(take_count_request(&mut lazy, &lazy_document));
+        assert!(lazy.apply_count_result(result));
+        let lazy_viewport = lazy.viewport(&lazy_document, 1, 80, 30, usize::MAX);
+        let rows = materialize_complete_structure_rows(
+            &lazy_document,
+            lazy.structure(),
+            lazy.lazy_layout_width(),
+        );
+        let lazy_row = &rows[lazy_viewport.effective_scroll];
+
+        assert_eq!(
+            lazy_viewport.effective_scroll,
+            lazy_viewport.max_scroll.unwrap()
+        );
+        assert_eq!(
+            lazy.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: lazy
+                    .unit_index_for_row_start(lazy_row.raw_range.start)
+                    .unwrap(),
+                raw_position: lazy_row.raw_range.start,
+            })
+        );
+    }
+
+    #[test]
+    fn eager_empty_rows_keep_distinct_top_anchors_including_eof() {
+        for (raw, expected_positions) in [
+            ("", vec![RawOffset(0)]),
+            ("\n", vec![RawOffset(0), RawOffset(1)]),
+            ("\n\n", vec![RawOffset(0), RawOffset(1), RawOffset(2)]),
+            ("abc\n", vec![RawOffset(0), RawOffset(4)]),
+        ] {
+            let segments = [raw];
+            let document = make_document(&segments);
+            let mut layout = DetailLayout::default();
+
+            for (scroll, raw_position) in expected_positions.iter().copied().enumerate() {
+                let viewport = layout.viewport(&document, 1, 80, 1, scroll);
+                assert_eq!(viewport.effective_scroll, scroll, "raw={raw:?}");
+                assert_eq!(
+                    layout.last_top_anchor,
+                    Some(ContentAnchor {
+                        unit_index: layout.unit_index_for_row_start(raw_position).unwrap(),
+                        raw_position,
+                    }),
+                    "raw={raw:?}, scroll={scroll}"
+                );
+            }
+
+            let eof = RawOffset(raw.len());
+            if expected_positions.last() == Some(&eof) {
+                assert_eq!(
+                    layout.last_top_anchor.unwrap().unit_index,
+                    layout.structure().units.len() - 1,
+                    "an EOF empty row belongs to the final structural unit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_top_anchor_survives_compatible_structure_ready_promotion() {
+        let raw = Arc::new(many_lines(100_000));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 41, 80, 20, 17);
+        assert!(!layout.structure_is_complete());
+        assert!(!viewport.text.lines.is_empty());
+        let anchor = layout
+            .last_top_anchor
+            .expect("partial viewport must have an anchor");
+        let cached_rows = layout.materialized_chunks[0].rows.clone();
+
+        let result = structure_result(take_structure_request(&mut layout, &document));
+        assert!(layout.apply_structure_result(result));
+        assert!(layout.structure_is_complete());
+        assert_eq!(layout.last_top_anchor, Some(anchor));
+        assert_eq!(layout.materialized_chunks[0].rows, cached_rows);
+    }
+
+    #[test]
+    fn unicode_segment_spanning_row_uses_document_global_top_anchor() {
+        let segments = ["abc👩‍", "💻日本語 e\u{301} 🇯🇵 tail"];
+        let document = make_document(&segments);
+        let segment_edge = segments[0].len();
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 10, 1, 0);
+        let crossing_row = layout
+            .materialized_eager_rows
+            .iter()
+            .position(|row| {
+                row.raw_range.start.0 < segment_edge && segment_edge < row.raw_range.end.0
+            })
+            .expect("one visual row must cross the artificial segment edge");
+        let expected = layout.materialized_eager_rows[crossing_row].raw_range.start;
+
+        let viewport = layout.viewport(&document, 1, 10, 1, crossing_row);
+        assert_eq!(viewport.effective_scroll, crossing_row);
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: layout.unit_index_for_row_start(expected).unwrap(),
+                raw_position: expected,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_height_preserves_same_document_anchor_and_document_change_clears_it() {
+        let first_segments = ["alpha\nbeta"];
+        let first_document = make_document(&first_segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&first_document, 1, 80, 1, 1);
+        let anchor = layout
+            .last_top_anchor
+            .expect("non-empty viewport must have an anchor");
+        let collapsed = layout.viewport(&first_document, 1, 80, 0, usize::MAX);
+        assert!(collapsed.text.lines.is_empty());
+        assert_eq!(layout.last_top_anchor, Some(anchor));
+
+        let second_segments = ["other\ndocument"];
+        let second_document = make_document(&second_segments);
+        let collapsed_new_document = layout.viewport(&second_document, 2, 80, 0, 0);
+        assert!(collapsed_new_document.text.lines.is_empty());
+        assert_eq!(layout.last_top_anchor, None);
+    }
+
+    #[test]
+    fn normal_width_change_renders_from_anchor_then_reconciles_exact_scroll_once() {
+        let raw = many_varied_lines(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 120, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
+        let initial_count = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(initial_count));
+
+        let baseline_scroll = 12_000;
+        layout.viewport(&document, 1, 120, 20, baseline_scroll);
+        let preserved = layout.last_top_anchor.unwrap();
+        let immediate = layout.viewport(&document, 1, 80, 20, baseline_scroll);
+
+        assert_eq!(immediate.max_scroll, None);
+        assert!(layout.pending_width_anchor.is_some());
+        assert_eq!(layout.chunk_layout_operations, 1);
+        let target_chunk_index = layout
+            .chunks
+            .iter()
+            .position(|chunk| chunk.unit_index == preserved.unit_index)
+            .unwrap();
+        let target_chunk = layout
+            .materialized_chunks
+            .iter()
+            .find(|chunk| chunk.index == target_chunk_index)
+            .unwrap();
+        let immediate_row = target_chunk
+            .rows
+            .iter()
+            .find(|row| row.raw_range.start == layout.last_top_anchor.unwrap().raw_position)
+            .unwrap();
+        assert!(row_matches_anchor(immediate_row, preserved.raw_position));
+
+        let request = take_count_request(&mut layout, &document);
+        assert_eq!(request.anchor, Some(preserved));
+        let result = count_result(request);
+        let exact_row = result.anchor_visual_row.unwrap();
+        let exact_raw_start = result.anchor_row_raw_start.unwrap();
+        assert!(layout.apply_count_result(result));
+        assert_eq!(layout.take_scroll_reconciliation(), Some(exact_row));
+        assert_eq!(layout.take_scroll_reconciliation(), None);
+
+        let exact = layout.viewport(&document, 1, 80, 20, exact_row);
+        assert!(exact.max_scroll.is_some());
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: preserved.unit_index,
+                raw_position: exact_raw_start,
+            })
+        );
+    }
+
+    #[test]
+    fn giant_width_change_is_anchor_local_and_exact_count_seeds_a_true_checkpoint() {
+        let raw = "abcdefghij-日本語-e\u{301}-👩‍💻 ".repeat(40_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        let baseline_scroll = 2_000;
+
+        layout.viewport(&document, 1, 120, 20, baseline_scroll);
+        let structure = structure_result(take_structure_request(&mut layout, &document));
+        let preserved = layout.last_top_anchor.unwrap();
+
+        let immediate = layout.viewport(&document, 1, 80, 20, baseline_scroll);
+        assert_eq!(immediate.max_scroll, None);
+        assert_eq!(layout.last_top_anchor, Some(preserved));
+        assert_eq!(layout.giant_checkpoint_count(), 1);
+        assert!(layout.materialized_giant_pages.is_empty());
+        assert!(layout.giant_scanned_bytes < raw.len() / 20);
+
+        assert!(layout.apply_structure_result(structure));
+        let request = take_count_request(&mut layout, &document);
+        assert_eq!(request.anchor, Some(preserved));
+        let result = count_result(request);
+        let exact_row = result.anchor_visual_row.unwrap();
+        let exact_raw_start = result.anchor_row_raw_start.unwrap();
+        assert!(layout.apply_count_result(result));
+        assert!(layout.chunks[0].checkpoints.iter().any(|checkpoint| {
+            checkpoint.visual_row == exact_row && checkpoint.raw_position == exact_raw_start
+        }));
+        assert_eq!(layout.take_scroll_reconciliation(), Some(exact_row));
+
+        let scanned_before_exact = layout.giant_scanned_bytes;
+        let exact = layout.viewport(&document, 1, 80, 20, exact_row);
+        assert!(exact.max_scroll.is_some());
+        assert_eq!(
+            layout.last_top_anchor,
+            Some(ContentAnchor {
+                unit_index: preserved.unit_index,
+                raw_position: exact_raw_start,
+            })
+        );
+        assert!(
+            layout
+                .giant_scanned_bytes
+                .saturating_sub(scanned_before_exact)
+                < raw.len() / 20
+        );
+    }
+
+    #[test]
+    fn explicit_scroll_cancels_pending_anchor_and_delayed_count_cannot_reconcile() {
+        let raw = many_varied_lines(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 100, 20, 0);
+        let initial_count = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(initial_count));
+        let baseline_scroll = 500;
+        layout.viewport(&document, 1, 100, 20, baseline_scroll);
+        layout.viewport(&document, 1, 70, 20, baseline_scroll);
+        let anchored_request = take_count_request(&mut layout, &document);
+        assert!(anchored_request.anchor.is_some());
+        let delayed = count_result(anchored_request);
+
+        let explicit_scroll = baseline_scroll + 3;
+        let user_view = layout.viewport(&document, 1, 70, 20, explicit_scroll);
+        assert_eq!(user_view.effective_scroll, explicit_scroll);
+        assert_eq!(layout.pending_width_anchor, None);
+        assert!(layout.apply_count_result(delayed));
+        assert_eq!(layout.take_scroll_reconciliation(), None);
+    }
+
+    #[test]
+    fn width_churn_accepts_only_the_latest_anchor_count_and_reconciliation() {
+        let raw = many_varied_lines(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 120, 20, 0);
+        let initial_count = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(initial_count));
+        let structure = Arc::clone(completed_structure(&layout));
+        let baseline_scroll = 700;
+        layout.viewport(&document, 1, 120, 20, baseline_scroll);
+
+        let mut results = Vec::new();
+        for width in [80, 100, 70, 120] {
+            layout.viewport(&document, 1, width, 20, baseline_scroll);
+            let request = take_count_request(&mut layout, &document);
+            assert_eq!(
+                request.anchor,
+                layout.pending_width_anchor.map(|pending| pending.anchor)
+            );
+            results.push(count_result(request));
+            assert!(Arc::ptr_eq(&structure, completed_structure(&layout)));
+        }
+
+        let latest = results.pop().unwrap();
+        for stale in results {
+            assert!(!layout.apply_count_result(stale));
+            assert_eq!(layout.take_scroll_reconciliation(), None);
+        }
+        let exact_row = latest.anchor_visual_row.unwrap();
+        assert!(layout.apply_count_result(latest));
+        assert_eq!(layout.take_scroll_reconciliation(), Some(exact_row));
+        assert_eq!(layout.document_structure_builds, 1);
+    }
+
+    #[test]
+    fn eager_width_anchor_resolves_immediately_and_survives_zero_height() {
+        let raw = "abc defghij klmnop 日本語 e\u{301} 👩‍💻 tail";
+        let segments = [raw];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 10, 2, 2);
+        let preserved = layout.last_top_anchor.unwrap();
+        let collapsed = layout.viewport(&document, 1, 20, 0, 2);
+        assert!(collapsed.text.lines.is_empty());
+        assert_eq!(layout.pending_width_anchor.unwrap().anchor, preserved);
+        assert_eq!(layout.take_scroll_reconciliation(), None);
+
+        let restored = layout.viewport(&document, 1, 20, 2, 2);
+        let exact_row = layout.take_scroll_reconciliation().unwrap();
+        assert_eq!(
+            restored.effective_scroll,
+            exact_row.min(restored.max_scroll.unwrap())
+        );
+        assert_eq!(layout.pending_width_anchor, None);
+        assert_eq!(layout.take_scroll_reconciliation(), None);
+    }
+
+    #[test]
+    fn vertical_only_resize_does_not_create_width_anchor_or_analysis_work() {
+        let segments = ["abc defghij klmnop\nsecond line"];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 12, 2, 1);
+        for height in [4, 1, 8] {
+            let viewport = layout.viewport(&document, 1, 12, height, 1);
+            assert_eq!(layout.pending_width_anchor, None);
+            assert_eq!(layout.take_scroll_reconciliation(), None);
+            assert!(layout.pending_analysis_command.is_none());
+            assert!(layout.ready_analysis_command.is_none());
+            assert_eq!(
+                viewport.effective_scroll,
+                1.min(viewport.max_scroll.unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn document_change_discards_pending_anchor_and_unconsumed_reconciliation() {
+        let first_segments = ["abc defghij klmnop 日本語 tail"];
+        let first = make_document(&first_segments);
+        let second_segments = ["different document"];
+        let second = make_document(&second_segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&first, 1, 10, 2, 1);
+        layout.viewport(&first, 1, 20, 2, 1);
+        assert!(layout.pending_scroll_reconciliation.is_some());
+
+        let empty = layout.viewport(&second, 2, 20, 0, 0);
+        assert!(empty.text.lines.is_empty());
+        assert_eq!(layout.last_top_anchor, None);
+        assert_eq!(layout.pending_width_anchor, None);
+        assert_eq!(layout.take_scroll_reconciliation(), None);
     }
 
     #[test]
@@ -4182,7 +5134,7 @@ mod tests {
         assert!(layout.chunks[1].checkpoints.len() > 1);
 
         for width in [80u16, 120] {
-            layout.prepare(&document, 1, width);
+            layout.prepare(&document, 1, width, 0);
             assert_eq!(layout.chunks[1].checkpoints.len(), 1);
             assert!(layout.materialized_giant_pages.is_empty());
             assert_eq!(layout.chunks[1].checkpoints[0].raw_position, raw_start);
@@ -4790,7 +5742,7 @@ mod tests {
         let stale = count_result(take_count_request(&mut layout, &document));
         assert!(layout.giant_checkpoint_count() > 1);
 
-        layout.prepare(&document, 1, 80);
+        layout.prepare(&document, 1, 80, 0);
         assert!(Arc::ptr_eq(
             &document_structure,
             completed_structure(&layout)
@@ -4824,7 +5776,7 @@ mod tests {
         let stale = count_result(request);
         assert_eq!(stale.anchor_visual_row, Some(0));
 
-        layout.prepare(&document, 1, 80);
+        layout.prepare(&document, 1, 80, 0);
         assert!(!layout.apply_count_result(stale));
         assert!(
             layout
@@ -5011,7 +5963,7 @@ mod tests {
         assert_eq!(layout.known_chunk_count(), 1);
         assert!(!layout.materialized_chunks.is_empty());
         for width in [80, 100, 120] {
-            layout.prepare(&document, 1, width);
+            layout.prepare(&document, 1, width, 0);
             assert!(Arc::ptr_eq(
                 &document_structure,
                 completed_structure(&layout)
@@ -5032,12 +5984,12 @@ mod tests {
         let second = make_document(&second);
         let mut layout = DetailLayout::default();
 
-        layout.prepare(&first, 1, 120);
+        layout.prepare(&first, 1, 120, 0);
         let old_structure = Arc::clone(completed_structure(&layout));
-        layout.prepare(&first, 1, 80);
+        layout.prepare(&first, 1, 80, 0);
         assert!(Arc::ptr_eq(&old_structure, completed_structure(&layout)));
 
-        layout.prepare(&second, 2, 80);
+        layout.prepare(&second, 2, 80, 0);
         assert!(!Arc::ptr_eq(&old_structure, completed_structure(&layout)));
         assert_eq!(layout.document_structure_builds, 2);
         assert_eq!(layout.structure().logical_line_count, 2);
@@ -5053,9 +6005,9 @@ mod tests {
         let split_segments = make_document(&split_segments);
         let mut layout = DetailLayout::default();
 
-        layout.prepare(&single_segment, 1, 80);
+        layout.prepare(&single_segment, 1, 80, 0);
         let old_structure = Arc::clone(completed_structure(&layout));
-        layout.prepare(&split_segments, 1, 80);
+        layout.prepare(&split_segments, 1, 80, 0);
 
         assert!(!Arc::ptr_eq(&old_structure, completed_structure(&layout)));
         assert_eq!(layout.document_structure_builds, 2);
@@ -5077,7 +6029,7 @@ mod tests {
         let discovered_units = layout.structure().units.len();
         let discovered_lines = layout.structure().logical_line_count;
         for width in [80, 100, 120] {
-            layout.prepare(&document, 1, width);
+            layout.prepare(&document, 1, width, 0);
             assert_eq!(building_frontier(&layout), frontier);
             assert_eq!(layout.structure().units.len(), discovered_units);
         }
@@ -5269,6 +6221,37 @@ mod tests {
         let count = take_count_request(&mut layout, &document);
         assert_eq!(count.identity.document_generation, document_generation);
         assert_eq!(count.identity.layout_width, 119);
+        assert_eq!(
+            count.anchor,
+            layout.pending_width_anchor.map(|pending| pending.anchor)
+        );
+        assert!(count.anchor.is_some());
+    }
+
+    #[test]
+    fn foreground_structure_completion_stages_count_with_the_pending_width_anchor() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 61, 120, 30, 0);
+        let preserved = layout.last_top_anchor.unwrap();
+        layout.viewport(&document, 61, 80, 30, 0);
+        assert_eq!(
+            layout.pending_width_anchor.map(|pending| pending.anchor),
+            Some(preserved)
+        );
+
+        complete_structure_via_foreground(&mut layout, &document);
+        let count = take_count_request(&mut layout, &document);
+        assert_eq!(count.identity.layout_width, 79);
+        assert_eq!(count.anchor, Some(preserved));
+
+        let result = count_result(count);
+        let exact_row = result.anchor_visual_row.unwrap();
+        assert!(layout.apply_count_result(result));
+        assert_eq!(layout.take_scroll_reconciliation(), Some(exact_row));
     }
 
     #[test]

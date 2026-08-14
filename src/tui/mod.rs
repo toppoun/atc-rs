@@ -160,6 +160,15 @@ fn handle_detail_analysis_results(
     Ok(changed)
 }
 
+fn apply_detail_scroll_reconciliation(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+) -> bool {
+    detail_layout
+        .take_scroll_reconciliation()
+        .is_some_and(|absolute_row| app.reconcile_detail_scroll(absolute_row))
+}
+
 fn send_detail_analysis_command(
     command_tx: &Sender<DetailAnalysisCommand>,
     command: DetailAnalysisCommand,
@@ -214,6 +223,9 @@ pub(crate) fn run(
         )? {
             dirty = true;
         }
+        if apply_detail_scroll_reconciliation(&mut app, &mut detail_layout) {
+            dirty = true;
+        }
 
         // message batch処理中にqが到着していれば、重いwrap/再描画より優先する。
         if terminal_events.is_empty() {
@@ -237,6 +249,8 @@ pub(crate) fn run(
             })?;
 
             render_info = next_render_info;
+
+            apply_detail_scroll_reconciliation(&mut app, &mut detail_layout);
 
             if let Some(max_detail_scroll) = render_info.max_detail_scroll {
                 app.clamp_detail_scroll(max_detail_scroll);
@@ -821,7 +835,9 @@ mod tests {
         let result = detail_layout::DetailAnalysisResult::Count(detail_layout::DetailCountResult {
             identity: request.identity,
             chunk_visual_lines: count.chunk_visual_lines,
+            anchor: request.anchor,
             anchor_visual_row: count.anchor_visual_row,
+            anchor_row_raw_start: count.anchor_row_raw_start,
         });
         let (tx, rx) = mpsc::channel();
         for _ in 0..=MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK {
@@ -842,6 +858,23 @@ mod tests {
             error.to_string(),
             "detail analysis worker result channel disconnected"
         );
+    }
+
+    #[test]
+    fn detail_scroll_reconciliation_crosses_layout_app_boundary_once() {
+        let raw = "a".repeat(100);
+        let segments = [raw.as_str()];
+        let document = detail::DetailDocument::from_borrowed_segments(&segments);
+        let mut layout = detail_layout::DetailLayout::default();
+
+        layout.viewport(&document, 1, 6, 2, 5);
+        let anchored = layout.viewport(&document, 1, 11, 2, 5);
+        let mut app = app_with_problems(&[1]);
+        app.scroll_detail_down(5);
+
+        assert!(apply_detail_scroll_reconciliation(&mut app, &mut layout));
+        assert_eq!(app.detail_scroll(), anchored.effective_scroll);
+        assert!(!apply_detail_scroll_reconciliation(&mut app, &mut layout));
     }
 
     #[test]

@@ -172,7 +172,6 @@ impl WatchApp {
 
     pub fn toggle_samples_pane(&mut self) {
         self.samples_pane_enabled = !self.samples_pane_enabled;
-        self.reset_detail_scroll();
     }
 
     pub fn contest_id(&self) -> &str {
@@ -221,6 +220,12 @@ impl WatchApp {
 
     pub fn clamp_detail_scroll(&mut self, max: usize) {
         self.detail_scroll = self.detail_scroll.min(max);
+    }
+
+    pub(super) fn reconcile_detail_scroll(&mut self, absolute_row: usize) -> bool {
+        let previous = self.detail_scroll;
+        self.detail_scroll = absolute_row;
+        self.detail_scroll != previous
     }
 
     fn reset_detail_scroll(&mut self) {
@@ -1589,15 +1594,27 @@ mod tests {
         let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
 
         assert!(!app.samples_pane_enabled());
+        app.scroll_detail_down(37);
 
         app.toggle_samples_pane();
         assert!(app.samples_pane_enabled());
+        assert_eq!(app.detail_scroll(), 37);
 
         app.next_problem();
         assert!(app.samples_pane_enabled());
 
         app.toggle_samples_pane();
         assert!(!app.samples_pane_enabled());
+    }
+
+    #[test]
+    fn detail_scroll_reconciliation_is_an_explicit_absolute_update() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        app.scroll_detail_down(10);
+
+        assert!(app.reconcile_detail_scroll(42));
+        assert_eq!(app.detail_scroll(), 42);
+        assert!(!app.reconcile_detail_scroll(42));
     }
     #[test]
     fn selected_problem_returns_current_problem_index() {
