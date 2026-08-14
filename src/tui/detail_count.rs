@@ -104,12 +104,12 @@ fn count_request(
         .collect::<Vec<_>>();
 
     if segment_lengths != request.identity.segment_lengths
-        || request.line_index.chunk_count() != request.identity.chunk_count
+        || request.structure.chunk_count() != request.identity.chunk_count
     {
         return None;
     }
 
-    let chunk_visual_lines = request.line_index.count_chunks(
+    let chunk_visual_lines = request.structure.count_chunks(
         &request.snapshot,
         request.identity.layout_width,
         is_cancelled,
@@ -312,6 +312,25 @@ mod tests {
 
         assert_eq!(result.chunk_visual_lines, [reference_height]);
         assert_eq!(Arc::strong_count(&raw), owners);
+    }
+
+    #[test]
+    fn mixed_normal_and_giant_sparse_units_match_the_eager_reference() {
+        let normal = "normal 日本語 e\u{301} 👩‍💻\n\n".repeat(600);
+        let giant = "giant-token ".repeat(8_000);
+        let tail = "tail\n".repeat(600);
+        let raw = Arc::new(format!("{normal}{giant}\n{tail}"));
+        let request = request(&raw, 1, 23);
+        let layout_width = request.identity.layout_width;
+        let reference_height =
+            wrap_detail_document(&request.snapshot, u16::try_from(layout_width).unwrap()).height();
+
+        assert!(request.identity.chunk_count > 3);
+        let result = count_request(request, &mut || false).unwrap();
+        assert_eq!(
+            result.chunk_visual_lines.iter().sum::<usize>(),
+            reference_height
+        );
     }
 
     #[test]

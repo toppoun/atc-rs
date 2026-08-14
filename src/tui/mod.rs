@@ -801,7 +801,7 @@ mod tests {
         };
         let mut never_cancel = || false;
         let counts = request
-            .line_index
+            .structure
             .count_chunks(
                 &request.snapshot,
                 request.identity.layout_width,

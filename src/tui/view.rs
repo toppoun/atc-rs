@@ -529,7 +529,7 @@ mod tests {
         };
         let mut never_cancel = || false;
         let chunk_visual_lines = request
-            .line_index
+            .structure
             .count_chunks(
                 &request.snapshot,
                 request.identity.layout_width,
