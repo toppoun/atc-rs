@@ -17,6 +17,7 @@ const NORMAL_BLOCK_MAX_RAW_BYTES: usize = GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 // reach the boundary that publishes its containing block. The builder still
 // stops earlier as soon as it publishes a structural unit.
 const FOREGROUND_STRUCTURE_SCAN_BUDGET: usize = 2 * GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
+pub(super) const BACKGROUND_STRUCTURE_SCAN_BUDGET: usize = GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 const GIANT_LINE_PAGE_ROWS: usize = 128;
 const GIANT_LINE_PAGE_CACHE_SIZE: usize = 3;
 const GIANT_LINE_WINDOW_MIN_BYTES: usize = 4 * 1024;
@@ -577,27 +578,65 @@ impl IncrementalDetailIndexBuilder {
     }
 
     fn resolve_open_giant_by_scanning(&mut self, document: &(impl DetailTextSource + ?Sized)) {
+        while !self.finished && self.current_line_kind == InProgressLineKind::Giant {
+            let progress = self.advance_open_giant(document, usize::MAX);
+            debug_assert!(progress.finished || progress.scanned_bytes > 0);
+        }
+    }
+
+    fn advance_open_giant(
+        &mut self,
+        document: &(impl DetailTextSource + ?Sized),
+        byte_budget: usize,
+    ) -> DetailIndexAdvance {
         self.assert_document_identity(document);
-        let mut position = self.scan_position;
-        while position < self.structure.raw_map.total_len() {
-            let available = self.structure.raw_map.bytes_from(document, position);
-            if let Some(relative) = available.iter().position(|byte| *byte == b'\n') {
-                let content_end = RawOffset(position.0.saturating_add(relative));
+        assert_eq!(self.current_line_kind, InProgressLineKind::Giant);
+
+        let mut scanned_bytes = 0usize;
+        while scanned_bytes < byte_budget && self.scan_position < self.structure.raw_map.total_len()
+        {
+            let available = self
+                .structure
+                .raw_map
+                .bytes_from(document, self.scan_position);
+            debug_assert!(!available.is_empty());
+            let scan_len = available
+                .len()
+                .min(byte_budget.saturating_sub(scanned_bytes));
+            let candidate = &available[..scan_len];
+
+            if let Some(relative) = candidate.iter().position(|byte| *byte == b'\n') {
+                let content_end = RawOffset(self.scan_position.0.saturating_add(relative));
+                let consumed = relative.saturating_add(1);
                 self.resolve_open_giant(GiantLineEnd {
                     content_end,
                     next_line_start: RawOffset(content_end.0.saturating_add(1)),
                     eof: false,
                 });
-                return;
+                scanned_bytes = scanned_bytes.saturating_add(consumed);
+                return DetailIndexAdvance {
+                    scanned_bytes,
+                    finished: self.finished,
+                };
             }
-            position = RawOffset(position.0.saturating_add(available.len()));
+
+            self.scan_position = RawOffset(self.scan_position.0.saturating_add(scan_len));
+            scanned_bytes = scanned_bytes.saturating_add(scan_len);
         }
-        let eof = self.structure.raw_map.total_len();
-        self.resolve_open_giant(GiantLineEnd {
-            content_end: eof,
-            next_line_start: eof,
-            eof: true,
-        });
+
+        if self.scan_position == self.structure.raw_map.total_len() {
+            let eof = self.structure.raw_map.total_len();
+            self.resolve_open_giant(GiantLineEnd {
+                content_end: eof,
+                next_line_start: eof,
+                eof: true,
+            });
+        }
+
+        DetailIndexAdvance {
+            scanned_bytes,
+            finished: self.finished,
+        }
     }
 
     fn assert_document_identity(&self, document: &(impl DetailTextSource + ?Sized)) {
@@ -610,6 +649,11 @@ impl IncrementalDetailIndexBuilder {
 }
 
 impl DetailDocumentStructure {
+    #[cfg(test)]
+    pub(super) fn is_complete(&self) -> bool {
+        self.complete
+    }
+
     pub(super) fn len(&self) -> usize {
         self.logical_line_count
     }
@@ -663,11 +707,32 @@ impl DetailDocumentStructure {
     }
 }
 
-pub(crate) type DetailCountGeneration = u64;
+pub(crate) type DetailDocumentGeneration = u64;
+pub(crate) type DetailLayoutGeneration = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetailDocumentIdentity {
+    pub(super) generation: DetailDocumentGeneration,
+    pub(super) revision: u64,
+    pub(super) segment_lengths: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DetailStructureRequest {
+    pub(super) identity: DetailDocumentIdentity,
+    pub(super) snapshot: DetailSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DetailStructureResult {
+    pub(super) identity: DetailDocumentIdentity,
+    pub(super) structure: Arc<DetailDocumentStructure>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetailCountIdentity {
-    pub(super) generation: DetailCountGeneration,
+    pub(super) document_generation: DetailDocumentGeneration,
+    pub(super) layout_generation: DetailLayoutGeneration,
     pub(super) revision: u64,
     pub(super) layout_width: usize,
     pub(super) segment_lengths: Vec<usize>,
@@ -688,16 +753,26 @@ pub(crate) struct DetailCountResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum DetailCountCommand {
+pub(crate) enum DetailAnalysisCommand {
+    BuildStructure(DetailStructureRequest),
     Count(DetailCountRequest),
-    Cancel { generation: DetailCountGeneration },
+    Cancel {
+        layout_generation: DetailLayoutGeneration,
+    },
     Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingCountCommand {
+enum PendingAnalysisCommand {
+    BuildStructure,
     Count,
     Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DetailAnalysisResult {
+    StructureReady(DetailStructureResult),
+    Count(DetailCountResult),
 }
 
 #[derive(Debug)]
@@ -742,9 +817,10 @@ pub(super) struct DetailLayout {
     chunks: Vec<ChunkMeta>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
-    count_generation: DetailCountGeneration,
-    pending_count_command: Option<PendingCountCommand>,
-    ready_count_command: Option<DetailCountCommand>,
+    document_generation: DetailDocumentGeneration,
+    layout_generation: DetailLayoutGeneration,
+    pending_analysis_command: Option<PendingAnalysisCommand>,
+    ready_analysis_command: Option<DetailAnalysisCommand>,
 
     #[cfg(test)]
     chunk_layout_operations: usize,
@@ -785,17 +861,23 @@ impl DetailLayout {
         }
     }
 
-    pub(super) fn stage_count_command(&mut self, document: &DetailDocument<'_>) {
-        if self.ready_count_command.is_some() {
+    pub(super) fn stage_analysis_command(&mut self, document: &DetailDocument<'_>) {
+        if self.ready_analysis_command.is_some() {
             return;
         }
 
-        let Some(pending) = self.pending_count_command.take() else {
+        let Some(pending) = self.pending_analysis_command.take() else {
             return;
         };
 
-        self.ready_count_command = Some(match pending {
-            PendingCountCommand::Count => {
+        self.ready_analysis_command = Some(match pending {
+            PendingAnalysisCommand::BuildStructure => {
+                DetailAnalysisCommand::BuildStructure(DetailStructureRequest {
+                    identity: self.document_identity(),
+                    snapshot: document.snapshot(),
+                })
+            }
+            PendingAnalysisCommand::Count => {
                 let structure = match self
                     .structure_state
                     .as_ref()
@@ -806,20 +888,27 @@ impl DetailLayout {
                         panic!("incomplete detail structure cannot stage exact count")
                     }
                 };
-                DetailCountCommand::Count(DetailCountRequest {
+                DetailAnalysisCommand::Count(DetailCountRequest {
                     identity: self.count_identity(),
                     snapshot: document.snapshot(),
                     structure,
                 })
             }
-            PendingCountCommand::Cancel => DetailCountCommand::Cancel {
-                generation: self.count_generation,
+            PendingAnalysisCommand::Cancel => DetailAnalysisCommand::Cancel {
+                layout_generation: self.layout_generation,
             },
         });
     }
 
-    pub(super) fn take_count_command(&mut self) -> Option<DetailCountCommand> {
-        self.ready_count_command.take()
+    pub(super) fn take_analysis_command(&mut self) -> Option<DetailAnalysisCommand> {
+        self.ready_analysis_command.take()
+    }
+
+    pub(super) fn apply_analysis_result(&mut self, result: DetailAnalysisResult) -> bool {
+        match result {
+            DetailAnalysisResult::StructureReady(result) => self.apply_structure_result(result),
+            DetailAnalysisResult::Count(result) => self.apply_count_result(result),
+        }
     }
 
     pub(super) fn apply_count_result(&mut self, result: DetailCountResult) -> bool {
@@ -850,6 +939,39 @@ impl DetailLayout {
         changed
     }
 
+    fn apply_structure_result(&mut self, result: DetailStructureResult) -> bool {
+        if result.identity != self.document_identity()
+            || !result.structure.complete
+            || result.structure.raw_map != self.structure().raw_map
+        {
+            return false;
+        }
+
+        match self
+            .structure_state
+            .as_ref()
+            .expect("detail structure state must exist")
+        {
+            DetailStructureState::Building(builder) => {
+                if !structure_prefix_is_compatible(builder.structure(), &result.structure) {
+                    return false;
+                }
+            }
+            DetailStructureState::Complete(current) => {
+                if **current != *result.structure {
+                    return false;
+                }
+                return false;
+            }
+        }
+
+        self.structure_state = Some(DetailStructureState::Complete(result.structure));
+        self.append_discovered_chunks();
+        self.pending_analysis_command = Some(PendingAnalysisCommand::Count);
+        self.ready_analysis_command = None;
+        true
+    }
+
     fn prepare(&mut self, document: &impl DetailTextSource, revision: u64, detail_width: u16) {
         let segment_lengths = (0..document.segment_count())
             .map(|index| document.segment_text(index).map_or(0, str::len))
@@ -863,6 +985,11 @@ impl DetailLayout {
         }
 
         let previous_mode = self.mode;
+        let preserve_pending_build = !document_changed
+            && matches!(
+                self.structure_state,
+                Some(DetailStructureState::Building(_))
+            );
         if document_changed {
             let raw_bytes = segment_lengths.iter().copied().sum::<usize>();
             let (structure_state, mode) = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD {
@@ -884,6 +1011,7 @@ impl DetailLayout {
             self.segment_lengths = segment_lengths;
             self.structure_state = Some(structure_state);
             self.mode = Some(mode);
+            self.document_generation = self.document_generation.wrapping_add(1);
 
             #[cfg(test)]
             {
@@ -899,19 +1027,31 @@ impl DetailLayout {
         self.append_discovered_chunks();
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
-        self.count_generation = self.count_generation.wrapping_add(1);
-        self.pending_count_command = match self.mode.expect("detail layout must have a mode") {
-            LayoutMode::Lazy if self.structure_is_complete() => Some(PendingCountCommand::Count),
-            LayoutMode::Lazy if previous_mode == Some(LayoutMode::Lazy) => {
-                Some(PendingCountCommand::Cancel)
-            }
-            LayoutMode::Lazy => None,
-            LayoutMode::Eager if previous_mode == Some(LayoutMode::Lazy) => {
-                Some(PendingCountCommand::Cancel)
-            }
-            LayoutMode::Eager => None,
-        };
-        self.ready_count_command = None;
+        self.layout_generation = self.layout_generation.wrapping_add(1);
+
+        if !preserve_pending_build {
+            self.pending_analysis_command = if document_changed {
+                match self.mode.expect("detail layout must have a mode") {
+                    LayoutMode::Lazy if self.structure_is_complete() => {
+                        Some(PendingAnalysisCommand::Count)
+                    }
+                    LayoutMode::Lazy => Some(PendingAnalysisCommand::BuildStructure),
+                    LayoutMode::Eager if previous_mode == Some(LayoutMode::Lazy) => {
+                        Some(PendingAnalysisCommand::Cancel)
+                    }
+                    LayoutMode::Eager => None,
+                }
+            } else {
+                match self.mode.expect("detail layout must have a mode") {
+                    LayoutMode::Lazy if self.structure_is_complete() => {
+                        Some(PendingAnalysisCommand::Count)
+                    }
+                    LayoutMode::Lazy => None,
+                    LayoutMode::Eager => None,
+                }
+            };
+            self.ready_analysis_command = None;
+        }
 
         #[cfg(test)]
         {
@@ -1028,7 +1168,7 @@ impl DetailLayout {
         self.structure_state = Some(DetailStructureState::Complete(Arc::new(
             builder.into_structure(),
         )));
-        self.pending_count_command = Some(PendingCountCommand::Count);
+        self.pending_analysis_command = Some(PendingAnalysisCommand::Count);
     }
 
     #[cfg(test)]
@@ -1433,9 +1573,18 @@ impl DetailLayout {
         self.structure().units[unit_index].is_giant()
     }
 
+    fn document_identity(&self) -> DetailDocumentIdentity {
+        DetailDocumentIdentity {
+            generation: self.document_generation,
+            revision: self.revision.unwrap_or_default(),
+            segment_lengths: self.segment_lengths.clone(),
+        }
+    }
+
     fn count_identity(&self) -> DetailCountIdentity {
         DetailCountIdentity {
-            generation: self.count_generation,
+            document_generation: self.document_generation,
+            layout_generation: self.layout_generation,
             revision: self.revision.unwrap_or_default(),
             layout_width: self.lazy_layout_width(),
             segment_lengths: self.segment_lengths.clone(),
@@ -1510,6 +1659,63 @@ fn eager_viewport(
 
 fn build_document_structure(document: &impl DetailTextSource) -> DetailDocumentStructure {
     IncrementalDetailIndexBuilder::new(document).build_to_end(document)
+}
+
+pub(crate) fn build_document_structure_cancellable(
+    document: &impl DetailTextSource,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<Arc<DetailDocumentStructure>> {
+    let mut builder = IncrementalDetailIndexBuilder::new(document);
+
+    while !builder.finished {
+        if is_cancelled() {
+            return None;
+        }
+
+        let progress = if builder.current_line_kind == InProgressLineKind::Giant {
+            builder.advance_open_giant(document, BACKGROUND_STRUCTURE_SCAN_BUDGET)
+        } else {
+            builder.advance(document, BACKGROUND_STRUCTURE_SCAN_BUDGET)
+        };
+        debug_assert!(progress.finished || progress.scanned_bytes > 0);
+    }
+
+    if is_cancelled() {
+        return None;
+    }
+
+    Some(Arc::new(builder.into_structure()))
+}
+
+fn structure_prefix_is_compatible(
+    partial: &DetailDocumentStructure,
+    complete: &DetailDocumentStructure,
+) -> bool {
+    if !complete.complete
+        || partial.raw_map != complete.raw_map
+        || partial.units.len() > complete.units.len()
+        || partial.logical_line_count > complete.logical_line_count
+    {
+        return false;
+    }
+
+    partial
+        .units
+        .iter()
+        .zip(&complete.units)
+        .all(|(partial, complete)| match (partial, complete) {
+            (StructuralUnit::Normal(partial), StructuralUnit::Normal(complete)) => {
+                partial == complete
+            }
+            (StructuralUnit::Giant(partial), StructuralUnit::Giant(complete)) => {
+                partial.raw_start == complete.raw_start
+                    && match partial.raw_end {
+                        Some(end) => complete.raw_end == Some(end),
+                        None => complete.raw_end.is_some(),
+                    }
+            }
+            _ => false,
+        })
 }
 
 fn visit_normal_block_lines(
@@ -2611,10 +2817,29 @@ mod tests {
         layout: &mut DetailLayout,
         document: &DetailDocument<'_>,
     ) -> DetailCountRequest {
-        layout.stage_count_command(document);
-        match layout.take_count_command() {
-            Some(DetailCountCommand::Count(request)) => request,
+        layout.stage_analysis_command(document);
+        match layout.take_analysis_command() {
+            Some(DetailAnalysisCommand::Count(request)) => request,
             other => panic!("expected detail count request, got {other:?}"),
+        }
+    }
+
+    fn take_structure_request(
+        layout: &mut DetailLayout,
+        document: &DetailDocument<'_>,
+    ) -> DetailStructureRequest {
+        layout.stage_analysis_command(document);
+        match layout.take_analysis_command() {
+            Some(DetailAnalysisCommand::BuildStructure(request)) => request,
+            other => panic!("expected detail structure request, got {other:?}"),
+        }
+    }
+
+    fn structure_result(request: DetailStructureRequest) -> DetailStructureResult {
+        let structure = Arc::new(build_document_structure(&request.snapshot));
+        DetailStructureResult {
+            identity: request.identity,
+            structure,
         }
     }
 
@@ -3977,13 +4202,18 @@ mod tests {
         let initial = layout.viewport(&document, 23, 80, 30, 0);
         assert_eq!(initial.max_scroll, None);
         assert!(!layout.structure_is_complete());
-        layout.stage_count_command(&document);
-        assert!(layout.take_count_command().is_none());
+        layout.stage_analysis_command(&document);
+        assert!(matches!(
+            layout.take_analysis_command(),
+            Some(DetailAnalysisCommand::BuildStructure(_))
+        ));
+        layout.stage_analysis_command(&document);
+        assert!(layout.take_analysis_command().is_none());
 
         complete_structure_via_foreground(&mut layout, &document);
-        layout.stage_count_command(&document);
-        let request = match layout.take_count_command() {
-            Some(DetailCountCommand::Count(request)) => request,
+        layout.stage_analysis_command(&document);
+        let request = match layout.take_analysis_command() {
+            Some(DetailAnalysisCommand::Count(request)) => request,
             other => panic!("completed structure must stage exact count, got {other:?}"),
         };
         let result = count_result(request);
@@ -3992,6 +4222,164 @@ mod tests {
             layout.viewport(&document, 23, 80, 30, 0).max_scroll,
             Some(99_971)
         );
+    }
+
+    #[test]
+    fn background_structure_completion_restores_exact_count_and_preserves_normal_cache() {
+        let raw = Arc::new(many_lines(100_000));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        let initial = layout.viewport(&document, 50, 80, 30, 0);
+        assert_eq!(initial.max_scroll, None);
+        assert!(!layout.structure_is_complete());
+        assert_eq!(layout.materialized_chunks.len(), 1);
+        let initial_chunks = layout.chunks.len();
+        let cached_lines = layout.materialized_chunks[0].lines.clone();
+
+        let request = take_structure_request(&mut layout, &document);
+        assert!(request.snapshot.shares_buffer(&raw));
+        let result = structure_result(request);
+        assert!(layout.apply_structure_result(result));
+
+        assert!(layout.structure_is_complete());
+        assert!(layout.chunks.len() > initial_chunks);
+        assert_eq!(layout.materialized_chunks.len(), 1);
+        assert_eq!(layout.materialized_chunks[0].lines, cached_lines);
+
+        let count = take_count_request(&mut layout, &document);
+        assert_eq!(count.identity.layout_width, 79);
+        assert!(layout.apply_count_result(count_result(count)));
+        assert_eq!(
+            layout.viewport(&document, 50, 80, 30, 0).max_scroll,
+            Some(99_971)
+        );
+    }
+
+    #[test]
+    fn width_changes_do_not_restart_structure_build_and_count_uses_latest_width() {
+        let raw = Arc::new(many_lines(100_000));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 60, 120, 30, 0);
+        let build = take_structure_request(&mut layout, &document);
+        let document_generation = build.identity.generation;
+        let structure = structure_result(build);
+
+        for width in [80, 100, 120] {
+            layout.viewport(&document, 60, width, 30, 0);
+            layout.stage_analysis_command(&document);
+            assert!(layout.take_analysis_command().is_none());
+            assert_eq!(layout.document_generation, document_generation);
+        }
+
+        assert!(layout.apply_structure_result(structure));
+        let count = take_count_request(&mut layout, &document);
+        assert_eq!(count.identity.document_generation, document_generation);
+        assert_eq!(count.identity.layout_width, 119);
+    }
+
+    #[test]
+    fn stale_structure_ready_after_document_switch_is_rejected() {
+        let raw_a = Arc::new(many_lines(20_000));
+        let raw_b = Arc::new(format!("{}tail-b\n", many_lines(20_000)));
+        let shared_a = [&raw_a];
+        let shared_b = [&raw_b];
+        let document_a = DetailDocument::from_shared_segments(&shared_a);
+        let document_b = DetailDocument::from_shared_segments(&shared_b);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document_a, 70, 80, 20, 0);
+        let stale = structure_result(take_structure_request(&mut layout, &document_a));
+        layout.viewport(&document_b, 71, 80, 20, 0);
+        let current_generation = layout.document_generation;
+        let current_frontier = building_frontier(&layout);
+
+        assert!(!layout.apply_structure_result(stale));
+        assert_eq!(layout.document_generation, current_generation);
+        assert_eq!(building_frontier(&layout), current_frontier);
+        assert!(!layout.structure_is_complete());
+    }
+
+    #[test]
+    fn background_closes_open_giant_without_invalidating_e1_pages_or_checkpoints() {
+        let raw = Arc::new(format!(
+            "{}\ntail-one\ntail-two\n",
+            "word-日本語-e\u{301}-👩‍💻 ".repeat(8_000)
+        ));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 80, 31, 30, 0);
+        let StructuralUnit::Giant(open) = &layout.structure().units[0] else {
+            panic!("first unit must be the open giant");
+        };
+        assert_eq!(open.raw_end, None);
+        let checkpoints = layout.chunks[0].checkpoints.clone();
+        let cached_pages = layout.materialized_giant_pages.len();
+        assert!(cached_pages > 0);
+
+        let result = structure_result(take_structure_request(&mut layout, &document));
+        assert!(layout.apply_structure_result(result));
+        let StructuralUnit::Giant(closed) = &layout.structure().units[0] else {
+            panic!("first unit must remain giant");
+        };
+        assert!(closed.raw_end.is_some());
+        assert_eq!(layout.chunks[0].checkpoints, checkpoints);
+        assert_eq!(layout.materialized_giant_pages.len(), cached_pages);
+        assert_eq!(
+            text_lines(&viewport.text),
+            text_lines(&viewport_text(wrap_detail_document(&document, 30), 0, 30))
+        );
+        let after_promotion = layout.viewport(&document, 80, 31, 20, 200);
+        assert_eq!(
+            text_lines(&after_promotion.text),
+            text_lines(&viewport_text(wrap_detail_document(&document, 30), 200, 20))
+        );
+    }
+
+    #[test]
+    fn foreground_giant_closure_before_structure_ready_is_a_cache_preserving_noop() {
+        let raw = Arc::new(format!(
+            "{}\nnormal-tail\n",
+            "giant-token-日本語-e\u{301}-👩‍💻 ".repeat(5_000)
+        ));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 90, 28, 20, 0);
+        let background = structure_result(take_structure_request(&mut layout, &document));
+        complete_structure_via_foreground(&mut layout, &document);
+        let current = Arc::clone(completed_structure(&layout));
+        let checkpoints = layout.chunks[0].checkpoints.clone();
+        let cached_pages = layout.materialized_giant_pages.len();
+
+        assert!(!layout.apply_structure_result(background));
+        assert!(Arc::ptr_eq(&current, completed_structure(&layout)));
+        assert_eq!(layout.chunks[0].checkpoints, checkpoints);
+        assert_eq!(layout.materialized_giant_pages.len(), cached_pages);
+    }
+
+    #[test]
+    fn foreground_normal_completion_before_structure_ready_keeps_current_arc_and_count() {
+        let raw = Arc::new(many_lines(20_000));
+        let shared = [&raw];
+        let document = DetailDocument::from_shared_segments(&shared);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 91, 80, 20, 0);
+        let background = structure_result(take_structure_request(&mut layout, &document));
+        complete_structure_via_foreground(&mut layout, &document);
+        let current = Arc::clone(completed_structure(&layout));
+
+        assert!(!layout.apply_structure_result(background));
+        assert!(Arc::ptr_eq(&current, completed_structure(&layout)));
+        let _count = take_count_request(&mut layout, &document);
     }
 
     #[test]
@@ -4085,7 +4473,8 @@ mod tests {
         let good = count_result(request);
 
         for mutate in [
-            |identity: &mut DetailCountIdentity| identity.generation += 1,
+            |identity: &mut DetailCountIdentity| identity.document_generation += 1,
+            |identity: &mut DetailCountIdentity| identity.layout_generation += 1,
             |identity: &mut DetailCountIdentity| identity.revision += 1,
             |identity: &mut DetailCountIdentity| identity.layout_width += 1,
             |identity: &mut DetailCountIdentity| identity.chunk_count += 1,
@@ -4132,27 +4521,27 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.viewport(&large, 1, 80, 20, 0);
-        layout.stage_count_command(&large);
+        layout.stage_analysis_command(&large);
         assert!(matches!(
-            layout.take_count_command(),
-            Some(DetailCountCommand::Count(_))
+            layout.take_analysis_command(),
+            Some(DetailAnalysisCommand::Count(_))
         ));
-        layout.stage_count_command(&large);
-        assert!(layout.take_count_command().is_none());
+        layout.stage_analysis_command(&large);
+        assert!(layout.take_analysis_command().is_none());
 
         layout.viewport(&small, 2, 80, 20, 0);
-        layout.stage_count_command(&small);
+        layout.stage_analysis_command(&small);
         assert!(matches!(
-            layout.take_count_command(),
-            Some(DetailCountCommand::Cancel { .. })
+            layout.take_analysis_command(),
+            Some(DetailAnalysisCommand::Cancel { .. })
         ));
-        layout.stage_count_command(&small);
-        assert!(layout.take_count_command().is_none());
+        layout.stage_analysis_command(&small);
+        assert!(layout.take_analysis_command().is_none());
 
         let mut eager_only = DetailLayout::default();
         eager_only.viewport(&small, 1, 80, 20, 0);
-        eager_only.stage_count_command(&small);
-        assert!(eager_only.take_count_command().is_none());
+        eager_only.stage_analysis_command(&small);
+        assert!(eager_only.take_analysis_command().is_none());
     }
 
     #[test]
@@ -4180,8 +4569,8 @@ mod tests {
         assert!(Arc::ptr_eq(&document_structure, &new_request.structure));
         assert_eq!(layout.document_structure_builds, 1);
         assert_ne!(
-            old_result.identity.generation,
-            new_request.identity.generation
+            old_result.identity.layout_generation,
+            new_request.identity.layout_generation
         );
         assert_ne!(
             old_result.identity.layout_width,

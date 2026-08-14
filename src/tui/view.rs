@@ -129,7 +129,7 @@ pub(super) fn render(
         viewport_height,
         app.detail_scroll(),
     );
-    detail_layout.stage_count_command(&detail_document);
+    detail_layout.stage_analysis_command(&detail_document);
     let detail = Paragraph::new(detail_viewport.text);
 
     frame.render_widget(detail, detail_area);
@@ -524,10 +524,10 @@ mod tests {
 
         let document = DetailDocument::from_app(&app);
         layout.complete_structure_for_test(&document);
-        layout.stage_count_command(&document);
+        layout.stage_analysis_command(&document);
 
-        let Some(crate::tui::detail_layout::DetailCountCommand::Count(request)) =
-            layout.take_count_command()
+        let Some(crate::tui::detail_layout::DetailAnalysisCommand::Count(request)) =
+            layout.take_analysis_command()
         else {
             panic!("large render must stage background counting");
         };

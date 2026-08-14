@@ -1,6 +1,6 @@
 pub mod app;
 mod detail;
-pub(crate) mod detail_count;
+pub(crate) mod detail_analysis;
 mod detail_layout;
 pub mod message;
 pub mod reporter;
@@ -17,10 +17,10 @@ use ratatui::DefaultTerminal;
 
 use crate::model::Contest;
 use app::WatchApp;
-use detail_layout::{DetailCountCommand, DetailCountResult};
+use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
-const MAX_DETAIL_COUNT_RESULTS_PER_TICK: usize = 64;
+const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -129,25 +129,29 @@ fn handle_messages(
     Ok(changed)
 }
 
-fn handle_detail_count_results(
+fn handle_detail_analysis_results(
     detail_layout: &mut detail_layout::DetailLayout,
     current_detail_revision: u64,
-    result_rx: &Receiver<DetailCountResult>,
+    result_rx: &Receiver<DetailAnalysisResult>,
 ) -> io::Result<bool> {
     let mut changed = false;
 
-    for _ in 0..MAX_DETAIL_COUNT_RESULTS_PER_TICK {
+    for _ in 0..MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK {
         match result_rx.try_recv() {
             Ok(result) => {
-                if result.identity.revision == current_detail_revision {
-                    changed |= detail_layout.apply_count_result(result);
+                let result_revision = match &result {
+                    DetailAnalysisResult::StructureReady(result) => result.identity.revision,
+                    DetailAnalysisResult::Count(result) => result.identity.revision,
+                };
+                if result_revision == current_detail_revision {
+                    changed |= detail_layout.apply_analysis_result(result);
                 }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "detail count worker result channel disconnected",
+                    "detail analysis worker result channel disconnected",
                 ));
             }
         }
@@ -156,14 +160,14 @@ fn handle_detail_count_results(
     Ok(changed)
 }
 
-fn send_detail_count_command(
-    command_tx: &Sender<DetailCountCommand>,
-    command: DetailCountCommand,
+fn send_detail_analysis_command(
+    command_tx: &Sender<DetailAnalysisCommand>,
+    command: DetailAnalysisCommand,
 ) -> io::Result<()> {
     command_tx.send(command).map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "detail count worker request channel disconnected",
+            "detail analysis worker request channel disconnected",
         )
     })
 }
@@ -174,8 +178,8 @@ pub(crate) fn run(
     sample_counts: Vec<usize>,
     message_rx: Receiver<Message>,
     run_tx: Sender<RunRequest>,
-    detail_count_tx: Sender<DetailCountCommand>,
-    detail_count_rx: Receiver<DetailCountResult>,
+    detail_analysis_tx: Sender<DetailAnalysisCommand>,
+    detail_analysis_rx: Receiver<DetailAnalysisResult>,
 ) -> io::Result<()> {
     let mut app = WatchApp::new(contest, sample_counts)?;
 
@@ -203,8 +207,11 @@ pub(crate) fn run(
             dirty = true;
         }
 
-        if handle_detail_count_results(&mut detail_layout, app.detail_revision(), &detail_count_rx)?
-        {
+        if handle_detail_analysis_results(
+            &mut detail_layout,
+            app.detail_revision(),
+            &detail_analysis_rx,
+        )? {
             dirty = true;
         }
 
@@ -235,8 +242,8 @@ pub(crate) fn run(
                 app.clamp_detail_scroll(max_detail_scroll);
             }
 
-            if let Some(command) = detail_layout.take_count_command() {
-                send_detail_count_command(&detail_count_tx, command)?;
+            if let Some(command) = detail_layout.take_analysis_command() {
+                send_detail_analysis_command(&detail_analysis_tx, command)?;
             }
 
             dirty = false;
@@ -787,15 +794,17 @@ mod tests {
     }
 
     #[test]
-    fn detail_count_results_update_layout_and_disconnection_is_an_error() {
+    fn detail_analysis_results_update_layout_and_disconnection_is_an_error() {
         let raw = "line\n".repeat(3_000);
         let segments = [raw.as_str()];
         let document = detail::DetailDocument::from_borrowed_segments(&segments);
         let mut layout = detail_layout::DetailLayout::default();
         let initial = layout.viewport(&document, 5, 80, 20, 0);
         assert_eq!(initial.max_scroll, None);
-        layout.stage_count_command(&document);
-        let Some(detail_layout::DetailCountCommand::Count(request)) = layout.take_count_command()
+        layout.complete_structure_for_test(&document);
+        layout.stage_analysis_command(&document);
+        let Some(detail_layout::DetailAnalysisCommand::Count(request)) =
+            layout.take_analysis_command()
         else {
             panic!("large detail must request background counting");
         };
@@ -808,16 +817,16 @@ mod tests {
                 &mut never_cancel,
             )
             .unwrap();
-        let result = detail_layout::DetailCountResult {
+        let result = detail_layout::DetailAnalysisResult::Count(detail_layout::DetailCountResult {
             identity: request.identity,
             chunk_visual_lines: counts,
-        };
+        });
         let (tx, rx) = mpsc::channel();
-        for _ in 0..=MAX_DETAIL_COUNT_RESULTS_PER_TICK {
+        for _ in 0..=MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK {
             tx.send(result.clone()).unwrap();
         }
 
-        assert!(handle_detail_count_results(&mut layout, 5, &rx).unwrap());
+        assert!(handle_detail_analysis_results(&mut layout, 5, &rx).unwrap());
         assert!(rx.try_recv().is_ok(), "result draining must stay bounded");
         assert_eq!(
             layout.viewport(&document, 5, 80, 20, 0).max_scroll,
@@ -825,12 +834,41 @@ mod tests {
         );
 
         drop(tx);
-        let error = handle_detail_count_results(&mut layout, 5, &rx).unwrap_err();
+        let error = handle_detail_analysis_results(&mut layout, 5, &rx).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(
             error.to_string(),
-            "detail count worker result channel disconnected"
+            "detail analysis worker result channel disconnected"
         );
+    }
+
+    #[test]
+    fn stale_structure_result_is_rejected_before_layout_prepares_the_new_document() {
+        let raw = "line\n".repeat(100_000);
+        let segments = [raw.as_str()];
+        let document = detail::DetailDocument::from_borrowed_segments(&segments);
+        let mut layout = detail_layout::DetailLayout::default();
+        layout.viewport(&document, 5, 80, 20, 0);
+        layout.stage_analysis_command(&document);
+        let Some(detail_layout::DetailAnalysisCommand::BuildStructure(request)) =
+            layout.take_analysis_command()
+        else {
+            panic!("large detail must request background structure discovery");
+        };
+        let structure =
+            detail_layout::build_document_structure_cancellable(&request.snapshot, || false)
+                .unwrap();
+        let result = detail_layout::DetailAnalysisResult::StructureReady(
+            detail_layout::DetailStructureResult {
+                identity: request.identity,
+                structure,
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+
+        assert!(!handle_detail_analysis_results(&mut layout, 6, &rx).unwrap());
+        assert_eq!(layout.viewport(&document, 5, 80, 20, 0).max_scroll, None);
     }
 
     #[test]
