@@ -4477,6 +4477,104 @@ mod tests {
     }
 
     #[test]
+    fn normal_width_round_trip_matches_reference_without_structural_rescan() {
+        let raw = many_varied_lines(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        let viewport_height = 20;
+
+        layout.viewport(&document, 2, 120, viewport_height, 0);
+        complete_structure_via_foreground(&mut layout, &document);
+        let initial_count = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(initial_count));
+        let structure = Arc::clone(completed_structure(&layout));
+        let builds = layout.document_structure_builds;
+        let structural_scanned = layout.foreground_structural_scanned_bytes;
+        let mut requested_scroll = 12_000;
+        layout.viewport(&document, 2, 120, viewport_height, requested_scroll);
+
+        for detail_width in [80u16, 120] {
+            let preserved = layout.last_top_anchor.unwrap();
+            let immediate = layout.viewport(
+                &document,
+                2,
+                detail_width,
+                viewport_height,
+                requested_scroll,
+            );
+            let reference_rows = materialize_complete_structure_rows(
+                &document,
+                &structure,
+                usize::from(detail_width - 1),
+            );
+            let expected_row =
+                reference_anchor_visual_row(&reference_rows, preserved.raw_position).unwrap();
+
+            assert_eq!(immediate.max_scroll, None);
+            assert_eq!(
+                layout.last_top_anchor.unwrap().raw_position,
+                reference_rows[expected_row].raw_range.start
+            );
+            assert!(row_matches_anchor(
+                &reference_rows[expected_row],
+                preserved.raw_position
+            ));
+            assert!(Arc::ptr_eq(&structure, completed_structure(&layout)));
+            assert_eq!(layout.document_structure_builds, builds);
+            assert_eq!(
+                layout.foreground_structural_scanned_bytes,
+                structural_scanned
+            );
+            assert_eq!(layout.chunk_layout_operations, 1);
+
+            let request = take_count_request(&mut layout, &document);
+            assert_eq!(request.anchor, Some(preserved));
+            let result = count_result(request);
+            assert_eq!(result.anchor_visual_row, Some(expected_row));
+            assert!(layout.apply_count_result(result));
+            assert_eq!(layout.take_scroll_reconciliation(), Some(expected_row));
+            assert_eq!(layout.take_scroll_reconciliation(), None);
+
+            requested_scroll = expected_row;
+            let exact = layout.viewport(
+                &document,
+                2,
+                detail_width,
+                viewport_height,
+                requested_scroll,
+            );
+            let expected_lines = reference_rows
+                .iter()
+                .skip(expected_row)
+                .take(viewport_height)
+                .map(materialized_row_text)
+                .collect::<Vec<_>>();
+            assert_eq!(text_lines(&exact.text), expected_lines);
+        }
+    }
+
+    #[test]
+    fn eager_width_change_preserves_and_reconciles_the_trailing_empty_eof_row() {
+        let segments = ["abcdef\n"];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let narrow = layout.viewport(&document, 3, 4, 1, usize::MAX);
+        let eof_anchor = layout.last_top_anchor.unwrap();
+        assert_eq!(eof_anchor.raw_position, RawOffset(segments[0].len()));
+        assert_eq!(text_lines(&narrow.text), [""]);
+
+        let wide = layout.viewport(&document, 3, 10, 1, narrow.effective_scroll);
+        let correction = layout.take_scroll_reconciliation().unwrap();
+        assert_eq!(correction, wide.max_scroll.unwrap());
+        assert_eq!(wide.effective_scroll, correction);
+        assert_eq!(text_lines(&wide.text), [""]);
+        assert_eq!(layout.last_top_anchor, Some(eof_anchor));
+        assert_eq!(layout.take_scroll_reconciliation(), None);
+    }
+
+    #[test]
     fn giant_width_change_is_anchor_local_and_exact_count_seeds_a_true_checkpoint() {
         let raw = "abcdefghij-日本語-e\u{301}-👩‍💻 ".repeat(40_000);
         let segments = [raw.as_str()];

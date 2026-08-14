@@ -878,6 +878,86 @@ mod tests {
     }
 
     #[test]
+    fn mouse_scroll_cancels_pending_width_reconciliation_without_snap_back() {
+        let raw = "long normal detail line\n".repeat(4_000);
+        let segments = [raw.as_str()];
+        let document = detail::DetailDocument::from_borrowed_segments(&segments);
+        let mut layout = detail_layout::DetailLayout::default();
+
+        layout.viewport(&document, 2, 100, 20, 0);
+        layout.complete_structure_for_test(&document);
+        layout.stage_analysis_command(&document);
+        let Some(detail_layout::DetailAnalysisCommand::Count(initial_request)) =
+            layout.take_analysis_command()
+        else {
+            panic!("completed lazy detail must stage its initial count");
+        };
+        let mut never_cancel = || false;
+        let initial = initial_request
+            .structure
+            .count_chunks(
+                &initial_request.snapshot,
+                initial_request.identity.layout_width,
+                initial_request.anchor,
+                &mut never_cancel,
+            )
+            .unwrap();
+        assert!(layout.apply_count_result(detail_layout::DetailCountResult {
+            identity: initial_request.identity,
+            chunk_visual_lines: initial.chunk_visual_lines,
+            anchor: initial_request.anchor,
+            anchor_visual_row: initial.anchor_visual_row,
+            anchor_row_raw_start: initial.anchor_row_raw_start,
+        }));
+
+        let baseline_scroll = 500;
+        layout.viewport(&document, 2, 100, 20, baseline_scroll);
+        layout.viewport(&document, 2, 70, 20, baseline_scroll);
+        layout.stage_analysis_command(&document);
+        let Some(detail_layout::DetailAnalysisCommand::Count(anchored_request)) =
+            layout.take_analysis_command()
+        else {
+            panic!("width transition must stage an anchored count");
+        };
+        assert!(anchored_request.anchor.is_some());
+        let delayed = anchored_request
+            .structure
+            .count_chunks(
+                &anchored_request.snapshot,
+                anchored_request.identity.layout_width,
+                anchored_request.anchor,
+                &mut never_cancel,
+            )
+            .unwrap();
+
+        let mut app = app_with_problems(&[1]);
+        app.scroll_detail_down(baseline_scroll);
+        let info = view::RenderInfo {
+            max_detail_scroll: None,
+            samples_area: None,
+            detail_area: ratatui::layout::Rect::new(0, 0, 70, 20),
+        };
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, 30, 5),
+            &info,
+        ));
+        let user_scroll = baseline_scroll + DETAIL_SCROLL_LINES;
+        assert_eq!(app.detail_scroll(), user_scroll);
+
+        layout.viewport(&document, 2, 70, 20, app.detail_scroll());
+        assert!(layout.apply_count_result(detail_layout::DetailCountResult {
+            identity: anchored_request.identity,
+            chunk_visual_lines: delayed.chunk_visual_lines,
+            anchor: anchored_request.anchor,
+            anchor_visual_row: delayed.anchor_visual_row,
+            anchor_row_raw_start: delayed.anchor_row_raw_start,
+        }));
+        assert!(!apply_detail_scroll_reconciliation(&mut app, &mut layout));
+        assert_eq!(app.detail_scroll(), user_scroll);
+    }
+
+    #[test]
     fn stale_structure_result_is_rejected_before_layout_prepares_the_new_document() {
         let raw = "line\n".repeat(100_000);
         let segments = [raw.as_str()];
