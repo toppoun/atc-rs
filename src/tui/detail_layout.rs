@@ -791,7 +791,17 @@ struct ChunkMeta {
 #[derive(Debug)]
 struct MaterializedChunk {
     index: usize,
-    lines: Vec<Line<'static>>,
+    rows: Vec<MaterializedRow>,
+}
+
+// A cached visual row owns only its rendered text and a half-open range of
+// logical-line content in the document-global raw coordinate space. Newline
+// delimiters are structural and are never included. Empty logical lines use a
+// stable zero-length range at their content position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializedRow {
+    line: Line<'static>,
+    raw_range: Range<RawOffset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,7 +814,7 @@ struct WrapCheckpoint {
 struct MaterializedGiantPage {
     chunk_index: usize,
     start_row: usize,
-    lines: Vec<Line<'static>>,
+    rows: Vec<MaterializedRow>,
 }
 
 #[derive(Debug, Default)]
@@ -815,6 +825,7 @@ pub(super) struct DetailLayout {
     segment_lengths: Vec<usize>,
     structure_state: Option<DetailStructureState>,
     chunks: Vec<ChunkMeta>,
+    materialized_eager_rows: Vec<MaterializedRow>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
     document_generation: DetailDocumentGeneration,
@@ -855,7 +866,7 @@ impl DetailLayout {
 
         match self.mode.expect("detail layout must be prepared") {
             LayoutMode::Eager => {
-                eager_viewport(document, detail_width, viewport_height, requested_scroll)
+                self.eager_viewport(document, detail_width, viewport_height, requested_scroll)
             }
             LayoutMode::Lazy => self.lazy_viewport(document, viewport_height, requested_scroll),
         }
@@ -1025,6 +1036,7 @@ impl DetailLayout {
             LayoutMode::Eager => Vec::new(),
         };
         self.append_discovered_chunks();
+        self.materialized_eager_rows.clear();
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
         self.layout_generation = self.layout_generation.wrapping_add(1);
@@ -1252,6 +1264,47 @@ impl DetailLayout {
         }
     }
 
+    fn eager_viewport(
+        &mut self,
+        document: &impl DetailTextSource,
+        detail_width: u16,
+        viewport_height: usize,
+        requested_scroll: usize,
+    ) -> DetailViewport {
+        let mut rows = materialize_complete_structure_rows(
+            document,
+            self.structure(),
+            usize::from(detail_width),
+        );
+        let mut exact_max = max_scroll(rows.len(), viewport_height);
+
+        if exact_max > 0 && detail_width > 1 {
+            rows = materialize_complete_structure_rows(
+                document,
+                self.structure(),
+                usize::from(detail_width.saturating_sub(1)),
+            );
+            exact_max = max_scroll(rows.len(), viewport_height);
+        }
+
+        let effective_scroll = requested_scroll.min(exact_max);
+        self.materialized_eager_rows = rows;
+        let text = Text::from(
+            self.materialized_eager_rows
+                .iter()
+                .skip(effective_scroll)
+                .take(viewport_height)
+                .map(|row| row.line.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        DetailViewport {
+            text,
+            max_scroll: Some(exact_max),
+            effective_scroll,
+        }
+    }
+
     fn materialize_viewport(
         &mut self,
         document: &impl DetailTextSource,
@@ -1293,9 +1346,13 @@ impl DetailLayout {
                     .expect("materialized detail chunk must be cached");
                 let end = offset_in_chunk
                     .saturating_add(remaining)
-                    .min(chunk_lines.lines.len());
+                    .min(chunk_lines.rows.len());
 
-                viewport.extend_from_slice(&chunk_lines.lines[offset_in_chunk..end]);
+                viewport.extend(
+                    chunk_lines.rows[offset_in_chunk..end]
+                        .iter()
+                        .map(|row| row.line.clone()),
+                );
             }
 
             chunk_index = chunk_index.saturating_add(1);
@@ -1367,17 +1424,18 @@ impl DetailLayout {
             .structure()
             .raw_map
             .bounded_text(document, block.raw_range.clone());
-        let mut lines = Vec::new();
-        let wrapped = wrap_normal_block(
+        let mut rows = Vec::new();
+        let wrapped = wrap_normal_block_at(
             &text,
             block.logical_line_count,
             self.lazy_layout_width(),
-            &mut MaterializeSink::new(&mut lines),
+            block.raw_range.start.0,
+            &mut ProvenanceMaterializeSink::new(&mut rows),
             &mut || false,
         );
         debug_assert!(wrapped);
 
-        let visual_lines = lines.len();
+        let visual_lines = rows.len();
         if let Some(known) = self.chunks[chunk_index].visual_lines {
             debug_assert_eq!(known, visual_lines);
         } else {
@@ -1386,7 +1444,7 @@ impl DetailLayout {
 
         self.materialized_chunks.push_back(MaterializedChunk {
             index: chunk_index,
-            lines,
+            rows,
         });
 
         while self.materialized_chunks.len() > MATERIALIZED_CHUNK_CACHE_SIZE {
@@ -1418,13 +1476,17 @@ impl DetailLayout {
                 .find(|page| {
                     page.chunk_index == chunk_index
                         && page.start_row <= visual_row
-                        && visual_row < page.start_row.saturating_add(page.lines.len())
+                        && visual_row < page.start_row.saturating_add(page.rows.len())
                 })
                 .expect("requested giant detail row must be materialized");
             let page_offset = visual_row.saturating_sub(page.start_row);
             let remaining = target_len.saturating_sub(viewport.len());
-            let end = page_offset.saturating_add(remaining).min(page.lines.len());
-            viewport.extend_from_slice(&page.lines[page_offset..end]);
+            let end = page_offset.saturating_add(remaining).min(page.rows.len());
+            viewport.extend(
+                page.rows[page_offset..end]
+                    .iter()
+                    .map(|row| row.line.clone()),
+            );
             visual_row = visual_row.saturating_add(end.saturating_sub(page_offset));
         }
     }
@@ -1472,13 +1534,13 @@ impl DetailLayout {
                 raw_start,
                 known_end: raw_end,
             };
-            let mut sink_lines = Vec::new();
+            let mut sink_rows = Vec::new();
             let progress = wrap_document_giant_line_page(
                 &source,
                 checkpoint.raw_position,
                 self.lazy_layout_width(),
                 GIANT_LINE_PAGE_ROWS,
-                &mut MaterializeSink::new(&mut sink_lines),
+                &mut ProvenanceMaterializeSink::new(&mut sink_rows),
                 &mut || false,
             )
             .expect("foreground giant detail layout is not cancellable");
@@ -1517,7 +1579,7 @@ impl DetailLayout {
                 .push_back(MaterializedGiantPage {
                     chunk_index,
                     start_row: checkpoint.visual_row,
-                    lines: sink_lines,
+                    rows: sink_rows,
                 });
             while self.materialized_giant_pages.len() > GIANT_LINE_PAGE_CACHE_SIZE {
                 self.materialized_giant_pages.pop_front();
@@ -1545,7 +1607,7 @@ impl DetailLayout {
         self.materialized_giant_pages.iter().any(|page| {
             page.chunk_index == chunk_index
                 && page.start_row <= visual_row
-                && visual_row < page.start_row.saturating_add(page.lines.len())
+                && visual_row < page.start_row.saturating_add(page.rows.len())
         })
     }
 
@@ -1553,7 +1615,7 @@ impl DetailLayout {
         let Some(position) = self.materialized_giant_pages.iter().position(|page| {
             page.chunk_index == chunk_index
                 && page.start_row <= visual_row
-                && visual_row < page.start_row.saturating_add(page.lines.len())
+                && visual_row < page.start_row.saturating_add(page.rows.len())
         }) else {
             return;
         };
@@ -1613,7 +1675,7 @@ impl DetailLayout {
     fn materialized_visual_line_count(&self) -> usize {
         self.materialized_chunks
             .iter()
-            .map(|chunk| chunk.lines.len())
+            .map(|chunk| chunk.rows.len())
             .sum()
     }
 
@@ -1621,7 +1683,7 @@ impl DetailLayout {
     fn materialized_giant_visual_line_count(&self) -> usize {
         self.materialized_giant_pages
             .iter()
-            .map(|page| page.lines.len())
+            .map(|page| page.rows.len())
             .sum()
     }
 
@@ -1634,27 +1696,62 @@ impl DetailLayout {
     }
 }
 
-fn eager_viewport(
+fn materialize_complete_structure_rows(
     document: &impl DetailTextSource,
-    detail_width: u16,
-    viewport_height: usize,
-    requested_scroll: usize,
-) -> DetailViewport {
-    let mut wrapped_text = wrap_detail_document(document, detail_width);
-    let mut exact_max = max_scroll(wrapped_text.height(), viewport_height);
+    structure: &DetailDocumentStructure,
+    width: usize,
+) -> Vec<MaterializedRow> {
+    debug_assert!(structure.complete);
+    let mut rows = Vec::new();
 
-    if exact_max > 0 && detail_width > 1 {
-        wrapped_text = wrap_detail_document(document, detail_width.saturating_sub(1));
-        exact_max = max_scroll(wrapped_text.height(), viewport_height);
+    for unit in &structure.units {
+        match unit {
+            StructuralUnit::Normal(block) => {
+                let text = structure
+                    .raw_map
+                    .bounded_text(document, block.raw_range.clone());
+                let wrapped = wrap_normal_block_at(
+                    &text,
+                    block.logical_line_count,
+                    width,
+                    block.raw_range.start.0,
+                    &mut ProvenanceMaterializeSink::new(&mut rows),
+                    &mut || false,
+                );
+                debug_assert!(wrapped);
+            }
+            StructuralUnit::Giant(line) => {
+                let known_end = line
+                    .raw_end
+                    .expect("complete detail structure must close giant lines");
+                let source = DocumentGiantSource {
+                    document,
+                    raw_map: &structure.raw_map,
+                    raw_start: line.raw_start,
+                    known_end: Some(known_end),
+                };
+                let mut raw_position = line.raw_start;
+                loop {
+                    let progress = wrap_document_giant_line_page(
+                        &source,
+                        raw_position,
+                        width,
+                        GIANT_LINE_PAGE_ROWS,
+                        &mut ProvenanceMaterializeSink::new(&mut rows),
+                        &mut || false,
+                    )
+                    .expect("foreground eager detail layout is not cancellable");
+                    raw_position = progress.next_raw_position;
+                    if progress.finished {
+                        break;
+                    }
+                    debug_assert!(progress.rows > 0);
+                }
+            }
+        }
     }
 
-    let effective_scroll = requested_scroll.min(exact_max);
-
-    DetailViewport {
-        text: viewport_text(wrapped_text, effective_scroll, viewport_height),
-        max_scroll: Some(exact_max),
-        effective_scroll,
-    }
+    rows
 }
 
 fn build_document_structure(document: &impl DetailTextSource) -> DetailDocumentStructure {
@@ -1721,13 +1818,14 @@ fn structure_prefix_is_compatible(
 fn visit_normal_block_lines(
     text: &str,
     logical_line_count: usize,
-    mut visit: impl FnMut(&str) -> bool,
+    mut visit: impl FnMut(&str, Range<usize>) -> bool,
 ) -> bool {
     let mut line_start = 0usize;
     let mut visited = 0usize;
 
     for (newline, _) in text.match_indices('\n') {
-        if visited >= logical_line_count || !visit(&text[line_start..newline]) {
+        if visited >= logical_line_count || !visit(&text[line_start..newline], line_start..newline)
+        {
             return false;
         }
         visited = visited.saturating_add(1);
@@ -1735,7 +1833,7 @@ fn visit_normal_block_lines(
     }
 
     if visited < logical_line_count {
-        if !visit(&text[line_start..]) {
+        if !visit(&text[line_start..], line_start..text.len()) {
             return false;
         }
         visited = visited.saturating_add(1);
@@ -1752,11 +1850,29 @@ fn wrap_normal_block(
     sink: &mut impl WrapSink,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> bool {
-    visit_normal_block_lines(text, logical_line_count, |logical_line| {
-        wrap_logical_line(logical_line, width, sink, is_cancelled)
+    wrap_normal_block_at(text, logical_line_count, width, 0, sink, is_cancelled)
+}
+
+fn wrap_normal_block_at(
+    text: &str,
+    logical_line_count: usize,
+    width: usize,
+    raw_offset_base: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    visit_normal_block_lines(text, logical_line_count, |logical_line, local_range| {
+        wrap_logical_line_at(
+            logical_line,
+            width,
+            raw_offset_base.saturating_add(local_range.start),
+            sink,
+            is_cancelled,
+        )
     })
 }
 
+#[cfg(test)]
 pub(super) fn wrap_detail_document(document: &impl DetailTextSource, width: u16) -> Text<'static> {
     let width = usize::from(width);
     let mut lines = Vec::new();
@@ -1783,6 +1899,7 @@ pub(super) fn wrap_detail_document(document: &impl DetailTextSource, width: u16)
     Text::from(lines)
 }
 
+#[cfg(test)]
 fn wrap_logical_line_fragments(fragments: &[&str], width: usize, lines: &mut Vec<Line<'static>>) {
     let mut non_empty = fragments
         .iter()
@@ -1907,7 +2024,7 @@ fn wrap_document_giant_line_page_with_window_bytes(
             });
         }
         sink.push(&probe.text);
-        sink.emit();
+        sink.emit(start_raw_position.0..start_raw_position.0.saturating_add(probe.text.len()));
         let next_raw_position = RawOffset(start_raw_position.0.saturating_add(probe.text.len()));
         return Some(DocumentGiantWrapProgress {
             rows: 1,
@@ -1951,6 +2068,7 @@ fn wrap_document_giant_line_page_with_window_bytes(
         let progress = wrap_logical_line_window(
             window.text.as_ref(),
             width,
+            raw_position.0,
             sink,
             is_cancelled,
             remaining_rows,
@@ -2118,7 +2236,7 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         for fragment in fragments {
             sink.push(fragment);
         }
-        sink.emit();
+        sink.emit(start_raw_offset..total_bytes);
         return Some(GiantWrapProgress {
             rows: 1,
             next_raw_offset: total_bytes,
@@ -2144,6 +2262,7 @@ fn wrap_giant_logical_line_page_with_window_bytes(
         let progress = wrap_logical_line_window(
             window.as_ref(),
             width,
+            raw_offset,
             sink,
             is_cancelled,
             remaining_rows,
@@ -2322,15 +2441,17 @@ fn truncate_window(window: Cow<'_, str>, end: usize) -> Cow<'_, str> {
 trait WrapSink {
     fn has_content(&self) -> bool;
     fn push(&mut self, text: &str);
-    fn emit(&mut self);
+    fn emit(&mut self, raw_range: Range<usize>);
     fn discard_current(&mut self);
 }
 
+#[cfg(test)]
 struct MaterializeSink<'a> {
     current: String,
     lines: &'a mut Vec<Line<'static>>,
 }
 
+#[cfg(test)]
 impl<'a> MaterializeSink<'a> {
     fn new(lines: &'a mut Vec<Line<'static>>) -> Self {
         Self {
@@ -2340,6 +2461,7 @@ impl<'a> MaterializeSink<'a> {
     }
 }
 
+#[cfg(test)]
 impl WrapSink for MaterializeSink<'_> {
     fn has_content(&self) -> bool {
         !self.current.is_empty()
@@ -2349,9 +2471,45 @@ impl WrapSink for MaterializeSink<'_> {
         self.current.push_str(text);
     }
 
-    fn emit(&mut self) {
+    fn emit(&mut self, _raw_range: Range<usize>) {
         self.lines
             .push(Line::from(std::mem::take(&mut self.current)));
+    }
+
+    fn discard_current(&mut self) {
+        self.current.clear();
+    }
+}
+
+struct ProvenanceMaterializeSink<'a> {
+    current: String,
+    rows: &'a mut Vec<MaterializedRow>,
+}
+
+impl<'a> ProvenanceMaterializeSink<'a> {
+    fn new(rows: &'a mut Vec<MaterializedRow>) -> Self {
+        Self {
+            current: String::new(),
+            rows,
+        }
+    }
+}
+
+impl WrapSink for ProvenanceMaterializeSink<'_> {
+    fn has_content(&self) -> bool {
+        !self.current.is_empty()
+    }
+
+    fn push(&mut self, text: &str) {
+        self.current.push_str(text);
+    }
+
+    fn emit(&mut self, raw_range: Range<usize>) {
+        debug_assert!(raw_range.start <= raw_range.end);
+        self.rows.push(MaterializedRow {
+            line: Line::from(std::mem::take(&mut self.current)),
+            raw_range: RawOffset(raw_range.start)..RawOffset(raw_range.end),
+        });
     }
 
     fn discard_current(&mut self) {
@@ -2374,7 +2532,7 @@ impl WrapSink for CountSink {
         self.has_content |= !text.is_empty();
     }
 
-    fn emit(&mut self) {
+    fn emit(&mut self, _raw_range: Range<usize>) {
         self.lines = self.lines.saturating_add(1);
         self.has_content = false;
     }
@@ -2409,18 +2567,39 @@ struct DocumentGiantWrapProgress {
     discovered_end: Option<GiantLineEnd>,
 }
 
+#[cfg(test)]
 fn wrap_logical_line(
     logical_line: &str,
     width: usize,
     sink: &mut impl WrapSink,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> bool {
-    wrap_logical_line_window(logical_line, width, sink, is_cancelled, usize::MAX, true).is_some()
+    wrap_logical_line_at(logical_line, width, 0, sink, is_cancelled)
+}
+
+fn wrap_logical_line_at(
+    logical_line: &str,
+    width: usize,
+    raw_offset_base: usize,
+    sink: &mut impl WrapSink,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    wrap_logical_line_window(
+        logical_line,
+        width,
+        raw_offset_base,
+        sink,
+        is_cancelled,
+        usize::MAX,
+        true,
+    )
+    .is_some()
 }
 
 fn wrap_logical_line_window(
     logical_line: &str,
     width: usize,
+    raw_offset_base: usize,
     sink: &mut impl WrapSink,
     is_cancelled: &mut impl FnMut() -> bool,
     row_budget: usize,
@@ -2437,7 +2616,7 @@ fn wrap_logical_line_window(
 
     if width == 0 || logical_line.is_empty() {
         sink.push(logical_line);
-        sink.emit();
+        sink.emit(raw_offset_base..raw_offset_base.saturating_add(logical_line.len()));
         return Some(WrapProgress {
             rows: 1,
             next_offset: logical_line.len(),
@@ -2448,6 +2627,7 @@ fn wrap_logical_line_window(
 
     let mut current_width = 0usize;
     let mut rows = 0usize;
+    let mut row_start = 0usize;
     let mut next_offset = 0usize;
     let mut scanned_bytes = 0usize;
 
@@ -2462,9 +2642,13 @@ fn wrap_logical_line_window(
 
         if token_width <= width {
             if sink.has_content() && current_width.saturating_add(token_width) > width {
-                sink.emit();
+                sink.emit(
+                    raw_offset_base.saturating_add(row_start)
+                        ..raw_offset_base.saturating_add(token_start),
+                );
                 rows = rows.saturating_add(1);
                 next_offset = token_start;
+                row_start = token_start;
                 current_width = 0;
                 if rows >= row_budget {
                     return Some(WrapProgress {
@@ -2480,9 +2664,13 @@ fn wrap_logical_line_window(
             current_width = current_width.saturating_add(token_width);
 
             if current_width == width {
-                sink.emit();
+                sink.emit(
+                    raw_offset_base.saturating_add(row_start)
+                        ..raw_offset_base.saturating_add(token_end),
+                );
                 rows = rows.saturating_add(1);
                 next_offset = token_end;
+                row_start = token_end;
                 current_width = 0;
                 if rows >= row_budget {
                     return Some(WrapProgress {
@@ -2498,9 +2686,13 @@ fn wrap_logical_line_window(
         }
 
         if current_width > 0 {
-            sink.emit();
+            sink.emit(
+                raw_offset_base.saturating_add(row_start)
+                    ..raw_offset_base.saturating_add(token_start),
+            );
             rows = rows.saturating_add(1);
             next_offset = token_start;
+            row_start = token_start;
             current_width = 0;
             if rows >= row_budget {
                 return Some(WrapProgress {
@@ -2523,9 +2715,14 @@ fn wrap_logical_line_window(
             let grapheme_width = UnicodeWidthStr::width(grapheme);
 
             if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                sink.emit();
+                let grapheme_offset = token_start.saturating_add(grapheme_start);
+                sink.emit(
+                    raw_offset_base.saturating_add(row_start)
+                        ..raw_offset_base.saturating_add(grapheme_offset),
+                );
                 rows = rows.saturating_add(1);
-                next_offset = token_start.saturating_add(grapheme_start);
+                next_offset = grapheme_offset;
+                row_start = grapheme_offset;
                 current_width = 0;
                 if rows >= row_budget {
                     return Some(WrapProgress {
@@ -2541,9 +2738,13 @@ fn wrap_logical_line_window(
             current_width = current_width.saturating_add(grapheme_width);
 
             if current_width >= width {
-                sink.emit();
+                sink.emit(
+                    raw_offset_base.saturating_add(row_start)
+                        ..raw_offset_base.saturating_add(grapheme_end),
+                );
                 rows = rows.saturating_add(1);
                 next_offset = grapheme_end;
+                row_start = grapheme_end;
                 current_width = 0;
                 if rows >= row_budget {
                     return Some(WrapProgress {
@@ -2558,7 +2759,10 @@ fn wrap_logical_line_window(
     }
 
     if flush_at_end && sink.has_content() {
-        sink.emit();
+        sink.emit(
+            raw_offset_base.saturating_add(row_start)
+                ..raw_offset_base.saturating_add(logical_line.len()),
+        );
         rows = rows.saturating_add(1);
         next_offset = logical_line.len();
     } else if !flush_at_end {
@@ -2577,6 +2781,7 @@ pub(super) fn max_scroll(content_height: usize, viewport_height: usize) -> usize
     content_height.saturating_sub(viewport_height)
 }
 
+#[cfg(test)]
 pub(super) fn viewport_text(
     wrapped_text: Text<'static>,
     absolute_scroll: usize,
@@ -2651,6 +2856,29 @@ mod tests {
             .collect()
     }
 
+    fn materialized_row_text(row: &MaterializedRow) -> String {
+        row.line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn assert_materialized_rows_match_raw(
+        document: &impl DetailTextSource,
+        raw_map: &DetailRawMap,
+        rows: &[MaterializedRow],
+    ) {
+        for row in rows {
+            assert!(row.raw_range.start <= row.raw_range.end);
+            assert_eq!(
+                raw_map.bounded_text(document, row.raw_range.clone()),
+                materialized_row_text(row),
+                "materialized visual row must retain its exact raw content range"
+            );
+        }
+    }
+
     fn indexed_logical_lines(document: &DetailDocument<'_>) -> Vec<String> {
         let structure = build_document_structure(document);
         structure_logical_lines(document, &structure)
@@ -2670,7 +2898,7 @@ mod tests {
                     assert!(visit_normal_block_lines(
                         &text,
                         block.logical_line_count,
-                        |line| {
+                        |line, _local_range| {
                             lines.push(line.to_string());
                             true
                         },
@@ -3227,6 +3455,211 @@ mod tests {
     }
 
     #[test]
+    fn normal_visual_rows_retain_exact_wrapped_raw_ranges() {
+        let text = "abc defghij";
+        let mut rows = Vec::new();
+
+        assert!(wrap_normal_block_at(
+            text,
+            1,
+            5,
+            10,
+            &mut ProvenanceMaterializeSink::new(&mut rows),
+            &mut || false,
+        ));
+
+        assert_eq!(
+            rows.iter().map(materialized_row_text).collect::<Vec<_>>(),
+            ["abc ", "defgh", "ij"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.raw_range.clone())
+                .collect::<Vec<_>>(),
+            [
+                RawOffset(10)..RawOffset(14),
+                RawOffset(14)..RawOffset(19),
+                RawOffset(19)..RawOffset(21),
+            ]
+        );
+    }
+
+    #[test]
+    fn eager_foreground_rows_keep_provenance_for_small_documents() {
+        for segments in [
+            vec![""],
+            vec!["\n"],
+            vec!["\n\n"],
+            vec!["abc\n"],
+            vec!["abc👩‍", "💻 defghijklmnopqrstuvwxyz"],
+        ] {
+            let document = make_document(&segments);
+            let mut layout = DetailLayout::default();
+            let viewport = layout.viewport(&document, 1, 6, 40, 0);
+
+            assert_eq!(
+                text_lines(&viewport.text),
+                layout
+                    .materialized_eager_rows
+                    .iter()
+                    .map(materialized_row_text)
+                    .collect::<Vec<_>>()
+            );
+            assert_materialized_rows_match_raw(
+                &document,
+                &layout.structure().raw_map,
+                &layout.materialized_eager_rows,
+            );
+        }
+
+        let segments = ["\n\n"];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 1, 80, 10, 0);
+        assert_eq!(
+            layout
+                .materialized_eager_rows
+                .iter()
+                .map(|row| row.raw_range.clone())
+                .collect::<Vec<_>>(),
+            [
+                RawOffset(0)..RawOffset(0),
+                RawOffset(1)..RawOffset(1),
+                RawOffset(2)..RawOffset(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn normal_cache_provenance_stays_global_across_blocks_and_segments() {
+        let filler = "x\n".repeat(3_000);
+        let segments = ["abc", "def ghi\n", filler.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let first = layout.viewport(&document, 1, 7, 1, 0);
+        assert_eq!(text_lines(&first.text), ["abcdef"]);
+        let crossing = layout.materialized_chunks[0].rows[0].clone();
+        assert_eq!(crossing.raw_range, RawOffset(0)..RawOffset(6));
+        assert!(crossing.raw_range.start.0 < segments[0].len());
+        assert!(crossing.raw_range.end.0 > segments[0].len());
+
+        // At this width every following `x` is one row. Account for the two
+        // rows of the first logical line when crossing the 256-line boundary.
+        layout.viewport(&document, 1, 7, 1, DETAIL_CHUNK_LINES + 1);
+        let first_chunk = layout
+            .materialized_chunks
+            .iter()
+            .find(|chunk| chunk.index == 0)
+            .unwrap();
+        let second_chunk = layout
+            .materialized_chunks
+            .iter()
+            .find(|chunk| chunk.index == 1)
+            .unwrap();
+        let last_before_boundary = first_chunk.rows.last().unwrap();
+        let first_after_boundary = second_chunk.rows.first().unwrap();
+
+        assert_materialized_rows_match_raw(
+            &document,
+            &layout.structure().raw_map,
+            &first_chunk.rows,
+        );
+        assert_materialized_rows_match_raw(
+            &document,
+            &layout.structure().raw_map,
+            &second_chunk.rows,
+        );
+        assert_eq!(
+            last_before_boundary.raw_range.end.0.saturating_add(1),
+            first_after_boundary.raw_range.start.0,
+            "the newline delimiter between blocks is structural, not row content"
+        );
+        assert!(first_after_boundary.raw_range.start.0 > segments[0].len());
+    }
+
+    #[test]
+    fn empty_logical_rows_use_distinct_stable_zero_length_ranges() {
+        for (text, logical_lines, expected) in [
+            ("", 1, vec![RawOffset(20)..RawOffset(20)]),
+            (
+                "\n",
+                2,
+                vec![RawOffset(20)..RawOffset(20), RawOffset(21)..RawOffset(21)],
+            ),
+            (
+                "\n\n",
+                3,
+                vec![
+                    RawOffset(20)..RawOffset(20),
+                    RawOffset(21)..RawOffset(21),
+                    RawOffset(22)..RawOffset(22),
+                ],
+            ),
+            (
+                "abc\n",
+                2,
+                vec![RawOffset(20)..RawOffset(23), RawOffset(24)..RawOffset(24)],
+            ),
+        ] {
+            let mut rows = Vec::new();
+            assert!(wrap_normal_block_at(
+                text,
+                logical_lines,
+                80,
+                20,
+                &mut ProvenanceMaterializeSink::new(&mut rows),
+                &mut || false,
+            ));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.raw_range.clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "raw={text:?}"
+            );
+            assert_eq!(rows.len(), logical_lines);
+        }
+    }
+
+    #[test]
+    fn unicode_visual_row_provenance_uses_utf8_and_grapheme_safe_boundaries() {
+        let text = concat!(
+            "👩‍💻",
+            "👨‍👩‍👧‍👦",
+            "e\u{301}\u{327}",
+            "👍🏽",
+            "🇯🇵",
+            "日本語token",
+            "abcdefghijklmnopqrstuvwxyz",
+            "\u{200b}"
+        );
+        let mut rows = Vec::new();
+        assert!(wrap_logical_line_at(
+            text,
+            4,
+            0,
+            &mut ProvenanceMaterializeSink::new(&mut rows),
+            &mut || false,
+        ));
+
+        for row in &rows {
+            assert!(text.is_char_boundary(row.raw_range.start.0));
+            assert!(text.is_char_boundary(row.raw_range.end.0));
+            assert!(is_grapheme_boundary(text, row.raw_range.start.0));
+            assert!(is_grapheme_boundary(text, row.raw_range.end.0));
+            assert_eq!(
+                &text[row.raw_range.start.0..row.raw_range.end.0],
+                materialized_row_text(row)
+            );
+        }
+        assert_eq!(
+            rows.iter().map(materialized_row_text).collect::<Vec<_>>(),
+            eager_fragment_lines(&[text], 4)
+        );
+    }
+
+    #[test]
     fn builder_can_pause_with_a_known_open_giant_line() {
         let raw = format!(
             "{}\ntail",
@@ -3690,6 +4123,7 @@ mod tests {
     #[test]
     fn giant_zero_width_keeps_the_existing_single_visual_line_semantics() {
         let raw = "abc".repeat(30_000);
+        let raw_len = raw.len();
         let segments = [raw.as_str()];
         let document = make_document(&segments);
         let mut layout = DetailLayout::default();
@@ -3699,6 +4133,109 @@ mod tests {
         assert_eq!(viewport.text.height(), 1);
         assert_eq!(text_lines(&viewport.text), [raw]);
         assert_eq!(viewport.max_scroll, Some(0));
+        assert_eq!(layout.materialized_giant_pages.len(), 1);
+        assert_eq!(layout.materialized_giant_pages[0].rows.len(), 1);
+        assert_eq!(
+            layout.materialized_giant_pages[0].rows[0].raw_range,
+            RawOffset(0)..RawOffset(raw_len)
+        );
+    }
+
+    #[test]
+    fn giant_page_rows_retain_exact_global_raw_ranges_across_pages() {
+        let raw = "0123456789 ".repeat(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        for scroll in [0, GIANT_LINE_PAGE_ROWS, 2 * GIANT_LINE_PAGE_ROWS] {
+            let viewport = layout.viewport(&document, 1, 12, 1, scroll);
+            assert_eq!(viewport.text.height(), 1);
+        }
+
+        assert_eq!(layout.materialized_giant_pages.len(), 3);
+        let mut pages = layout.materialized_giant_pages.iter().collect::<Vec<_>>();
+        pages.sort_by_key(|page| page.start_row);
+        assert_eq!(
+            pages.iter().map(|page| page.start_row).collect::<Vec<_>>(),
+            [0, GIANT_LINE_PAGE_ROWS, 2 * GIANT_LINE_PAGE_ROWS]
+        );
+
+        for page in &pages {
+            assert_eq!(page.rows.len(), GIANT_LINE_PAGE_ROWS);
+            assert_materialized_rows_match_raw(&document, &layout.structure().raw_map, &page.rows);
+            for adjacent in page.rows.windows(2) {
+                assert_eq!(adjacent[0].raw_range.end, adjacent[1].raw_range.start);
+            }
+        }
+        assert_eq!(
+            pages[0].rows.last().unwrap().raw_range.end,
+            pages[1].rows.first().unwrap().raw_range.start
+        );
+        assert_eq!(
+            pages[1].rows.last().unwrap().raw_range.end,
+            pages[2].rows.first().unwrap().raw_range.start
+        );
+    }
+
+    #[test]
+    fn giant_provenance_crosses_segment_edges_without_creating_boundaries() {
+        let first = "a".repeat(1_003);
+        let second = "a".repeat(70_000);
+        let segments = [first.as_str(), second.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 12, GIANT_LINE_PAGE_ROWS, 0);
+        assert_eq!(viewport.text.height(), GIANT_LINE_PAGE_ROWS);
+        let page = &layout.materialized_giant_pages[0];
+        assert_materialized_rows_match_raw(&document, &layout.structure().raw_map, &page.rows);
+
+        let crossing = page
+            .rows
+            .iter()
+            .find(|row| row.raw_range.start.0 < first.len() && row.raw_range.end.0 > first.len())
+            .expect("one visual row must span the artificial segment boundary");
+        assert_eq!(materialized_row_text(crossing), "a".repeat(11));
+        assert_eq!(crossing.raw_range.end.0 - crossing.raw_range.start.0, 11);
+
+        let reference = wrap_detail_document(&document, 11);
+        assert_eq!(
+            text_lines(&viewport.text),
+            text_lines(&reference)[..GIANT_LINE_PAGE_ROWS]
+        );
+    }
+
+    #[test]
+    fn giant_unicode_provenance_is_global_utf8_and_grapheme_safe() {
+        let first = "ab👩‍";
+        let unit = "💻 👨‍👩‍👧‍👦 e\u{301}\u{327} 👍🏽 🇯🇵 日本語token abcdefghijklmnopqrstuvwxyz ";
+        let second = unit.repeat(2_000);
+        let raw = format!("{first}{second}");
+        assert!(raw.len() >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        let segments = [first, second.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 18, GIANT_LINE_PAGE_ROWS, 0);
+        let page = &layout.materialized_giant_pages[0];
+        assert_materialized_rows_match_raw(&document, &layout.structure().raw_map, &page.rows);
+
+        for row in &page.rows {
+            assert!(raw.is_char_boundary(row.raw_range.start.0));
+            assert!(raw.is_char_boundary(row.raw_range.end.0));
+            assert!(is_grapheme_boundary(&raw, row.raw_range.start.0));
+            assert!(is_grapheme_boundary(&raw, row.raw_range.end.0));
+        }
+        assert!(page.rows.iter().any(|row| {
+            row.raw_range.start.0 < first.len() && row.raw_range.end.0 > first.len()
+        }));
+
+        let reference = wrap_detail_document(&document, 17);
+        assert_eq!(
+            text_lines(&viewport.text),
+            text_lines(&reference)[..GIANT_LINE_PAGE_ROWS]
+        );
     }
 
     #[test]
@@ -4236,7 +4773,7 @@ mod tests {
         assert!(!layout.structure_is_complete());
         assert_eq!(layout.materialized_chunks.len(), 1);
         let initial_chunks = layout.chunks.len();
-        let cached_lines = layout.materialized_chunks[0].lines.clone();
+        let cached_rows = layout.materialized_chunks[0].rows.clone();
 
         let request = take_structure_request(&mut layout, &document);
         assert!(request.snapshot.shares_buffer(&raw));
@@ -4246,7 +4783,7 @@ mod tests {
         assert!(layout.structure_is_complete());
         assert!(layout.chunks.len() > initial_chunks);
         assert_eq!(layout.materialized_chunks.len(), 1);
-        assert_eq!(layout.materialized_chunks[0].lines, cached_lines);
+        assert_eq!(layout.materialized_chunks[0].rows, cached_rows);
 
         let count = take_count_request(&mut layout, &document);
         assert_eq!(count.identity.layout_width, 79);
