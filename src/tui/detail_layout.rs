@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 
 use ratatui::text::{Line, Text};
 use unicode_segmentation::UnicodeSegmentation;
@@ -41,7 +42,7 @@ struct LayoutUnitIndex {
     giant_line: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct DetailLineIndex {
     lines: Vec<LogicalLine>,
     units: Vec<LayoutUnitIndex>,
@@ -106,7 +107,7 @@ pub(crate) struct DetailCountIdentity {
 pub(crate) struct DetailCountRequest {
     pub(super) identity: DetailCountIdentity,
     pub(super) snapshot: DetailSnapshot,
-    pub(super) line_index: DetailLineIndex,
+    pub(super) line_index: Arc<DetailLineIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,7 +162,7 @@ pub(super) struct DetailLayout {
     detail_width: u16,
     mode: Option<LayoutMode>,
     segment_lengths: Vec<usize>,
-    logical_lines: DetailLineIndex,
+    logical_lines: Arc<DetailLineIndex>,
     chunks: Vec<ChunkMeta>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
@@ -177,6 +178,8 @@ pub(super) struct DetailLayout {
     giant_page_layout_operations: usize,
     #[cfg(test)]
     invalidations: usize,
+    #[cfg(test)]
+    logical_line_index_builds: usize,
 }
 
 pub(super) struct DetailViewport {
@@ -217,7 +220,7 @@ impl DetailLayout {
             PendingCountCommand::Count => DetailCountCommand::Count(DetailCountRequest {
                 identity: self.count_identity(),
                 snapshot: document.snapshot(),
-                line_index: self.logical_lines.clone(),
+                line_index: Arc::clone(&self.logical_lines),
             }),
             PendingCountCommand::Cancel => DetailCountCommand::Cancel {
                 generation: self.count_generation,
@@ -261,30 +264,44 @@ impl DetailLayout {
         let segment_lengths = (0..document.segment_count())
             .map(|index| document.segment_text(index).map_or(0, str::len))
             .collect::<Vec<_>>();
+        let document_changed =
+            self.revision != Some(revision) || self.segment_lengths != segment_lengths;
+        let width_changed = self.detail_width != detail_width;
 
-        if self.revision == Some(revision)
-            && self.detail_width == detail_width
-            && self.segment_lengths == segment_lengths
-        {
+        if !document_changed && !width_changed {
             return;
         }
 
         let previous_mode = self.mode;
-        let logical_lines = build_logical_line_index(document);
-        let raw_bytes = segment_lengths
-            .iter()
-            .copied()
-            .fold(0usize, usize::saturating_add);
-        let mode = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD
-            || logical_lines.len() >= LAZY_DETAIL_LINE_THRESHOLD
-        {
-            LayoutMode::Lazy
-        } else {
-            LayoutMode::Eager
-        };
+        if document_changed {
+            let logical_lines = Arc::new(build_logical_line_index(document));
+            let raw_bytes = segment_lengths
+                .iter()
+                .copied()
+                .fold(0usize, usize::saturating_add);
+            let mode = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD
+                || logical_lines.len() >= LAZY_DETAIL_LINE_THRESHOLD
+            {
+                LayoutMode::Lazy
+            } else {
+                LayoutMode::Eager
+            };
 
-        let chunks = if mode == LayoutMode::Lazy {
-            logical_lines
+            self.revision = Some(revision);
+            self.segment_lengths = segment_lengths;
+            self.logical_lines = logical_lines;
+            self.mode = Some(mode);
+
+            #[cfg(test)]
+            {
+                self.logical_line_index_builds = self.logical_line_index_builds.saturating_add(1);
+            }
+        }
+
+        self.detail_width = detail_width;
+        self.chunks = match self.mode.expect("detail layout must have a document") {
+            LayoutMode::Lazy => self
+                .logical_lines
                 .units
                 .iter()
                 .map(|unit| ChunkMeta {
@@ -300,21 +317,13 @@ impl DetailLayout {
                         Vec::new()
                     },
                 })
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            LayoutMode::Eager => Vec::new(),
         };
-
-        self.revision = Some(revision);
-        self.detail_width = detail_width;
-        self.mode = Some(mode);
-        self.segment_lengths = segment_lengths;
-        self.logical_lines = logical_lines;
-        self.chunks = chunks;
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
         self.count_generation = self.count_generation.wrapping_add(1);
-        self.pending_count_command = match mode {
+        self.pending_count_command = match self.mode.expect("detail layout must have a mode") {
             LayoutMode::Lazy => Some(PendingCountCommand::Count),
             LayoutMode::Eager if previous_mode == Some(LayoutMode::Lazy) => {
                 Some(PendingCountCommand::Cancel)
@@ -2024,13 +2033,20 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.viewport(&document, 1, 120, 20, 300);
+        let line_index = Arc::clone(&layout.logical_lines);
         let stale = count_result(take_count_request(&mut layout, &document));
         assert!(layout.giant_checkpoint_count() > 1);
 
-        layout.viewport(&document, 1, 80, 20, 300);
+        layout.prepare(&document, 1, 80);
+        assert!(Arc::ptr_eq(&line_index, &layout.logical_lines));
+        assert_eq!(layout.logical_line_index_builds, 1);
+        assert_eq!(layout.giant_checkpoint_count(), 1);
+        assert!(layout.materialized_giant_pages.is_empty());
         assert!(!layout.apply_count_result(stale));
         assert_eq!(layout.invalidations, 2);
         assert_eq!(layout.lazy_layout_width(), 79);
+
+        layout.viewport(&document, 1, 80, 20, 300);
         assert!(layout.materialized_giant_pages.len() <= GIANT_LINE_PAGE_CACHE_SIZE);
         assert!(layout.giant_checkpoint_count() > 1);
     }
@@ -2174,20 +2190,124 @@ mod tests {
 
         layout.viewport(&document, 1, 80, 20, 0);
         assert_eq!(layout.invalidations, 1);
+        assert_eq!(layout.logical_line_index_builds, 1);
         layout.viewport(&document, 1, 80, 20, 3);
         assert_eq!(layout.invalidations, 1);
+        assert_eq!(layout.logical_line_index_builds, 1);
 
         let revised = layout.viewport(&changed_document, 2, 80, 20, 0);
         assert_eq!(layout.invalidations, 2);
+        assert_eq!(layout.logical_line_index_builds, 2);
         assert_eq!(text_lines(&revised.text)[0], "other-");
 
         layout.viewport(&changed_document, 2, 79, 20, 0);
         assert_eq!(layout.invalidations, 3);
+        assert_eq!(layout.logical_line_index_builds, 2);
 
         let structurally_changed = [changed.as_str(), "x"];
         let structurally_changed = make_document(&structurally_changed);
         layout.viewport(&structurally_changed, 2, 79, 20, 0);
         assert_eq!(layout.invalidations, 4);
+        assert_eq!(layout.logical_line_index_builds, 3);
+    }
+
+    #[test]
+    fn repeated_width_changes_reuse_one_logical_line_index() {
+        let raw = many_lines(4_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 120, 20, 0);
+        let line_index = Arc::clone(&layout.logical_lines);
+        assert_eq!(layout.known_chunk_count(), 1);
+        assert!(!layout.materialized_chunks.is_empty());
+        for width in [80, 100, 120] {
+            layout.prepare(&document, 1, width);
+            assert!(Arc::ptr_eq(&line_index, &layout.logical_lines));
+            assert_eq!(layout.known_chunk_count(), 0);
+            assert!(layout.materialized_chunks.is_empty());
+        }
+
+        assert_eq!(layout.logical_line_index_builds, 1);
+        assert_eq!(layout.invalidations, 4);
+    }
+
+    #[test]
+    fn revision_change_rebuilds_the_logical_line_index() {
+        let first = ["a\nb"];
+        let second = ["ab\n"];
+        let first = make_document(&first);
+        let second = make_document(&second);
+        let mut layout = DetailLayout::default();
+
+        layout.prepare(&first, 1, 120);
+        let old_index = Arc::clone(&layout.logical_lines);
+        layout.prepare(&first, 1, 80);
+        assert!(Arc::ptr_eq(&old_index, &layout.logical_lines));
+
+        layout.prepare(&second, 2, 80);
+        assert!(!Arc::ptr_eq(&old_index, &layout.logical_lines));
+        assert_eq!(layout.logical_line_index_builds, 2);
+        assert_eq!(layout.logical_lines.lines.len(), 2);
+    }
+
+    #[test]
+    fn segment_shape_change_rebuilds_even_when_total_bytes_are_unchanged() {
+        let raw = many_lines(3_000);
+        let split = raw.len() / 3;
+        let single_segment = [raw.as_str()];
+        let split_segments = [&raw[..split], &raw[split..]];
+        let single_segment = make_document(&single_segment);
+        let split_segments = make_document(&split_segments);
+        let mut layout = DetailLayout::default();
+
+        layout.prepare(&single_segment, 1, 80);
+        let old_index = Arc::clone(&layout.logical_lines);
+        layout.prepare(&split_segments, 1, 80);
+
+        assert!(!Arc::ptr_eq(&old_index, &layout.logical_lines));
+        assert_eq!(layout.logical_line_index_builds, 2);
+        assert_eq!(layout.logical_lines.lines.len(), old_index.lines.len());
+    }
+
+    #[test]
+    fn newline_heavy_document_keeps_the_same_index_across_widths() {
+        let raw = many_lines(100_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.prepare(&document, 1, 120);
+        let line_index = Arc::clone(&layout.logical_lines);
+        for width in [80, 100, 120] {
+            layout.prepare(&document, 1, width);
+        }
+
+        assert!(Arc::ptr_eq(&line_index, &layout.logical_lines));
+        assert_eq!(layout.logical_line_index_builds, 1);
+        assert_eq!(layout.logical_lines.lines.len(), 100_001);
+    }
+
+    #[test]
+    fn width_relayout_reuses_index_and_matches_eager_reference() {
+        let raw = "word boundary 日本語 e\u{301} 👩‍💻 abcdefghijklmnopqrstuvwxyz\n".repeat(3_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        let height = 25usize;
+        let scroll = 90usize;
+
+        for width in [120u16, 80, 100, 120] {
+            let reference = wrap_detail_document(&document, width - 1);
+            let viewport = layout.viewport(&document, 1, width, height, scroll);
+            assert_eq!(
+                text_lines(&viewport.text),
+                text_lines(&reference)[scroll..scroll + height]
+            );
+        }
+
+        assert_eq!(layout.logical_line_index_builds, 1);
     }
 
     #[test]
@@ -2380,10 +2500,16 @@ mod tests {
         let mut layout = DetailLayout::default();
 
         layout.viewport(&document, 1, 80, 20, 0);
-        let old_result = count_result(take_count_request(&mut layout, &document));
+        let old_request = take_count_request(&mut layout, &document);
+        let line_index = Arc::clone(&old_request.line_index);
+        assert!(Arc::ptr_eq(&line_index, &layout.logical_lines));
+        let old_result = count_result(old_request);
 
         layout.viewport(&document, 1, 60, 20, 0);
         let new_request = take_count_request(&mut layout, &document);
+        assert!(Arc::ptr_eq(&line_index, &layout.logical_lines));
+        assert!(Arc::ptr_eq(&line_index, &new_request.line_index));
+        assert_eq!(layout.logical_line_index_builds, 1);
         assert_ne!(
             old_result.identity.generation,
             new_request.identity.generation
