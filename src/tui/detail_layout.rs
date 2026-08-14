@@ -30,6 +30,100 @@ struct SegmentCursor {
     offset: usize,
 }
 
+// Byte position in the virtual concatenation of all detail segments. Segment
+// boundaries contribute no bytes and are not logical-line boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct RawOffset(usize);
+
+#[derive(Debug)]
+struct DetailRawMap {
+    segment_starts: Vec<RawOffset>,
+    total_len: RawOffset,
+}
+
+impl DetailRawMap {
+    fn new(document: &(impl DetailTextSource + ?Sized)) -> Self {
+        let mut segment_starts = Vec::with_capacity(document.segment_count().saturating_add(1));
+        let mut total_len = 0usize;
+
+        for segment_index in 0..document.segment_count() {
+            segment_starts.push(RawOffset(total_len));
+            let segment_len = document
+                .segment_text(segment_index)
+                .expect("detail segment index must exist")
+                .len();
+            total_len = total_len
+                .checked_add(segment_len)
+                .expect("detail document byte length must fit in usize");
+        }
+        segment_starts.push(RawOffset(total_len));
+
+        Self {
+            segment_starts,
+            total_len: RawOffset(total_len),
+        }
+    }
+
+    fn total_len(&self) -> RawOffset {
+        self.total_len
+    }
+
+    fn segment_position(&self, offset: RawOffset) -> Option<(usize, usize)> {
+        if offset >= self.total_len {
+            return None;
+        }
+
+        let segment = self
+            .segment_starts
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1);
+        Some((
+            segment,
+            offset.0.saturating_sub(self.segment_starts[segment].0),
+        ))
+    }
+
+    fn cursor_at(
+        &self,
+        document: &(impl DetailTextSource + ?Sized),
+        offset: RawOffset,
+    ) -> SegmentCursor {
+        let Some((segment, local_offset)) = self.segment_position(offset) else {
+            debug_assert_eq!(offset, self.total_len);
+            return SegmentCursor {
+                segment: document.segment_count(),
+                offset: 0,
+            };
+        };
+        let text = document
+            .segment_text(segment)
+            .expect("raw detail position must reference an existing segment");
+        debug_assert!(
+            text.is_char_boundary(local_offset),
+            "logical-line cursors must use UTF-8 boundaries"
+        );
+
+        SegmentCursor {
+            segment,
+            offset: local_offset,
+        }
+    }
+
+    fn bytes_from<'a>(
+        &self,
+        document: &'a (impl DetailTextSource + ?Sized),
+        offset: RawOffset,
+    ) -> &'a [u8] {
+        let Some((segment, local_offset)) = self.segment_position(offset) else {
+            return &[];
+        };
+        &document
+            .segment_text(segment)
+            .expect("raw detail position must reference an existing segment")
+            .as_bytes()[local_offset..]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LogicalLine {
     start: SegmentCursor,
@@ -42,10 +136,187 @@ struct LayoutUnitIndex {
     giant_line: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DetailLineIndex {
     lines: Vec<LogicalLine>,
     units: Vec<LayoutUnitIndex>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InProgressLineKind {
+    Normal,
+    Giant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailIndexAdvance {
+    scanned_bytes: usize,
+    finished: bool,
+}
+
+struct IncrementalDetailIndexBuilder<'a, D: DetailTextSource + ?Sized> {
+    document: &'a D,
+    raw_map: DetailRawMap,
+    scan_position: RawOffset,
+    current_line_start: RawOffset,
+    current_line_start_cursor: SegmentCursor,
+    current_line_kind: InProgressLineKind,
+    pending_normal_start: usize,
+    lines: Vec<LogicalLine>,
+    units: Vec<LayoutUnitIndex>,
+    finished: bool,
+}
+
+impl<'a, D: DetailTextSource + ?Sized> IncrementalDetailIndexBuilder<'a, D> {
+    fn new(document: &'a D) -> Self {
+        Self {
+            document,
+            raw_map: DetailRawMap::new(document),
+            scan_position: RawOffset::default(),
+            current_line_start: RawOffset::default(),
+            current_line_start_cursor: SegmentCursor {
+                segment: 0,
+                offset: 0,
+            },
+            current_line_kind: InProgressLineKind::Normal,
+            pending_normal_start: 0,
+            lines: Vec::new(),
+            units: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn advance(&mut self, byte_budget: usize) -> DetailIndexAdvance {
+        if self.finished {
+            return DetailIndexAdvance {
+                scanned_bytes: 0,
+                finished: true,
+            };
+        }
+
+        let mut scanned_bytes = 0usize;
+        while scanned_bytes < byte_budget && self.scan_position < self.raw_map.total_len() {
+            let available = self.raw_map.bytes_from(self.document, self.scan_position);
+            debug_assert!(!available.is_empty());
+            let remaining_budget = byte_budget.saturating_sub(scanned_bytes);
+            let scan_len = available.len().min(remaining_budget);
+            // The frontier may stop inside a UTF-8 code point. Structural
+            // discovery only looks for ASCII newline bytes; SegmentCursor
+            // values are created solely at newline/EOF boundaries.
+            let candidate = &available[..scan_len];
+
+            if let Some(relative_newline) = candidate.iter().position(|byte| *byte == b'\n') {
+                let newline = RawOffset(self.scan_position.0.saturating_add(relative_newline));
+                let newline_cursor = self.raw_map.cursor_at(self.document, newline);
+                let consumed = relative_newline.saturating_add(1);
+
+                self.finish_current_line(newline, newline_cursor);
+                self.scan_position = RawOffset(self.scan_position.0.saturating_add(consumed));
+                self.current_line_start = self.scan_position;
+                self.current_line_start_cursor = SegmentCursor {
+                    segment: newline_cursor.segment,
+                    offset: newline_cursor.offset.saturating_add(1),
+                };
+                self.current_line_kind = InProgressLineKind::Normal;
+                scanned_bytes = scanned_bytes.saturating_add(consumed);
+            } else {
+                self.scan_position = RawOffset(self.scan_position.0.saturating_add(scan_len));
+                scanned_bytes = scanned_bytes.saturating_add(scan_len);
+                self.update_current_line_kind();
+            }
+        }
+
+        if self.scan_position == self.raw_map.total_len() {
+            self.finish_at_eof();
+        }
+
+        DetailIndexAdvance {
+            scanned_bytes,
+            finished: self.finished,
+        }
+    }
+
+    fn build_to_end(mut self) -> DetailLineIndex {
+        while !self.finished {
+            let progress = self.advance(usize::MAX);
+            debug_assert!(progress.finished || progress.scanned_bytes > 0);
+        }
+        self.into_index()
+    }
+
+    fn into_index(self) -> DetailLineIndex {
+        assert!(
+            self.finished,
+            "detail line index may only be taken after the document is complete"
+        );
+        DetailLineIndex {
+            lines: self.lines,
+            units: self.units,
+        }
+    }
+
+    #[cfg(test)]
+    fn current_line_is_known_giant(&self) -> bool {
+        !self.finished && self.current_line_kind == InProgressLineKind::Giant
+    }
+
+    fn update_current_line_kind(&mut self) {
+        // This state is intentionally retained before the line end is known.
+        // A later phase can publish an open giant unit without changing the
+        // closed DetailLineIndex produced by build_to_end().
+        if self
+            .scan_position
+            .0
+            .saturating_sub(self.current_line_start.0)
+            >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD
+        {
+            self.current_line_kind = InProgressLineKind::Giant;
+        }
+    }
+
+    fn finish_current_line(&mut self, end: RawOffset, end_cursor: SegmentCursor) {
+        let logical_index = self.lines.len();
+        let giant_line = self.current_line_kind == InProgressLineKind::Giant
+            || end.0.saturating_sub(self.current_line_start.0) >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
+
+        self.lines.push(LogicalLine {
+            start: self.current_line_start_cursor,
+            end: end_cursor,
+        });
+
+        if giant_line {
+            self.flush_pending_normal(logical_index);
+            self.units.push(LayoutUnitIndex {
+                logical_range: logical_index..logical_index.saturating_add(1),
+                giant_line: true,
+            });
+            self.pending_normal_start = logical_index.saturating_add(1);
+        } else if self.lines.len().saturating_sub(self.pending_normal_start) == DETAIL_CHUNK_LINES {
+            self.flush_pending_normal(self.lines.len());
+        }
+    }
+
+    fn flush_pending_normal(&mut self, end: usize) {
+        if self.pending_normal_start < end {
+            self.units.push(LayoutUnitIndex {
+                logical_range: self.pending_normal_start..end,
+                giant_line: false,
+            });
+        }
+        self.pending_normal_start = end;
+    }
+
+    fn finish_at_eof(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        let eof = self.raw_map.total_len();
+        let eof_cursor = self.raw_map.cursor_at(self.document, eof);
+        self.finish_current_line(eof, eof_cursor);
+        self.flush_pending_normal(self.lines.len());
+        self.finished = true;
+    }
 }
 
 impl DetailLineIndex {
@@ -740,84 +1011,7 @@ fn eager_viewport(
 }
 
 fn build_logical_line_index(document: &impl DetailTextSource) -> DetailLineIndex {
-    let mut logical_lines = Vec::new();
-    let mut start = SegmentCursor {
-        segment: 0,
-        offset: 0,
-    };
-
-    for segment_index in 0..document.segment_count() {
-        let text = document
-            .segment_text(segment_index)
-            .expect("detail segment index must exist");
-        for (newline, _) in text.match_indices('\n') {
-            logical_lines.push(LogicalLine {
-                start,
-                end: SegmentCursor {
-                    segment: segment_index,
-                    offset: newline,
-                },
-            });
-            start = SegmentCursor {
-                segment: segment_index,
-                offset: newline.saturating_add(1),
-            };
-        }
-    }
-
-    logical_lines.push(LogicalLine {
-        start,
-        end: SegmentCursor {
-            segment: document.segment_count(),
-            offset: 0,
-        },
-    });
-
-    let mut units = Vec::new();
-    let mut normal_start = 0usize;
-
-    for (logical_index, logical_line) in logical_lines.iter().copied().enumerate() {
-        let giant_line =
-            logical_line_byte_len(document, logical_line) >= GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
-        let normal_len = logical_index.saturating_sub(normal_start);
-
-        if giant_line || normal_len == DETAIL_CHUNK_LINES {
-            if normal_start < logical_index {
-                units.push(LayoutUnitIndex {
-                    logical_range: normal_start..logical_index,
-                    giant_line: false,
-                });
-            }
-            normal_start = logical_index;
-        }
-
-        if giant_line {
-            units.push(LayoutUnitIndex {
-                logical_range: logical_index..logical_index.saturating_add(1),
-                giant_line: true,
-            });
-            normal_start = logical_index.saturating_add(1);
-        }
-    }
-
-    if normal_start < logical_lines.len() {
-        units.push(LayoutUnitIndex {
-            logical_range: normal_start..logical_lines.len(),
-            giant_line: false,
-        });
-    }
-
-    DetailLineIndex {
-        lines: logical_lines,
-        units,
-    }
-}
-
-fn logical_line_byte_len(document: &impl DetailTextSource, logical_line: LogicalLine) -> usize {
-    logical_line_fragments(document, logical_line)
-        .iter()
-        .map(|fragment| fragment.len())
-        .fold(0usize, usize::saturating_add)
+    IncrementalDetailIndexBuilder::new(document).build_to_end()
 }
 
 fn logical_line_fragments(
@@ -1529,6 +1723,75 @@ mod tests {
             .collect()
     }
 
+    fn index_logical_lines(document: &DetailDocument<'_>, index: &DetailLineIndex) -> Vec<String> {
+        index
+            .lines
+            .iter()
+            .copied()
+            .map(|line| logical_line_fragments(document, line).concat())
+            .collect()
+    }
+
+    fn unit_signature(index: &DetailLineIndex) -> Vec<(Range<usize>, bool)> {
+        index
+            .units
+            .iter()
+            .map(|unit| (unit.logical_range.clone(), unit.giant_line))
+            .collect()
+    }
+
+    fn build_index_with_budgets(
+        document: &DetailDocument<'_>,
+        budgets: &[usize],
+    ) -> DetailLineIndex {
+        assert!(!budgets.is_empty());
+        assert!(budgets.iter().all(|budget| *budget > 0));
+
+        let mut builder = IncrementalDetailIndexBuilder::new(document);
+        let mut budget_index = 0usize;
+        while !builder.finished {
+            let budget = budgets[budget_index % budgets.len()];
+            let progress = builder.advance(budget);
+            assert!(progress.scanned_bytes <= budget);
+            assert!(progress.finished || progress.scanned_bytes > 0);
+            budget_index = budget_index.saturating_add(1);
+        }
+        builder.into_index()
+    }
+
+    fn assert_pause_patterns_match_build_to_end(document: &DetailDocument<'_>) {
+        let reference = IncrementalDetailIndexBuilder::new(document).build_to_end();
+        let budgets = [
+            1,
+            2,
+            7,
+            63,
+            64,
+            4 * 1024,
+            GIANT_LOGICAL_LINE_BYTE_THRESHOLD - 1,
+            GIANT_LOGICAL_LINE_BYTE_THRESHOLD,
+            GIANT_LOGICAL_LINE_BYTE_THRESHOLD + 1,
+            usize::MAX,
+        ];
+
+        for budget in budgets {
+            assert_eq!(
+                build_index_with_budgets(document, &[budget]),
+                reference,
+                "single repeated budget {budget} changed the final index"
+            );
+        }
+
+        assert_eq!(
+            build_index_with_budgets(
+                document,
+                &[1, 64, 7, 4 * 1024, GIANT_LOGICAL_LINE_BYTE_THRESHOLD + 1, 2,],
+            ),
+            reference,
+            "mixed budgets changed the final index"
+        );
+    }
+
     fn many_lines(count: usize) -> String {
         let mut raw = String::new();
         for line in 0..count {
@@ -1670,6 +1933,192 @@ mod tests {
             let document = make_document(&segments);
             assert_eq!(indexed_logical_lines(&document), expected);
         }
+    }
+
+    #[test]
+    fn global_raw_offsets_map_across_empty_and_non_empty_segments() {
+        let segments = ["abc", "", "def\n", "ghi"];
+        let document = make_document(&segments);
+        let raw_map = DetailRawMap::new(&document);
+
+        assert_eq!(raw_map.total_len(), RawOffset(10));
+        assert_eq!(
+            raw_map.cursor_at(&document, RawOffset(0)),
+            SegmentCursor {
+                segment: 0,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            raw_map.cursor_at(&document, RawOffset(3)),
+            SegmentCursor {
+                segment: 2,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            raw_map.cursor_at(&document, RawOffset(6)),
+            SegmentCursor {
+                segment: 2,
+                offset: 3
+            }
+        );
+        assert_eq!(
+            raw_map.cursor_at(&document, RawOffset(7)),
+            SegmentCursor {
+                segment: 3,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            raw_map.cursor_at(&document, RawOffset(10)),
+            SegmentCursor {
+                segment: 4,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn resumable_builder_preserves_exact_line_and_segment_cursor_semantics() {
+        let segments = ["ab\n", "", "日本", "語", "\n"];
+        let document = make_document(&segments);
+        let index = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+
+        assert_eq!(index_logical_lines(&document, &index), ["ab", "日本語", ""]);
+        assert_eq!(
+            index.lines,
+            [
+                LogicalLine {
+                    start: SegmentCursor {
+                        segment: 0,
+                        offset: 0,
+                    },
+                    end: SegmentCursor {
+                        segment: 0,
+                        offset: 2,
+                    },
+                },
+                LogicalLine {
+                    start: SegmentCursor {
+                        segment: 0,
+                        offset: 3,
+                    },
+                    end: SegmentCursor {
+                        segment: 4,
+                        offset: 0,
+                    },
+                },
+                LogicalLine {
+                    start: SegmentCursor {
+                        segment: 4,
+                        offset: 1,
+                    },
+                    end: SegmentCursor {
+                        segment: 5,
+                        offset: 0,
+                    },
+                },
+            ]
+        );
+        assert_eq!(unit_signature(&index), [(0..3, false)]);
+    }
+
+    #[test]
+    fn builder_preserves_giant_threshold_and_normal_unit_partitioning() {
+        for (len, giant) in [
+            (GIANT_LOGICAL_LINE_BYTE_THRESHOLD - 1, false),
+            (GIANT_LOGICAL_LINE_BYTE_THRESHOLD, true),
+            (GIANT_LOGICAL_LINE_BYTE_THRESHOLD + 1, true),
+        ] {
+            let raw = "a".repeat(len);
+            let segments = [raw.as_str()];
+            let document = make_document(&segments);
+            let index = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+            assert_eq!(unit_signature(&index), [(0..1, giant)], "len={len}");
+        }
+
+        let normal_lines = "x\n".repeat(DETAIL_CHUNK_LINES * 2);
+        let segments = [normal_lines.as_str()];
+        let document = make_document(&segments);
+        let index = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        assert_eq!(
+            unit_signature(&index),
+            [
+                (0..DETAIL_CHUNK_LINES, false),
+                (DETAIL_CHUNK_LINES..DETAIL_CHUNK_LINES * 2, false),
+                (DETAIL_CHUNK_LINES * 2..DETAIL_CHUNK_LINES * 2 + 1, false),
+            ]
+        );
+
+        let giant = "g".repeat(GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        let mixed = format!("normal\n{giant}\ntail");
+        let segments = [mixed.as_str()];
+        let document = make_document(&segments);
+        let index = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        assert_eq!(
+            index_logical_lines(&document, &index),
+            ["normal", giant.as_str(), "tail"]
+        );
+        assert_eq!(
+            unit_signature(&index),
+            [(0..1, false), (1..2, true), (2..3, false)]
+        );
+
+        let at_eof = format!("normal\n{giant}");
+        let segments = [at_eof.as_str()];
+        let document = make_document(&segments);
+        let index = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        assert_eq!(unit_signature(&index), [(0..1, false), (1..2, true)]);
+    }
+
+    #[test]
+    fn pause_resume_budgets_do_not_change_the_final_structure() {
+        let newline_heavy = many_lines(DETAIL_CHUNK_LINES * 3 + 17);
+        let segments = [newline_heavy.as_str()];
+        assert_pause_patterns_match_build_to_end(&make_document(&segments));
+
+        let giant = "giant-token ".repeat(GIANT_LOGICAL_LINE_BYTE_THRESHOLD / 6);
+        let segments = [giant.as_str()];
+        assert_pause_patterns_match_build_to_end(&make_document(&segments));
+
+        let mixed = format!("first\n{}\nlast\n", "z".repeat(70 * 1024));
+        let segments = ["prefix\n", mixed.as_str(), "tail"];
+        assert_pause_patterns_match_build_to_end(&make_document(&segments));
+
+        let unicode_segments = ["", "日", "本語🙂", "\n", "e\u{301}", "", "\n終"];
+        assert_pause_patterns_match_build_to_end(&make_document(&unicode_segments));
+    }
+
+    #[test]
+    fn builder_can_pause_with_a_known_open_giant_line() {
+        let raw = format!(
+            "{}\ntail",
+            "界".repeat(GIANT_LOGICAL_LINE_BYTE_THRESHOLD / 3 + 128)
+        );
+        assert!(!raw.is_char_boundary(GIANT_LOGICAL_LINE_BYTE_THRESHOLD));
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let reference = IncrementalDetailIndexBuilder::new(&document).build_to_end();
+        let mut builder = IncrementalDetailIndexBuilder::new(&document);
+
+        let progress = builder.advance(GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+
+        assert_eq!(progress.scanned_bytes, GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+        assert!(!progress.finished);
+        assert!(builder.current_line_is_known_giant());
+        assert_eq!(
+            builder.scan_position,
+            RawOffset(GIANT_LOGICAL_LINE_BYTE_THRESHOLD)
+        );
+        assert!(builder.lines.is_empty());
+        assert!(builder.units.is_empty());
+
+        while !builder.finished {
+            let resumed = builder.advance(7);
+            assert!(resumed.finished || resumed.scanned_bytes > 0);
+        }
+        assert_eq!(builder.into_index(), reference);
     }
 
     #[test]
