@@ -282,4 +282,11 @@ mod tests {
                 if contest_id == "abc466"
         ));
     }
+
+    #[test]
+    fn parses_login_without_arguments() {
+        let cli = Cli::try_parse_from(["atc-rs", "login"]).unwrap();
+        assert!(matches!(cli.command, Command::Login));
+        assert!(Cli::try_parse_from(["atc-rs", "login", "extra"]).is_err());
+    }
 }

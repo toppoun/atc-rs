@@ -114,23 +114,8 @@ pub struct AtCoderClient {
 
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
-        let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-        let mut headers = HeaderMap::new();
-
-        if let Some(cookie) = auth::load_cookie().map_err(AtCoderError::Auth)? {
-            let cookie =
-                HeaderValue::from_str(&cookie).map_err(|_| AtCoderError::InvalidStoredCookie)?;
-
-            headers.insert(COOKIE, cookie);
-        }
-
-        let client = Client::builder()
-            .user_agent(user_agent)
-            .timeout(Duration::from_secs(10))
-            .default_headers(headers)
-            .cookie_store(true)
-            .build()?;
+        let cookie = auth::load_cookie().map_err(AtCoderError::Auth)?;
+        let client = build_http_client(cookie)?;
 
         Ok(Self {
             source: Source::Http(HttpSource {
@@ -230,6 +215,39 @@ impl AtCoderClient {
             url: url.to_string(),
         })
     }
+}
+
+fn build_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
+    let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+    let authenticated = cookie.is_some();
+    let headers = default_headers(cookie)?;
+
+    let mut builder = Client::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(10))
+        .default_headers(headers);
+
+    // Preserve the pre-authentication anonymous cookie-jar behavior. A
+    // manually stored Cookie header is deliberately authoritative instead of
+    // competing with a second in-memory cookie source.
+    if !authenticated {
+        builder = builder.cookie_store(true);
+    }
+
+    Ok(builder.build()?)
+}
+
+fn default_headers(cookie: Option<String>) -> Result<HeaderMap, AtCoderError> {
+    let mut headers = HeaderMap::new();
+
+    if let Some(cookie) = cookie {
+        let mut cookie =
+            HeaderValue::from_str(&cookie).map_err(|_| AtCoderError::InvalidStoredCookie)?;
+        cookie.set_sensitive(true);
+        headers.insert(COOKIE, cookie);
+    }
+
+    Ok(headers)
 }
 
 fn read_fixture(path: PathBuf) -> Result<String, AtCoderError> {
@@ -520,6 +538,29 @@ mod tests {
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
+    #[test]
+    fn stored_cookie_header_is_sensitive_and_invalid_values_do_not_leak() {
+        let secret = "REVEL_SESSION=do-not-print";
+        let headers = default_headers(Some(secret.to_string())).unwrap();
+        let cookie = headers.get(COOKIE).unwrap();
+
+        assert_eq!(cookie.to_str().unwrap(), secret);
+        assert!(cookie.is_sensitive());
+        assert!(!format!("{headers:?}").contains(secret));
+
+        let invalid = "REVEL_SESSION=secret\r\nX-Injected: yes";
+        let error = default_headers(Some(invalid.to_string())).unwrap_err();
+        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
+        assert!(!error.to_string().contains("secret"));
+        assert!(!format!("{error:?}").contains("secret"));
+    }
+
+    #[test]
+    fn anonymous_default_headers_have_no_cookie() {
+        let headers = default_headers(None).unwrap();
+        assert!(!headers.contains_key(COOKIE));
     }
 
     #[test]
