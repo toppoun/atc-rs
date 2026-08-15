@@ -23,6 +23,18 @@ struct ContestMetadata {
 }
 
 #[derive(Deserialize)]
+struct ContestMetadataHeader {
+    version: u32,
+}
+
+pub enum ContestMetadataHealth {
+    Healthy(Contest),
+    Missing,
+    Invalid,
+    UnsupportedVersion(u32),
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceConfig {
     version: u32,
@@ -162,6 +174,49 @@ pub fn load_metadata(destination: &Path) -> io::Result<Contest> {
         contest_id: metadata.contest_id,
         problems: metadata.problems,
     })
+}
+
+pub fn contest_directory_exists(destination: &Path) -> io::Result<bool> {
+    existing_real_directory(destination, "contest directory")
+}
+
+pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
+    let marker = destination.join(".atc");
+
+    if !existing_real_directory(&marker, "workspace marker")? {
+        return Ok(ContestMetadataHealth::Missing);
+    }
+
+    let path = marker.join("contest.toml");
+
+    if !existing_regular_file(&path, "contest metadata")? {
+        return Ok(ContestMetadataHealth::Missing);
+    }
+
+    let content = fs::read_to_string(&path)?;
+
+    let header: ContestMetadataHeader = match toml::from_str(&content) {
+        Ok(header) => header,
+        Err(_) => {
+            return Ok(ContestMetadataHealth::Invalid);
+        }
+    };
+
+    if header.version != METADATA_VERSION {
+        return Ok(ContestMetadataHealth::UnsupportedVersion(header.version));
+    }
+
+    let metadata: ContestMetadata = match toml::from_str(&content) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Ok(ContestMetadataHealth::Invalid);
+        }
+    };
+
+    Ok(ContestMetadataHealth::Healthy(Contest {
+        contest_id: metadata.contest_id,
+        problems: metadata.problems,
+    }))
 }
 
 pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -> io::Result<()> {

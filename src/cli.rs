@@ -50,6 +50,9 @@ pub enum Command {
         #[arg(long)]
         plain: bool,
     },
+    Contest {
+        contest_id: String,
+    },
     Login,
 }
 
@@ -258,6 +261,16 @@ mod tests {
                 language: None,
                 debug: false,
             } if problem == "A" && contest == "abc466"
+        ));
+    }
+    #[test]
+    fn parses_contest() {
+        let cli = Cli::try_parse_from(["atc-rs", "contest", "abc466"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Contest { contest_id }
+                if contest_id == "abc466"
         ));
     }
 }

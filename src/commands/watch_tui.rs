@@ -192,6 +192,10 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
 
     let (contest, sample_counts) = load_watch_input(&destination)?;
+    watch_tui_at(&destination)
+}
+pub(super) fn watch_tui_at(destination: &Path) -> Result<(), AppError> {
+    let (contest, sample_counts) = load_watch_input(destination)?;
 
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
@@ -205,7 +209,7 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
 
     // test workerも、同じchannelへ結果を送る。
     let test_worker = match TestWorker::start(
-        destination.clone(),
+        destination.to_path_buf(),
         contest.problems.clone(),
         config.runner,
         message_tx.clone(),

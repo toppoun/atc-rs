@@ -64,6 +64,9 @@ fn run() -> Result<(), AppError> {
                 commands::watch_tui(contest.as_deref())?;
             }
         }
+        cli::Command::Contest { contest_id } => {
+            commands::contest(&contest_id, &mut reporter)?;
+        }
         cli::Command::Login => {
             println!("login");
         }

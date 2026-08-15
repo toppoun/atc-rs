@@ -1,4 +1,5 @@
 mod attempt_executor;
+mod contest;
 mod create;
 mod new;
 mod refresh;
@@ -9,6 +10,7 @@ mod watch_source;
 mod watch_tui;
 mod watch_worker;
 
+pub(crate) use contest::contest;
 pub(crate) use create::create;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
