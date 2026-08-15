@@ -29,7 +29,6 @@ pub fn state_dir() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(cookie_location()?.state_dir)
 }
 
-#[cfg(test)]
 pub fn cookie_file() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(cookie_location()?.file)
 }

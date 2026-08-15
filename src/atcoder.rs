@@ -47,6 +47,41 @@ pub enum AtCoderError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationStatus {
+    NotConfigured,
+    Authenticated,
+    Unauthenticated,
+}
+
+pub fn authentication_status() -> Result<AuthenticationStatus, AtCoderError> {
+    let Some(cookie) = auth::load_cookie().map_err(AtCoderError::Auth)? else {
+        return Ok(AuthenticationStatus::NotConfigured);
+    };
+
+    let client = build_http_client(Some(cookie))?;
+
+    let response = client
+        .get(format!("{BASE_URL}/settings"))
+        .send()?
+        .error_for_status()?;
+
+    if is_authenticated_settings_url(response.url()) {
+        Ok(AuthenticationStatus::Authenticated)
+    } else {
+        Ok(AuthenticationStatus::Unauthenticated)
+    }
+}
+
+fn is_authenticated_settings_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("atcoder.jp")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/settings"
+}
+
 impl fmt::Display for AtCoderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -714,5 +749,27 @@ mod tests {
             reqwest::header::HeaderValue::from_static("invalid"),
         );
         assert_eq!(retry_wait(&headers), DEFAULT_RETRY_WAIT);
+    }
+
+    #[test]
+    fn settings_url_identifies_authenticated_session() {
+        assert!(is_authenticated_settings_url(
+            &reqwest::Url::parse("https://atcoder.jp/settings").unwrap()
+        ));
+
+        assert!(!is_authenticated_settings_url(
+            &reqwest::Url::parse(
+                "https://atcoder.jp/login?continue=https%3A%2F%2Fatcoder.jp%2Fsettings"
+            )
+            .unwrap()
+        ));
+
+        assert!(!is_authenticated_settings_url(
+            &reqwest::Url::parse("http://atcoder.jp/settings").unwrap()
+        ));
+
+        assert!(!is_authenticated_settings_url(
+            &reqwest::Url::parse("https://example.com/settings").unwrap()
+        ));
     }
 }

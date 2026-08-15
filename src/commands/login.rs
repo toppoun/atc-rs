@@ -1,31 +1,48 @@
-use crate::auth;
+use crate::atcoder::{self, AtCoderError, AuthenticationStatus};
 use crate::error::AppError;
-use std::io::{self, BufRead, Write};
+use crate::paths;
+
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 pub(crate) fn login() -> Result<(), AppError> {
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    login_with(&mut stdin.lock(), &mut stdout.lock(), auth::save_cookie)
+
+    login_with(&mut stdout.lock(), atcoder::authentication_status, || {
+        Ok(paths::cookie_file()?)
+    })
 }
 
 fn login_with(
-    input: &mut impl BufRead,
     output: &mut impl Write,
-    save: impl FnOnce(&str) -> io::Result<PathBuf>,
+    check: impl FnOnce() -> Result<AuthenticationStatus, AtCoderError>,
+    cookie_file: impl FnOnce() -> Result<PathBuf, AppError>,
 ) -> Result<(), AppError> {
-    write!(output, "Paste AtCoder cookie: ")?;
-    output.flush()?;
+    match check()? {
+        AuthenticationStatus::Authenticated => {
+            writeln!(output, "Authenticated.")?;
+        }
 
-    let mut cookie = String::new();
-    input.read_line(&mut cookie)?;
-    let cookie = cookie.trim();
-    if cookie.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "cookie must not be empty").into());
+        AuthenticationStatus::NotConfigured => {
+            let path = cookie_file()?;
+
+            writeln!(output, "Authentication cookie is not configured.")?;
+            writeln!(output)?;
+            writeln!(output, "Create:")?;
+            writeln!(output, "{}", path.display())?;
+            writeln!(output)?;
+            writeln!(output, "with:")?;
+            writeln!(output, "REVEL_SESSION=<value>")?;
+        }
+
+        AuthenticationStatus::Unauthenticated => {
+            let path = cookie_file()?;
+
+            writeln!(output, "Authentication failed.")?;
+            writeln!(output, "Update REVEL_SESSION in:")?;
+            writeln!(output, "{}", path.display())?;
+        }
     }
-
-    let path = save(cookie)?;
-    writeln!(output, "Cookie saved to {}", path.display())?;
 
     Ok(())
 }
@@ -33,56 +50,53 @@ fn login_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
-    fn login_prints_only_the_saved_path_after_success() {
-        let secret = "REVEL_SESSION=do-not-print";
-        let mut input = Cursor::new(format!("{secret}\n"));
+    fn authenticated_session_reports_success() {
         let mut output = Vec::new();
-        let path = PathBuf::from("state/cookie");
 
-        login_with(&mut input, &mut output, |cookie| {
-            assert_eq!(cookie, secret);
-            Ok(path.clone())
-        })
+        login_with(
+            &mut output,
+            || Ok(AuthenticationStatus::Authenticated),
+            || panic!("authenticated status must not need cookie path"),
+        )
+        .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "Authenticated.\n");
+    }
+
+    #[test]
+    fn missing_cookie_reports_how_to_configure_it() {
+        let mut output = Vec::new();
+
+        login_with(
+            &mut output,
+            || Ok(AuthenticationStatus::NotConfigured),
+            || Ok(PathBuf::from("state/cookie")),
+        )
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains(secret));
-        assert!(output.contains("Cookie saved to state/cookie"));
+
+        assert!(output.contains("Authentication cookie is not configured."));
+        assert!(output.contains("state/cookie"));
+        assert!(output.contains("REVEL_SESSION=<value>"));
     }
 
     #[test]
-    fn login_eof_and_empty_input_do_not_report_success() {
-        for input in [Vec::new(), b"  \r\n".to_vec()] {
-            let mut input = Cursor::new(input);
-            let mut output = Vec::new();
-
-            let result = login_with(&mut input, &mut output, |_| {
-                panic!("empty input must not reach cookie storage")
-            });
-
-            assert!(result.is_err());
-            let output = String::from_utf8(output).unwrap();
-            assert!(output.contains("Paste AtCoder cookie"));
-            assert!(!output.contains("Cookie saved"));
-        }
-    }
-
-    #[test]
-    fn login_does_not_report_success_when_saving_fails() {
-        let secret = "REVEL_SESSION=secret";
-        let mut input = Cursor::new(format!("{secret}\n"));
+    fn unauthenticated_session_reports_cookie_path() {
         let mut output = Vec::new();
 
-        let result = login_with(&mut input, &mut output, |_| {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
-        });
+        login_with(
+            &mut output,
+            || Ok(AuthenticationStatus::Unauthenticated),
+            || Ok(PathBuf::from("state/cookie")),
+        )
+        .unwrap();
 
-        assert!(result.is_err());
         let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains(secret));
-        assert!(!output.contains("Cookie saved"));
+
+        assert!(output.contains("Authentication failed."));
+        assert!(output.contains("state/cookie"));
     }
 }
