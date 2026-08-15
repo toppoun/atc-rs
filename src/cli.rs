@@ -50,6 +50,7 @@ pub enum Command {
         #[arg(long)]
         plain: bool,
     },
+    #[command(alias = "c")]
     Contest {
         contest_id: String,
     },
@@ -280,6 +281,12 @@ mod tests {
             cli.command,
             Command::Contest { contest_id }
                 if contest_id == "abc466"
+        ));
+        let cli = Cli::try_parse_from(["atc-rs", "c", "abc471"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Contest { contest_id } if contest_id == "abc471"
         ));
     }
 
