@@ -11,6 +11,25 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+
+    match result {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314) =>
+        {
+            false
+        }
+        Err(error) => panic!("failed to create directory symlink: {error}"),
+    }
+}
+
 fn create_single_problem_fixture(root: &Path, contest_id: &str) {
     std::fs::create_dir_all(root.join("contests")).expect("contest fixtures should be created");
     std::fs::create_dir_all(root.join("problems")).expect("problem fixtures should be created");
@@ -780,6 +799,55 @@ fn new_flow_runs_entirely_from_fixtures() {
 }
 
 #[test]
+fn new_at_creates_a_missing_mapped_parent_directory() {
+    let mut reporter = NullReporter;
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc").join("abc466");
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+
+    new_at(
+        &destination,
+        "abc466",
+        Language::Cpp,
+        &client,
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        workspace::load_metadata(&destination).unwrap().contest_id,
+        "abc466"
+    );
+}
+
+#[test]
+fn new_at_rejects_a_symlinked_contest_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    if !create_directory_symlink(external.path(), &destination) {
+        return;
+    }
+    let client = atcoder::AtCoderClient::fixture(temp.path().join("missing-fixtures"));
+    let mut reporter = NullReporter;
+
+    let error = new_at(
+        &destination,
+        "abc466",
+        Language::Cpp,
+        &client,
+        &mut reporter,
+    )
+    .expect_err("a symlinked destination must fail before fixture access");
+
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::InvalidInput
+    ));
+    assert!(std::fs::read_dir(external.path()).unwrap().next().is_none());
+}
+
+#[test]
 fn new_flow_creates_python_sources_from_the_builtin_template() {
     let mut reporter = NullReporter;
     let temp = tempfile::tempdir().expect("temporary directory should be created");
@@ -1268,6 +1336,32 @@ fn refresh_override_recovers_malformed_metadata_inside_workspace() {
             .contest_id,
         "abc466"
     );
+}
+
+#[test]
+fn refresh_override_rejects_healthy_metadata_id_mismatch_and_newer_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    create_workspace(&destination, "arc001");
+
+    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false)
+        .expect_err("healthy metadata for a different contest must not be overwritten");
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
+    ));
+
+    std::fs::write(
+        destination.join(".atc").join("contest.toml"),
+        "version = 99\ncontest_id = \"abc466\"\nproblems = []\n",
+    )
+    .unwrap();
+    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false)
+        .expect_err("a newer metadata schema must not be overwritten implicitly");
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
+    ));
 }
 
 #[test]

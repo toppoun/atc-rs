@@ -56,6 +56,26 @@ pub(super) fn resolve_refresh_contest_id(
     match specified_contest_id {
         Some(contest_id) => {
             validate_refresh_destination(destination, contest_id, false)?;
+
+            match workspace::inspect_contest_metadata(destination)? {
+                workspace::ContestMetadataHealth::Healthy(contest) => {
+                    workspace::validate_contest_identity(&contest, contest_id)?;
+                }
+                workspace::ContestMetadataHealth::UnsupportedVersion(version) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported contest metadata version: {version}"),
+                    )
+                    .into());
+                }
+                workspace::ContestMetadataHealth::Missing
+                | workspace::ContestMetadataHealth::Invalid => {
+                    // An explicit contest ID is the existing recovery mechanism for
+                    // missing or malformed metadata. Healthy metadata, however, must
+                    // agree with the requested target before it may be replaced.
+                }
+            }
+
             Ok(contest_id.to_string())
         }
         None => {
@@ -78,7 +98,12 @@ pub(super) fn refresh_at(
         contest,
         samples_by_problem,
     } = fetch_contest_data(contest_id, atcoder, reporter)?;
+    workspace::validate_contest_identity(&contest, contest_id)?;
     workspace::validate_contest_paths(&contest)?;
+
+    // Fetching may take long enough for the destination to change. Revalidate
+    // immediately before choosing it as the staging parent.
+    validate_refresh_destination(destination, contest_id, force)?;
 
     let staging = tempfile::Builder::new()
         .prefix(".atc-refresh-")

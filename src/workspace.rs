@@ -153,9 +153,17 @@ pub fn save_metadata(destination: &Path, contest: &Contest) -> io::Result<()> {
 }
 
 pub fn load_metadata(destination: &Path) -> io::Result<Contest> {
+    validate_workspace_marker(destination)?;
     let path = destination.join(".atc").join("contest.toml");
 
-    let content = fs::read_to_string(path)?;
+    if !existing_regular_file(&path, "contest metadata")? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("contest metadata not found: {}", path.display()),
+        ));
+    }
+
+    let content = fs::read_to_string(&path)?;
 
     let metadata: ContestMetadata = toml::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -180,7 +188,42 @@ pub fn contest_directory_exists(destination: &Path) -> io::Result<bool> {
     existing_real_directory(destination, "contest directory")
 }
 
+pub fn ensure_contest_parent(destination: &Path) -> io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest destination has no parent directory: {}",
+                destination.display()
+            ),
+        )
+    })?;
+
+    if existing_real_directory(parent, "contest parent directory")? {
+        return Ok(());
+    }
+
+    match fs::create_dir(parent) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if existing_real_directory(parent, "contest parent directory")? {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "contest parent is not a real directory: {}",
+                        parent.display()
+                    ),
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
+    validate_contest_directory(destination)?;
     let marker = destination.join(".atc");
 
     if !existing_real_directory(&marker, "workspace marker")? {
@@ -430,7 +473,6 @@ pub fn create_source_files(
 
 fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
     let contains_path_separator = value.contains('/') || value.contains('\\');
-    let contains_windows_stream_separator = cfg!(windows) && value.contains(':');
 
     let mut components = Path::new(value).components();
     let is_single_normal_component = matches!(
@@ -438,7 +480,9 @@ fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
         Some(Component::Normal(component)) if component == OsStr::new(value)
     ) && components.next().is_none();
 
-    if is_single_normal_component && !contains_path_separator && !contains_windows_stream_separator
+    if is_single_normal_component
+        && !contains_path_separator
+        && is_safe_platform_path_component(value)
     {
         return Ok(());
     }
@@ -449,6 +493,40 @@ fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
     ))
 }
 
+fn is_safe_platform_path_component(value: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = value;
+        true
+    }
+
+    #[cfg(windows)]
+    {
+        if value.ends_with([' ', '.'])
+            || value
+                .chars()
+                .any(|character| character < '\u{20}' || r#"<>:"|?*"#.contains(character))
+        {
+            return false;
+        }
+
+        let stem = value
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+            && !matches!(
+                stem.as_str(),
+                "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            )
+            && !matches!(
+                stem.as_str(),
+                "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+            )
+    }
+}
+
 pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
     for problem in &contest.problems {
@@ -457,7 +535,36 @@ pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
     Ok(())
 }
 
+pub fn validate_contest_identity(contest: &Contest, expected_contest_id: &str) -> io::Result<()> {
+    validate_path_component(expected_contest_id, "contest ID")?;
+
+    if contest.contest_id == expected_contest_id {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "contest ID mismatch: requested {expected_contest_id:?}, but metadata contains {:?}",
+            contest.contest_id
+        ),
+    ))
+}
+
+fn validate_contest_directory(destination: &Path) -> io::Result<()> {
+    if existing_real_directory(destination, "contest directory")? {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("contest directory not found: {}", destination.display()),
+    ))
+}
+
 pub fn validate_workspace_marker(destination: &Path) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+
     let marker = destination.join(".atc");
 
     if existing_real_directory(&marker, "workspace marker")? {
@@ -476,6 +583,7 @@ pub fn validate_refresh_destination(
     allow_missing_marker: bool,
 ) -> std::io::Result<()> {
     validate_path_component(contest_id, "contest ID")?;
+    validate_contest_directory(cwd)?;
 
     let marker = cwd.join(".atc");
     if !existing_real_directory(&marker, "workspace marker")? && !allow_missing_marker {
@@ -507,6 +615,8 @@ pub fn replace_refresh_data(
     staging: TempDir,
     allow_missing_marker: bool,
 ) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+
     let staging_root = staging.path().to_path_buf();
     let destination_tests = destination.join("tests");
     let staged_tests = staging_root.join("tests");
@@ -686,6 +796,15 @@ fn refresh_update_error(
 mod tests {
     use super::*;
 
+    fn write_workspace_config(root: &Path, body: &str) {
+        fs::write(root.join(WORKSPACE_CONFIG_FILE), body).unwrap();
+    }
+
+    fn write_metadata_text(destination: &Path, body: &str) {
+        fs::create_dir_all(destination.join(".atc")).unwrap();
+        fs::write(destination.join(".atc").join("contest.toml"), body).unwrap();
+    }
+
     fn problem(index: &str) -> Problem {
         Problem {
             index: index.to_string(),
@@ -734,6 +853,270 @@ mod tests {
             }
             Err(error) => panic!("failed to create file symlink: {error}"),
         }
+    }
+
+    #[test]
+    fn contest_resolver_uses_only_the_explicit_root_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+
+        assert_eq!(
+            resolve_contest_path(&cwd, "abc466").unwrap(),
+            cwd.join("abc466")
+        );
+
+        write_workspace_config(
+            temp.path(),
+            "version = 1\n[[paths]]\npattern = \"^abc\"\npath = \"parent-only\"\n",
+        );
+        assert_eq!(
+            resolve_contest_path(&cwd, "abc466").unwrap(),
+            cwd.join("abc466"),
+            "the resolver must not search parent directories"
+        );
+    }
+
+    #[test]
+    fn contest_resolver_requires_exactly_one_authoritative_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_config(
+            temp.path(),
+            concat!(
+                "version = 1\n",
+                "[[paths]]\npattern = \"^abc\"\npath = \"abc\"\n",
+                "[[paths]]\npattern = \"^arc\"\npath = \"arc\"\n",
+            ),
+        );
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc466").unwrap(),
+            temp.path().join("abc").join("abc466")
+        );
+        assert!(resolve_contest_path(temp.path(), "agc001").is_err());
+
+        write_workspace_config(
+            temp.path(),
+            concat!(
+                "version = 1\n",
+                "[[paths]]\npattern = \"abc\"\npath = \"first\"\n",
+                "[[paths]]\npattern = \"^abc466$\"\npath = \"second\"\n",
+            ),
+        );
+        assert!(resolve_contest_path(temp.path(), "abc466").is_err());
+    }
+
+    #[test]
+    fn contest_resolver_rejects_invalid_rules_ids_and_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        for id in ["..", "a/b", "a\\b"] {
+            assert_eq!(
+                resolve_contest_path(temp.path(), id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let absolute = temp.path().join("absolute").to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_contest_path(temp.path(), &absolute)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        write_workspace_config(
+            temp.path(),
+            "version = 1\n[[paths]]\npattern = \"[\"\npath = \"abc\"\n",
+        );
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc466")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        write_workspace_config(
+            temp.path(),
+            "version = 1\n[[paths]]\npattern = \".*\"\npath = \"../outside\"\n",
+        );
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc466")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        write_workspace_config(temp.path(), "version = 2\npaths = []\n");
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc466")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn contest_resolver_rejects_windows_ads_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        for id in ["abc466:stream", "CON", "nul.txt", "abc466.", "abc466?x"] {
+            assert_eq!(
+                resolve_contest_path(temp.path(), id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "unsafe Windows component: {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contest_resolver_rejects_non_file_workspace_config() {
+        let directory_root = tempfile::tempdir().unwrap();
+        fs::create_dir(directory_root.path().join(WORKSPACE_CONFIG_FILE)).unwrap();
+        assert_eq!(
+            resolve_contest_path(directory_root.path(), "abc466")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let symlink_root = tempfile::tempdir().unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        if !create_file_symlink(
+            external.path(),
+            &symlink_root.path().join(WORKSPACE_CONFIG_FILE),
+        ) {
+            return;
+        }
+        assert_eq!(
+            resolve_contest_path(symlink_root.path(), "abc466")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn metadata_health_distinguishes_missing_invalid_unsupported_and_healthy() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::Missing
+        ));
+
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::Missing
+        ));
+
+        for invalid in [
+            "version = ???",
+            "contest_id = \"abc466\"\nproblems = []\n",
+            concat!(
+                "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
+                "source = \"A.py\"\ntests = \"tests/A\"\n"
+            ),
+        ] {
+            write_metadata_text(temp.path(), invalid);
+            assert!(matches!(
+                inspect_contest_metadata(temp.path()).unwrap(),
+                ContestMetadataHealth::Invalid
+            ));
+        }
+
+        write_metadata_text(
+            temp.path(),
+            "version = 99\ncontest_id = \"abc466\"\nproblems = []\nunknown = true\n",
+        );
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::UnsupportedVersion(99)
+        ));
+
+        write_metadata_text(
+            temp.path(),
+            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
+        );
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::Healthy(Contest { contest_id, problems })
+                if contest_id == "abc466" && problems.is_empty()
+        ));
+    }
+
+    #[test]
+    fn metadata_health_rejects_symlinked_marker_and_metadata() {
+        let marker_root = tempfile::tempdir().unwrap();
+        let external_marker = tempfile::tempdir().unwrap();
+        if !create_directory_symlink(external_marker.path(), &marker_root.path().join(".atc")) {
+            return;
+        }
+        assert_eq!(
+            inspect_contest_metadata(marker_root.path())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let file_root = tempfile::tempdir().unwrap();
+        let external_file = tempfile::NamedTempFile::new().unwrap();
+        fs::create_dir(file_root.path().join(".atc")).unwrap();
+        if !create_file_symlink(
+            external_file.path(),
+            &file_root.path().join(".atc").join("contest.toml"),
+        ) {
+            return;
+        }
+        assert_eq!(
+            inspect_contest_metadata(file_root.path())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            load_metadata(file_root.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn contest_operations_reject_a_symlinked_destination_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        save_metadata(
+            external.path(),
+            &Contest {
+                contest_id: "abc466".to_string(),
+                problems: Vec::new(),
+            },
+        )
+        .unwrap();
+        let destination = temp.path().join("abc466");
+        if !create_directory_symlink(external.path(), &destination) {
+            return;
+        }
+
+        for result in [
+            validate_workspace_marker(&destination),
+            validate_refresh_destination(&destination, "abc466", true),
+            inspect_contest_metadata(&destination).map(|_| ()),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn contest_parent_creation_rejects_a_symlinked_mapped_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let mapped = temp.path().join("mapped");
+        if !create_directory_symlink(external.path(), &mapped) {
+            return;
+        }
+
+        let error = ensure_contest_parent(&mapped.join("abc466"))
+            .expect_err("a mapped symlink must not be used as a staging parent");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!external.path().join("abc466").exists());
     }
 
     #[test]

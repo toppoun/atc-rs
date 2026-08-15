@@ -888,8 +888,10 @@ mod tests {
         fake.send(0, 1);
         let a = fake.spawned();
 
-        // B1 is displaced to pending by C1. B2 then removes B1, becomes foreground,
-        // and puts C1 at the pending tail. Cancelled A is requeued after C.
+        // B1 is displaced by C1 and then replaced by B2. Request and completion
+        // notifications use different channels, so A may be requeued immediately
+        // before or after C is adopted. That cross-channel order is intentionally
+        // unspecified; the invariant here is that B1 never starts and C/A each run.
         fake.send(1, 2);
         wait_cancel_requested(&a.cancellation);
         fake.send(2, 3);
@@ -899,12 +901,20 @@ mod tests {
         let latest_b = fake.spawned();
         assert_eq!(latest_b.request, request(1, 4));
         latest_b.finish(Finish::Completed);
-        let c = fake.spawned();
-        assert_eq!(c.request, request(2, 3));
-        c.finish(Finish::Completed);
-        let a_again = fake.spawned();
-        assert_eq!(a_again.request, request(0, 1));
-        a_again.finish(Finish::Completed);
+        let first_pending = fake.spawned();
+        let first_request = first_pending.request;
+        assert!(first_request == request(0, 1) || first_request == request(2, 3));
+        first_pending.finish(Finish::Completed);
+
+        let second_pending = fake.spawned();
+        let expected_second = if first_request == request(0, 1) {
+            request(2, 3)
+        } else {
+            assert_eq!(first_request, request(2, 3));
+            request(0, 1)
+        };
+        assert_eq!(second_pending.request, expected_second);
+        second_pending.finish(Finish::Completed);
         messages_until(&fake.message_rx, |message| {
             matches!(message, Message::RunCompleted { run_id: 1, .. })
         });

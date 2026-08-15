@@ -248,6 +248,15 @@ mod tests {
                 contest: Some(contest),
             } if contest == "abc466"
         ));
+
+        let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain", "-c", "abc466"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                plain: true,
+                contest: Some(contest),
+            } if contest == "abc466"
+        ));
     }
     #[test]
     fn parses_test_contest() {

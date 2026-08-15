@@ -6,6 +6,8 @@ use crate::language::Language;
 use crate::template::builtin_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
+use std::fs;
+use std::io;
 use std::path::Path;
 
 pub(crate) fn new(
@@ -48,7 +50,9 @@ pub(super) fn new_at(
         contest,
         samples_by_problem,
     } = fetch_contest_data(contest_id, atcoder, reporter)?;
+    workspace::validate_contest_identity(&contest, contest_id)?;
 
+    workspace::ensure_contest_parent(destination)?;
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -75,31 +79,38 @@ pub(super) fn new_at(
         return Ok(());
     }
 
-    match std::fs::rename(staging.path(), destination) {
+    match fs::rename(staging.path(), destination) {
         Ok(()) => {
             drop(staging.keep());
             reporter.report(Event::WorkspaceCreated { destination });
             Ok(())
         }
-        Err(_) if destination.is_dir() => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(rename_error) => match existing_contest_is_noop(destination) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(rename_error.into()),
+            Err(safety_error) => Err(safety_error.into()),
+        },
     }
 }
 
 fn existing_contest_is_noop(destination: &Path) -> std::io::Result<bool> {
-    if !destination.try_exists()? {
-        return Ok(false);
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest destination must not be a symbolic link: {}",
+                destination.display()
+            ),
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "contest destination exists but is not a directory: {}",
+                destination.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
-
-    if destination.is_dir() {
-        return Ok(true);
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "contest destination exists but is not a directory: {}",
-            destination.display()
-        ),
-    ))
 }

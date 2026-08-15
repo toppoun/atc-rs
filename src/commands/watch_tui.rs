@@ -191,11 +191,14 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
 
-    let (contest, sample_counts) = load_watch_input(&destination)?;
-    watch_tui_at(&destination)
+    watch_tui_at(&destination, cli_contest)
 }
-pub(super) fn watch_tui_at(destination: &Path) -> Result<(), AppError> {
-    let (contest, sample_counts) = load_watch_input(destination)?;
+
+pub(super) fn watch_tui_at(
+    destination: &Path,
+    expected_contest_id: Option<&str>,
+) -> Result<(), AppError> {
+    let (contest, sample_counts) = load_watch_input(destination, expected_contest_id)?;
 
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
@@ -205,7 +208,7 @@ pub(super) fn watch_tui_at(destination: &Path) -> Result<(), AppError> {
     let (message_tx, message_rx) = mpsc::channel();
 
     // filesystem watcherも、このchannelへ送る。
-    let watcher_thread = start_watcher(&destination, &contest, message_tx.clone())?;
+    let watcher_thread = start_watcher(destination, &contest, message_tx.clone())?;
 
     // test workerも、同じchannelへ結果を送る。
     let test_worker = match TestWorker::start(
@@ -340,11 +343,17 @@ pub(super) fn watch_tui_at(destination: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn load_watch_input(destination: &Path) -> Result<(Contest, Vec<usize>), AppError> {
+fn load_watch_input(
+    destination: &Path,
+    expected_contest_id: Option<&str>,
+) -> Result<(Contest, Vec<usize>), AppError> {
     workspace::validate_workspace_marker(destination)?;
 
     let contest = workspace::load_metadata(destination)?;
     workspace::validate_contest_paths(&contest)?;
+    if let Some(contest_id) = expected_contest_id {
+        workspace::validate_contest_identity(&contest, contest_id)?;
+    }
 
     let sample_counts = contest
         .problems
@@ -404,7 +413,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded_contest, sample_counts) = load_watch_input(temp.path()).unwrap();
+        let (loaded_contest, sample_counts) = load_watch_input(temp.path(), None).unwrap();
 
         assert_eq!(loaded_contest.contest_id, "contest");
         assert_eq!(
@@ -416,6 +425,24 @@ mod tests {
             ["A", "B", "C"]
         );
         assert_eq!(sample_counts, [2, 0, 1]);
+    }
+
+    #[test]
+    fn requested_contest_id_must_match_loaded_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "arc001".to_string(),
+            problems: Vec::new(),
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+
+        let error = load_watch_input(temp.path(), Some("abc466"))
+            .expect_err("resolved destination metadata must match the requested contest");
+
+        assert!(matches!(
+            error,
+            AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
+        ));
     }
 
     #[test]

@@ -191,6 +191,9 @@ pub(crate) fn test(
     let contest = workspace::load_metadata(&destination)?;
 
     workspace::validate_contest_paths(&contest)?;
+    if let Some(contest_id) = cli_contest {
+        workspace::validate_contest_identity(&contest, contest_id)?;
+    }
 
     let problem = find_problem(&contest, problem_index)?;
 
