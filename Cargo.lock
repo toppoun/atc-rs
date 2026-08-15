@@ -91,6 +91,7 @@ dependencies = [
  "etcetera",
  "notify",
  "ratatui",
+ "regex",
  "reqwest",
  "scraper",
  "serde",

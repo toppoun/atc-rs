@@ -13,7 +13,9 @@ pub(crate) fn refresh(
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
-    let contest_id = resolve_refresh_contest_id(&cwd, contest.as_deref(), force)?;
+    let destination = workspace::resolve_contest_target(&cwd, contest.as_deref())?;
+
+    let contest_id = resolve_refresh_contest_id(&destination, contest.as_deref(), force)?;
 
     let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         atcoder::AtCoderClient::fixture(path)
@@ -21,7 +23,7 @@ pub(crate) fn refresh(
         atcoder::AtCoderClient::new()?
     };
 
-    refresh_at(&cwd, &contest_id, force, &atcoder, reporter)
+    refresh_at(&destination, &contest_id, force, &atcoder, reporter)
 }
 
 pub(super) fn resolve_refresh_contest_id(

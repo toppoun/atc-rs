@@ -28,6 +28,9 @@ pub enum Command {
     Test {
         problem: String,
 
+        #[arg(short = 'c', long)]
+        contest: Option<String>,
+
         #[arg(short = 'l', long = "language")]
         language: Option<Language>,
 
@@ -41,8 +44,11 @@ pub enum Command {
         language: Option<Language>,
     },
     Watch {
+        #[arg(short = 'c', long)]
+        contest: Option<String>,
+
         #[arg(long)]
-        tui: bool,
+        plain: bool,
     },
     Login,
 }
@@ -151,6 +157,7 @@ mod tests {
                 cli.command,
                 Command::Test {
                     problem: parsed,
+                    contest: None,
                     language: None,
                     debug: false,
                 } if parsed == problem
@@ -162,6 +169,7 @@ mod tests {
             cli.command,
             Command::Test {
                 problem,
+                contest: None,
                 language: Some(Language::Python),
                 debug: false,
             } if problem == "A"
@@ -172,6 +180,7 @@ mod tests {
             cli.command,
             Command::Test {
                 problem,
+                contest: None,
                 language: None,
                 debug: true,
             } if problem == "A"
@@ -207,13 +216,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_plain_watch() {
+    fn parses_watch_plain_option() {
         let cli = Cli::try_parse_from(["atc-rs", "watch"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Watch { tui: false }));
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                plain: false,
+                contest: None,
+            }
+        ));
 
-        let cli = Cli::try_parse_from(["atc-rs", "watch", "--tui"]).unwrap();
+        let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Watch { tui: true }));
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                plain: true,
+                contest: None,
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["atc-rs", "watch", "-c", "abc466"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                plain: false,
+                contest: Some(contest),
+            } if contest == "abc466"
+        ));
+    }
+    #[test]
+    fn parses_test_contest() {
+        let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-c", "abc466"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                problem,
+                contest: Some(contest),
+                language: None,
+                debug: false,
+            } if problem == "A" && contest == "abc466"
+        ));
     }
 }

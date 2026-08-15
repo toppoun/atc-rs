@@ -1,5 +1,6 @@
 use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -10,12 +11,108 @@ use tempfile::TempDir;
 
 const METADATA_VERSION: u32 = 1;
 
+const WORKSPACE_CONFIG_FILE: &str = ".atc-workspace.toml";
+const WORKSPACE_CONFIG_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContestMetadata {
     version: u32,
     contest_id: String,
     problems: Vec<Problem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceConfig {
+    version: u32,
+    paths: Vec<WorkspacePathRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspacePathRule {
+    pattern: String,
+    path: String,
+}
+
+fn load_workspace_config(root: &Path) -> io::Result<Option<WorkspaceConfig>> {
+    let path = root.join(WORKSPACE_CONFIG_FILE);
+
+    if !existing_regular_file(&path, "workspace config")? {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)?;
+    let config: WorkspaceConfig = toml::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    if config.version != WORKSPACE_CONFIG_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported workspace config version: {} (expected {WORKSPACE_CONFIG_VERSION})",
+                config.version
+            ),
+        ));
+    }
+
+    Ok(Some(config))
+}
+
+pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf> {
+    validate_path_component(contest_id, "contest ID")?;
+
+    let Some(config) = load_workspace_config(root)? else {
+        return contest_path(root, contest_id);
+    };
+
+    // rulesを検証・match
+    let mut matched_path: Option<&str> = None;
+
+    for rule in &config.paths {
+        validate_path_component(&rule.path, "workspace path").map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid workspace path {:?}: {error}", rule.path),
+            )
+        })?;
+
+        let regex = Regex::new(&rule.pattern).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid workspace regex {:?}: {error}", rule.pattern),
+            )
+        })?;
+
+        if !regex.is_match(contest_id) {
+            continue;
+        }
+
+        if matched_path.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("multiple workspace path rules match contest ID {contest_id:?}"),
+            ));
+        }
+
+        matched_path = Some(&rule.path);
+    }
+    let path = matched_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no workspace path rule matches contest ID {contest_id:?}"),
+        )
+    })?;
+
+    contest_path(&root.join(path), contest_id)
+}
+
+pub fn resolve_contest_target(root: &Path, contest_id: Option<&str>) -> io::Result<PathBuf> {
+    match contest_id {
+        Some(contest_id) => resolve_contest_path(root, contest_id),
+        None => Ok(root.to_path_buf()),
+    }
 }
 
 pub fn contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf> {

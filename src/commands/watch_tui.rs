@@ -187,10 +187,11 @@ fn send_source_changes(
     true
 }
 
-pub(crate) fn watch_tui() -> Result<(), AppError> {
+pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
+    let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
 
-    let (contest, sample_counts) = load_watch_input(&cwd)?;
+    let (contest, sample_counts) = load_watch_input(&destination)?;
 
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
@@ -200,11 +201,11 @@ pub(crate) fn watch_tui() -> Result<(), AppError> {
     let (message_tx, message_rx) = mpsc::channel();
 
     // filesystem watcherも、このchannelへ送る。
-    let watcher_thread = start_watcher(&cwd, &contest, message_tx.clone())?;
+    let watcher_thread = start_watcher(&destination, &contest, message_tx.clone())?;
 
     // test workerも、同じchannelへ結果を送る。
     let test_worker = match TestWorker::start(
-        cwd.clone(),
+        destination.clone(),
         contest.problems.clone(),
         config.runner,
         message_tx.clone(),

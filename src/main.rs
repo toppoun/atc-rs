@@ -48,20 +48,21 @@ fn run() -> Result<(), AppError> {
         }
         cli::Command::Test {
             problem,
+            contest,
             language,
             debug,
         } => {
-            commands::test(&problem, language, debug, &mut reporter)?;
+            commands::test(&problem, contest.as_deref(), language, debug, &mut reporter)?;
         }
         cli::Command::Create { name, language } => {
             commands::create(&name, language, &mut reporter)?
         }
-        cli::Command::Watch { tui: false } => {
-            commands::watch(&mut reporter)?;
-        }
-
-        cli::Command::Watch { tui: true } => {
-            commands::watch_tui()?;
+        cli::Command::Watch { plain, contest } => {
+            if plain {
+                commands::watch(contest.as_deref(), &mut reporter)?;
+            } else {
+                commands::watch_tui(contest.as_deref())?;
+            }
         }
         cli::Command::Login => {
             println!("login");

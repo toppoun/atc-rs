@@ -176,17 +176,20 @@ pub(super) fn validate_debug_language(language: Language, debug: bool) -> io::Re
 
 pub(crate) fn test(
     problem_index: &str,
+    cli_contest: Option<&str>,
     cli_language: Option<Language>,
     debug: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
 
-    // contest directoryとして正しいか
-    workspace::validate_workspace_marker(&cwd)?;
+    let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
+
+    workspace::validate_workspace_marker(&destination)?;
 
     // このcontestに本当にそのproblemがあるか
-    let contest = workspace::load_metadata(&cwd)?;
+    let contest = workspace::load_metadata(&destination)?;
+
     workspace::validate_contest_paths(&contest)?;
 
     let problem = find_problem(&contest, problem_index)?;
@@ -196,7 +199,14 @@ pub(crate) fn test(
 
     validate_debug_language(language, debug)?;
 
-    test_problem(&cwd, problem, language, &config.runner, debug, reporter)
+    test_problem(
+        &destination,
+        problem,
+        language,
+        &config.runner,
+        debug,
+        reporter,
+    )
 }
 
 // 通常の test / plain watch 用。

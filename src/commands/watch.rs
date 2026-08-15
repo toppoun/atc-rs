@@ -9,24 +9,30 @@ use std::path::Path;
 
 use super::watch_source::{build_watched_sources, resolve_watched_source};
 
-pub(crate) fn watch(reporter: &mut dyn Reporter) -> Result<(), AppError> {
+pub(crate) fn watch(
+    cli_contest: Option<&str>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
+    let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
 
-    workspace::validate_workspace_marker(&cwd)?;
+    workspace::validate_workspace_marker(&destination)?;
 
-    let contest = workspace::load_metadata(&cwd)?;
+    let contest = workspace::load_metadata(&destination)?;
     workspace::validate_contest_paths(&contest)?;
 
     let config = Config::load()?;
 
-    let file_watcher = watcher::FileWatcher::new(&cwd)?;
+    let file_watcher = watcher::FileWatcher::new(&destination)?;
 
-    reporter.report(Event::WatchStarted { destination: &cwd });
+    reporter.report(Event::WatchStarted {
+        destination: &destination,
+    });
 
     loop {
         let paths = file_watcher.next_batch()?;
 
-        process_changed_paths(&cwd, &contest, &config.runner, paths, reporter)?;
+        process_changed_paths(&destination, &contest, &config.runner, paths, reporter)?;
     }
 }
 
