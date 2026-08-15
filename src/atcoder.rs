@@ -1,8 +1,9 @@
+use crate::auth;
 use crate::model::{Contest, Problem, Sample};
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, RETRY_AFTER};
 
 use scraper::{Html, Selector};
 
@@ -27,6 +28,8 @@ const MAX_429_RETRIES: usize = 3;
 #[derive(Debug)]
 pub enum AtCoderError {
     Http(reqwest::Error),
+    Auth(std::io::Error),
+    InvalidStoredCookie,
     Fixture {
         path: PathBuf,
         source: std::io::Error,
@@ -48,6 +51,13 @@ impl fmt::Display for AtCoderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(error) => write!(formatter, "HTTP request failed: {error}"),
+            Self::Auth(error) => {
+                write!(formatter, "failed to load authentication cookie: {error}")
+            }
+
+            Self::InvalidStoredCookie => {
+                write!(formatter, "stored authentication cookie is invalid")
+            }
             Self::Fixture { path, source } => {
                 write!(
                     formatter,
@@ -71,8 +81,10 @@ impl std::error::Error for AtCoderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
+            Self::Auth(error) => Some(error),
             Self::Fixture { source, .. } => Some(source),
-            Self::Parse(_)
+            Self::InvalidStoredCookie
+            | Self::Parse(_)
             | Self::InvalidIdentifier { .. }
             | Self::InvalidProblemUrl(_)
             | Self::RateLimited { .. } => None,
@@ -104,9 +116,19 @@ impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
         let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
+        let mut headers = HeaderMap::new();
+
+        if let Some(cookie) = auth::load_cookie().map_err(AtCoderError::Auth)? {
+            let cookie =
+                HeaderValue::from_str(&cookie).map_err(|_| AtCoderError::InvalidStoredCookie)?;
+
+            headers.insert(COOKIE, cookie);
+        }
+
         let client = Client::builder()
             .user_agent(user_agent)
             .timeout(Duration::from_secs(10))
+            .default_headers(headers)
             .cookie_store(true)
             .build()?;
 

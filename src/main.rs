@@ -6,6 +6,7 @@ mod atcoder;
 // production workerへの接続は後続段階で行う。
 #[cfg_attr(not(test), allow(dead_code))]
 mod attempt;
+mod auth;
 mod cli;
 mod commands;
 mod comparator;
@@ -68,7 +69,7 @@ fn run() -> Result<(), AppError> {
             commands::contest(&contest_id, &mut reporter)?;
         }
         cli::Command::Login => {
-            println!("login");
+            commands::login()?;
         }
     }
     Ok(())

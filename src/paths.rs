@@ -17,6 +17,19 @@ pub fn debug_include_dir() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(cache_dir()?.join("include"))
 }
 
+pub fn state_dir() -> Result<PathBuf, etcetera::HomeDirError> {
+    let strategy = choose_base_strategy()?;
+
+    Ok(match strategy.state_dir() {
+        Some(path) => path.join("atc"),
+        None => strategy.data_dir().join("atc").join("state"),
+    })
+}
+
+pub fn cookie_file() -> Result<PathBuf, etcetera::HomeDirError> {
+    Ok(state_dir()?.join("cookie"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +52,13 @@ mod tests {
         assert!(cache.is_absolute());
         assert_eq!(cache.file_name().unwrap(), "atc");
         assert_eq!(include, cache.join("include"));
+    }
+    #[test]
+    fn cookie_file_is_under_state_directory() {
+        let state = state_dir().unwrap();
+        let cookie = cookie_file().unwrap();
+
+        assert!(state.is_absolute());
+        assert_eq!(cookie, state.join("cookie"));
     }
 }

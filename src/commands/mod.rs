@@ -1,6 +1,7 @@
 mod attempt_executor;
 mod contest;
 mod create;
+mod login;
 mod new;
 mod refresh;
 mod run_scheduler;
@@ -12,6 +13,7 @@ mod watch_worker;
 
 pub(crate) use contest::contest;
 pub(crate) use create::create;
+pub(crate) use login::login;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
 pub(crate) use test::test;
