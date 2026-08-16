@@ -248,6 +248,46 @@ inline void print_quoted_c_string(
     output << '"';
 }
 
+#ifdef __SIZEOF_INT128__
+inline void print_uint128(
+    std::ostream& output,
+    unsigned __int128 value
+) {
+    char buffer[40];
+    char* end = buffer + sizeof(buffer);
+    char* current = end;
+
+    do {
+        *--current = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+
+    output.write(
+        current,
+        static_cast<std::streamsize>(end - current)
+    );
+}
+
+inline void print_int128(
+    std::ostream& output,
+    __int128 value
+) {
+    if (value < 0) {
+        output.put('-');
+
+        unsigned __int128 magnitude =
+            static_cast<unsigned __int128>(-(value + 1)) + 1;
+
+        print_uint128(output, magnitude);
+    } else {
+        print_uint128(
+            output,
+            static_cast<unsigned __int128>(value)
+        );
+    }
+}
+#endif
+
 template <class T>
 void print_string_like(std::ostream& output, const T& value) {
     using Value = remove_cvref_t<T>;
@@ -344,6 +384,17 @@ void print_value(std::ostream& output, const T& value) {
         output << '\'';
         print_escaped_char(output, value, '\'');
         output << '\'';
+#ifdef __SIZEOF_INT128__
+    } else if constexpr (std::is_same_v<Value, __int128>) {
+        print_int128(output, value);
+    } else if constexpr (std::is_same_v<Value, unsigned __int128>) {
+        print_uint128(output, value);
+#endif
+    } else if constexpr (std::is_enum_v<Value>) {
+        print_value(
+            output,
+            static_cast<std::underlying_type_t<Value>>(value)
+        );
     } else if constexpr (StringLike<T>) {
         print_string_like(output, value);
     } else if constexpr (is_pair_v<T>) {
