@@ -137,6 +137,15 @@ inline void copy_format_state(
     destination.imbue(source.getloc());
 }
 
+inline bool needs_escape(char value, char quote) {
+    return value == '\\'
+        || value == '\n'
+        || value == '\r'
+        || value == '\t'
+        || value == '\0'
+        || value == quote;
+}
+
 inline void print_escaped_char(
     std::ostream& output,
     char value,
@@ -172,9 +181,70 @@ inline void print_quoted_string(
     std::string_view value
 ) {
     output << '"';
-    for (char character : value) {
-        print_escaped_char(output, character, '"');
+
+    std::size_t chunk_begin = 0;
+
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (!needs_escape(value[index], '"')) {
+            continue;
+        }
+
+        if (chunk_begin < index) {
+            output.write(
+                value.data() + chunk_begin,
+                static_cast<std::streamsize>(index - chunk_begin)
+            );
+        }
+
+        print_escaped_char(output, value[index], '"');
+        chunk_begin = index + 1;
     }
+
+    if (chunk_begin < value.size()) {
+        output.write(
+            value.data() + chunk_begin,
+            static_cast<std::streamsize>(value.size() - chunk_begin)
+        );
+    }
+
+    output << '"';
+}
+
+inline void print_quoted_c_string(
+    std::ostream& output,
+    const char* value
+) {
+    output << '"';
+
+    const char* chunk_begin = value;
+    const char* current = value;
+
+    while (*current != '\0') {
+        if (!needs_escape(*current, '"')) {
+            ++current;
+            continue;
+        }
+
+        if (chunk_begin != current) {
+            output.write(
+                chunk_begin,
+                static_cast<std::streamsize>(current - chunk_begin)
+            );
+        }
+
+        print_escaped_char(output, *current, '"');
+
+        ++current;
+        chunk_begin = current;
+    }
+
+    if (chunk_begin != current) {
+        output.write(
+            chunk_begin,
+            static_cast<std::streamsize>(current - chunk_begin)
+        );
+    }
+
     output << '"';
 }
 
@@ -187,7 +257,7 @@ void print_string_like(std::ostream& output, const T& value) {
             output << "<null>";
             return;
         }
-        print_quoted_string(output, std::string_view(value));
+        print_quoted_c_string(output, value);
     } else if constexpr (is_char_array_v<Value>) {
         constexpr std::size_t extent = std::extent_v<Value>;
         std::size_t size = extent;
