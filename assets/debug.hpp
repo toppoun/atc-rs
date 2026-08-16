@@ -17,6 +17,7 @@
 #include <stack>
 #include <string>
 #include <string_view>
+#include <syncstream>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -124,6 +125,17 @@ concept Streamable = requires(
 ) {
     output << value;
 };
+
+inline void copy_format_state(
+    std::ostream& destination,
+    const std::ostream& source
+) {
+    destination.flags(source.flags());
+    destination.precision(source.precision());
+    destination.width(source.width());
+    destination.fill(source.fill());
+    destination.imbue(source.getloc());
+}
 
 inline void print_escaped_char(
     std::ostream& output,
@@ -292,7 +304,12 @@ void print_value(std::ostream& output, const T& value) {
 }
 
 inline void write(std::size_t line, std::string_view) {
-    std::cerr << "[L" << line << "]\n";
+    std::osyncstream output(std::cerr);
+    copy_format_state(output, std::cerr);
+
+    output << "[L" << line << "]\n";
+
+    copy_format_state(std::cerr, output);
 }
 
 template <class... Values>
@@ -301,17 +318,22 @@ void write(
     std::string_view expressions,
     const Values&... values
 ) {
-    std::cerr << "[L" << line << "] " << expressions << " = ";
+    std::osyncstream output(std::cerr);
+    copy_format_state(output, std::cerr);
+
+    output << "[L" << line << "] " << expressions << " = ";
     bool first = true;
     (
         (
-            std::cerr << (first ? "" : ", "),
+            output << (first ? "" : ", "),
             first = false,
-            print_value(std::cerr, values)
+            print_value(output, values)
         ),
         ...
     );
-    std::cerr << '\n';
+    output << '\n';
+
+    copy_format_state(std::cerr, output);
 }
 
 }  // namespace detail
