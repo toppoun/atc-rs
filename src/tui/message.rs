@@ -34,12 +34,15 @@ pub enum TestEvent {
         number: usize,
         elapsed: Duration,
     },
-
     TestCaseWrongAnswer {
+        number: usize,
+        elapsed: Duration,
+    },
+
+    TestCaseComparison {
         number: usize,
         expected: String,
         actual: String,
-        elapsed: Duration,
     },
 
     TestCaseRuntimeError {

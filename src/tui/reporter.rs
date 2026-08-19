@@ -77,17 +77,18 @@ impl Reporter for ChannelReporter {
                 self.send(TestEvent::TestCaseAccepted { number, elapsed });
             }
 
-            Event::TestCaseWrongAnswer {
+            Event::TestCaseWrongAnswer { number, elapsed } => {
+                self.send(TestEvent::TestCaseWrongAnswer { number, elapsed });
+            }
+            Event::TestCaseComparison {
                 number,
                 expected,
                 actual,
-                elapsed,
             } => {
-                self.send(TestEvent::TestCaseWrongAnswer {
+                self.send(TestEvent::TestCaseComparison {
                     number,
                     expected: expected.to_owned(),
                     actual: actual.to_owned(),
-                    elapsed,
                 });
             }
 
@@ -179,9 +180,12 @@ mod tests {
 
         reporter.report(Event::TestCaseWrongAnswer {
             number: 2,
+            elapsed: Duration::from_millis(5),
+        });
+        reporter.report(Event::TestCaseComparison {
+            number: 2,
             expected: &expected,
             actual: &actual,
-            elapsed: Duration::from_millis(5),
         });
 
         drop(expected);
@@ -191,12 +195,25 @@ mod tests {
 
         match message {
             Message::RunEvent {
+                event: TestEvent::TestCaseWrongAnswer { number, elapsed },
+                ..
+            } => {
+                assert_eq!(number, 2);
+                assert_eq!(elapsed, Duration::from_millis(5));
+            }
+
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let message = rx.recv().unwrap();
+
+        match message {
+            Message::RunEvent {
                 event:
-                    TestEvent::TestCaseWrongAnswer {
+                    TestEvent::TestCaseComparison {
                         number,
                         expected,
                         actual,
-                        ..
                     },
                 ..
             } => {

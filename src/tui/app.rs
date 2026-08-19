@@ -457,6 +457,7 @@ impl WatchApp {
         let affects_current_detail = self.selected_problem == problem
             && match &event {
                 TestEvent::TestCaseAccepted { number, .. }
+                | TestEvent::TestCaseComparison { number, .. }
                 | TestEvent::TestCaseWrongAnswer { number, .. }
                 | TestEvent::TestCaseRuntimeError { number, .. }
                 | TestEvent::TestCaseTimedOut { number, .. }
@@ -537,18 +538,13 @@ impl WatchApp {
 
                 case.verdict = CaseVerdict::Accepted;
                 case.elapsed = Some(elapsed);
-                case.expected = None;
-                case.actual = None;
 
                 true
             }
 
-            TestEvent::TestCaseWrongAnswer {
-                number,
-                expected,
-                actual,
-                elapsed,
-            } if run.phase == RunPhase::Running && run.test_run_started => {
+            TestEvent::TestCaseWrongAnswer { number, elapsed }
+                if run.phase == RunPhase::Running && run.test_run_started =>
+            {
                 let Some(case) = case_mut(run, number) else {
                     return false;
                 };
@@ -558,6 +554,22 @@ impl WatchApp {
 
                 case.verdict = CaseVerdict::WrongAnswer;
                 case.elapsed = Some(elapsed);
+
+                true
+            }
+            TestEvent::TestCaseComparison {
+                number,
+                expected,
+                actual,
+            } if run.phase == RunPhase::Running && run.test_run_started => {
+                let Some(case) = case_mut(run, number) else {
+                    return false;
+                };
+
+                if case.expected.is_some() || case.actual.is_some() {
+                    return false;
+                }
+
                 case.expected = Some(Arc::new(expected));
                 case.actual = Some(Arc::new(actual));
 
@@ -576,8 +588,6 @@ impl WatchApp {
 
                 case.verdict = CaseVerdict::RuntimeError;
                 case.elapsed = Some(elapsed);
-                case.expected = None;
-                case.actual = None;
 
                 true
             }
@@ -594,8 +604,6 @@ impl WatchApp {
 
                 case.verdict = CaseVerdict::TimedOut;
                 case.elapsed = Some(elapsed);
-                case.expected = None;
-                case.actual = None;
 
                 true
             }
@@ -1148,9 +1156,17 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 2,
-                expected: "Yes\n".to_string(),
-                actual: "No\n".to_string(),
                 elapsed: Duration::from_millis(6),
+            },
+        ));
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseComparison {
+                number: 2,
+                expected: "Yes\n".to_owned(),
+                actual: "No\n".to_owned(),
             },
         ));
 
@@ -1202,9 +1218,16 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
                 expected,
                 actual,
-                elapsed: Duration::from_millis(1),
             },
         ));
         assert!(app.run_event(
@@ -1298,8 +1321,6 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
-                expected: "expected".to_string(),
-                actual: "actual".to_string(),
                 elapsed: Duration::from_millis(5),
             },
         ));
@@ -1425,8 +1446,6 @@ mod tests {
             first.run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
-                expected: "Yes\n".to_string(),
-                actual: "No\n".to_string(),
                 elapsed: Duration::from_millis(5),
             },
         );
@@ -1684,9 +1703,16 @@ mod tests {
             run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 2,
-                expected: "expected\n".to_string(),
-                actual: "actual\n".to_string(),
                 elapsed: Duration::from_millis(2),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 2,
+                expected: "...".to_owned(),
+                actual: "...".to_owned(),
             },
         ));
         assert!(app.run_event(

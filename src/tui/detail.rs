@@ -203,40 +203,28 @@ impl<'a> DetailDocument<'a> {
         match case.verdict {
             CaseVerdict::Pending => {
                 self.push_static("\n\nPending...");
+                return;
             }
 
-            CaseVerdict::Accepted => {
-                self.push_static("\n\nAccepted");
+            CaseVerdict::Accepted => {}
 
-                if let Some(stderr) = case.stderr.as_ref() {
-                    self.push_shared_section("stderr", stderr);
-                }
-            }
-
-            CaseVerdict::WrongAnswer => {
-                self.push_optional_shared_section("expected", case.expected.as_ref());
-                self.push_optional_shared_section("actual", case.actual.as_ref());
-
-                if let Some(stderr) = case.stderr.as_ref() {
-                    self.push_shared_section("stderr", stderr);
-                }
-            }
+            CaseVerdict::WrongAnswer => {}
 
             CaseVerdict::RuntimeError => {
                 self.push_static("\n\nRuntime Error");
-
-                if let Some(stderr) = case.stderr.as_ref() {
-                    self.push_shared_section("stderr", stderr);
-                }
             }
 
             CaseVerdict::TimedOut => {
                 self.push_static("\n\nTime Limit Exceeded");
-
-                if let Some(stderr) = case.stderr.as_ref() {
-                    self.push_shared_section("stderr", stderr);
-                }
             }
+        }
+
+        self.push_optional_shared_section("expected", case.expected.as_ref());
+
+        self.push_optional_shared_section("actual", case.actual.as_ref());
+
+        if let Some(stderr) = case.stderr.as_ref() {
+            self.push_shared_section("stderr", stderr);
         }
     }
 
@@ -247,10 +235,6 @@ impl<'a> DetailDocument<'a> {
     ) {
         if let Some(content) = content {
             self.push_shared_section(label, content);
-        } else {
-            self.push_static("\n\n");
-            self.push_static(label);
-            self.push_static("\n(empty)");
         }
     }
 
@@ -426,9 +410,16 @@ mod tests {
             run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
                 expected,
                 actual,
-                elapsed: Duration::from_millis(1),
             },
         ));
         assert!(app.run_event(0, run_id, TestEvent::TestCaseStderr { number: 1, stderr },));
@@ -622,9 +613,17 @@ mod tests {
             run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
+                elapsed: Duration::ZERO,
+            },
+        ));
+
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
                 expected: String::new(),
                 actual: String::new(),
-                elapsed: Duration::ZERO,
             },
         ));
 
@@ -657,9 +656,16 @@ mod tests {
             run_id,
             TestEvent::TestCaseWrongAnswer {
                 number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
                 expected,
                 actual,
-                elapsed: Duration::from_millis(1),
             },
         ));
         assert!(app.run_event(0, run_id, TestEvent::TestCaseStderr { number: 1, stderr },));

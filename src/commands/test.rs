@@ -36,6 +36,7 @@ pub(super) fn report_case_result(
     number: usize,
     sample: &Sample,
     result: &runner::ExecutionResult,
+    debug: bool,
     reporter: &mut dyn Reporter,
 ) -> CaseVerdict {
     let verdict = judge_case(sample, result);
@@ -51,8 +52,6 @@ pub(super) fn report_case_result(
         CaseVerdict::WrongAnswer => {
             reporter.report(Event::TestCaseWrongAnswer {
                 number,
-                expected: &sample.output,
-                actual: &result.stdout,
                 elapsed: result.elapsed,
             });
         }
@@ -71,6 +70,13 @@ pub(super) fn report_case_result(
             });
         }
     }
+    if debug || matches!(verdict, CaseVerdict::WrongAnswer) {
+        reporter.report(Event::TestCaseComparison {
+            number,
+            expected: &sample.output,
+            actual: &result.stdout,
+        });
+    }
 
     if !result.stderr.is_empty() {
         reporter.report(Event::TestCaseStderr {
@@ -85,6 +91,7 @@ pub(super) fn report_case_result(
 pub(super) fn run_test_cases(
     problem_index: &str,
     samples: &[Sample],
+    debug: bool,
     mut execute_case: impl FnMut(&Sample) -> io::Result<runner::ExecutionResult>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
@@ -98,7 +105,7 @@ pub(super) fn run_test_cases(
     for (index, sample) in samples.iter().enumerate() {
         let result = execute_case(sample)?;
 
-        let verdict = report_case_result(index + 1, sample, &result, reporter);
+        let verdict = report_case_result(index + 1, sample, &result, debug, reporter);
 
         if matches!(verdict, CaseVerdict::Accepted) {
             accepted += 1;
@@ -327,6 +334,7 @@ fn test_problem_with_debug_header_and_cancel(
             run_test_cases(
                 &problem.index,
                 &samples,
+                debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {
                         runner::execute_python_with_cancel(
@@ -393,6 +401,7 @@ fn test_problem_with_debug_header_and_cancel(
             run_test_cases(
                 &problem.index,
                 &samples,
+                debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {
                         runner::execute_with_cancel(

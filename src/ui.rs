@@ -58,9 +58,13 @@ pub enum Event<'a> {
 
     TestCaseWrongAnswer {
         number: usize,
+        elapsed: Duration,
+    },
+
+    TestCaseComparison {
+        number: usize,
         expected: &'a str,
         actual: &'a str,
-        elapsed: Duration,
     },
 
     TestCaseRuntimeError {
@@ -148,6 +152,15 @@ impl TestDisplayState {
             case.stderr = Some(stderr.to_owned());
         }
     }
+    fn record_comparison(&mut self, number: usize, expected: &str, actual: &str) {
+        if let Some(case) = self.cases.iter_mut().find(|case| case.number == number)
+            && case.expected.is_none()
+            && case.actual.is_none()
+        {
+            case.expected = Some(expected.to_owned());
+            case.actual = Some(actual.to_owned());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -223,21 +236,25 @@ impl Reporter for TerminalReporter {
                 }
             }
 
-            Event::TestCaseWrongAnswer {
-                number,
-                expected,
-                actual,
-                elapsed,
-            } => {
+            Event::TestCaseWrongAnswer { number, elapsed } => {
                 if let Some(test) = &mut self.current_test {
                     test.record_case(CaseDisplay {
                         number,
                         verdict: DisplayVerdict::Wa,
                         elapsed,
-                        expected: Some(expected.to_owned()),
-                        actual: Some(actual.to_owned()),
+                        expected: None,
+                        actual: None,
                         stderr: None,
                     });
+                }
+            }
+            Event::TestCaseComparison {
+                number,
+                expected,
+                actual,
+            } => {
+                if let Some(test) = &mut self.current_test {
+                    test.record_comparison(number, expected, actual);
                 }
             }
             Event::TestCaseRuntimeError { number, elapsed } => {
@@ -373,7 +390,10 @@ impl TerminalReporter {
                 .as_deref()
                 .is_some_and(|stderr| !stderr.is_empty());
 
-            let needs_detail = !matches!(case.verdict, DisplayVerdict::Ac) || has_stderr;
+            let has_comparison = case.expected.is_some() || case.actual.is_some();
+
+            let needs_detail =
+                !matches!(case.verdict, DisplayVerdict::Ac) || has_comparison || has_stderr;
 
             if !needs_detail {
                 continue;
@@ -444,9 +464,12 @@ mod tests {
         });
         reporter.report(Event::TestCaseWrongAnswer {
             number: 2,
+            elapsed: Duration::from_micros(6_800),
+        });
+        reporter.report(Event::TestCaseComparison {
+            number: 2,
             expected: "",
             actual: "",
-            elapsed: Duration::from_micros(6_800),
         });
         reporter.report(Event::TestCaseStderr {
             number: 2,
@@ -508,8 +531,6 @@ mod tests {
 
         reporter.report(Event::TestCaseWrongAnswer {
             number: 1,
-            expected: "expected",
-            actual: "actual",
             elapsed: ELAPSED,
         });
         reporter.report(Event::TestCaseStderr {

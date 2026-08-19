@@ -187,6 +187,13 @@ impl Reporter for RecordingReporter {
             } => {
                 format!("test-finished:{problem_index}:{accepted}:{total_cases}")
             }
+            Event::TestCaseComparison {
+                number,
+                expected,
+                actual,
+            } => {
+                format!("case-comparison:{number}:expected={expected:?}:actual={actual:?}")
+            }
         };
         self.events.push(event);
     }
@@ -535,9 +542,15 @@ fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() 
 
     assert_eq!(reporter.events[0], "test-started:A:1");
     assert_eq!(reporter.events[1], "case-accepted:1");
-    assert!(reporter.events[2].starts_with("case-stderr:1:"));
-    assert!(reporter.events[2].contains("x = 7"));
-    assert_eq!(reporter.events[3], "test-finished:A:1:1");
+
+    assert!(reporter.events[2].starts_with("case-comparison:1:"));
+    assert!(reporter.events[2].contains("expected="));
+    assert!(reporter.events[2].contains("actual="));
+
+    assert!(reporter.events[3].starts_with("case-stderr:1:"));
+    assert!(reporter.events[3].contains("x = 7"));
+
+    assert_eq!(reporter.events[4], "test-finished:A:1:1");
 }
 
 #[test]
@@ -647,6 +660,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
         run_test_cases(
             "A",
             &samples,
+            false,
             |_| Ok(results.pop_front().unwrap()),
             &mut reporter,
         )
@@ -659,6 +673,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
         [
             "test-started:A:4",
             "case-wrong-answer:1",
+            r#"case-comparison:1:expected="expected\n":actual="wrong\n""#,
             "case-stderr:1:wa stderr",
             "case-runtime-error:2",
             "case-stderr:2:runtime",
@@ -701,6 +716,7 @@ fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
     run_test_cases(
         "A",
         &samples,
+        false,
         |_| Ok(results.pop_front().unwrap()),
         &mut reporter,
     )
@@ -708,6 +724,7 @@ fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
     run_test_cases(
         "B",
         &samples[..1],
+        false,
         |_| {
             Ok(execution(
                 ExecutionOutcome::Exited(exit_status(0)),
@@ -725,6 +742,7 @@ fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
             "test-started:A:3",
             "case-accepted:1",
             "case-wrong-answer:2",
+            r#"case-comparison:2:expected="expected\n":actual="wrong\n""#,
             "case-stderr:2:wa",
             "case-accepted:3",
             "case-stderr:3:debug",
@@ -749,7 +767,7 @@ fn stderr_does_not_change_an_accepted_stdout_verdict() {
     );
     let mut reporter = RecordingReporter::default();
 
-    report_case_result(1, &sample, &result, &mut reporter);
+    report_case_result(1, &sample, &result, false, &mut reporter);
 
     assert_eq!(
         reporter.events,
