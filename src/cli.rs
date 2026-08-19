@@ -1,7 +1,19 @@
 use crate::language::Language;
-use clap::{Parser, Subcommand};
+use clap::{Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-/// AtCoder用CLIツール
+const LOGO: &str = r#"
+
+ █████╗ ████████╗ ██████╗
+██╔══██╗╚══██╔══╝██╔════╝
+███████║   ██║   ██║     
+██╔══██║   ██║   ██║     
+██║  ██║   ██║   ╚██████╗
+╚═╝  ╚═╝   ╚═╝    ╚═════╝"#;
+
+const GRAY: &str = "\x1b[90m";
+const RESET: &str = "\x1b[0m";
+
+/// Fast AtCoder workflow from your terminal.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
@@ -9,14 +21,52 @@ pub struct Cli {
     pub command: Command,
 }
 
+impl Cli {
+    pub fn parse() -> Self {
+        let mut command = <Self as CommandFactory>::command();
+
+        command = command.override_help(render_help());
+
+        let mut matches = command.get_matches();
+
+        Self::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(flatten)]
+    Contest(ContestCommand),
+
+    #[command(flatten)]
+    RunTest(RunTestCommand),
+
+    #[command(flatten)]
+    Files(FileCommand),
+
+    #[command(flatten)]
+    Account(AccountCommand),
+}
+
+// ============================================================
+// Contest
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum ContestCommand {
+    /// Create a contest workspace
     New {
         contest: String,
 
         #[arg(short = 'l', long)]
         language: Option<Language>,
     },
+
+    /// Open or create a contest
+    #[command(alias = "c")]
+    Contest { contest_id: String },
+
+    /// Refresh contest metadata and samples
     Refresh {
         #[arg(short, long)]
         contest: Option<String>,
@@ -25,6 +75,15 @@ pub enum Command {
         #[arg(short, long)]
         force: bool,
     },
+}
+
+// ============================================================
+// Run & Test
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum RunTestCommand {
+    /// Run sample tests
     Test {
         problem: String,
 
@@ -37,12 +96,8 @@ pub enum Command {
         #[arg(short, long)]
         debug: bool,
     },
-    Create {
-        name: String,
 
-        #[arg(short = 'l', long)]
-        language: Option<Language>,
-    },
+    /// Watch sources and run tests
     Watch {
         #[arg(short = 'c', long)]
         contest: Option<String>,
@@ -50,11 +105,78 @@ pub enum Command {
         #[arg(long)]
         plain: bool,
     },
-    #[command(alias = "c")]
-    Contest {
-        contest_id: String,
+}
+
+// ============================================================
+// Files
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum FileCommand {
+    /// Create a source file
+    Create {
+        name: String,
+
+        #[arg(short = 'l', long)]
+        language: Option<Language>,
     },
+}
+
+// ============================================================
+// Account
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum AccountCommand {
+    /// Check AtCoder authentication
     Login,
+}
+
+fn render_category<T: Subcommand>(title: &str) -> String {
+    let command = T::augment_subcommands(ClapCommand::new("category"));
+
+    let mut out = String::new();
+    out.push_str(title);
+    out.push('\n');
+
+    for subcommand in command.get_subcommands() {
+        let name = subcommand.get_name();
+        let about = subcommand
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+
+        out.push_str(&format!("  {name:<10}{about}\n"));
+    }
+
+    out
+}
+
+fn render_help() -> String {
+    format!(
+        "{LOGO}
+{GRAY}Fast AtCoder workflow from your terminal.{RESET}
+
+Usage:
+  atc <command> [options]
+
+{}
+
+{}
+
+{}
+
+{}
+
+Options
+  -h, --help       Show help
+  -V, --version    Show version
+",
+        render_category::<ContestCommand>("Contest").trim_end(),
+        render_category::<RunTestCommand>("Run & Test").trim_end(),
+        render_category::<FileCommand>("Files").trim_end(),
+        render_category::<AccountCommand>("Account").trim_end(),
+    )
 }
 
 #[cfg(test)]
@@ -67,28 +189,28 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::New {
+            Command::Contest(ContestCommand::New {
                 contest,
                 language: None,
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "-l", "python"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::New {
+            Command::Contest(ContestCommand::New {
                 contest,
                 language: Some(Language::Python),
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "--language", "cpp"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::New {
+            Command::Contest(ContestCommand::New {
                 contest,
                 language: Some(Language::Cpp),
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
     }
 
@@ -96,59 +218,66 @@ mod tests {
     fn parses_refresh_with_and_without_contest_override() {
         let cli =
             Cli::try_parse_from(["atc", "refresh"]).expect("refresh without override should parse");
+
         assert!(matches!(
             cli.command,
-            Command::Refresh {
+            Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: false,
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["atc", "refresh", "-c", "abc466"])
             .expect("refresh with override should parse");
+
         assert!(matches!(
             cli.command,
-            Command::Refresh {
+            Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: false,
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
 
         let cli = Cli::try_parse_from(["atc", "refresh", "-c", "abc350", "-f"])
             .expect("forced refresh should parse");
+
         assert!(matches!(
             cli.command,
-            Command::Refresh {
+            Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
-            } if contest == "abc350"
+            }) if contest == "abc350"
         ));
 
         let cli = Cli::try_parse_from(["atc", "refresh", "-f"])
             .expect("forced refresh without an override should parse");
+
         assert!(matches!(
             cli.command,
-            Command::Refresh {
+            Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: true,
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["atc", "refresh", "--contest", "abc350", "--force"])
             .expect("long forced refresh options should parse");
+
         assert!(matches!(
             cli.command,
-            Command::Refresh {
+            Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
-            } if contest == "abc350"
+            }) if contest == "abc350"
         ));
 
         let mut command = Cli::command();
         let refresh = command
             .find_subcommand_mut("refresh")
             .expect("refresh subcommand should exist");
+
         let help = refresh.render_long_help().to_string();
+
         assert!(help.contains("-f, --force"));
         assert!(help.contains("Rebuild the current directory without trusting workspace metadata"));
     }
@@ -157,37 +286,40 @@ mod tests {
     fn parses_test_problem_and_optional_language() {
         for problem in ["A", "a"] {
             let cli = Cli::try_parse_from(["atc-rs", "test", problem]).unwrap();
+
             assert!(matches!(
                 cli.command,
-                Command::Test {
+                Command::RunTest(RunTestCommand::Test {
                     problem: parsed,
                     contest: None,
                     language: None,
                     debug: false,
-                } if parsed == problem
+                }) if parsed == problem
             ));
         }
 
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-l", "python"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: None,
                 language: Some(Language::Python),
                 debug: false,
-            } if problem == "A"
+            }) if problem == "A"
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "--debug"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: None,
                 language: None,
                 debug: true,
-            } if problem == "A"
+            }) if problem == "A"
         ));
     }
 
@@ -199,21 +331,23 @@ mod tests {
     #[test]
     fn parses_create_name_and_optional_language() {
         let cli = Cli::try_parse_from(["atc-rs", "create", "A"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Create {
+            Command::Files(FileCommand::Create {
                 name,
                 language: None,
-            } if name == "A"
+            }) if name == "A"
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "create", "main", "-l", "python"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Create {
+            Command::Files(FileCommand::Create {
                 name,
                 language: Some(Language::Python),
-            } if name == "main"
+            }) if name == "main"
         ));
 
         assert!(Cli::try_parse_from(["atc-rs", "create", "A", "-l", "py"]).is_err());
@@ -225,75 +359,86 @@ mod tests {
 
         assert!(matches!(
             cli.command,
-            Command::Watch {
+            Command::RunTest(RunTestCommand::Watch {
                 plain: false,
                 contest: None,
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            Command::Watch {
+            Command::RunTest(RunTestCommand::Watch {
                 plain: true,
                 contest: None,
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "watch", "-c", "abc466"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Watch {
+            Command::RunTest(RunTestCommand::Watch {
                 plain: false,
                 contest: Some(contest),
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
 
         let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain", "-c", "abc466"]).unwrap();
+
         assert!(matches!(
             cli.command,
-            Command::Watch {
+            Command::RunTest(RunTestCommand::Watch {
                 plain: true,
                 contest: Some(contest),
-            } if contest == "abc466"
+            }) if contest == "abc466"
         ));
     }
+
     #[test]
     fn parses_test_contest() {
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-c", "abc466"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: Some(contest),
                 language: None,
                 debug: false,
-            } if problem == "A" && contest == "abc466"
+            }) if problem == "A" && contest == "abc466"
         ));
     }
+
     #[test]
     fn parses_contest() {
         let cli = Cli::try_parse_from(["atc-rs", "contest", "abc466"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            Command::Contest { contest_id }
+            Command::Contest(ContestCommand::Contest { contest_id })
                 if contest_id == "abc466"
         ));
+
         let cli = Cli::try_parse_from(["atc-rs", "c", "abc471"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            Command::Contest { contest_id } if contest_id == "abc471"
+            Command::Contest(ContestCommand::Contest { contest_id })
+                if contest_id == "abc471"
         ));
     }
 
     #[test]
     fn parses_login_without_arguments() {
         let cli = Cli::try_parse_from(["atc-rs", "login"]).unwrap();
-        assert!(matches!(cli.command, Command::Login));
+
+        assert!(matches!(
+            cli.command,
+            Command::Account(AccountCommand::Login)
+        ));
+
         assert!(Cli::try_parse_from(["atc-rs", "login", "extra"]).is_err());
     }
 }

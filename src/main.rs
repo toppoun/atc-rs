@@ -41,36 +41,43 @@ fn run() -> Result<(), AppError> {
     let mut reporter = TerminalReporter::default();
 
     match cli.command {
-        cli::Command::New { contest, language } => {
+        cli::Command::Contest(cli::ContestCommand::New { contest, language }) => {
             commands::new(&contest, language, &mut reporter)?;
         }
-        cli::Command::Refresh { contest, force } => {
-            commands::refresh(contest, force, &mut reporter)?
+
+        cli::Command::Contest(cli::ContestCommand::Refresh { contest, force }) => {
+            commands::refresh(contest, force, &mut reporter)?;
         }
-        cli::Command::Test {
+
+        cli::Command::Contest(cli::ContestCommand::Contest { contest_id }) => {
+            commands::contest(&contest_id, &mut reporter)?;
+        }
+
+        cli::Command::RunTest(cli::RunTestCommand::Test {
             problem,
             contest,
             language,
             debug,
-        } => {
+        }) => {
             commands::test(&problem, contest.as_deref(), language, debug, &mut reporter)?;
         }
-        cli::Command::Create { name, language } => {
-            commands::create(&name, language, &mut reporter)?
-        }
-        cli::Command::Watch { plain, contest } => {
+
+        cli::Command::RunTest(cli::RunTestCommand::Watch { plain, contest }) => {
             if plain {
                 commands::watch(contest.as_deref(), &mut reporter)?;
             } else {
                 commands::watch_tui(contest.as_deref())?;
             }
         }
-        cli::Command::Contest { contest_id } => {
-            commands::contest(&contest_id, &mut reporter)?;
+
+        cli::Command::Files(cli::FileCommand::Create { name, language }) => {
+            commands::create(&name, language, &mut reporter)?;
         }
-        cli::Command::Login => {
+
+        cli::Command::Account(cli::AccountCommand::Login) => {
             commands::login()?;
         }
     }
+
     Ok(())
 }
