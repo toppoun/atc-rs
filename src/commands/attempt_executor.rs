@@ -8,9 +8,10 @@ use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
 use crate::config::RunnerConfig;
 use crate::error::AppError;
 use crate::model::Problem;
-use crate::tui::message::{Message, RunId, RunRequest};
+use crate::tui::message::{Message, RunId, RunKind, RunRequest};
 use crate::tui::reporter::ChannelReporter;
 
+use super::stress::build_request as build_stress_request;
 use super::test::test_problem_with_cancel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub(super) struct AttemptCompletion {
 
 pub(super) struct AttemptExecutor {
     destination: Arc<PathBuf>,
+    contest_id: Arc<String>,
     problems: Arc<Vec<Problem>>,
     runner_config: Arc<RunnerConfig>,
     message_tx: Sender<Message>,
@@ -29,12 +31,14 @@ pub(super) struct AttemptExecutor {
 impl AttemptExecutor {
     pub(super) fn new(
         destination: PathBuf,
+        contest_id: String,
         problems: Vec<Problem>,
         runner_config: RunnerConfig,
         message_tx: Sender<Message>,
     ) -> Self {
         Self {
             destination: Arc::new(destination),
+            contest_id: Arc::new(contest_id),
             problems: Arc::new(problems),
             runner_config: Arc::new(runner_config),
             message_tx,
@@ -47,6 +51,7 @@ impl AttemptExecutor {
         completion_tx: Sender<AttemptCompletion>,
     ) -> io::Result<ActiveAttempt> {
         let destination = Arc::clone(&self.destination);
+        let contest_id = Arc::clone(&self.contest_id);
         let problems = Arc::clone(&self.problems);
         let runner_config = Arc::clone(&self.runner_config);
         let message_tx = self.message_tx.clone();
@@ -64,15 +69,36 @@ impl AttemptExecutor {
                         )
                     })?;
 
-                    test_problem_with_cancel(
-                        &destination,
-                        problem,
-                        request.language,
-                        &runner_config,
-                        request.debug,
-                        reporter,
-                        is_cancelled,
-                    )
+                    match request.kind {
+                        RunKind::Samples => test_problem_with_cancel(
+                            &destination,
+                            problem,
+                            request.language,
+                            &runner_config,
+                            request.debug,
+                            reporter,
+                            is_cancelled,
+                        ),
+                        RunKind::Stress { base_seed, count } => {
+                            let stress_request = build_stress_request(
+                                &destination,
+                                contest_id.as_str(),
+                                problem,
+                                request.language,
+                                &runner_config,
+                                request.debug,
+                                base_seed,
+                                count,
+                            )?;
+                            match crate::stress::run(&stress_request, reporter, is_cancelled)? {
+                                crate::stress::StressOutcome::Cancelled { .. } => Err(
+                                    crate::attempt::clean_cancellation_io_error().into(),
+                                ),
+                                crate::stress::StressOutcome::Completed { .. }
+                                | crate::stress::StressOutcome::Failed { .. } => Ok(()),
+                            }
+                        }
+                    }
                 },
             )
         })
@@ -162,7 +188,7 @@ fn run_reported_attempt(
     request: RunRequest,
     message_tx: Sender<Message>,
     cancellation: &AttemptCancellation,
-    test: impl FnOnce(&mut ChannelReporter, &dyn Fn() -> bool) -> Result<(), AppError>,
+    run: impl FnOnce(&mut ChannelReporter, &dyn Fn() -> bool) -> Result<(), AppError>,
 ) -> AttemptOutcome {
     run_attempt(cancellation, |is_cancelled| {
         message_tx
@@ -179,24 +205,24 @@ fn run_reported_attempt(
 
         let mut reporter =
             ChannelReporter::new(request.run_id, request.problem, message_tx.clone());
-        let test_result = test(&mut reporter, is_cancelled);
+        let run_result = run(&mut reporter, is_cancelled);
         let reporter_result = reporter.finish().map_err(AppError::from);
 
-        combine_test_and_reporter_results(test_result, reporter_result)
+        combine_run_and_reporter_results(run_result, reporter_result)
     })
 }
 
-fn combine_test_and_reporter_results(
-    test_result: Result<(), AppError>,
+fn combine_run_and_reporter_results(
+    run_result: Result<(), AppError>,
     reporter_result: Result<(), AppError>,
 ) -> Result<(), AppError> {
-    match (test_result, reporter_result) {
+    match (run_result, reporter_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         // Neither failure is discarded. Combining them into an unmarked infrastructure error is
-        // also intentional: even a clean test cancellation is Failed if reporter cleanup failed.
-        (Err(test_error), Err(reporter_error)) => Err(io::Error::other(format!(
-            "test attempt failed: {test_error}; reporter also failed: {reporter_error}"
+        // also intentional: even a clean run cancellation is Failed if reporter cleanup failed.
+        (Err(run_error), Err(reporter_error)) => Err(io::Error::other(format!(
+            "run attempt failed: {run_error}; reporter also failed: {reporter_error}"
         ))
         .into()),
     }
@@ -220,6 +246,7 @@ mod tests {
             problem: 0,
             language: Language::Python,
             debug: false,
+            kind: RunKind::Samples,
         }
     }
 
@@ -239,6 +266,7 @@ mod tests {
         std::fs::write(temp.path().join("A.py"), "pass\n").unwrap();
         let executor = AttemptExecutor::new(
             temp.path().to_path_buf(),
+            "abc123".to_string(),
             vec![problem()],
             RunnerConfig::default(),
             message_tx,
@@ -452,7 +480,7 @@ mod tests {
         ));
 
         let error =
-            combine_test_and_reporter_results(Err(test_error), Err(reporter_error)).unwrap_err();
+            combine_run_and_reporter_results(Err(test_error), Err(reporter_error)).unwrap_err();
 
         assert!(matches!(error, AppError::Io(ref error) if
             !io_error_is_clean_cancellation(error)

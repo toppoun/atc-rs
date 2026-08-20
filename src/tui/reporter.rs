@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 
 use crate::ui::{Event, Reporter};
 
-use super::message::{Message, RunId, TestEvent};
+use super::message::{Message, RunId, StressEvent, TestEvent};
 
 pub struct ChannelReporter {
     run_id: RunId,
@@ -22,25 +22,33 @@ impl ChannelReporter {
         }
     }
 
-    fn send(&mut self, event: TestEvent) {
+    fn send_message(&mut self, message: Message) {
         if self.send_error.is_some() {
             return;
         }
 
-        if self
-            .tx
-            .send(Message::RunEvent {
-                run_id: self.run_id,
-                problem: self.problem,
-                event,
-            })
-            .is_err()
-        {
+        if self.tx.send(message).is_err() {
             self.send_error = Some(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUI message receiver disconnected",
             ));
         }
+    }
+
+    fn send(&mut self, event: TestEvent) {
+        self.send_message(Message::RunEvent {
+            run_id: self.run_id,
+            problem: self.problem,
+            event,
+        });
+    }
+
+    fn send_stress(&mut self, event: StressEvent) {
+        self.send_message(Message::StressEvent {
+            run_id: self.run_id,
+            problem: self.problem,
+            event,
+        });
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -118,6 +126,63 @@ impl Reporter for ChannelReporter {
                 });
             }
 
+            Event::StressStarted {
+                base_seed,
+                case_limit,
+                ..
+            } => {
+                self.send_stress(StressEvent::Started {
+                    base_seed,
+                    case_limit,
+                });
+            }
+
+            Event::StressProgress {
+                case_number,
+                seed,
+                passed,
+                elapsed,
+                cases_per_second,
+                ..
+            } => {
+                self.send_stress(StressEvent::Progress {
+                    case_number,
+                    seed,
+                    passed,
+                    elapsed,
+                    cases_per_second,
+                });
+            }
+
+            Event::StressFailed {
+                failure,
+                saved_to,
+                elapsed,
+                ..
+            } => {
+                self.send_stress(StressEvent::Failed {
+                    kind: failure.kind,
+                    case_number: failure.case_number,
+                    base_seed: failure.base_seed,
+                    seed: failure.seed,
+                    input: failure.input.clone(),
+                    expected: failure.expected.clone(),
+                    actual: failure.actual.clone(),
+                    stderr: failure.stderr.clone(),
+                    candidate_elapsed: failure.elapsed,
+                    elapsed,
+                    saved_to: saved_to.to_path_buf(),
+                });
+            }
+
+            Event::StressFinished { cases, elapsed, .. } => {
+                self.send_stress(StressEvent::Finished { cases, elapsed });
+            }
+
+            Event::StressCancelled { cases, elapsed, .. } => {
+                self.send_stress(StressEvent::Cancelled { cases, elapsed });
+            }
+
             Event::ContestFetching { .. }
             | Event::ContestFetched { .. }
             | Event::ProblemFetching { .. }
@@ -127,12 +192,7 @@ impl Reporter for ChannelReporter {
             | Event::WorkspaceRefreshed { .. }
             | Event::SourceCreated { .. }
             | Event::WatchStarted { .. }
-            | Event::WatchSourceChanged { .. }
-            | Event::StressStarted { .. }
-            | Event::StressProgress { .. }
-            | Event::StressFailed { .. }
-            | Event::StressFinished { .. }
-            | Event::StressCancelled { .. } => {}
+            | Event::WatchSourceChanged { .. } => {}
         }
     }
 }
@@ -316,6 +376,59 @@ mod tests {
                 ..
             } if elapsed == Duration::from_secs(3)
         ));
+    }
+
+    #[test]
+    fn converts_stress_failure_to_owned_message() {
+        let (tx, rx) = mpsc::channel();
+        let mut reporter = ChannelReporter::new(11, 0, tx);
+        let failure = crate::stress::StressFailure {
+            kind: crate::stress::CandidateFailureKind::WrongAnswer,
+            case_number: 14,
+            base_seed: 100,
+            seed: 113,
+            input: "2\n1 2\n".to_string(),
+            expected: Some("No\n".to_string()),
+            actual: "Yes\n".to_string(),
+            stderr: "debug\n".to_string(),
+            elapsed: Duration::from_millis(7),
+        };
+        let saved_to = std::path::PathBuf::from(".atc/stress/A");
+
+        reporter.report(Event::StressFailed {
+            problem_index: "A",
+            failure: &failure,
+            saved_to: &saved_to,
+            elapsed: Duration::from_millis(100),
+        });
+
+        drop(failure);
+
+        match rx.recv().unwrap() {
+            Message::StressEvent {
+                run_id: 11,
+                problem: 0,
+                event:
+                    StressEvent::Failed {
+                        kind: crate::stress::CandidateFailureKind::WrongAnswer,
+                        case_number: 14,
+                        seed: 113,
+                        input,
+                        expected: Some(expected),
+                        actual,
+                        stderr,
+                        saved_to,
+                        ..
+                    },
+            } => {
+                assert_eq!(input, "2\n1 2\n");
+                assert_eq!(expected, "No\n");
+                assert_eq!(actual, "Yes\n");
+                assert_eq!(stderr, "debug\n");
+                assert_eq!(saved_to, std::path::PathBuf::from(".atc/stress/A"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
+use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
 
 #[derive(Debug)]
 pub(super) struct DetailSegment<'a> {
@@ -130,6 +130,13 @@ impl<'a> DetailDocument<'a> {
     }
 
     fn push_problem_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
+        match problem.detail_mode {
+            DetailMode::Samples => self.push_sample_run_detail(app, problem),
+            DetailMode::Stress => self.push_stress_detail(problem),
+        }
+    }
+
+    fn push_sample_run_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
 
         match run.phase {
@@ -171,6 +178,85 @@ impl<'a> DetailDocument<'a> {
 
             RunPhase::Running | RunPhase::Finished => {
                 self.push_sample_detail(app, problem);
+            }
+        }
+    }
+
+    fn push_stress_detail(&mut self, problem: &'a ProblemState) {
+        let stress = &problem.stress;
+
+        match stress.phase {
+            StressPhase::Idle => {
+                self.push_static("Stress has not been started.");
+            }
+            StressPhase::Queued => {
+                self.push_static("STRESS QUEUED");
+                if let Some(seed) = stress.base_seed {
+                    self.push_owned(format!("\n\nseed       {seed}"));
+                }
+            }
+            StressPhase::Compiling => {
+                self.push_static("STRESS COMPILING");
+                if let Some(seed) = stress.base_seed {
+                    self.push_owned(format!("\n\nseed       {seed}"));
+                }
+            }
+            StressPhase::Running => {
+                self.push_static("STRESS RUNNING");
+                self.push_owned(format!("\n\ncases      {}", stress.passed));
+                if stress.case_number > 0 {
+                    self.push_owned(format!("\ncase       {}", stress.case_number));
+                }
+                if let Some(seed) = stress.seed.or(stress.base_seed) {
+                    self.push_owned(format!("\nseed       {seed}"));
+                }
+                self.push_owned(format!("\nelapsed    {}", stress_elapsed_label(stress.elapsed)));
+                self.push_owned(format!("\nrate       {:.1} cases/s", stress.cases_per_second));
+            }
+            StressPhase::Failed => {
+                let Some(failure) = stress.failure.as_ref() else {
+                    self.push_static("STRESS FAILED");
+                    return;
+                };
+
+                self.push_owned(format!(
+                    "STRESS {}   case {}   seed {}",
+                    failure.kind.as_str(),
+                    failure.case_number,
+                    failure.seed,
+                ));
+                self.push_owned(format!(
+                    "\n\nelapsed    {}\ncandidate  {}",
+                    stress_elapsed_label(stress.elapsed),
+                    stress_elapsed_label(failure.candidate_elapsed),
+                ));
+                self.push_shared_section("input", &failure.input);
+                self.push_optional_shared_section("expected", failure.expected.as_ref());
+                self.push_shared_section("actual", &failure.actual);
+                if !failure.stderr.is_empty() {
+                    self.push_shared_section("stderr", &failure.stderr);
+                }
+                self.push_owned(format!("\n\nsaved\n{}", failure.saved_to.display()));
+            }
+            StressPhase::Finished => {
+                self.push_owned(format!(
+                    "STRESS FINISHED\n\n{} cases passed\nelapsed    {}",
+                    stress.passed,
+                    stress_elapsed_label(stress.elapsed),
+                ));
+            }
+            StressPhase::Cancelled => {
+                self.push_owned(format!(
+                    "STRESS CANCELLED\n\n{} cases passed\nelapsed    {}",
+                    stress.passed,
+                    stress_elapsed_label(stress.elapsed),
+                ));
+            }
+            StressPhase::Error => {
+                self.push_static("STRESS ERROR");
+                if let Some(error) = stress.error.as_ref() {
+                    self.push_shared_section("error", error);
+                }
             }
         }
     }
@@ -310,6 +396,15 @@ fn verdict_label(verdict: CaseVerdict) -> &'static str {
         CaseVerdict::WrongAnswer => "WA",
         CaseVerdict::RuntimeError => "RE",
         CaseVerdict::TimedOut => "TLE",
+    }
+}
+
+
+fn stress_elapsed_label(elapsed: Duration) -> String {
+    if elapsed.as_secs() >= 1 {
+        format!("{:.2}s", elapsed.as_secs_f64())
+    } else {
+        format!("{:.1} ms", elapsed.as_secs_f64() * 1000.0)
     }
 }
 

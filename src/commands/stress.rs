@@ -1,13 +1,14 @@
 use std::io;
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::Duration;
 
 use super::resolve_language;
 use super::test::{find_problem, validate_debug_language};
-use crate::config::Config;
+use crate::config::{Config, RunnerConfig};
 use crate::error::AppError;
 use crate::language::Language;
+use crate::model::Problem;
 use crate::stress::{self, StressRequest};
 use crate::ui::Reporter;
 use crate::workspace;
@@ -38,6 +39,42 @@ pub(crate) fn stress(
     let problem = find_problem(&contest, problem_index)?;
     let config = Config::load()?;
     let language = resolve_language(cli_language, &config);
+
+    let base_seed = match seed {
+        Some(seed) => seed,
+        None => stress::automatic_seed()?,
+    };
+    let count = if forever {
+        None
+    } else {
+        Some(count.unwrap_or(DEFAULT_STRESS_COUNT))
+    };
+
+    let request = build_request(
+        &destination,
+        &contest.contest_id,
+        problem,
+        language,
+        &config.runner,
+        debug,
+        base_seed,
+        count,
+    )?;
+
+    let _ = stress::run(&request, reporter, &|| false)?;
+    Ok(())
+}
+
+pub(super) fn build_request(
+    destination: &Path,
+    contest_id: &str,
+    problem: &Problem,
+    language: Language,
+    runner: &RunnerConfig,
+    debug: bool,
+    base_seed: u64,
+    count: Option<NonZeroU64>,
+) -> Result<StressRequest, AppError> {
     validate_debug_language(language, debug)?;
 
     let candidate_source = destination.join(format!("{}.{}", problem.index, language.extension()));
@@ -48,41 +85,31 @@ pub(crate) fn stress(
     require_file(&generator_source, "stress generator")?;
     require_file(&reference_source, "stress reference")?;
 
-    let timeout = duration_from_seconds(config.runner.timeout_seconds, "runner.timeout_seconds")?;
+    let timeout = duration_from_seconds(runner.timeout_seconds, "runner.timeout_seconds")?;
     let compile_timeout = duration_from_seconds(
-        config.runner.compile_timeout_seconds,
+        runner.compile_timeout_seconds,
         "runner.compile_timeout_seconds",
     )?;
 
-    let request = StressRequest {
-        destination,
-        contest_id: contest.contest_id.clone(),
+    Ok(StressRequest {
+        destination: destination.to_path_buf(),
+        contest_id: contest_id.to_string(),
         problem_index: problem.index.clone(),
         candidate_source,
         candidate_language: language,
         generator_source,
         reference_source,
-        python: config.runner.python,
-        cpp_compiler: config.runner.cpp_compiler,
-        cpp_flags: config.runner.cpp_flags,
+        python: runner.python.clone(),
+        cpp_compiler: runner.cpp_compiler.clone(),
+        cpp_flags: runner.cpp_flags.clone(),
         candidate_timeout: timeout,
         generator_timeout: timeout,
         reference_timeout: timeout,
         compile_timeout,
-        base_seed: match seed {
-            Some(seed) => seed,
-            None => automatic_seed()?,
-        },
-        count: if forever {
-            None
-        } else {
-            Some(count.unwrap_or(DEFAULT_STRESS_COUNT))
-        },
+        base_seed,
+        count,
         debug,
-    };
-
-    let _ = stress::run(&request, reporter, &|| false)?;
-    Ok(())
+    })
 }
 
 fn require_file(path: &Path, kind: &str) -> io::Result<()> {
@@ -94,19 +121,6 @@ fn require_file(path: &Path, kind: &str) -> io::Result<()> {
         io::ErrorKind::NotFound,
         format!("{kind} not found: {}", path.display()),
     ))
-}
-
-fn automatic_seed() -> io::Result<u64> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
-        io::Error::other(format!("system clock is before UNIX epoch: {error}"))
-    })?;
-
-    u64::try_from(elapsed.as_nanos()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "current time does not fit in a u64 stress seed",
-        )
-    })
 }
 
 fn duration_from_seconds(seconds: f64, name: &str) -> io::Result<Duration> {

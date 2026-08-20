@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -18,6 +18,19 @@ use crate::workspace;
 
 const FAILURE_FORMAT_VERSION: u32 = 1;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+pub(crate) fn automatic_seed() -> io::Result<u64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
+        io::Error::other(format!("system clock is before UNIX epoch: {error}"))
+    })?;
+
+    u64::try_from(elapsed.as_nanos()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current time does not fit in a u64 stress seed",
+        )
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct StressRequest {

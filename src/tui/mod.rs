@@ -29,7 +29,7 @@ fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Res
     run_tx.send(request).map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "test worker request channel disconnected",
+            "run worker request channel disconnected",
         )
     })
 }
@@ -40,6 +40,22 @@ fn queue_problem_run(
     run_tx: &Sender<RunRequest>,
 ) -> io::Result<bool> {
     let Some(request) = app.queue_run(problem) else {
+        return Ok(false);
+    };
+
+    send_run_request(run_tx, request)?;
+
+    Ok(true)
+}
+
+
+fn queue_problem_stress(
+    app: &mut WatchApp,
+    problem: usize,
+    run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
+    let base_seed = crate::stress::automatic_seed()?;
+    let Some(request) = app.queue_stress(problem, base_seed) else {
         return Ok(false);
     };
 
@@ -104,6 +120,16 @@ fn handle_messages(
                 event,
             }) => {
                 if app.run_event(problem, run_id, event) {
+                    changed = true;
+                }
+            }
+
+            Ok(Message::StressEvent {
+                run_id,
+                problem,
+                event,
+            }) => {
+                if app.stress_event(problem, run_id, event) {
                     changed = true;
                 }
             }
@@ -412,6 +438,14 @@ fn handle_key_event(
             };
 
             queue_problem_run(app, problem, run_tx)
+        }
+
+        KeyCode::Char('S') if key.kind == KeyEventKind::Press => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+
+            queue_problem_stress(app, problem, run_tx)
         }
 
         KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
@@ -1331,6 +1365,34 @@ mod tests {
     }
 
     #[test]
+    fn stress_key_queues_unbounded_stress_for_current_source() {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('S'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        let request = run_rx.try_recv().unwrap();
+        assert_eq!(request.problem, 0);
+        assert_eq!(request.language, Language::Cpp);
+        assert!(matches!(
+            request.kind,
+            message::RunKind::Stress { count: None, .. }
+        ));
+        assert_eq!(
+            app.current_problem().unwrap().detail_mode,
+            app::DetailMode::Stress
+        );
+    }
+
+    #[test]
     fn rerun_uses_only_the_selected_problems_confirmed_source() {
         let mut app = app_with_problems(&[1, 1]);
         app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
@@ -1423,7 +1485,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(
             error.to_string(),
-            "test worker request channel disconnected"
+            "run worker request channel disconnected"
         );
     }
 

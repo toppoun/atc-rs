@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use super::watch_worker::TestWorker;
+use super::watch_worker::RunWorker;
 use crate::tui::detail_analysis::DetailAnalysisWorker;
 use crate::tui::message::Message;
 use crate::watcher;
@@ -210,9 +210,10 @@ pub(super) fn watch_tui_at(
     // filesystem watcherも、このchannelへ送る。
     let watcher_thread = start_watcher(destination, &contest, message_tx.clone())?;
 
-    // test workerも、同じchannelへ結果を送る。
-    let test_worker = match TestWorker::start(
+    // run workerも、同じchannelへ結果を送る。
+    let run_worker = match RunWorker::start(
         destination.to_path_buf(),
+        contest.contest_id.clone(),
         contest.problems.clone(),
         config.runner,
         message_tx.clone(),
@@ -230,7 +231,7 @@ pub(super) fn watch_tui_at(
             return Err(error.into());
         }
     };
-    let run_tx = test_worker.sender();
+    let run_tx = run_worker.sender();
 
     let mut detail_analysis_worker = match DetailAnalysisWorker::start() {
         Ok(worker) => worker,
@@ -238,10 +239,10 @@ pub(super) fn watch_tui_at(
             drop(message_rx);
             drop(message_tx);
 
-            test_worker.request_stop();
+            run_worker.request_stop();
             watcher_thread.request_stop();
 
-            let worker_result = test_worker.stop_and_join();
+            let worker_result = run_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
 
             worker_result?;
@@ -265,13 +266,13 @@ pub(super) fn watch_tui_at(
         Err(error) => {
             drop(message_rx);
 
-            test_worker.request_stop();
+            run_worker.request_stop();
             watcher_thread.request_stop();
             detail_analysis_worker.request_stop();
 
             ratatui::restore();
 
-            let worker_result = test_worker.stop_and_join();
+            let worker_result = run_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
             let detail_analysis_result = detail_analysis_worker.stop_and_join();
 
@@ -289,13 +290,13 @@ pub(super) fn watch_tui_at(
         Err(error) => {
             drop(message_rx);
 
-            test_worker.request_stop();
+            run_worker.request_stop();
             watcher_thread.request_stop();
             detail_analysis_worker.request_stop();
 
             ratatui::restore();
 
-            let worker_result = test_worker.stop_and_join();
+            let worker_result = run_worker.stop_and_join();
             let watcher_result = watcher_thread.stop();
             let detail_analysis_result = detail_analysis_worker.stop_and_join();
 
@@ -317,8 +318,8 @@ pub(super) fn watch_tui_at(
         detail_analysis_rx,
     );
 
-    // test実行中だった場合、runnerまでcancelを先に伝える。
-    test_worker.request_stop();
+    // sample/stress実行中だった場合、runnerまでcancelを先に伝える。
+    run_worker.request_stop();
     watcher_thread.request_stop();
     detail_analysis_worker.request_stop();
 
@@ -329,7 +330,7 @@ pub(super) fn watch_tui_at(
     // joinが予想外に長引いてもterminalは先に復元する。
     let restore_result = ratatui::try_restore();
 
-    let worker_result = test_worker.stop_and_join();
+    let worker_result = run_worker.stop_and_join();
     let watcher_result = watcher_thread.stop();
     let detail_analysis_result = detail_analysis_worker.stop_and_join();
 

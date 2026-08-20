@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use super::app::{CaseVerdict, ProblemState, RunPhase, WatchApp};
+use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
 use super::detail::DetailDocument;
 use super::detail_layout::DetailLayout;
 use crate::language::Language;
@@ -147,7 +147,7 @@ pub(super) fn render(
     }
 
     let footer = Paragraph::new(
-        "s samples   d debug   r rerun   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
+        "s samples   S stress   d debug   r rerun   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
     )
     .block(Block::default().borders(Borders::TOP));
 
@@ -172,28 +172,41 @@ fn language_label(language: Language) -> &'static str {
 }
 
 fn run_summary(problem: &ProblemState) -> String {
+    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
+        return stress_summary(problem);
+    }
+
     let run = &problem.run;
 
     match run.phase {
         RunPhase::Idle => "Idle".to_string(),
-
         RunPhase::Queued => "Queued".to_string(),
-
         RunPhase::Compiling => "Compiling...".to_string(),
-
         RunPhase::Running => "Running...".to_string(),
-
-        RunPhase::Finished => {
-            format!("{}/{} AC", run.accepted, run.total_cases)
-        }
-
+        RunPhase::Finished => format!("{}/{} AC", run.accepted, run.total_cases),
         RunPhase::CompileError => "CE".to_string(),
-
         RunPhase::CompileTimedOut => "Compile TLE".to_string(),
-
         RunPhase::NoSamples => "No Samples".to_string(),
-
         RunPhase::Failed => "Failed".to_string(),
+    }
+}
+
+fn stress_summary(problem: &ProblemState) -> String {
+    let stress = &problem.stress;
+
+    match stress.phase {
+        StressPhase::Idle => "Idle".to_string(),
+        StressPhase::Queued => "STRESS Queued".to_string(),
+        StressPhase::Compiling => "STRESS Compiling...".to_string(),
+        StressPhase::Running => format!("STRESS {}...", stress.passed),
+        StressPhase::Failed => stress
+            .failure
+            .as_ref()
+            .map(|failure| format!("STRESS {}", failure.kind.as_str()))
+            .unwrap_or_else(|| "STRESS Failed".to_string()),
+        StressPhase::Finished => format!("STRESS {} passed", stress.passed),
+        StressPhase::Cancelled => "STRESS Cancelled".to_string(),
+        StressPhase::Error => "STRESS Error".to_string(),
     }
 }
 
@@ -201,6 +214,17 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
     let Some(problem) = problem else {
         return Style::default();
     };
+
+    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
+        return match problem.stress.phase {
+            StressPhase::Failed | StressPhase::Error => Style::default().fg(Color::Red),
+            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => {
+                Style::default().fg(Color::Yellow)
+            }
+            StressPhase::Finished => Style::default().fg(Color::Green),
+            StressPhase::Idle | StressPhase::Cancelled => Style::default().fg(Color::DarkGray),
+        };
+    }
 
     match problem.run.phase {
         RunPhase::Finished
@@ -247,25 +271,41 @@ fn problem_status_line(app: &WatchApp) -> Line<'static> {
 }
 
 fn problem_symbol(problem: &ProblemState) -> &'static str {
+    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
+        return match problem.stress.phase {
+            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => "…",
+            StressPhase::Failed | StressPhase::Error => "✗",
+            StressPhase::Finished => "✓",
+            StressPhase::Idle | StressPhase::Cancelled => "·",
+        };
+    }
+
     let run = &problem.run;
 
     match run.phase {
         RunPhase::Idle => "·",
-
         RunPhase::Queued | RunPhase::Compiling | RunPhase::Running => "…",
-
         RunPhase::Finished if run.total_cases > 0 && run.accepted == run.total_cases => "✓",
-
         RunPhase::Finished
         | RunPhase::CompileError
         | RunPhase::CompileTimedOut
         | RunPhase::Failed => "✗",
-
         RunPhase::NoSamples => "-",
     }
 }
 
 fn problem_style(problem: &ProblemState) -> Style {
+    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
+        return match problem.stress.phase {
+            StressPhase::Failed | StressPhase::Error => Style::default().fg(Color::Red),
+            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => {
+                Style::default().fg(Color::Yellow)
+            }
+            StressPhase::Finished => Style::default().fg(Color::Green),
+            StressPhase::Idle | StressPhase::Cancelled => Style::default().fg(Color::DarkGray),
+        };
+    }
+
     match problem.run.phase {
         RunPhase::Finished
             if problem.run.total_cases > 0 && problem.run.accepted == problem.run.total_cases =>
@@ -302,8 +342,10 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
 
     let range = sample_window(total, app.selected_case(), visible);
 
+    let selected = (problem.detail_mode == DetailMode::Samples).then_some(app.selected_case());
+
     for index in range {
-        lines.push(sample_line(problem, index, app.selected_case()));
+        lines.push(sample_line(problem, index, selected));
     }
 
     Text::from(lines)
@@ -326,7 +368,11 @@ fn sample_window(total: usize, selected: usize, visible: usize) -> std::ops::Ran
     start..start + visible
 }
 
-fn sample_line(problem: &ProblemState, index: usize, selected: usize) -> Line<'static> {
+fn sample_line(
+    problem: &ProblemState,
+    index: usize,
+    selected: Option<usize>,
+) -> Line<'static> {
     let case = problem.run.cases.get(index);
 
     let (verdict, mut style) = match case {
@@ -345,9 +391,10 @@ fn sample_line(problem: &ProblemState, index: usize, selected: usize) -> Line<'s
         None => ("·", Style::default().fg(Color::DarkGray)),
     };
 
-    let marker = if index == selected { ">" } else { " " };
+    let is_selected = selected == Some(index);
+    let marker = if is_selected { ">" } else { " " };
 
-    if index == selected {
+    if is_selected {
         style = style.add_modifier(Modifier::BOLD);
     }
 

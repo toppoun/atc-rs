@@ -19,7 +19,7 @@ use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler};
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_RUN_REQUESTS_PER_TICK: usize = 64;
 
-pub(super) struct TestWorker {
+pub(super) struct RunWorker {
     request_tx: Sender<RunRequest>,
     control: Arc<WorkerControl>,
     handle: Option<JoinHandle<io::Result<()>>>,
@@ -63,15 +63,21 @@ enum RequestDrain {
     Shutdown,
 }
 
-impl TestWorker {
+impl RunWorker {
     pub fn start(
         destination: PathBuf,
+        contest_id: String,
         problems: Vec<Problem>,
         runner_config: RunnerConfig,
         message_tx: Sender<Message>,
     ) -> io::Result<Self> {
-        let executor =
-            AttemptExecutor::new(destination, problems, runner_config, message_tx.clone());
+        let executor = AttemptExecutor::new(
+            destination,
+            contest_id,
+            problems,
+            runner_config,
+            message_tx.clone(),
+        );
 
         Self::start_with(message_tx, move |request, completion_tx| {
             executor.spawn(request, completion_tx)
@@ -91,7 +97,7 @@ impl TestWorker {
         let failure_tx = message_tx.clone();
 
         let handle = thread::Builder::new()
-            .name("atc-watch-test".to_string())
+            .name("atc-watch-run".to_string())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     scheduler_loop(
@@ -111,7 +117,7 @@ impl TestWorker {
                         Err(error)
                     }
                     Err(_) => {
-                        let error = io::Error::other("test worker thread panicked");
+                        let error = io::Error::other("run worker thread panicked");
                         report_worker_failure(&failure_tx, &error);
                         Err(error)
                     }
@@ -140,7 +146,7 @@ impl TestWorker {
 
         handle
             .join()
-            .map_err(|_| io::Error::other("test worker thread panicked before reporting"))??;
+            .map_err(|_| io::Error::other("run worker thread panicked before reporting"))??;
         Ok(())
     }
 
@@ -150,7 +156,7 @@ impl TestWorker {
     }
 }
 
-impl Drop for TestWorker {
+impl Drop for RunWorker {
     fn drop(&mut self) {
         self.request_stop();
         let _ = self.join();
@@ -180,7 +186,7 @@ fn scheduler_loop(
             &mut active,
         )
     }))
-    .unwrap_or_else(|_| Err(io::Error::other("test worker scheduler loop panicked")));
+    .unwrap_or_else(|_| Err(io::Error::other("run worker scheduler loop panicked")));
     let cleanup_result = cleanup_active(&mut scheduler, active.take());
 
     combine_loop_and_cleanup_results(run_result, cleanup_result)
@@ -438,7 +444,7 @@ fn combine_loop_and_cleanup_results(
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(run_error), Err(cleanup_error)) => Err(io::Error::other(format!(
-            "test worker failed: {run_error}; active attempt cleanup also failed: {cleanup_error}"
+            "run worker failed: {run_error}; active attempt cleanup also failed: {cleanup_error}"
         ))),
     }
 }
@@ -492,7 +498,7 @@ fn send_message(message_tx: &Sender<Message>, message: Message) -> io::Result<()
     message_tx.send(message).map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "TUI message receiver disconnected from test worker",
+            "TUI message receiver disconnected from run worker",
         )
     })
 }
@@ -535,7 +541,7 @@ mod tests {
     }
 
     struct FakeWorker {
-        worker: TestWorker,
+        worker: RunWorker,
         request_tx: Sender<RunRequest>,
         spawned_rx: Receiver<SpawnedAttempt>,
         message_rx: Receiver<Message>,
@@ -553,7 +559,7 @@ mod tests {
             let closure_active = Arc::clone(&active_count);
             let closure_max = Arc::clone(&max_active);
 
-            let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+            let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
                 let messages = closure_messages.clone();
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
@@ -643,6 +649,7 @@ mod tests {
             problem,
             language: Language::Cpp,
             debug: false,
+            kind: crate::tui::message::RunKind::Samples,
         }
     }
 
@@ -970,7 +977,7 @@ mod tests {
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut release_rx = Some(release_rx);
-        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let release_rx = release_rx.take().unwrap();
             spawn_with(request, completion_tx, move |cancellation| {
@@ -1027,7 +1034,7 @@ mod tests {
         let attempt_messages = message_tx.clone();
         let mut first = true;
 
-        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let is_first = std::mem::replace(&mut first, false);
             let release_rx = is_first.then(|| first_release.take().unwrap());
             let spawned_tx = spawned_tx.clone();
@@ -1109,7 +1116,7 @@ mod tests {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut first = true;
-        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             spawned_tx.send(request).unwrap();
             if first {
                 first = false;
@@ -1145,7 +1152,7 @@ mod tests {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut fail_first = true;
-        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             if fail_first {
                 fail_first = false;
                 return Err(io::Error::other("fake spawn failure"));
@@ -1246,7 +1253,7 @@ mod tests {
         drop(message_rx);
         let (finished_tx, finished_rx) = mpsc::channel();
         let attempt_messages = message_tx.clone();
-        let mut worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let mut worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let attempt_messages = attempt_messages.clone();
             let finished_tx = finished_tx.clone();
             spawn_with(request, completion_tx, move |cancellation| {
@@ -1279,7 +1286,7 @@ mod tests {
     fn scheduler_helper_panic_is_reported_and_stops_without_next_spawn() {
         let (message_tx, message_rx) = mpsc::channel();
         let worker =
-            TestWorker::start_with(message_tx, |_, _| panic!("fake scheduler helper panic"))
+            RunWorker::start_with(message_tx, |_, _| panic!("fake scheduler helper panic"))
                 .unwrap();
         let request_tx = worker.sender();
         request_tx.send(request(0, 1)).unwrap();
@@ -1303,7 +1310,7 @@ mod tests {
     fn spawned_identity_mismatch_explicitly_cancels_and_joins_attempt() {
         let (message_tx, message_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
-        let worker = TestWorker::start_with(message_tx, move |_, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |_, completion_tx| {
             let physical = request(1, 99);
             let finished_tx = finished_tx.clone();
             spawn_with(physical, completion_tx, move |cancellation| {
@@ -1439,7 +1446,7 @@ mod tests {
         let closure_max = Arc::clone(&max_active);
         let attempt_messages = message_tx.clone();
 
-        let worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let allow_completion = Arc::clone(&closure_allow);
             let active_count = Arc::clone(&closure_active);
@@ -1488,6 +1495,7 @@ mod tests {
                     Language::Cpp
                 },
                 debug: run_id % 2 == 0 && run_id % 5 != 0,
+                kind: crate::tui::message::RunKind::Samples,
             };
             latest.insert(problem, request);
             request_tx.send(request).unwrap();
@@ -1497,6 +1505,7 @@ mod tests {
             problem: 3,
             language: Language::Cpp,
             debug: true,
+            kind: crate::tui::message::RunKind::Samples,
         };
         latest.insert(sentinel.problem, sentinel);
         request_tx.send(sentinel).unwrap();
@@ -1590,7 +1599,7 @@ mod tests {
             let release_cancelled_attempt = Arc::new(AtomicBool::new(false));
             let closure_active = Arc::clone(&active_count);
             let closure_release = Arc::clone(&release_cancelled_attempt);
-            let mut worker = TestWorker::start_with(message_tx, move |request, completion_tx| {
+            let mut worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
                 let release_cancelled_attempt = Arc::clone(&closure_release);

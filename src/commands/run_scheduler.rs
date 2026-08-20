@@ -64,6 +64,7 @@ impl RunScheduler {
 
         if let Some(previous_foreground) = self.foreground.take()
             && previous_foreground.problem != request.problem
+            && previous_foreground.kind.preserve_on_preemption()
         {
             self.push_pending_latest(previous_foreground);
         }
@@ -116,7 +117,8 @@ impl RunScheduler {
 
     pub(super) fn retire_active(&mut self) -> Option<RetiredActive> {
         let active = self.active.take()?;
-        let requeue_eligible = active.logical_state == ActiveLogicalState::Latest
+        let requeue_eligible = active.request.kind.preserve_on_preemption()
+            && active.logical_state == ActiveLogicalState::Latest
             && self.latest_seen.get(&active.request.problem) == Some(&active.request.run_id)
             && !self.has_logical_request_for(active.request.problem);
 
@@ -215,6 +217,7 @@ impl RunScheduler {
 mod tests {
     use super::*;
     use crate::language::Language;
+    use crate::tui::message::RunKind;
 
     fn request(problem: usize, run_id: RunId) -> RunRequest {
         RunRequest {
@@ -222,6 +225,7 @@ mod tests {
             problem,
             language: Language::Cpp,
             debug: false,
+            kind: RunKind::Samples,
         }
     }
 
@@ -566,12 +570,62 @@ mod tests {
             problem: 0,
             language: Language::Python,
             debug: true,
+            kind: RunKind::Samples,
         };
         assert_eq!(
             scheduler.request_arrived(duplicate),
             RequestArrival::IgnoredStale
         );
         assert_eq!(scheduler.start_next(), Some(original));
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn stress_foreground_is_discarded_instead_of_demoted_to_pending() {
+        let mut scheduler = RunScheduler::default();
+        let stress = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(0, 1)
+        };
+        let b = request(1, 2);
+
+        assert_eq!(
+            scheduler.request_arrived(stress),
+            RequestArrival::Accepted {
+                cancel_active: false
+            }
+        );
+        assert_eq!(
+            scheduler.request_arrived(b),
+            RequestArrival::Accepted {
+                cancel_active: false
+            }
+        );
+
+        assert_eq!(scheduler.start_next(), Some(b));
+        assert!(scheduler.pending.is_empty());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn cancelled_stress_request_is_never_requeued() {
+        let mut scheduler = RunScheduler::default();
+        let stress = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(0, 1)
+        };
+
+        start(&mut scheduler, stress);
+        let retired = scheduler.retire_active().unwrap();
+
+        assert!(!scheduler.requeue_retired(retired));
+        assert!(scheduler.start_next().is_none());
         assert_invariants(&scheduler);
     }
 
@@ -583,6 +637,7 @@ mod tests {
             problem: 0,
             language: Language::Python,
             debug: true,
+            kind: RunKind::Samples,
         };
 
         scheduler.request_arrived(python_debug);
