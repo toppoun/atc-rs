@@ -198,7 +198,7 @@ pub(super) fn watch_tui_at(
     destination: &Path,
     expected_contest_id: Option<&str>,
 ) -> Result<(), AppError> {
-    let (contest, sample_counts) = load_watch_input(destination, expected_contest_id)?;
+    let (contest, sample_counts, stress_cases) = load_watch_input(destination, expected_contest_id)?;
 
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
@@ -312,6 +312,7 @@ pub(super) fn watch_tui_at(
         &mut terminal,
         &contest,
         sample_counts,
+        stress_cases,
         message_rx,
         run_tx,
         detail_analysis_tx,
@@ -347,7 +348,7 @@ pub(super) fn watch_tui_at(
 fn load_watch_input(
     destination: &Path,
     expected_contest_id: Option<&str>,
-) -> Result<(Contest, Vec<usize>), AppError> {
+) -> Result<(Contest, Vec<usize>, Vec<Option<crate::model::Sample>>), AppError> {
     workspace::validate_workspace_marker(destination)?;
 
     let contest = workspace::load_metadata(destination)?;
@@ -363,8 +364,13 @@ fn load_watch_input(
             workspace::load_samples(destination, &problem.index).map(|samples| samples.len())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let stress_cases = contest
+        .problems
+        .iter()
+        .map(|problem| crate::stress::load_saved_case(destination, &problem.index))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    Ok((contest, sample_counts))
+    Ok((contest, sample_counts, stress_cases))
 }
 
 #[cfg(test)]
@@ -413,8 +419,13 @@ mod tests {
             }],
         )
         .unwrap();
+        let stress_a = temp.path().join(".atc").join("stress").join("A");
+        std::fs::create_dir_all(&stress_a).unwrap();
+        std::fs::write(stress_a.join("failed.in"), "7\n").unwrap();
+        std::fs::write(stress_a.join("expected.out"), "8\n").unwrap();
 
-        let (loaded_contest, sample_counts) = load_watch_input(temp.path(), None).unwrap();
+        let (loaded_contest, sample_counts, stress_cases) =
+            load_watch_input(temp.path(), None).unwrap();
 
         assert_eq!(loaded_contest.contest_id, "contest");
         assert_eq!(
@@ -426,6 +437,17 @@ mod tests {
             ["A", "B", "C"]
         );
         assert_eq!(sample_counts, [2, 0, 1]);
+        assert_eq!(
+            stress_cases,
+            [
+                Some(Sample {
+                    input: "7\n".to_string(),
+                    output: "8\n".to_string(),
+                }),
+                None,
+                None,
+            ]
+        );
     }
 
     #[test]

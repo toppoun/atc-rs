@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::message::{RunId, RunKind, RunRequest, StressEvent, TestEvent};
 use crate::language::Language;
-use crate::model::Contest;
+use crate::model::{Contest, Sample};
 use crate::stress::CandidateFailureKind;
 
 #[derive(Debug)]
@@ -15,11 +15,28 @@ pub struct SourceState {
     pub language: Language,
 }
 
+#[derive(Debug, Clone)]
+pub struct SavedStressCaseState {
+    pub input: Arc<String>,
+    pub expected: Arc<String>,
+}
+
+impl From<Sample> for SavedStressCaseState {
+    fn from(sample: Sample) -> Self {
+        Self {
+            input: Arc::new(sample.input),
+            expected: Arc::new(sample.output),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProblemState {
     pub index: String,
     pub title: String,
+    pub sample_cases: usize,
     pub total_cases: usize,
+    pub saved_stress_case: Option<SavedStressCaseState>,
     pub source: Option<SourceState>,
     pub run: RunState,
     pub stress: StressState,
@@ -70,7 +87,7 @@ pub struct StressFailureState {
     pub base_seed: u64,
     pub seed: u64,
     pub input: Arc<String>,
-    pub expected: Option<Arc<String>>,
+    pub expected: Arc<String>,
     pub actual: Arc<String>,
     pub stderr: Arc<String>,
     pub candidate_elapsed: Duration,
@@ -192,6 +209,15 @@ fn case_mut(run: &mut RunState, number: usize) -> Option<&mut CaseState> {
 
 impl WatchApp {
     pub fn new(contest: &Contest, sample_counts: Vec<usize>) -> io::Result<Self> {
+        let stress_cases = vec![None; contest.problems.len()];
+        Self::new_with_stress_cases(contest, sample_counts, stress_cases)
+    }
+
+    pub fn new_with_stress_cases(
+        contest: &Contest,
+        sample_counts: Vec<usize>,
+        stress_cases: Vec<Option<Sample>>,
+    ) -> io::Result<Self> {
         if contest.problems.len() != sample_counts.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -202,19 +228,35 @@ impl WatchApp {
                 ),
             ));
         }
+        if contest.problems.len() != stress_cases.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "problem and stress case lengths differ: {} problems, {} stress cases",
+                    contest.problems.len(),
+                    stress_cases.len()
+                ),
+            ));
+        }
 
         let problems = contest
             .problems
             .iter()
             .zip(sample_counts)
-            .map(|(problem, total_cases)| ProblemState {
-                index: problem.index.clone(),
-                title: problem.title.clone(),
-                total_cases,
-                source: None,
-                run: RunState::default(),
-                stress: StressState::default(),
-                detail_mode: DetailMode::Samples,
+            .zip(stress_cases)
+            .map(|((problem, sample_cases), stress_case)| {
+                let saved_stress_case = stress_case.map(SavedStressCaseState::from);
+                ProblemState {
+                    index: problem.index.clone(),
+                    title: problem.title.clone(),
+                    sample_cases,
+                    total_cases: sample_cases + if saved_stress_case.is_some() { 1 } else { 0 },
+                    saved_stress_case,
+                    source: None,
+                    run: RunState::default(),
+                    stress: StressState::default(),
+                    detail_mode: DetailMode::Samples,
+                }
             })
             .collect();
 
@@ -637,7 +679,53 @@ impl WatchApp {
 
         true
     }
+    fn apply_test_case_layout(
+        &mut self,
+        problem: usize,
+        run_id: RunId,
+        sample_cases: usize,
+        stress_case: Option<Sample>,
+    ) -> bool {
+        let affects_current_detail = self.selected_problem == problem;
+        let Some(problem_state) = self.problems.get_mut(problem) else {
+            return false;
+        };
+        if problem_state.run.id != Some(run_id)
+            || problem_state.run.test_run_started
+            || !matches!(problem_state.run.phase, RunPhase::Compiling | RunPhase::Running)
+        {
+            return false;
+        }
+
+        problem_state.sample_cases = sample_cases;
+        problem_state.saved_stress_case = stress_case.map(SavedStressCaseState::from);
+        let total_cases = sample_cases + if problem_state.saved_stress_case.is_some() { 1 } else { 0 };
+        problem_state.total_cases = total_cases;
+        problem_state.run.total_cases = total_cases;
+        problem_state.run.cases = vec![CaseState::default(); total_cases];
+
+        if affects_current_detail {
+            if total_cases == 0 || self.selected_case >= total_cases {
+                self.selected_case = 0;
+            }
+            self.reset_detail_scroll();
+            self.invalidate_detail();
+        }
+
+        true
+    }
+
     pub fn run_event(&mut self, problem: usize, run_id: RunId, event: TestEvent) -> bool {
+        let event = match event {
+            TestEvent::TestCaseLayout {
+                sample_cases,
+                stress_case,
+            } => {
+                return self.apply_test_case_layout(problem, run_id, sample_cases, stress_case);
+            }
+            event => event,
+        };
+
         let affects_current_detail = self.selected_problem == problem
             && match &event {
                 TestEvent::TestCaseAccepted { number, .. }
@@ -812,6 +900,10 @@ impl WatchApp {
 
         if changed && let Some(total_cases) = updated_total_cases {
             self.problems[problem].total_cases = total_cases;
+            if total_cases == 0 {
+                self.problems[problem].sample_cases = 0;
+                self.problems[problem].saved_stress_case = None;
+            }
             if self.selected_problem == problem
                 && (total_cases == 0 || self.selected_case >= total_cases)
             {
@@ -826,7 +918,128 @@ impl WatchApp {
 
         changed
     }
+    #[allow(clippy::too_many_arguments)]
+    fn stress_failed(
+        &mut self,
+        problem: usize,
+        run_id: RunId,
+        kind: CandidateFailureKind,
+        case_number: u64,
+        base_seed: u64,
+        seed: u64,
+        input: String,
+        expected: String,
+        actual: String,
+        stderr: String,
+        candidate_elapsed: Duration,
+        elapsed: Duration,
+        saved_to: PathBuf,
+    ) -> bool {
+        let affects_current_detail = self.selected_problem == problem
+            && self
+                .problems
+                .get(problem)
+                .is_some_and(|problem| problem.detail_mode == DetailMode::Stress);
+        let Some(problem_state) = self.problems.get_mut(problem) else {
+            return false;
+        };
+        if problem_state.stress.id != Some(run_id)
+            || !matches!(
+                problem_state.stress.phase,
+                StressPhase::Running | StressPhase::Compiling
+            )
+        {
+            return false;
+        }
+
+        let input = Arc::new(input);
+        let expected = Arc::new(expected);
+        let actual = Arc::new(actual);
+        let stderr = Arc::new(stderr);
+
+        problem_state.stress.phase = StressPhase::Failed;
+        problem_state.stress.base_seed = Some(base_seed);
+        problem_state.stress.case_number = case_number;
+        problem_state.stress.seed = Some(seed);
+        problem_state.stress.elapsed = elapsed;
+        problem_state.stress.failure = Some(StressFailureState {
+            kind,
+            case_number,
+            base_seed,
+            seed,
+            input: Arc::clone(&input),
+            expected: Arc::clone(&expected),
+            actual: Arc::clone(&actual),
+            stderr: Arc::clone(&stderr),
+            candidate_elapsed,
+            saved_to,
+        });
+
+        problem_state.saved_stress_case = Some(SavedStressCaseState {
+            input,
+            expected: Arc::clone(&expected),
+        });
+        problem_state.total_cases = problem_state.sample_cases + 1;
+        problem_state.run.total_cases = problem_state.total_cases;
+        problem_state
+            .run
+            .cases
+            .resize_with(problem_state.total_cases, CaseState::default);
+
+        let stress_index = problem_state.sample_cases;
+        if let Some(case) = problem_state.run.cases.get_mut(stress_index) {
+            case.verdict = match kind {
+                CandidateFailureKind::WrongAnswer => CaseVerdict::WrongAnswer,
+                CandidateFailureKind::RuntimeError => CaseVerdict::RuntimeError,
+                CandidateFailureKind::TimedOut => CaseVerdict::TimedOut,
+            };
+            case.elapsed = Some(candidate_elapsed);
+            case.expected = Some(expected);
+            case.actual = Some(actual);
+            case.stderr = (!stderr.is_empty()).then_some(stderr);
+        }
+
+        if affects_current_detail {
+            self.invalidate_detail();
+        }
+
+        true
+    }
+
     pub fn stress_event(&mut self, problem: usize, run_id: RunId, event: StressEvent) -> bool {
+        let event = match event {
+            StressEvent::Failed {
+                kind,
+                case_number,
+                base_seed,
+                seed,
+                input,
+                expected,
+                actual,
+                stderr,
+                candidate_elapsed,
+                elapsed,
+                saved_to,
+            } => {
+                return self.stress_failed(
+                    problem,
+                    run_id,
+                    kind,
+                    case_number,
+                    base_seed,
+                    seed,
+                    input,
+                    expected,
+                    actual,
+                    stderr,
+                    candidate_elapsed,
+                    elapsed,
+                    saved_to,
+                );
+            }
+            event => event,
+        };
+
         let affects_current_detail = self.selected_problem == problem
             && self
                 .problems
@@ -867,39 +1080,6 @@ impl WatchApp {
                 stress.passed = passed;
                 stress.elapsed = elapsed;
                 stress.cases_per_second = cases_per_second;
-                true
-            }
-
-            StressEvent::Failed {
-                kind,
-                case_number,
-                base_seed,
-                seed,
-                input,
-                expected,
-                actual,
-                stderr,
-                candidate_elapsed,
-                elapsed,
-                saved_to,
-            } if matches!(stress.phase, StressPhase::Running | StressPhase::Compiling) => {
-                stress.phase = StressPhase::Failed;
-                stress.base_seed = Some(base_seed);
-                stress.case_number = case_number;
-                stress.seed = Some(seed);
-                stress.elapsed = elapsed;
-                stress.failure = Some(StressFailureState {
-                    kind,
-                    case_number,
-                    base_seed,
-                    seed,
-                    input: Arc::new(input),
-                    expected: expected.map(Arc::new),
-                    actual: Arc::new(actual),
-                    stderr: Arc::new(stderr),
-                    candidate_elapsed,
-                    saved_to,
-                });
                 true
             }
 
@@ -1114,6 +1294,26 @@ mod tests {
         app.next_case();
         assert_eq!(app.selected_case(), 1);
         assert_selection_invariant(&app);
+    }
+
+    #[test]
+    fn saved_stress_case_is_part_of_case_navigation() {
+        let mut app = WatchApp::new_with_stress_cases(
+            &contest(1),
+            vec![2],
+            vec![Some(Sample {
+                input: "1 2\n".to_string(),
+                output: "3\n".to_string(),
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(app.problems[0].sample_cases, 2);
+        assert_eq!(app.problems[0].total_cases, 3);
+        app.previous_case();
+        assert_eq!(app.selected_case(), 2);
+        app.next_case();
+        assert_eq!(app.selected_case(), 0);
     }
 
     #[test]
@@ -2277,7 +2477,7 @@ mod tests {
                 base_seed: 100,
                 seed: 113,
                 input: "2\n1 2\n".to_string(),
-                expected: Some("No\n".to_string()),
+                expected: "No\n".to_string(),
                 actual: "Yes\n".to_string(),
                 stderr: String::new(),
                 candidate_elapsed: Duration::from_millis(4),
@@ -2287,12 +2487,80 @@ mod tests {
         ));
 
         assert_eq!(app.problems[0].run.cases[0].verdict, CaseVerdict::Accepted);
+        assert_eq!(app.problems[0].run.cases[1].verdict, CaseVerdict::WrongAnswer);
+        assert_eq!(app.problems[0].sample_cases, 1);
+        assert_eq!(app.problems[0].total_cases, 2);
+        assert_eq!(
+            app.problems[0]
+                .saved_stress_case
+                .as_ref()
+                .map(|case| (case.input.as_str(), case.expected.as_str())),
+            Some(("2\n1 2\n", "No\n"))
+        );
         assert_eq!(app.problems[0].stress.phase, StressPhase::Failed);
         let detail = detail_text(&app);
         assert!(detail.contains("STRESS WA   case 14   seed 113"));
         assert!(detail.contains("input\n2\n1 2\n"));
         assert!(detail.contains("expected\nNo\n"));
         assert!(detail.contains("actual\nYes\n"));
+    }
+
+    #[test]
+    fn normal_test_layout_promotes_saved_stress_case_as_last_case() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseLayout {
+                sample_cases: 1,
+                stress_case: Some(Sample {
+                    input: "9\n".to_string(),
+                    output: "10\n".to_string(),
+                }),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 2 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(2),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 2,
+                elapsed: Duration::from_millis(3),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseComparison {
+                number: 2,
+                expected: "10\n".to_string(),
+                actual: "11\n".to_string(),
+            },
+        ));
+
+        assert_eq!(app.problems[0].sample_cases, 1);
+        assert_eq!(app.problems[0].total_cases, 2);
+        assert!(app.next_case());
+        let detail = detail_text(&app);
+        assert!(detail.contains("stress 1 / 1   WA"));
+        assert!(detail.contains("input\n9\n"));
+        assert!(detail.contains("expected\n10\n"));
+        assert!(detail.contains("actual\n11\n"));
     }
 
     #[test]

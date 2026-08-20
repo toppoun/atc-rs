@@ -2,6 +2,8 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::model::Sample;
+
 pub enum Event<'a> {
     ContestFetching {
         contest_id: &'a str,
@@ -39,6 +41,12 @@ pub enum Event<'a> {
 
     CompileTimedOut {
         elapsed: Duration,
+    },
+
+    TestCaseLayout {
+        problem_index: &'a str,
+        sample_cases: usize,
+        stress_case: Option<&'a Sample>,
     },
 
     TestRunStarted {
@@ -163,6 +171,7 @@ struct CaseDisplay {
 #[derive(Debug)]
 struct TestDisplayState {
     problem_index: String,
+    sample_cases: usize,
     total_cases: usize,
     cases: Vec<CaseDisplay>,
 }
@@ -201,6 +210,7 @@ impl TestDisplayState {
 #[derive(Default)]
 pub struct TerminalReporter {
     current_test: Option<TestDisplayState>,
+    pending_test_layout: Option<(String, usize)>,
     stress_progress_visible: bool,
 }
 
@@ -342,12 +352,27 @@ impl Reporter for TerminalReporter {
                         .to_string_lossy()
                 );
             }
+            Event::TestCaseLayout {
+                problem_index,
+                sample_cases,
+                ..
+            } => {
+                self.pending_test_layout = Some((problem_index.to_owned(), sample_cases));
+            }
+
             Event::TestRunStarted {
                 problem_index,
                 total_cases,
             } => {
+                let sample_cases = self
+                    .pending_test_layout
+                    .take()
+                    .filter(|(index, _)| index == problem_index)
+                    .map(|(_, sample_cases)| sample_cases)
+                    .unwrap_or(total_cases);
                 self.current_test = Some(TestDisplayState {
                     problem_index: problem_index.to_owned(),
+                    sample_cases,
                     total_cases,
                     cases: Vec::with_capacity(total_cases),
                 });
@@ -413,11 +438,9 @@ impl Reporter for TerminalReporter {
                 println!("input:");
                 print!("{}", print_section(&failure.input));
 
-                if let Some(expected) = &failure.expected {
-                    println!();
-                    println!("expected:");
-                    print!("{}", print_section(expected));
-                }
+                println!();
+                println!("expected:");
+                print!("{}", print_section(&failure.expected));
 
                 println!();
                 println!("actual:");
@@ -451,6 +474,14 @@ impl Reporter for TerminalReporter {
                 println!("Stress {problem_index}: cancelled after {cases} cases ({elapsed:.2?})");
             }
         }
+    }
+}
+
+fn case_label(number: usize, sample_cases: usize) -> String {
+    if number <= sample_cases {
+        format!("sample-{number}")
+    } else {
+        format!("stress-{}", number - sample_cases)
     }
 }
 
@@ -503,7 +534,7 @@ impl TerminalReporter {
             writeln!(
                 output,
                 "{:<12} {:<8} {:>7.2} ms",
-                format!("sample-{}", case.number),
+                case_label(case.number, test.sample_cases),
                 case.verdict.as_str(),
                 case.elapsed.as_secs_f64() * 1000.0,
             )
@@ -532,8 +563,8 @@ impl TerminalReporter {
             writeln!(output).expect("writing to String cannot fail");
             writeln!(
                 output,
-                "=== sample-{} {} ===",
-                case.number,
+                "=== {} {} ===",
+                case_label(case.number, test.sample_cases),
                 case.verdict.as_str()
             )
             .expect("writing to String cannot fail");
@@ -582,6 +613,33 @@ mod tests {
             problem_index,
             total_cases,
         });
+    }
+
+    #[test]
+    fn labels_promoted_stress_case_separately_from_samples() {
+        let mut reporter = TerminalReporter::default();
+        let stress = Sample {
+            input: "1\n".to_string(),
+            output: "2\n".to_string(),
+        };
+        reporter.report(Event::TestCaseLayout {
+            problem_index: "A",
+            sample_cases: 2,
+            stress_case: Some(&stress),
+        });
+        start(&mut reporter, "A", 3);
+        for number in 1..=3 {
+            reporter.report(Event::TestCaseAccepted {
+                number,
+                elapsed: ELAPSED,
+            });
+        }
+
+        let output = reporter.finish_test_result("A", 3, 3).unwrap();
+        assert!(output.contains("sample-1"));
+        assert!(output.contains("sample-2"));
+        assert!(output.contains("stress-1"));
+        assert!(!output.contains("sample-3"));
     }
 
     #[test]

@@ -91,18 +91,25 @@ pub(super) fn report_case_result(
 pub(super) fn run_test_cases(
     problem_index: &str,
     samples: &[Sample],
+    stress_case: Option<&Sample>,
     debug: bool,
     mut execute_case: impl FnMut(&Sample) -> io::Result<runner::ExecutionResult>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
+    let total_cases = samples.len() + if stress_case.is_some() { 1 } else { 0 };
+    reporter.report(Event::TestCaseLayout {
+        problem_index,
+        sample_cases: samples.len(),
+        stress_case,
+    });
     reporter.report(Event::TestRunStarted {
         problem_index,
-        total_cases: samples.len(),
+        total_cases,
     });
 
     let mut accepted = 0;
 
-    for (index, sample) in samples.iter().enumerate() {
+    for (index, sample) in samples.iter().chain(stress_case).enumerate() {
         let result = execute_case(sample)?;
 
         let verdict = report_case_result(index + 1, sample, &result, debug, reporter);
@@ -115,7 +122,7 @@ pub(super) fn run_test_cases(
     reporter.report(Event::TestRunFinished {
         problem_index,
         accepted,
-        total_cases: samples.len(),
+        total_cases,
     });
 
     Ok(())
@@ -313,8 +320,9 @@ fn test_problem_with_debug_header_and_cancel(
     }
 
     let samples = workspace::load_samples(destination, &problem.index)?;
+    let stress_case = crate::stress::load_saved_case(destination, &problem.index)?;
 
-    if samples.is_empty() {
+    if samples.is_empty() && stress_case.is_none() {
         reporter.report(Event::NoSamples {
             problem_index: &problem.index,
         });
@@ -334,6 +342,7 @@ fn test_problem_with_debug_header_and_cancel(
             run_test_cases(
                 &problem.index,
                 &samples,
+                stress_case.as_ref(),
                 debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {
@@ -401,6 +410,7 @@ fn test_problem_with_debug_header_and_cancel(
             run_test_cases(
                 &problem.index,
                 &samples,
+                stress_case.as_ref(),
                 debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {

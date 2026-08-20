@@ -211,12 +211,13 @@ pub(crate) fn run(
     terminal: &mut DefaultTerminal,
     contest: &Contest,
     sample_counts: Vec<usize>,
+    stress_cases: Vec<Option<crate::model::Sample>>,
     message_rx: Receiver<Message>,
     run_tx: Sender<RunRequest>,
     detail_analysis_tx: Sender<DetailAnalysisCommand>,
     detail_analysis_rx: Receiver<DetailAnalysisResult>,
 ) -> io::Result<()> {
-    let mut app = WatchApp::new(contest, sample_counts)?;
+    let mut app = WatchApp::new_with_stress_cases(contest, sample_counts, stress_cases)?;
 
     let mut dirty = true;
 

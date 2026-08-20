@@ -173,6 +173,7 @@ impl Reporter for RecordingReporter {
             Event::WatchSourceChanged { source } => {
                 format!("watch-source-changed:{}", source.display())
             }
+            Event::TestCaseLayout { .. } => return,
             Event::TestRunStarted {
                 problem_index,
                 total_cases,
@@ -702,6 +703,7 @@ fn recoverable_case_results_do_not_stop_later_samples() {
         run_test_cases(
             "A",
             &samples,
+            None,
             false,
             |_| Ok(results.pop_front().unwrap()),
             &mut reporter,
@@ -724,6 +726,55 @@ fn recoverable_case_results_do_not_stop_later_samples() {
             "case-accepted:4",
             "case-stderr:4:ac stderr",
             "test-finished:A:1:4",
+        ]
+    );
+}
+
+#[test]
+fn saved_stress_case_runs_after_official_samples() {
+    let samples = vec![
+        Sample {
+            input: "sample-1\n".to_string(),
+            output: "ok\n".to_string(),
+        },
+        Sample {
+            input: "sample-2\n".to_string(),
+            output: "ok\n".to_string(),
+        },
+    ];
+    let stress = Sample {
+        input: "stress\n".to_string(),
+        output: "ok\n".to_string(),
+    };
+    let mut executed = Vec::new();
+    let mut reporter = RecordingReporter::default();
+
+    run_test_cases(
+        "A",
+        &samples,
+        Some(&stress),
+        false,
+        |sample| {
+            executed.push(sample.input.clone());
+            Ok(execution(
+                ExecutionOutcome::Exited(exit_status(0)),
+                "ok\n",
+                "",
+            ))
+        },
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(executed, ["sample-1\n", "sample-2\n", "stress\n"]);
+    assert_eq!(
+        reporter.events,
+        [
+            "test-started:A:3",
+            "case-accepted:1",
+            "case-accepted:2",
+            "case-accepted:3",
+            "test-finished:A:3:3",
         ]
     );
 }
@@ -758,6 +809,7 @@ fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
     run_test_cases(
         "A",
         &samples,
+        None,
         false,
         |_| Ok(results.pop_front().unwrap()),
         &mut reporter,
@@ -766,6 +818,7 @@ fn test_run_boundaries_and_accepted_counts_are_independent_between_runs() {
     run_test_cases(
         "B",
         &samples[..1],
+        None,
         false,
         |_| {
             Ok(execution(

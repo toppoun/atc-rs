@@ -231,7 +231,7 @@ impl<'a> DetailDocument<'a> {
                     stress_elapsed_label(failure.candidate_elapsed),
                 ));
                 self.push_shared_section("input", &failure.input);
-                self.push_optional_shared_section("expected", failure.expected.as_ref());
+                self.push_shared_section("expected", &failure.expected);
                 self.push_shared_section("actual", &failure.actual);
                 if !failure.stderr.is_empty() {
                     self.push_shared_section("stderr", &failure.stderr);
@@ -262,10 +262,15 @@ impl<'a> DetailDocument<'a> {
     }
 
     fn push_sample_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
-        let total = problem.run.total_cases;
+        let total = problem.total_cases;
 
         if total == 0 {
             self.push_static("Running samples...");
+            return;
+        }
+
+        if app.selected_case() >= problem.sample_cases {
+            self.push_saved_stress_case_detail(app, problem);
             return;
         }
 
@@ -273,7 +278,7 @@ impl<'a> DetailDocument<'a> {
             self.push_owned(format!(
                 "sample {} / {}\n\nPending...",
                 app.selected_case() + 1,
-                total,
+                problem.sample_cases,
             ));
             return;
         };
@@ -281,7 +286,7 @@ impl<'a> DetailDocument<'a> {
         self.push_owned(format!(
             "sample {} / {}   {}{}",
             app.selected_case() + 1,
-            total,
+            problem.sample_cases,
             verdict_label(case.verdict),
             elapsed_label(case.elapsed),
         ));
@@ -311,6 +316,39 @@ impl<'a> DetailDocument<'a> {
 
         if let Some(stderr) = case.stderr.as_ref() {
             self.push_shared_section("stderr", stderr);
+        }
+    }
+
+    fn push_saved_stress_case_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
+        let Some(saved) = problem.saved_stress_case.as_ref() else {
+            self.push_static("stress 1 / 1\n\nPending...");
+            return;
+        };
+
+        let case = app.selected_case_state();
+        let verdict = case.map(|case| case.verdict).unwrap_or(CaseVerdict::Pending);
+        let elapsed = case.and_then(|case| case.elapsed);
+
+        self.push_owned(format!(
+            "stress 1 / 1   {}{}",
+            verdict_label(verdict),
+            elapsed_label(elapsed),
+        ));
+        self.push_shared_section("input", &saved.input);
+        self.push_shared_section("expected", &saved.expected);
+
+        match verdict {
+            CaseVerdict::Pending => self.push_static("\n\nPending..."),
+            CaseVerdict::Accepted | CaseVerdict::WrongAnswer => {}
+            CaseVerdict::RuntimeError => self.push_static("\n\nRuntime Error"),
+            CaseVerdict::TimedOut => self.push_static("\n\nTime Limit Exceeded"),
+        }
+
+        if let Some(case) = case {
+            self.push_optional_shared_section("actual", case.actual.as_ref());
+            if let Some(stderr) = case.stderr.as_ref() {
+                self.push_shared_section("stderr", stderr);
+            }
         }
     }
 

@@ -326,26 +326,74 @@ fn problem_style(problem: &ProblemState) -> Style {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleRow {
+    Sample { flat_index: usize, number: usize },
+    Blank,
+    StressHeader,
+    Stress { flat_index: usize },
+}
+
+fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
+    let mut rows = (0..problem.sample_cases)
+        .map(|index| SampleRow::Sample {
+            flat_index: index,
+            number: index + 1,
+        })
+        .collect::<Vec<_>>();
+
+    if problem.saved_stress_case.is_some() {
+        if !rows.is_empty() {
+            rows.push(SampleRow::Blank);
+        }
+        rows.push(SampleRow::StressHeader);
+        rows.push(SampleRow::Stress {
+            flat_index: problem.sample_cases,
+        });
+    }
+
+    rows
+}
+
 fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
     let Some(problem) = app.current_problem() else {
         return Text::default();
     };
-
-    let total = problem.total_cases;
 
     let mut lines = vec![
         Line::styled("Samples", Style::default().add_modifier(Modifier::BOLD)),
         Line::from(""),
     ];
 
+    let rows = sample_rows(problem);
     let visible = usize::from(height.saturating_sub(2));
+    let selected_case = app.selected_case();
+    let selected_row = rows
+        .iter()
+        .position(|row| match row {
+            SampleRow::Sample { flat_index, .. } | SampleRow::Stress { flat_index } => {
+                *flat_index == selected_case
+            }
+            SampleRow::Blank | SampleRow::StressHeader => false,
+        })
+        .unwrap_or(0);
+    let range = sample_window(rows.len(), selected_row, visible);
+    let selected = (problem.detail_mode == DetailMode::Samples).then_some(selected_case);
 
-    let range = sample_window(total, app.selected_case(), visible);
-
-    let selected = (problem.detail_mode == DetailMode::Samples).then_some(app.selected_case());
-
-    for index in range {
-        lines.push(sample_line(problem, index, selected));
+    for row in &rows[range] {
+        match *row {
+            SampleRow::Sample { flat_index, number } => {
+                lines.push(sample_line(problem, flat_index, number, selected));
+            }
+            SampleRow::Blank => lines.push(Line::from("")),
+            SampleRow::StressHeader => lines.push(Line::styled(
+                "Stress",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            SampleRow::Stress { flat_index } => {
+                lines.push(sample_line(problem, flat_index, 1, selected));
+            }
+        }
     }
 
     Text::from(lines)
@@ -370,10 +418,11 @@ fn sample_window(total: usize, selected: usize, visible: usize) -> std::ops::Ran
 
 fn sample_line(
     problem: &ProblemState,
-    index: usize,
+    flat_index: usize,
+    number: usize,
     selected: Option<usize>,
 ) -> Line<'static> {
-    let case = problem.run.cases.get(index);
+    let case = problem.run.cases.get(flat_index);
 
     let (verdict, mut style) = match case {
         Some(case) => match case.verdict {
@@ -391,7 +440,7 @@ fn sample_line(
         None => ("·", Style::default().fg(Color::DarkGray)),
     };
 
-    let is_selected = selected == Some(index);
+    let is_selected = selected == Some(flat_index);
     let marker = if is_selected { ">" } else { " " };
 
     if is_selected {
@@ -404,9 +453,9 @@ fn sample_line(
         .unwrap_or_default();
 
     let text = if elapsed.is_empty() {
-        format!("{marker} {:>2}  {verdict}", index + 1)
+        format!("{marker} {:>2}  {verdict}", number)
     } else {
-        format!("{marker} {:>2}  {:<3}  {elapsed}", index + 1, verdict,)
+        format!("{marker} {:>2}  {:<3}  {elapsed}", number, verdict,)
     };
 
     Line::styled(text, style)
@@ -684,6 +733,45 @@ mod tests {
                 .unwrap();
         }
     }
+    #[test]
+    fn saved_stress_case_is_rendered_after_samples_with_its_own_header() {
+        let app = WatchApp::new_with_stress_cases(
+            &Contest {
+                contest_id: "abc123".to_string(),
+                problems: vec![Problem {
+                    index: "A".to_string(),
+                    title: "Problem A".to_string(),
+                    task_id: "abc123_a".to_string(),
+                    url: "https://example.invalid/a".to_string(),
+                }],
+            },
+            vec![2],
+            vec![Some(crate::model::Sample {
+                input: "1\n".to_string(),
+                output: "2\n".to_string(),
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            sample_rows(app.current_problem().unwrap()),
+            vec![
+                SampleRow::Sample {
+                    flat_index: 0,
+                    number: 1,
+                },
+                SampleRow::Sample {
+                    flat_index: 1,
+                    number: 2,
+                },
+                SampleRow::Blank,
+                SampleRow::StressHeader,
+                SampleRow::Stress { flat_index: 2 },
+            ]
+        );
+        assert_eq!(sample_window(5, 4, 2), 3..5);
+    }
+
     #[test]
     fn sample_window_keeps_selected_sample_visible() {
         assert_eq!(sample_window(0, 0, 5), 0..0);

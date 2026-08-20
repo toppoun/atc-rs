@@ -138,6 +138,7 @@ mod tests {
                 Event::NoSamples { problem_index } => {
                     self.events.push(format!("no-samples:{problem_index}"));
                 }
+                Event::TestCaseLayout { .. } => {}
                 Event::TestRunStarted {
                     problem_index,
                     total_cases,

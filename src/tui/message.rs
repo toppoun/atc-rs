@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::language::Language;
+use crate::model::Sample;
 use crate::stress::CandidateFailureKind;
 
 pub type RunId = u64;
@@ -42,6 +43,11 @@ pub enum TestEvent {
 
     CompileTimedOut {
         elapsed: Duration,
+    },
+
+    TestCaseLayout {
+        sample_cases: usize,
+        stress_case: Option<Sample>,
     },
 
     TestRunStarted {
@@ -103,7 +109,7 @@ pub enum StressEvent {
         base_seed: u64,
         seed: u64,
         input: String,
-        expected: Option<String>,
+        expected: String,
         actual: String,
         stderr: String,
         candidate_elapsed: Duration,

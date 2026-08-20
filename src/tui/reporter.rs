@@ -77,6 +77,17 @@ impl Reporter for ChannelReporter {
                 self.send(TestEvent::CompileTimedOut { elapsed });
             }
 
+            Event::TestCaseLayout {
+                sample_cases,
+                stress_case,
+                ..
+            } => {
+                self.send(TestEvent::TestCaseLayout {
+                    sample_cases,
+                    stress_case: stress_case.cloned(),
+                });
+            }
+
             Event::TestRunStarted { total_cases, .. } => {
                 self.send(TestEvent::TestRunStarted { total_cases });
             }
@@ -388,7 +399,7 @@ mod tests {
             base_seed: 100,
             seed: 113,
             input: "2\n1 2\n".to_string(),
-            expected: Some("No\n".to_string()),
+            expected: "No\n".to_string(),
             actual: "Yes\n".to_string(),
             stderr: "debug\n".to_string(),
             elapsed: Duration::from_millis(7),
@@ -414,7 +425,7 @@ mod tests {
                         case_number: 14,
                         seed: 113,
                         input,
-                        expected: Some(expected),
+                        expected,
                         actual,
                         stderr,
                         saved_to,

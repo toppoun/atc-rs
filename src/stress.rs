@@ -12,6 +12,7 @@ use crate::attempt::io_error_is_clean_cancellation;
 use crate::comparator::{self, ComparisonResult};
 use crate::error::AppError;
 use crate::language::Language;
+use crate::model::Sample;
 use crate::runner::{self, ExecutionOutcome};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
@@ -85,7 +86,7 @@ pub struct StressFailure {
     pub(crate) base_seed: u64,
     pub(crate) seed: u64,
     pub(crate) input: String,
-    pub(crate) expected: Option<String>,
+    pub(crate) expected: String,
     pub(crate) actual: String,
     pub(crate) stderr: String,
     pub(crate) elapsed: Duration,
@@ -257,28 +258,7 @@ pub(crate) fn run(
             }
         };
 
-        if let Some(kind) = candidate_failure_kind(&candidate) {
-            let failure = StressFailure {
-                kind,
-                case_number,
-                base_seed: request.base_seed,
-                seed,
-                input,
-                expected: None,
-                actual: candidate.stdout,
-                stderr: candidate.stderr,
-                elapsed: candidate.elapsed,
-            };
-
-            return finish_failure(
-                request,
-                failure,
-                passed,
-                loop_started,
-                reporter,
-                is_cancelled,
-            );
-        }
+        let candidate_failure = candidate_failure_kind(&candidate);
 
         let expected = match run_reference(request, &input, seed, is_cancelled)? {
             ProcessStep::Completed(expected) => expected,
@@ -292,17 +272,22 @@ pub(crate) fn run(
             }
         };
 
-        if matches!(
-            comparator::compare(&expected, &candidate.stdout),
-            ComparisonResult::WrongAnswer
-        ) {
+        let failure_kind = candidate_failure.or_else(|| {
+            matches!(
+                comparator::compare(&expected, &candidate.stdout),
+                ComparisonResult::WrongAnswer
+            )
+            .then_some(CandidateFailureKind::WrongAnswer)
+        });
+
+        if let Some(kind) = failure_kind {
             let failure = StressFailure {
-                kind: CandidateFailureKind::WrongAnswer,
+                kind,
                 case_number,
                 base_seed: request.base_seed,
                 seed,
                 input,
-                expected: Some(expected),
+                expected,
                 actual: candidate.stdout,
                 stderr: candidate.stderr,
                 elapsed: candidate.elapsed,
@@ -688,9 +673,7 @@ fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Resu
     write_new_file(&new_generation.join("failed.in"), &failure.input)?;
     write_new_file(&new_generation.join("actual.out"), &failure.actual)?;
 
-    if let Some(expected) = &failure.expected {
-        write_new_file(&new_generation.join("expected.out"), expected)?;
-    }
+    write_new_file(&new_generation.join("expected.out"), &failure.expected)?;
 
     if !failure.stderr.is_empty() {
         write_new_file(&new_generation.join("stderr.txt"), &failure.stderr)?;
@@ -750,6 +733,36 @@ fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Resu
     Ok(target)
 }
 
+pub(crate) fn load_saved_case(
+    destination: &Path,
+    problem_index: &str,
+) -> io::Result<Option<Sample>> {
+    let stress_root = destination.join(".atc").join("stress");
+    if !existing_real_directory(&stress_root, "stress directory")? {
+        return Ok(None);
+    }
+
+    let target = stress_root.join(problem_index);
+    if !existing_real_directory(&target, "stress failure directory")? {
+        return Ok(None);
+    }
+
+    let input_path = target.join("failed.in");
+    let expected_path = target.join("expected.out");
+    let has_input = existing_regular_file(&input_path, "stress input")?;
+    let has_expected = existing_regular_file(&expected_path, "stress expected output")?;
+
+    // v1 RE/TLE failures did not have expected.out and cannot be promoted safely.
+    if !has_input || !has_expected {
+        return Ok(None);
+    }
+
+    Ok(Some(Sample {
+        input: fs::read_to_string(input_path)?,
+        output: fs::read_to_string(expected_path)?,
+    }))
+}
+
 fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -768,6 +781,18 @@ fn existing_real_directory(path: &Path, kind: &str) -> io::Result<bool> {
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{kind} is not a real directory: {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn existing_regular_file(path: &Path, kind: &str) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is not a real file: {}", path.display()),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -839,7 +864,7 @@ mod tests {
             base_seed: 10,
             seed: 10,
             input: "1\n".to_string(),
-            expected: Some("2\n".to_string()),
+            expected: "2\n".to_string(),
             actual: "3\n".to_string(),
             stderr: "debug\n".to_string(),
             elapsed: Duration::from_millis(5),
@@ -855,19 +880,38 @@ mod tests {
             base_seed: 10,
             seed: 11,
             input: "4\n".to_string(),
-            expected: None,
+            expected: "5\n".to_string(),
             actual: String::new(),
             stderr: String::new(),
             elapsed: Duration::from_millis(7),
         };
 
         let target = persist_failure(&request, &re).unwrap();
-        assert!(!target.join("expected.out").exists());
+        assert_eq!(fs::read_to_string(target.join("expected.out")).unwrap(), "5\n");
         assert!(!target.join("stderr.txt").exists());
         assert_eq!(fs::read_to_string(target.join("failed.in")).unwrap(), "4\n");
 
         let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
         assert!(metadata.contains("kind = \"runtime-error\""));
         assert!(metadata.contains("seed = 11"));
+    }
+
+    #[test]
+    fn saved_case_requires_both_input_and_expected_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join(".atc").join("stress").join("A");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("failed.in"), "1 2\n").unwrap();
+
+        assert_eq!(load_saved_case(temp.path(), "A").unwrap(), None);
+
+        fs::write(target.join("expected.out"), "3\n").unwrap();
+        assert_eq!(
+            load_saved_case(temp.path(), "A").unwrap(),
+            Some(Sample {
+                input: "1 2\n".to_string(),
+                output: "3\n".to_string(),
+            })
+        );
     }
 }

@@ -15,7 +15,7 @@ pub struct Problem {
     pub url: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
     pub input: String,
     pub output: String,
