@@ -2179,6 +2179,34 @@ mod tests {
     }
 
     #[test]
+    fn stress_attempt_error_transitions_to_error_detail() {
+        for (source, language) in [
+            (PathBuf::from("A.cpp"), Language::Cpp),
+            (PathBuf::from("A.py"), Language::Python),
+        ] {
+            let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+            assert!(app.source_changed(0, source, language));
+            let stress = app.queue_stress(0, 100).unwrap();
+            assert!(app.run_started(0, stress.run_id));
+
+            assert!(app.run_failed(
+                0,
+                stress.run_id,
+                "reference program failed".to_string(),
+            ));
+
+            assert_eq!(app.problems[0].stress.phase, StressPhase::Error);
+            assert_eq!(
+                app.problems[0].stress.error.as_deref().map(String::as_str),
+                Some("reference program failed")
+            );
+            let detail = detail_text(&app);
+            assert!(detail.contains("STRESS ERROR"));
+            assert!(detail.contains("reference program failed"));
+        }
+    }
+
+    #[test]
     fn switching_between_samples_and_stress_rejects_late_cross_mode_events() {
         let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
         assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));

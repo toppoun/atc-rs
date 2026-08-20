@@ -653,6 +653,16 @@ mod tests {
         }
     }
 
+    fn stress_request(problem: usize, run_id: u64) -> RunRequest {
+        RunRequest {
+            kind: crate::tui::message::RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(problem, run_id)
+        }
+    }
+
     fn wait_cancel_requested(cancellation: &AttemptCancellation) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while !cancellation.is_requested() {
@@ -838,6 +848,28 @@ mod tests {
         messages_until(&fake.message_rx, |message| {
             matches!(message, Message::RunCompleted { run_id: 2, .. })
         });
+        fake.stop();
+    }
+
+    #[test]
+    fn latest_stress_failure_is_published_without_requeue() {
+        let fake = FakeWorker::start();
+        let stress = stress_request(0, 1);
+        fake.request_tx.send(stress).unwrap();
+        let active = fake.spawned();
+        assert_eq!(active.request, stress);
+
+        active.finish(Finish::Failed);
+
+        let messages = messages_until(&fake.message_rx, |message| {
+            matches!(message, Message::RunFailed { run_id: 1, .. })
+        });
+        assert!(
+            messages
+                .iter()
+                .all(|message| { !matches!(message, Message::RunRequeued { run_id: 1, .. }) })
+        );
+        assert!(fake.spawned_rx.try_recv().is_err());
         fake.stop();
     }
 

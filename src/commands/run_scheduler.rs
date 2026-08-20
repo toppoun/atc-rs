@@ -24,6 +24,7 @@ struct ActiveRequest {
 #[derive(Debug)]
 pub(super) struct RetiredActive {
     request: RunRequest,
+    is_latest: bool,
     requeue_eligible: bool,
 }
 
@@ -33,7 +34,7 @@ impl RetiredActive {
     }
 
     pub(super) fn is_latest(&self) -> bool {
-        self.requeue_eligible
+        self.is_latest
     }
 }
 
@@ -117,15 +118,16 @@ impl RunScheduler {
 
     pub(super) fn retire_active(&mut self) -> Option<RetiredActive> {
         let active = self.active.take()?;
-        let requeue_eligible = active.request.kind.preserve_on_preemption()
-            && active.logical_state == ActiveLogicalState::Latest
+        let is_latest = active.logical_state == ActiveLogicalState::Latest
             && self.latest_seen.get(&active.request.problem) == Some(&active.request.run_id)
             && !self.has_logical_request_for(active.request.problem);
+        let requeue_eligible = is_latest && active.request.kind.preserve_on_preemption();
 
         debug_assert!(self.invariants_hold());
 
         Some(RetiredActive {
             request: active.request,
+            is_latest,
             requeue_eligible,
         })
     }
@@ -624,6 +626,8 @@ mod tests {
         start(&mut scheduler, stress);
         let retired = scheduler.retire_active().unwrap();
 
+        assert!(retired.is_latest());
+        assert!(!retired.requeue_eligible);
         assert!(!scheduler.requeue_retired(retired));
         assert!(scheduler.start_next().is_none());
         assert_invariants(&scheduler);
