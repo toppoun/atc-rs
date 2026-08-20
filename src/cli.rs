@@ -1,4 +1,5 @@
 use crate::language::Language;
+use std::num::NonZeroU64;
 use clap::{Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 const LOGO: &str = r#"
@@ -104,6 +105,29 @@ pub enum RunTestCommand {
 
         #[arg(long)]
         plain: bool,
+    },
+
+    /// Find counterexamples with stress testing
+    Stress {
+        problem: String,
+
+        #[arg(short = 'c', long)]
+        contest: Option<String>,
+
+        #[arg(short = 'l', long = "language")]
+        language: Option<Language>,
+
+        #[arg(short, long)]
+        debug: bool,
+
+        #[arg(long, conflicts_with = "forever")]
+        count: Option<NonZeroU64>,
+
+        #[arg(long, conflicts_with = "count")]
+        forever: bool,
+
+        #[arg(long)]
+        seed: Option<u64>,
     },
 }
 
@@ -326,6 +350,71 @@ mod tests {
     #[test]
     fn test_language_rejects_unsupported_alias() {
         assert!(Cli::try_parse_from(["atc-rs", "test", "A", "-l", "py"]).is_err());
+    }
+
+    #[test]
+    fn parses_stress_options() {
+        let cli = Cli::try_parse_from(["atc-rs", "stress", "A"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RunTest(RunTestCommand::Stress {
+                problem,
+                contest: None,
+                language: None,
+                debug: false,
+                count: None,
+                forever: false,
+                seed: None,
+            }) if problem == "A"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "atc-rs",
+            "stress",
+            "B",
+            "-c",
+            "abc466",
+            "-l",
+            "cpp",
+            "--debug",
+            "--count",
+            "1000",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::RunTest(RunTestCommand::Stress {
+                problem,
+                contest: Some(contest),
+                language: Some(Language::Cpp),
+                debug: true,
+                count: Some(count),
+                forever: false,
+                seed: Some(42),
+            }) if problem == "B" && contest == "abc466" && count.get() == 1000
+        ));
+    }
+
+    #[test]
+    fn stress_count_and_forever_are_exclusive_and_count_must_be_nonzero() {
+        assert!(
+            Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "10", "--forever"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "0"]).is_err());
+
+        let cli = Cli::try_parse_from(["atc-rs", "stress", "A", "--forever"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RunTest(RunTestCommand::Stress {
+                forever: true,
+                count: None,
+                ..
+            })
+        ));
     }
 
     #[test]

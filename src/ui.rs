@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -90,6 +91,40 @@ pub enum Event<'a> {
     WatchSourceChanged {
         source: &'a Path,
     },
+
+    StressStarted {
+        problem_index: &'a str,
+        base_seed: u64,
+        case_limit: Option<u64>,
+    },
+
+    StressProgress {
+        problem_index: &'a str,
+        case_number: u64,
+        seed: u64,
+        passed: u64,
+        elapsed: Duration,
+        cases_per_second: f64,
+    },
+
+    StressFailed {
+        problem_index: &'a str,
+        failure: &'a crate::stress::StressFailure,
+        saved_to: &'a Path,
+        elapsed: Duration,
+    },
+
+    StressFinished {
+        problem_index: &'a str,
+        cases: u64,
+        elapsed: Duration,
+    },
+
+    StressCancelled {
+        problem_index: &'a str,
+        cases: u64,
+        elapsed: Duration,
+    },
 }
 
 pub trait Reporter {
@@ -166,6 +201,7 @@ impl TestDisplayState {
 #[derive(Default)]
 pub struct TerminalReporter {
     current_test: Option<TestDisplayState>,
+    stress_progress_visible: bool,
 }
 
 impl Reporter for TerminalReporter {
@@ -327,6 +363,93 @@ impl Reporter for TerminalReporter {
                     print!("{output}");
                 }
             }
+
+            Event::StressStarted {
+                problem_index,
+                base_seed,
+                case_limit,
+            } => {
+                self.finish_stress_progress_line();
+                match case_limit {
+                    Some(limit) => {
+                        println!("Stress {problem_index}  seed {base_seed}  max {limit} cases");
+                    }
+                    None => {
+                        println!("Stress {problem_index}  seed {base_seed}  until failure");
+                    }
+                }
+            }
+
+            Event::StressProgress {
+                problem_index,
+                case_number,
+                seed,
+                passed,
+                elapsed,
+                cases_per_second,
+            } => {
+                eprint!(
+                    "\rStress {problem_index}  passed {passed}  case {case_number}  seed {seed}  {cases_per_second:.1} cases/s  {elapsed:.1?}"
+                );
+                let _ = std::io::stderr().flush();
+                self.stress_progress_visible = true;
+            }
+
+            Event::StressFailed {
+                problem_index,
+                failure,
+                saved_to,
+                elapsed,
+            } => {
+                self.finish_stress_progress_line();
+                println!(
+                    "Stress {problem_index}: {} at case {} (seed {}) after {elapsed:.2?}, candidate {candidate_elapsed:.2?}",
+                    failure.kind.as_str(),
+                    failure.case_number,
+                    failure.seed,
+                    candidate_elapsed = failure.elapsed
+                );
+                println!();
+                println!("input:");
+                print!("{}", print_section(&failure.input));
+
+                if let Some(expected) = &failure.expected {
+                    println!();
+                    println!("expected:");
+                    print!("{}", print_section(expected));
+                }
+
+                println!();
+                println!("actual:");
+                print!("{}", print_section(&failure.actual));
+
+                if !failure.stderr.is_empty() {
+                    println!();
+                    println!("stderr:");
+                    print!("{}", print_section(&failure.stderr));
+                }
+
+                println!();
+                println!("Saved to {}", saved_to.display());
+            }
+
+            Event::StressFinished {
+                problem_index,
+                cases,
+                elapsed,
+            } => {
+                self.finish_stress_progress_line();
+                println!("Stress {problem_index}: {cases} cases passed ({elapsed:.2?})");
+            }
+
+            Event::StressCancelled {
+                problem_index,
+                cases,
+                elapsed,
+            } => {
+                self.finish_stress_progress_line();
+                println!("Stress {problem_index}: cancelled after {cases} cases ({elapsed:.2?})");
+            }
         }
     }
 }
@@ -346,6 +469,13 @@ fn print_section(text: &str) -> String {
 }
 
 impl TerminalReporter {
+    fn finish_stress_progress_line(&mut self) {
+        if self.stress_progress_visible {
+            eprintln!();
+            self.stress_progress_visible = false;
+        }
+    }
+
     fn finish_test_result(
         &mut self,
         problem_index: &str,

@@ -127,7 +127,12 @@ impl Reporter for ChannelReporter {
             | Event::WorkspaceRefreshed { .. }
             | Event::SourceCreated { .. }
             | Event::WatchStarted { .. }
-            | Event::WatchSourceChanged { .. } => {}
+            | Event::WatchSourceChanged { .. }
+            | Event::StressStarted { .. }
+            | Event::StressProgress { .. }
+            | Event::StressFailed { .. }
+            | Event::StressFinished { .. }
+            | Event::StressCancelled { .. } => {}
         }
     }
 }

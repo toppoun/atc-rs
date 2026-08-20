@@ -30,12 +30,12 @@ int main() {
         cin >> x;
         if(x >= 0) ans = false;  
     }
-    for(int i = 0; i < 1e7; i++){
-        cout << i << " ";
-    }
-    for(int i = 0; i < 1e7; i++){
-        cout << i << "\n";
-    }
+    // for(int i = 0; i < 1e7; i++){
+    //     cout << i << " ";
+    // }
+    // for(int i = 0; i < 1e7; i++){
+    //     cout << i << "\n";
+    // }
     cout << (ans ? "Yes":"No") << endl;
     debug(ans);
 

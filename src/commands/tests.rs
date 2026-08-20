@@ -194,6 +194,48 @@ impl Reporter for RecordingReporter {
             } => {
                 format!("case-comparison:{number}:expected={expected:?}:actual={actual:?}")
             }
+            Event::StressStarted {
+                problem_index,
+                base_seed,
+                case_limit,
+            } => {
+                format!("stress-started:{problem_index}:{base_seed}:{case_limit:?}")
+            }
+            Event::StressProgress {
+                problem_index,
+                case_number,
+                seed,
+                passed,
+                ..
+            } => {
+                format!("stress-progress:{problem_index}:{case_number}:{seed}:{passed}")
+            }
+            Event::StressFailed {
+                problem_index,
+                failure,
+                ..
+            } => {
+                format!(
+                    "stress-failed:{problem_index}:{}:{}:{}",
+                    failure.kind.as_str(),
+                    failure.case_number,
+                    failure.seed
+                )
+            }
+            Event::StressFinished {
+                problem_index,
+                cases,
+                ..
+            } => {
+                format!("stress-finished:{problem_index}:{cases}")
+            }
+            Event::StressCancelled {
+                problem_index,
+                cases,
+                ..
+            } => {
+                format!("stress-cancelled:{problem_index}:{cases}")
+            }
         };
         self.events.push(event);
     }

@@ -17,6 +17,7 @@ mod language;
 mod model;
 mod paths;
 mod runner;
+mod stress;
 mod template;
 mod tui;
 mod ui;
@@ -68,6 +69,27 @@ fn run() -> Result<(), AppError> {
             } else {
                 commands::watch_tui(contest.as_deref())?;
             }
+        }
+
+        cli::Command::RunTest(cli::RunTestCommand::Stress {
+            problem,
+            contest,
+            language,
+            debug,
+            count,
+            forever,
+            seed,
+        }) => {
+            commands::stress(
+                &problem,
+                contest.as_deref(),
+                language,
+                debug,
+                count,
+                forever,
+                seed,
+                &mut reporter,
+            )?;
         }
 
         cli::Command::Files(cli::FileCommand::Create { name, language }) => {
