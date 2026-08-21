@@ -95,7 +95,6 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "clap",
- "crossterm",
  "etcetera",
  "libc",
  "notify",
@@ -105,7 +104,7 @@ dependencies = [
  "scraper",
  "serde",
  "tempfile",
- "termina 0.3.3 (git+https://github.com/toppoun/termina?rev=6c208fd5ce149db85625af75f7b526424d605550)",
+ "termina",
  "toml",
  "unicode-segmentation",
  "unicode-width",
@@ -1639,6 +1638,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "numtoa"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aa2c4e539b869820a2b82e1aef6ff40aa85e65decdd5185e83fb4b1249cd00f"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2068,6 +2073,7 @@ dependencies = [
  "ratatui-crossterm",
  "ratatui-macros",
  "ratatui-termina",
+ "ratatui-termion",
  "ratatui-termwiz",
  "ratatui-widgets",
  "serde",
@@ -2125,7 +2131,18 @@ checksum = "c0bf912d9e66f057a759d92e386a280ea886b352ab757d6ac4d653c7ed2c43c2"
 dependencies = [
  "instability",
  "ratatui-core",
- "termina 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "termina",
+]
+
+[[package]]
+name = "ratatui-termion"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87c732202fa5a71a9da0991013f0853e53f87048f45198e3a1ca3ee722accc2f"
+dependencies = [
+ "instability",
+ "ratatui-core",
+ "termion",
 ]
 
 [[package]]
@@ -2785,19 +2802,6 @@ dependencies = [
 [[package]]
 name = "termina"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
-dependencies = [
- "bitflags 2.13.1",
- "parking_lot",
- "rustix",
- "signal-hook",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "termina"
-version = "0.3.3"
 source = "git+https://github.com/toppoun/termina?rev=6c208fd5ce149db85625af75f7b526424d605550#6c208fd5ce149db85625af75f7b526424d605550"
 dependencies = [
  "bitflags 2.13.1",
@@ -2817,6 +2821,16 @@ dependencies = [
  "nom",
  "phf 0.11.3",
  "phf_codegen 0.11.3",
+]
+
+[[package]]
+name = "termion"
+version = "4.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f44138a9ae08f0f502f24104d82517ef4da7330c35acd638f1f29d3cd5475ecb"
+dependencies = [
+ "libc",
+ "numtoa",
 ]
 
 [[package]]

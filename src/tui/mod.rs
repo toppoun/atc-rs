@@ -1,11 +1,11 @@
 pub mod app;
-mod crossterm_adapter;
 mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
 pub mod message;
 pub mod reporter;
+mod termina_adapter;
 mod terminal;
 pub mod view;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -14,13 +14,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use message::{Message, RunRequest};
-use ratatui::DefaultTerminal;
-
 use crate::model::Contest;
 use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
+use message::{Message, RunRequest};
+pub(crate) use terminal::TerminaSession;
 use terminal::{
     KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind, TerminalEvent,
 };
@@ -241,7 +240,7 @@ fn send_detail_analysis_command(
 }
 
 pub(crate) fn run(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut TerminaSession,
     contest: &Contest,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
@@ -261,7 +260,7 @@ pub(crate) fn run(
 
     while !app.should_quit() {
         if terminal_events.is_empty() {
-            terminal_events = read_terminal_events(Duration::ZERO)?;
+            terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
         if contains_quit_event(&terminal_events) {
@@ -291,7 +290,7 @@ pub(crate) fn run(
 
         // message batch処理中にqが到着していれば、重いwrap/再描画より優先する。
         if terminal_events.is_empty() {
-            terminal_events = read_terminal_events(Duration::ZERO)?;
+            terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
         if contains_quit_event(&terminal_events) {
@@ -328,7 +327,7 @@ pub(crate) fn run(
         }
 
         if terminal_events.is_empty() {
-            terminal_events = read_terminal_events(TERMINAL_POLL_INTERVAL)?;
+            terminal_events = read_terminal_events(terminal, TERMINAL_POLL_INTERVAL)?;
         }
 
         // qは同じbatch内のresize/mouseより先に扱い、再描画を挟まず終了する。
@@ -352,8 +351,11 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn read_terminal_events(wait: Duration) -> io::Result<VecDeque<TerminalEvent>> {
-    read_terminal_events_with(wait, crossterm_adapter::poll, crossterm_adapter::read)
+fn read_terminal_events(
+    terminal: &TerminaSession,
+    wait: Duration,
+) -> io::Result<VecDeque<TerminalEvent>> {
+    read_terminal_events_with(wait, |wait| terminal.poll(wait), || terminal.read())
 }
 
 fn read_terminal_events_with(
