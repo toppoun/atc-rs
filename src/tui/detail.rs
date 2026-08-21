@@ -297,7 +297,9 @@ impl<'a> DetailDocument<'a> {
                 return;
             }
 
-            CaseVerdict::Accepted => {}
+            CaseVerdict::Accepted => {
+                self.push_static("\n\nAccepted");
+            }
 
             CaseVerdict::WrongAnswer => {}
 
@@ -713,6 +715,48 @@ mod tests {
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&accepted_app));
+    }
+
+    #[test]
+    fn debug_accepted_detail_keeps_status_before_comparison_and_stderr() {
+        let (mut app, run_id) = running_app();
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(4),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                expected: "expected\n".to_string(),
+                actual: "actual\n".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseStderr {
+                number: 1,
+                stderr: "debug output\n".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            document_text(&DetailDocument::from_app(&app)),
+            concat!(
+                "A - Problem A\n\n",
+                "sample 1 / 1   AC   4.0 ms",
+                "\n\nAccepted",
+                "\n\nexpected\nexpected\n",
+                "\n\nactual\nactual\n",
+                "\n\nstderr\ndebug output\n",
+            )
+        );
     }
 
     #[test]
