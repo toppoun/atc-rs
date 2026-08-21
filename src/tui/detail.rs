@@ -139,6 +139,14 @@ impl<'a> DetailDocument<'a> {
     fn push_sample_run_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
 
+        if run.phase == RunPhase::Idle
+            && problem.saved_stress_case.is_some()
+            && app.selected_case() >= problem.sample_cases
+        {
+            self.push_saved_stress_case_detail(app, problem);
+            return;
+        }
+
         match run.phase {
             RunPhase::Idle => {
                 self.push_static("Waiting for a source change...");

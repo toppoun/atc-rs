@@ -367,7 +367,9 @@ fn load_watch_input(
     let stress_cases = contest
         .problems
         .iter()
-        .map(|problem| crate::stress::load_saved_case(destination, &problem.index))
+        .map(|problem| {
+            crate::stress::load_saved_case(destination, &contest.contest_id, &problem.index)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok((contest, sample_counts, stress_cases))
@@ -422,7 +424,13 @@ mod tests {
         let stress_a = temp.path().join(".atc").join("stress").join("A");
         std::fs::create_dir_all(&stress_a).unwrap();
         std::fs::write(stress_a.join("failed.in"), "7\n").unwrap();
+        std::fs::write(stress_a.join("actual.out"), "9\n").unwrap();
         std::fs::write(stress_a.join("expected.out"), "8\n").unwrap();
+        std::fs::write(
+            stress_a.join("meta.toml"),
+            "version = 1\ncontest = \"contest\"\nproblem = \"A\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 10\nseed = 10\n",
+        )
+        .unwrap();
 
         let (loaded_contest, sample_counts, stress_cases) =
             load_watch_input(temp.path(), None).unwrap();

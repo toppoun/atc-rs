@@ -1,11 +1,14 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::attempt::io_error_is_clean_cancellation;
@@ -683,6 +686,14 @@ fn persist_failure(
 
     let stress_root = request.destination.join(".atc").join("stress");
     ensure_real_directory(&stress_root, "stress directory")?;
+    let stress_directory = open_stress_directory(&request.destination)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("stress directory disappeared: {}", stress_root.display()),
+        )
+    })?;
+    let generation_lock = open_stress_lock(&stress_directory, &request.problem_index, true)?
+        .expect("create was requested for the stress generation lock");
 
     let target = stress_root.join(&request.problem_index);
     let target_exists = existing_real_directory(&target, "stress failure directory")?;
@@ -727,6 +738,20 @@ fn persist_failure(
     // longer win without either hiding a committed failure or requiring a destructive rollback.
     if is_cancelled() {
         return Ok(PersistenceOutcome::Cancelled);
+    }
+
+    loop {
+        if is_cancelled() {
+            return Ok(PersistenceOutcome::Cancelled);
+        }
+
+        match generation_lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
     }
 
     // destructive swap直前に再検査する。symlinkやfileへ差し替わっていたら止める。
@@ -879,6 +904,26 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
     Ok(())
 }
 
+fn valid_failure_metadata(
+    metadata: &StoredFailureMetadata,
+    contest_id: &str,
+    problem_index: &str,
+) -> bool {
+    metadata.version == FAILURE_FORMAT_VERSION
+        && metadata.contest == contest_id
+        && metadata.problem == problem_index
+        && metadata.case != 0
+        && metadata
+            .case
+            .checked_sub(1)
+            .and_then(|offset| metadata.base_seed.checked_add(offset))
+            == Some(metadata.seed)
+        && matches!(
+            metadata.kind.as_str(),
+            "wrong-answer" | "runtime-error" | "timed-out"
+        )
+}
+
 fn rollback_previous_generation(
     staging: tempfile::TempDir,
     target: &Path,
@@ -903,32 +948,175 @@ fn rollback_previous_generation(
 
 pub(crate) fn load_saved_case(
     destination: &Path,
+    contest_id: &str,
     problem_index: &str,
 ) -> io::Result<Option<Sample>> {
-    let stress_root = destination.join(".atc").join("stress");
-    if !existing_real_directory(&stress_root, "stress directory")? {
+    load_saved_case_with_hook(destination, contest_id, problem_index, || {})
+}
+
+fn load_saved_case_with_hook(
+    destination: &Path,
+    contest_id: &str,
+    problem_index: &str,
+    before_shared_lock: impl FnOnce(),
+) -> io::Result<Option<Sample>> {
+    workspace::validate_problem_index(problem_index)?;
+
+    let Some(stress_directory) = open_stress_directory(destination)? else {
+        return Ok(None);
+    };
+
+    let generation_lock = open_stress_lock(&stress_directory, problem_index, false)?;
+    before_shared_lock();
+    if let Some(lock) = generation_lock.as_ref() {
+        lock.lock_shared()?;
+    }
+
+    let Some(generation) = open_optional_directory(&stress_directory, problem_index)? else {
+        return Ok(None);
+    };
+
+    let Some(snapshot) = open_saved_case_snapshot(&generation)? else {
+        return Ok(None);
+    };
+
+    // Keep the shared lock through the reads. On Windows, no-follow file handles intentionally
+    // block a directory rename, so releasing the lock before closing them would make the writer's
+    // generation swap fail instead of merely waiting for this coherent read to finish.
+    drop(generation);
+    let result = read_saved_case_snapshot(snapshot, contest_id, problem_index);
+    drop(generation_lock);
+    result
+}
+
+struct SavedCaseSnapshot {
+    metadata: fs::File,
+    _actual: fs::File,
+    input: fs::File,
+    expected: fs::File,
+}
+
+fn open_saved_case_snapshot(generation: &CapDir) -> io::Result<Option<SavedCaseSnapshot>> {
+    let Some(metadata) = open_regular_file(generation, "meta.toml")? else {
+        return Ok(None);
+    };
+    let Some(actual) = open_regular_file(generation, "actual.out")? else {
+        return Ok(None);
+    };
+    let Some(input) = open_regular_file(generation, "failed.in")? else {
+        return Ok(None);
+    };
+    let Some(expected) = open_regular_file(generation, "expected.out")? else {
+        // Historical v1 RE/TLE generations did not have expected.out and cannot be promoted.
+        return Ok(None);
+    };
+
+    Ok(Some(SavedCaseSnapshot {
+        metadata,
+        _actual: actual,
+        input,
+        expected,
+    }))
+}
+
+fn read_saved_case_snapshot(
+    mut snapshot: SavedCaseSnapshot,
+    contest_id: &str,
+    problem_index: &str,
+) -> io::Result<Option<Sample>> {
+    let Some(metadata_text) = read_utf8_or_ignore(&mut snapshot.metadata)? else {
+        return Ok(None);
+    };
+    let Ok(metadata) = toml::from_str::<StoredFailureMetadata>(&metadata_text) else {
+        return Ok(None);
+    };
+    if !valid_failure_metadata(&metadata, contest_id, problem_index) {
         return Ok(None);
     }
 
-    let target = stress_root.join(problem_index);
-    if !existing_real_directory(&target, "stress failure directory")? {
+    let Some(input) = read_utf8_or_ignore(&mut snapshot.input)? else {
         return Ok(None);
-    }
-
-    let input_path = target.join("failed.in");
-    let expected_path = target.join("expected.out");
-    let has_input = existing_regular_file(&input_path, "stress input")?;
-    let has_expected = existing_regular_file(&expected_path, "stress expected output")?;
-
-    // v1 RE/TLE failures did not have expected.out and cannot be promoted safely.
-    if !has_input || !has_expected {
+    };
+    let Some(expected) = read_utf8_or_ignore(&mut snapshot.expected)? else {
         return Ok(None);
-    }
+    };
 
     Ok(Some(Sample {
-        input: fs::read_to_string(input_path)?,
-        output: fs::read_to_string(expected_path)?,
+        input,
+        output: expected,
     }))
+}
+
+fn read_utf8_or_ignore(file: &mut fs::File) -> io::Result<Option<String>> {
+    let mut content = String::new();
+    match file.read_to_string(&mut content) {
+        Ok(_) => Ok(Some(content)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_stress_directory(destination: &Path) -> io::Result<Option<CapDir>> {
+    let workspace = CapDir::open_ambient_dir(destination, ambient_authority())?;
+    let Some(marker) = open_optional_directory(&workspace, ".atc")? else {
+        return Ok(None);
+    };
+
+    open_optional_directory(&marker, "stress")
+}
+
+fn open_optional_directory(parent: &CapDir, name: &str) -> io::Result<Option<CapDir>> {
+    match parent.open_dir_nofollow(name) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_regular_file(directory: &CapDir, name: &str) -> io::Result<Option<fs::File>> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+
+    let file = match directory.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("stress generation entry is not a regular file: {name}"),
+        ));
+    }
+
+    Ok(Some(file.into_std()))
+}
+
+fn open_stress_lock(
+    stress_directory: &CapDir,
+    problem_index: &str,
+    create: bool,
+) -> io::Result<Option<fs::File>> {
+    let name = format!(".{problem_index}.lock");
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    if create {
+        options.write(true).create(true).truncate(false);
+    }
+
+    let file = match stress_directory.open_with(&name, &options) {
+        Ok(file) => file,
+        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("stress generation lock is not a regular file: {name}"),
+        ));
+    }
+
+    Ok(Some(file.into_std()))
 }
 
 fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
@@ -1022,6 +1210,29 @@ mod tests {
             PersistenceOutcome::Saved(path) => path,
             PersistenceOutcome::Cancelled => panic!("persistence unexpectedly cancelled"),
         }
+    }
+
+    fn write_v1_generation(
+        target: &Path,
+        contest: &str,
+        problem: &str,
+        kind: &str,
+        input: &str,
+        expected: Option<&str>,
+    ) {
+        fs::create_dir_all(target).unwrap();
+        fs::write(target.join("failed.in"), input).unwrap();
+        fs::write(target.join("actual.out"), "old actual\n").unwrap();
+        if let Some(expected) = expected {
+            fs::write(target.join("expected.out"), expected).unwrap();
+        }
+        fs::write(
+            target.join("meta.toml"),
+            format!(
+                "version = 1\ncontest = {contest:?}\nproblem = {problem:?}\nkind = {kind:?}\ncase = 1\nbase_seed = 10\nseed = 10\n"
+            ),
+        )
+        .unwrap();
     }
 
     #[derive(Default)]
@@ -1226,21 +1437,143 @@ mod tests {
     }
 
     #[test]
-    fn saved_case_requires_both_input_and_expected_output() {
+    fn partial_generation_is_not_promoted() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join(".atc").join("stress").join("A");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("failed.in"), "1 2\n").unwrap();
-
-        assert_eq!(load_saved_case(temp.path(), "A").unwrap(), None);
-
         fs::write(target.join("expected.out"), "3\n").unwrap();
+
         assert_eq!(
-            load_saved_case(temp.path(), "A").unwrap(),
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_case_problem_index_cannot_escape_the_stress_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(".atc").join("stress")).unwrap();
+
+        let error = load_saved_case(temp.path(), "abc123", "../outside").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn old_v1_wrong_answer_is_promoted_but_old_re_without_expected_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join(".atc").join("stress").join("A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "1 2\n",
+            Some("3\n"),
+        );
+
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
             Some(Sample {
                 input: "1 2\n".to_string(),
                 output: "3\n".to_string(),
             })
         );
+
+        fs::remove_dir_all(&target).unwrap();
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "runtime-error",
+            "4\n",
+            None,
+        );
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_case_metadata_must_match_the_current_contest_and_problem() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join(".atc").join("stress").join("A");
+        write_v1_generation(
+            &target,
+            "other-contest",
+            "A",
+            "wrong-answer",
+            "1\n",
+            Some("2\n"),
+        );
+
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            None
+        );
+
+        fs::write(
+            target.join("meta.toml"),
+            "version = 1\ncontest = \"abc123\"\nproblem = \"B\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 10\nseed = 10\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn loader_waits_for_generation_replacement_and_reads_only_the_new_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let stress_root = temp.path().join(".atc").join("stress");
+        let target = stress_root.join("A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old input\n",
+            Some("old expected\n"),
+        );
+
+        let stress_directory = open_stress_directory(temp.path()).unwrap().unwrap();
+        let writer_lock = open_stress_lock(&stress_directory, "A", true)
+            .unwrap()
+            .unwrap();
+        writer_lock.lock().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let loader = scope.spawn(|| {
+                load_saved_case_with_hook(temp.path(), "abc123", "A", || {
+                    ready_tx.send(()).unwrap();
+                })
+                .unwrap()
+            });
+            ready_rx.recv().unwrap();
+
+            let previous = stress_root.join("previous");
+            fs::rename(&target, &previous).unwrap();
+            write_v1_generation(
+                &target,
+                "abc123",
+                "A",
+                "wrong-answer",
+                "new input\n",
+                Some("new expected\n"),
+            );
+            drop(writer_lock);
+
+            assert_eq!(
+                loader.join().unwrap(),
+                Some(Sample {
+                    input: "new input\n".to_string(),
+                    output: "new expected\n".to_string(),
+                })
+            );
+        });
     }
 }

@@ -419,9 +419,11 @@ impl WatchApp {
         }
 
         let next = (self.selected_case + 1) % count;
-        if next == self.selected_case {
+        let mode_changed = self.problems[self.selected_problem].detail_mode != DetailMode::Samples;
+        if next == self.selected_case && !mode_changed {
             return false;
         }
+        self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.selected_case = next;
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -441,9 +443,11 @@ impl WatchApp {
         } else {
             self.selected_case - 1
         };
-        if previous == self.selected_case {
+        let mode_changed = self.problems[self.selected_problem].detail_mode != DetailMode::Samples;
+        if previous == self.selected_case && !mode_changed {
             return false;
         }
+        self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.selected_case = previous;
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -987,6 +991,14 @@ impl WatchApp {
             .resize_with(problem_state.total_cases, CaseState::default);
 
         let stress_index = problem_state.sample_cases;
+        if problem_state
+            .run
+            .cases
+            .get(stress_index)
+            .is_some_and(|case| case.verdict == CaseVerdict::Accepted)
+        {
+            problem_state.run.accepted = problem_state.run.accepted.saturating_sub(1);
+        }
         if let Some(case) = problem_state.run.cases.get_mut(stress_index) {
             case.verdict = match kind {
                 CandidateFailureKind::WrongAnswer => CaseVerdict::WrongAnswer,
@@ -2561,6 +2573,105 @@ mod tests {
         assert!(detail.contains("input\n9\n"));
         assert!(detail.contains("expected\n10\n"));
         assert!(detail.contains("actual\n11\n"));
+    }
+
+    #[test]
+    fn case_navigation_switches_from_live_stress_to_the_only_saved_case() {
+        let mut app = WatchApp::new_with_stress_cases(
+            &contest(1),
+            vec![0],
+            vec![Some(Sample {
+                input: "saved input\n".to_string(),
+                output: "saved expected\n".to_string(),
+            })],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let stress = app.queue_stress(0, 100).unwrap();
+        assert!(app.run_started(0, stress.run_id));
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Stress);
+
+        assert!(app.next_case());
+
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
+        let detail = detail_text(&app);
+        assert!(detail.contains("stress 1 / 1   Pending"));
+        assert!(detail.contains("input\nsaved input\n"));
+        assert!(detail.contains("expected\nsaved expected\n"));
+        assert!(!detail.contains("STRESS RUNNING"));
+    }
+
+    #[test]
+    fn replacing_an_accepted_stress_case_updates_the_preserved_run_summary() {
+        let mut app = WatchApp::new_with_stress_cases(
+            &contest(1),
+            vec![1],
+            vec![Some(Sample {
+                input: "old input\n".to_string(),
+                output: "old expected\n".to_string(),
+            })],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let normal = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, normal.run_id));
+        assert!(app.run_event(
+            0,
+            normal.run_id,
+            TestEvent::TestRunStarted { total_cases: 2 },
+        ));
+        for number in 1..=2 {
+            assert!(app.run_event(
+                0,
+                normal.run_id,
+                TestEvent::TestCaseAccepted {
+                    number,
+                    elapsed: Duration::from_millis(1),
+                },
+            ));
+        }
+        assert!(app.run_event(
+            0,
+            normal.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 2,
+                total_cases: 2,
+            },
+        ));
+
+        let stress = app.queue_stress(0, 200).unwrap();
+        assert!(app.run_started(0, stress.run_id));
+        assert!(app.stress_event(
+            0,
+            stress.run_id,
+            StressEvent::Started {
+                base_seed: 200,
+                case_limit: None,
+            },
+        ));
+        assert!(app.stress_event(
+            0,
+            stress.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 200,
+                seed: 200,
+                input: "new input\n".to_string(),
+                expected: "new expected\n".to_string(),
+                actual: "new actual\n".to_string(),
+                stderr: String::new(),
+                candidate_elapsed: Duration::from_millis(2),
+                elapsed: Duration::from_millis(5),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+
+        let problem = &app.problems[0];
+        assert_eq!(problem.run.accepted, 1);
+        assert_eq!(problem.run.total_cases, 2);
+        assert_eq!(problem.run.cases[1].verdict, CaseVerdict::WrongAnswer);
     }
 
     #[test]

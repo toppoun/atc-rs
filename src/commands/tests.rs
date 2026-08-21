@@ -451,6 +451,7 @@ fn no_samples_is_reported_without_starting_a_runner() {
 
     test_problem(
         temp.path(),
+        "abc123",
         &problem,
         Language::Cpp,
         &runner_config,
@@ -475,6 +476,7 @@ fn no_samples_in_debug_mode_does_not_materialize_header_or_start_compiler() {
 
     test_problem_with_debug_header(
         temp.path(),
+        "abc123",
         &problem,
         Language::Cpp,
         &runner_config,
@@ -522,6 +524,7 @@ fn normal_cpp_build_neither_materializes_nor_requires_debug_header() {
 
     test_problem_with_debug_header(
         temp.path(),
+        "abc123",
         &problem,
         Language::Cpp,
         &runner_config,
@@ -574,6 +577,7 @@ fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() 
 
     test_problem_with_debug_header(
         temp.path(),
+        "abc123",
         &problem,
         Language::Cpp,
         &runner_config,
@@ -618,6 +622,7 @@ fn debug_header_materialization_error_is_fatal_before_compiler_start() {
 
     let error = test_problem_with_debug_header(
         temp.path(),
+        "abc123",
         &problem,
         Language::Cpp,
         &runner_config,
@@ -643,6 +648,7 @@ fn resolved_language_does_not_fall_back_to_an_existing_other_source() {
 
     let error = test_problem(
         temp.path(),
+        "abc123",
         &problem,
         Language::Python,
         &RunnerConfig::default(),

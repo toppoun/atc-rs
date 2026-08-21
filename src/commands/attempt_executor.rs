@@ -72,6 +72,7 @@ impl AttemptExecutor {
                     match request.kind {
                         RunKind::Samples => test_problem_with_cancel(
                             &destination,
+                            contest_id.as_str(),
                             problem,
                             request.language,
                             &runner_config,

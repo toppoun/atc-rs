@@ -218,6 +218,7 @@ pub(crate) fn test(
 
     test_problem(
         &destination,
+        &contest.contest_id,
         problem,
         language,
         &config.runner,
@@ -230,6 +231,7 @@ pub(crate) fn test(
 // cancel は絶対に発生しない。
 pub(super) fn test_problem(
     destination: &Path,
+    contest_id: &str,
     problem: &Problem,
     language: Language,
     runner_config: &RunnerConfig,
@@ -238,6 +240,7 @@ pub(super) fn test_problem(
 ) -> Result<(), AppError> {
     test_problem_with_debug_header_and_cancel(
         destination,
+        contest_id,
         problem,
         language,
         runner_config,
@@ -250,8 +253,10 @@ pub(super) fn test_problem(
 
 // TUI worker 用。
 // worker の shutdown flag を is_cancelled として受け取る。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn test_problem_with_cancel(
     destination: &Path,
+    contest_id: &str,
     problem: &Problem,
     language: Language,
     runner_config: &RunnerConfig,
@@ -261,6 +266,7 @@ pub(super) fn test_problem_with_cancel(
 ) -> Result<(), AppError> {
     test_problem_with_debug_header_and_cancel(
         destination,
+        contest_id,
         problem,
         language,
         runner_config,
@@ -275,8 +281,10 @@ pub(super) fn test_problem_with_cancel(
 // debug.hpp を作る処理だけ差し替えられる。
 // cancel は発生しない。
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn test_problem_with_debug_header(
     destination: &Path,
+    contest_id: &str,
     problem: &Problem,
     language: Language,
     runner_config: &RunnerConfig,
@@ -286,6 +294,7 @@ pub(super) fn test_problem_with_debug_header(
 ) -> Result<(), AppError> {
     test_problem_with_debug_header_and_cancel(
         destination,
+        contest_id,
         problem,
         language,
         runner_config,
@@ -301,6 +310,7 @@ pub(super) fn test_problem_with_debug_header(
 #[allow(clippy::too_many_arguments)]
 fn test_problem_with_debug_header_and_cancel(
     destination: &Path,
+    contest_id: &str,
     problem: &Problem,
     language: Language,
     runner_config: &RunnerConfig,
@@ -320,7 +330,7 @@ fn test_problem_with_debug_header_and_cancel(
     }
 
     let samples = workspace::load_samples(destination, &problem.index)?;
-    let stress_case = crate::stress::load_saved_case(destination, &problem.index)?;
+    let stress_case = crate::stress::load_saved_case(destination, contest_id, &problem.index)?;
 
     if samples.is_empty() && stress_case.is_none() {
         reporter.report(Event::NoSamples {

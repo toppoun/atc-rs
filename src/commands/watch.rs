@@ -52,7 +52,17 @@ fn process_changed_paths(
         runner_config,
         paths,
         reporter,
-        test_problem,
+        |destination, problem, language, runner_config, debug, reporter| {
+            test_problem(
+                destination,
+                &contest.contest_id,
+                problem,
+                language,
+                runner_config,
+                debug,
+                reporter,
+            )
+        },
     )
 }
 
