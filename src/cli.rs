@@ -23,12 +23,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    fn command() -> ClapCommand {
+        let command = <Self as CommandFactory>::command();
+        let mut command_tree = command.clone();
+        command_tree.build();
+
+        command.override_help(render_help(&command_tree))
+    }
+
     pub fn parse() -> Self {
-        let mut command = <Self as CommandFactory>::command();
-
-        command = command.override_help(render_help());
-
-        let mut matches = command.get_matches();
+        let mut matches = Self::command().get_matches();
 
         Self::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
     }
@@ -156,14 +160,22 @@ pub enum AccountCommand {
     Login,
 }
 
-fn render_category<T: Subcommand>(title: &str) -> String {
-    let command = T::augment_subcommands(ClapCommand::new("category"));
+fn render_category<T: Subcommand>(title: &str, command_tree: &ClapCommand) -> String {
+    let category = T::augment_subcommands(ClapCommand::new("category"));
 
     let mut out = String::new();
     out.push_str(title);
     out.push('\n');
 
-    for subcommand in command.get_subcommands() {
+    for category_subcommand in category.get_subcommands() {
+        let subcommand = command_tree
+            .find_subcommand(category_subcommand.get_name())
+            .expect("flattened subcommand should exist in the top-level command");
+
+        if subcommand.is_hide_set() {
+            continue;
+        }
+
         let name = subcommand.get_name();
         let about = subcommand
             .get_about()
@@ -176,13 +188,31 @@ fn render_category<T: Subcommand>(title: &str) -> String {
     out
 }
 
-fn render_help() -> String {
+fn render_help_command(command_tree: &ClapCommand) -> String {
+    let Some(help) = command_tree
+        .find_subcommand("help")
+        .filter(|help| !help.is_hide_set())
+    else {
+        return String::new();
+    };
+
+    let about = help
+        .get_about()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+
+    format!("Help\n  {:<10}{about}\n", help.get_name())
+}
+
+fn render_help(command_tree: &ClapCommand) -> String {
     format!(
         "{LOGO}
 {GRAY}Fast AtCoder workflow from your terminal.{RESET}
 
 Usage:
-  atc <command> [options]
+  atc [options] <command>
+
+{}
 
 {}
 
@@ -196,17 +226,111 @@ Options
   -h, --help       Show help
   -V, --version    Show version
 ",
-        render_category::<ContestCommand>("Contest").trim_end(),
-        render_category::<RunTestCommand>("Run & Test").trim_end(),
-        render_category::<FileCommand>("Files").trim_end(),
-        render_category::<AccountCommand>("Account").trim_end(),
+        render_category::<ContestCommand>("Contest", command_tree).trim_end(),
+        render_category::<RunTestCommand>("Run & Test", command_tree).trim_end(),
+        render_category::<FileCommand>("Files", command_tree).trim_end(),
+        render_category::<AccountCommand>("Account", command_tree).trim_end(),
+        render_help_command(command_tree).trim_end(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{ColorChoice, error::ErrorKind};
+
+    #[test]
+    fn custom_help_matches_visible_top_level_commands_and_option_scope() {
+        let mut command_tree = <Cli as CommandFactory>::command();
+        command_tree.build();
+        let help = render_help(&command_tree);
+
+        for subcommand in command_tree
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let occurrences = help
+                .lines()
+                .filter(|line| line.split_whitespace().next() == Some(subcommand.get_name()))
+                .count();
+
+            assert_eq!(
+                occurrences,
+                1,
+                "visible clap subcommand {:?} should appear exactly once in custom help",
+                subcommand.get_name()
+            );
+        }
+
+        assert!(help.contains("  atc [options] <command>"));
+        assert!(!help.contains("  atc <command> [options]"));
+    }
+
+    #[test]
+    fn clap_help_and_errors_keep_their_exit_and_stream_behavior() {
+        for (args, kind, exit_code, use_stderr) in [
+            (&["atc", "--help"][..], ErrorKind::DisplayHelp, 0, false),
+            (
+                &["atc", "--version"][..],
+                ErrorKind::DisplayVersion,
+                0,
+                false,
+            ),
+            (
+                &["atc"][..],
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                2,
+                true,
+            ),
+            (
+                &["atc", "unknown"][..],
+                ErrorKind::InvalidSubcommand,
+                2,
+                true,
+            ),
+            (
+                &["atc", "test"][..],
+                ErrorKind::MissingRequiredArgument,
+                2,
+                true,
+            ),
+            (
+                &["atc", "test", "A", "--unknown"][..],
+                ErrorKind::UnknownArgument,
+                2,
+                true,
+            ),
+        ] {
+            let error = Cli::command()
+                .color(ColorChoice::Never)
+                .try_get_matches_from(args)
+                .expect_err("case should stop in clap");
+
+            assert_eq!(error.kind(), kind, "unexpected error kind for {args:?}");
+            assert_eq!(
+                error.exit_code(),
+                exit_code,
+                "unexpected exit code for {args:?}"
+            );
+            assert_eq!(
+                error.use_stderr(),
+                use_stderr,
+                "unexpected output stream for {args:?}"
+            );
+            assert!(
+                !error.render().to_string().contains('\x1b'),
+                "non-colored output contained an ANSI escape for {args:?}"
+            );
+        }
+
+        assert_eq!(
+            Cli::command()
+                .try_get_matches_from(["atc", "test", "A", "--version"])
+                .expect_err("version is scoped to the root command")
+                .kind(),
+            ErrorKind::UnknownArgument
+        );
+    }
 
     #[test]
     fn parses_new_contest_and_optional_language() {
