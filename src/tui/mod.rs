@@ -1,10 +1,12 @@
 pub mod app;
+mod crossterm_adapter;
 mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
 pub mod message;
 pub mod reporter;
+mod terminal;
 pub mod view;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
@@ -12,9 +14,6 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
 use message::{Message, RunRequest};
 use ratatui::DefaultTerminal;
 
@@ -22,6 +21,9 @@ use crate::model::Contest;
 use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
+use terminal::{
+    KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind, TerminalEvent,
+};
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
@@ -79,7 +81,6 @@ fn queue_problem_run(
 
     Ok(true)
 }
-
 
 fn queue_problem_stress(
     app: &mut WatchApp,
@@ -351,15 +352,15 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn read_terminal_events(wait: Duration) -> io::Result<VecDeque<Event>> {
-    read_terminal_events_with(wait, event::poll, event::read)
+fn read_terminal_events(wait: Duration) -> io::Result<VecDeque<TerminalEvent>> {
+    read_terminal_events_with(wait, crossterm_adapter::poll, crossterm_adapter::read)
 }
 
 fn read_terminal_events_with(
     wait: Duration,
     mut poll_event: impl FnMut(Duration) -> io::Result<bool>,
-    mut read_event: impl FnMut() -> io::Result<Event>,
-) -> io::Result<VecDeque<Event>> {
+    mut read_event: impl FnMut() -> io::Result<TerminalEvent>,
+) -> io::Result<VecDeque<TerminalEvent>> {
     let mut events = VecDeque::new();
 
     if !poll_event(wait)? {
@@ -380,14 +381,14 @@ fn read_terminal_events_with(
     Ok(events)
 }
 
-fn contains_quit_event(events: &VecDeque<Event>) -> bool {
+fn contains_quit_event(events: &VecDeque<TerminalEvent>) -> bool {
     events.iter().any(is_quit_event)
 }
 
-fn is_quit_event(terminal_event: &Event) -> bool {
+fn is_quit_event(terminal_event: &TerminalEvent) -> bool {
     matches!(
         terminal_event,
-        Event::Key(KeyEvent {
+        TerminalEvent::Key(KeyEvent {
             code: KeyCode::Char('q'),
             kind: KeyEventKind::Press,
             ..
@@ -395,10 +396,10 @@ fn is_quit_event(terminal_event: &Event) -> bool {
     )
 }
 
-fn take_leading_resizes(events: &mut VecDeque<Event>) -> bool {
+fn take_leading_resizes(events: &mut VecDeque<TerminalEvent>) -> bool {
     let mut found = false;
 
-    while matches!(events.front(), Some(Event::Resize(_, _))) {
+    while matches!(events.front(), Some(TerminalEvent::Resize(_))) {
         events.pop_front();
         found = true;
     }
@@ -411,7 +412,7 @@ fn handle_terminal_events(
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
     render_info: &view::RenderInfo,
-    events: &mut VecDeque<Event>,
+    events: &mut VecDeque<TerminalEvent>,
     run_tx: &Sender<RunRequest>,
 ) -> io::Result<bool> {
     let mut changed = false;
@@ -421,10 +422,8 @@ fn handle_terminal_events(
         if scrollbar_geometry_changed_by_drag
             && matches!(
                 terminal_event,
-                Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Down(_)
-                        | MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown,
+                TerminalEvent::Pointer(PointerEvent {
+                    kind: PointerKind::Down(_) | PointerKind::ScrollUp | PointerKind::ScrollDown,
                     ..
                 })
             )
@@ -435,13 +434,13 @@ fn handle_terminal_events(
         let terminal_event = events
             .pop_front()
             .expect("front terminal event must still exist");
-        if matches!(terminal_event, Event::Resize(_, _)) {
+        if matches!(terminal_event, TerminalEvent::Resize(_)) {
             detail_scrollbar_drag.cancel();
             changed = true;
 
             // 連続resizeは1回の再描画へまとめる。後続mouseは新しいRectが
             // 描画されてから処理し、古いRenderInfoでhit testしない。
-            while matches!(events.front(), Some(Event::Resize(_, _))) {
+            while matches!(events.front(), Some(TerminalEvent::Resize(_))) {
                 events.pop_front();
             }
             break;
@@ -452,8 +451,8 @@ fn handle_terminal_events(
         let detail_scroll_before = app.detail_scroll();
         let is_left_drag = matches!(
             terminal_event,
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
+            TerminalEvent::Pointer(PointerEvent {
+                kind: PointerKind::Drag(PointerButton::Left),
                 ..
             })
         );
@@ -493,27 +492,27 @@ fn handle_terminal_event(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
-    terminal_event: Event,
+    terminal_event: TerminalEvent,
     render_info: &view::RenderInfo,
     run_tx: &Sender<RunRequest>,
 ) -> io::Result<bool> {
     match terminal_event {
-        Event::Key(key) => handle_key_event(app, key, run_tx),
+        TerminalEvent::Key(key) => handle_key_event(app, key, run_tx),
 
-        Event::Mouse(mouse) => Ok(handle_mouse_event(
+        TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event(
             app,
             detail_layout,
             detail_scrollbar_drag,
-            mouse,
+            pointer,
             render_info,
         )),
 
-        Event::Resize(_, _) => {
+        TerminalEvent::Resize(_) => {
             detail_scrollbar_drag.cancel();
             Ok(true)
         }
 
-        _ => Ok(false),
+        TerminalEvent::Ignored => Ok(false),
     }
 }
 
@@ -584,25 +583,29 @@ fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn handle_mouse_event(
+fn handle_pointer_event(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
-    mouse: MouseEvent,
+    pointer: PointerEvent,
     render_info: &view::RenderInfo,
 ) -> bool {
-    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+    if matches!(pointer.kind, PointerKind::Up(_)) {
         detail_scrollbar_drag.cancel();
         return false;
     }
 
-    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+    let Some((column, row)) = pointer.position.cells() else {
+        return false;
+    };
+
+    if matches!(pointer.kind, PointerKind::Down(_)) {
         // Every new press terminates a previous interaction before the new hit
         // target is interpreted.
         detail_scrollbar_drag.cancel();
     }
 
-    if let MouseEventKind::Drag(MouseButton::Left) = mouse.kind {
+    if let PointerKind::Drag(PointerButton::Left) = pointer.kind {
         let Some(drag) = detail_scrollbar_drag.active else {
             return false;
         };
@@ -617,9 +620,7 @@ fn handle_mouse_event(
             return false;
         }
 
-        let target = scrollbar
-            .geometry
-            .scroll_for_drag(mouse.row, drag.grab_offset);
+        let target = scrollbar.geometry.scroll_for_drag(row, drag.grab_offset);
         return set_detail_scroll_from_user(
             app,
             detail_layout,
@@ -629,21 +630,21 @@ fn handle_mouse_event(
     }
 
     if let Some(samples_area) = render_info.samples_area
-        && contains(samples_area, mouse.column, mouse.row)
+        && contains(samples_area, column, row)
     {
-        return match mouse.kind {
-            MouseEventKind::ScrollUp => app.previous_case(),
+        return match pointer.kind {
+            PointerKind::ScrollUp => app.previous_case(),
 
-            MouseEventKind::ScrollDown => app.next_case(),
+            PointerKind::ScrollDown => app.next_case(),
 
             _ => false,
         };
     }
 
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+    if let PointerKind::Down(PointerButton::Left) = pointer.kind
         && let Some(scrollbar) = render_info.detail_scrollbar.as_ref()
         && scrollbar.identity.layout.revision == app.detail_revision()
-        && let Some(hit) = scrollbar.geometry.hit_test(mouse.column, mouse.row)
+        && let Some(hit) = scrollbar.geometry.hit_test(column, row)
     {
         return match hit {
             DetailScrollbarHit::Thumb { grab_offset } => {
@@ -668,15 +669,15 @@ fn handle_mouse_event(
             DetailScrollbarHit::Track => set_detail_scroll_from_user(
                 app,
                 detail_layout,
-                scrollbar.geometry.scroll_for_track_click(mouse.row),
+                scrollbar.geometry.scroll_for_track_click(row),
                 Some(scrollbar.geometry.max_scroll),
             ),
         };
     }
 
-    if contains(render_info.detail_area, mouse.column, mouse.row) {
-        return match mouse.kind {
-            MouseEventKind::ScrollUp => {
+    if contains(render_info.detail_area, column, row) {
+        return match pointer.kind {
+            PointerKind::ScrollUp => {
                 let target = app.detail_scroll().saturating_sub(DETAIL_SCROLL_LINES);
                 set_detail_scroll_from_user(
                     app,
@@ -686,7 +687,7 @@ fn handle_mouse_event(
                 )
             }
 
-            MouseEventKind::ScrollDown => {
+            PointerKind::ScrollDown => {
                 let target = app.detail_scroll().saturating_add(DETAIL_SCROLL_LINES);
                 set_detail_scroll_from_user(
                     app,
@@ -718,10 +719,10 @@ mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+    use terminal::{PointerButton as MouseButton, PointerKind as MouseEventKind};
 
     fn app() -> WatchApp {
         app_with_problems(&[3])
@@ -748,7 +749,15 @@ mod tests {
     }
 
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
-        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+        KeyEvent {
+            code,
+            kind,
+            modifiers: terminal::Modifiers::default(),
+        }
+    }
+
+    fn resize(columns: u16, rows: u16) -> TerminalEvent {
+        TerminalEvent::Resize(terminal::TerminalSize { columns, rows })
     }
 
     fn handle_key(app: &mut WatchApp, code: KeyCode, kind: KeyEventKind) -> bool {
@@ -760,7 +769,7 @@ mod tests {
     fn handle_terminal_events(
         app: &mut WatchApp,
         render_info: &view::RenderInfo,
-        events: &mut VecDeque<Event>,
+        events: &mut VecDeque<TerminalEvent>,
         run_tx: &Sender<RunRequest>,
     ) -> io::Result<bool> {
         let mut detail_layout = detail_layout::DetailLayout::default();
@@ -795,9 +804,10 @@ mod tests {
     fn queued_quit_is_processed_before_later_events_without_intermediate_draws() {
         let mut app = app();
         let events = RefCell::new(VecDeque::from([
-            Event::Resize(80, 24),
-            Event::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
-            Event::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)),
+            TerminalEvent::Ignored,
+            resize(80, 24),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, 5, 5)),
         ]));
         let poll_waits = RefCell::new(Vec::new());
 
@@ -823,16 +833,16 @@ mod tests {
         assert_eq!(events.borrow().len(), 1);
         assert_eq!(
             poll_waits.into_inner(),
-            [TERMINAL_POLL_INTERVAL, Duration::ZERO]
+            [TERMINAL_POLL_INTERVAL, Duration::ZERO, Duration::ZERO,]
         );
     }
 
     #[test]
-    fn terminal_event_drain_is_bounded() {
-        let events = RefCell::new(VecDeque::from(vec![
-            Event::Resize(80, 24);
-            MAX_TERMINAL_EVENTS_PER_TICK + 1
-        ]));
+    fn ignored_events_preserve_the_raw_event_batch_cap_before_quit() {
+        let quit = TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press));
+        let mut source = vec![TerminalEvent::Ignored; MAX_TERMINAL_EVENTS_PER_TICK];
+        source.push(quit);
+        let events = RefCell::new(VecDeque::from(source));
 
         let queued = read_terminal_events_with(
             Duration::ZERO,
@@ -847,7 +857,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(queued.len(), MAX_TERMINAL_EVENTS_PER_TICK);
+        assert!(queued.iter().all(|event| *event == TerminalEvent::Ignored));
+        assert!(!contains_quit_event(&queued));
         assert_eq!(events.borrow().len(), 1);
+        assert_eq!(events.borrow().front(), Some(&quit));
+    }
+
+    #[test]
+    fn leading_resizes_only_coalesce_across_contiguous_raw_events() {
+        let mut events = VecDeque::from([
+            resize(80, 24),
+            resize(120, 40),
+            TerminalEvent::Ignored,
+            resize(160, 50),
+            TerminalEvent::Key(key(KeyCode::Char('j'), KeyEventKind::Press)),
+        ]);
+
+        assert!(take_leading_resizes(&mut events));
+        assert_eq!(
+            events,
+            VecDeque::from([
+                TerminalEvent::Ignored,
+                resize(160, 50),
+                TerminalEvent::Key(key(KeyCode::Char('j'), KeyEventKind::Press)),
+            ])
+        );
+    }
+
+    #[test]
+    fn quit_priority_requires_lowercase_press_but_ignores_modifiers() {
+        let modified_q = TerminalEvent::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                alt: true,
+                ..terminal::Modifiers::default()
+            },
+        });
+
+        assert!(is_quit_event(&modified_q));
+        assert!(!is_quit_event(&TerminalEvent::Key(key(
+            KeyCode::Char('Q'),
+            KeyEventKind::Press,
+        ))));
+        assert!(!is_quit_event(&TerminalEvent::Key(key(
+            KeyCode::Char('q'),
+            KeyEventKind::Repeat,
+        ))));
+        assert!(!is_quit_event(&TerminalEvent::Key(key(
+            KeyCode::Char('q'),
+            KeyEventKind::Release,
+        ))));
     }
 
     #[test]
@@ -863,8 +924,8 @@ mod tests {
         };
 
         let mut events = VecDeque::from([
-            Event::Resize(100, 40),
-            Event::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)),
+            resize(100, 40),
+            TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, 5, 5)),
         ]);
 
         assert!(handle_terminal_events(&mut app, &old_info, &mut events, &run_tx,).unwrap());
@@ -1193,11 +1254,11 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 70, 20),
             detail_scrollbar: None,
         };
-        assert!(super::handle_mouse_event(
+        assert!(super::handle_pointer_event(
             &mut app,
             &mut layout,
             &mut DetailScrollbarDragState::default(),
-            mouse(MouseEventKind::ScrollDown, 30, 5),
+            pointer(PointerKind::ScrollDown, 30, 5),
             &info,
         ));
         let user_scroll = baseline_scroll + DETAIL_SCROLL_LINES;
@@ -1397,22 +1458,21 @@ mod tests {
         ),);
         assert!(!app.samples_pane_enabled());
     }
-    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-        MouseEvent {
+    fn pointer(kind: PointerKind, column: u16, row: u16) -> PointerEvent {
+        PointerEvent {
             kind,
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
+            position: terminal::PointerPosition::Cells { column, row },
+            modifiers: terminal::Modifiers::default(),
         }
     }
-    fn handle_mouse_event(
+    fn handle_pointer_event(
         app: &mut WatchApp,
-        mouse: MouseEvent,
+        pointer: PointerEvent,
         render_info: &view::RenderInfo,
     ) -> bool {
         let mut detail_layout = detail_layout::DetailLayout::default();
         let mut drag = DetailScrollbarDragState::default();
-        super::handle_mouse_event(app, &mut detail_layout, &mut drag, mouse, render_info)
+        super::handle_pointer_event(app, &mut detail_layout, &mut drag, pointer, render_info)
     }
 
     fn scrollbar_info(
@@ -1452,11 +1512,11 @@ mod tests {
         layout: &mut detail_layout::DetailLayout,
         drag: &mut DetailScrollbarDragState,
         info: &view::RenderInfo,
-        kind: MouseEventKind,
+        kind: PointerKind,
         column: u16,
         row: u16,
     ) -> bool {
-        super::handle_mouse_event(app, layout, drag, mouse(kind, column, row), info)
+        super::handle_pointer_event(app, layout, drag, pointer(kind, column, row), info)
     }
 
     fn pending_width_layout(
@@ -1524,9 +1584,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(handle_mouse_event(
+        assert!(handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 5, 5),
+            pointer(PointerKind::ScrollDown, 5, 5),
             &info,
         ));
 
@@ -1544,9 +1604,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(handle_mouse_event(
+        assert!(handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 30, 5),
+            pointer(PointerKind::ScrollDown, 30, 5),
             &info,
         ));
 
@@ -1564,9 +1624,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(handle_mouse_event(
+        assert!(handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 30, 5),
+            pointer(PointerKind::ScrollDown, 30, 5),
             &info,
         ));
         assert_eq!(app.detail_scroll(), DETAIL_SCROLL_LINES);
@@ -1584,9 +1644,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(!handle_mouse_event(
+        assert!(!handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 30, 5),
+            pointer(PointerKind::ScrollDown, 30, 5),
             &info,
         ));
 
@@ -1604,9 +1664,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(!handle_mouse_event(
+        assert!(!handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollUp, 30, 5),
+            pointer(PointerKind::ScrollUp, 30, 5),
             &info,
         ));
 
@@ -1623,18 +1683,18 @@ mod tests {
         };
 
         let mut samples_app = app();
-        assert!(handle_mouse_event(
+        assert!(handle_pointer_event(
             &mut samples_app,
-            mouse(MouseEventKind::ScrollDown, 19, 5),
+            pointer(PointerKind::ScrollDown, 19, 5),
             &info,
         ));
         assert_eq!(samples_app.selected_case(), 1);
         assert_eq!(samples_app.detail_scroll(), 0);
 
         let mut detail_app = app();
-        assert!(handle_mouse_event(
+        assert!(handle_pointer_event(
             &mut detail_app,
-            mouse(MouseEventKind::ScrollDown, 20, 5),
+            pointer(PointerKind::ScrollDown, 20, 5),
             &info,
         ));
         assert_eq!(detail_app.selected_case(), 0);
@@ -1651,9 +1711,9 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(!handle_mouse_event(
+        assert!(!handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 5, 5),
+            pointer(PointerKind::ScrollDown, 5, 5),
             &info,
         ));
         assert_eq!(app.selected_case(), 0);
@@ -1669,12 +1729,32 @@ mod tests {
             detail_scrollbar: None,
         };
 
-        assert!(!handle_mouse_event(
+        assert!(!handle_pointer_event(
             &mut app,
-            mouse(MouseEventKind::ScrollDown, 5, 1),
+            pointer(PointerKind::ScrollDown, 5, 1),
             &info,
         ));
 
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn absolute_pixel_pointer_positions_are_not_projected_as_cells() {
+        let mut app = app();
+        let info = view::RenderInfo {
+            max_detail_scroll: Some(20),
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
+        };
+        let pointer = PointerEvent {
+            kind: PointerKind::ScrollDown,
+            position: terminal::PointerPosition::AbsolutePixels { x: 30, y: 5 },
+            modifiers: terminal::Modifiers::default(),
+        };
+
+        assert!(!handle_pointer_event(&mut app, pointer, &info));
         assert_eq!(app.selected_case(), 0);
         assert_eq!(app.detail_scroll(), 0);
     }
@@ -1798,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_without_down_is_ignored_and_any_delivered_up_terminates_drag() {
+    fn drag_without_start_and_pixel_down_are_ignored_but_up_terminates() {
         let mut app = app();
         let mut layout = detail_layout::DetailLayout::default();
         let mut drag = DetailScrollbarDragState::default();
@@ -1824,14 +1904,28 @@ mod tests {
             geometry.thumb_start_row,
         );
         assert!(drag.active.is_some());
-        assert!(!dispatch_mouse(
+        assert!(!super::handle_pointer_event(
             &mut app,
             &mut layout,
             &mut drag,
+            PointerEvent {
+                kind: PointerKind::Down(PointerButton::Right),
+                position: terminal::PointerPosition::AbsolutePixels { x: 0, y: 0 },
+                modifiers: terminal::Modifiers::default(),
+            },
             &info,
-            MouseEventKind::Up(MouseButton::Right),
-            0,
-            0,
+        ));
+        assert!(drag.active.is_some());
+        assert!(!super::handle_pointer_event(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            PointerEvent {
+                kind: PointerKind::Up(PointerButton::Right),
+                position: terminal::PointerPosition::AbsolutePixels { x: 0, y: 0 },
+                modifiers: terminal::Modifiers::default(),
+            },
+            &info,
         ));
         assert!(drag.active.is_none());
     }
@@ -1901,7 +1995,7 @@ mod tests {
 
         start(&mut app, &mut layout, &mut drag);
         let (run_tx, _run_rx) = mpsc::channel();
-        let mut events = VecDeque::from([Event::Resize(100, 40)]);
+        let mut events = VecDeque::from([resize(100, 40)]);
         assert!(
             super::handle_terminal_events(
                 &mut app,
@@ -1957,13 +2051,13 @@ mod tests {
         let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
         let (run_tx, _run_rx) = mpsc::channel();
         let mut events = VecDeque::from([
-            Event::Mouse(mouse(
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::Down(MouseButton::Left),
                 geometry.gutter.x,
                 geometry.thumb_start_row,
             )),
-            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 15)),
-            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 20)),
+            TerminalEvent::Pointer(pointer(MouseEventKind::Drag(MouseButton::Left), 0, 15)),
+            TerminalEvent::Pointer(pointer(MouseEventKind::Drag(MouseButton::Left), 0, 20)),
         ]);
 
         assert!(
@@ -1990,12 +2084,12 @@ mod tests {
         let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
         let (run_tx, _run_rx) = mpsc::channel();
         let mut events = VecDeque::from([
-            Event::Mouse(mouse(
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::ScrollDown,
                 geometry.gutter.x.saturating_sub(1),
                 geometry.thumb_start_row,
             )),
-            Event::Mouse(mouse(
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::Down(MouseButton::Left),
                 geometry.gutter.x,
                 geometry.thumb_start_row,
@@ -2019,6 +2113,43 @@ mod tests {
     }
 
     #[test]
+    fn track_seek_queues_a_later_drag_until_redraw() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                geometry.gutter.x,
+                geometry.track_end_row().saturating_sub(1),
+            )),
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Drag(PointerButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            )),
+        ]);
+
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(app.detail_scroll() > 0);
+        assert_eq!(events.len(), 1);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
     fn a_new_pointer_interaction_after_drag_waits_for_redrawn_thumb_geometry() {
         let mut app = app();
         let mut layout = detail_layout::DetailLayout::default();
@@ -2027,13 +2158,13 @@ mod tests {
         let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
         let (run_tx, _run_rx) = mpsc::channel();
         let mut events = VecDeque::from([
-            Event::Mouse(mouse(
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::Down(MouseButton::Left),
                 geometry.gutter.x,
                 geometry.thumb_start_row,
             )),
-            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 18)),
-            Event::Mouse(mouse(
+            TerminalEvent::Pointer(pointer(MouseEventKind::Drag(MouseButton::Left), 0, 18)),
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::Down(MouseButton::Left),
                 geometry.gutter.x,
                 geometry.thumb_start_row,
@@ -2065,8 +2196,8 @@ mod tests {
         let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
         let (run_tx, _run_rx) = mpsc::channel();
         let mut events = VecDeque::from([
-            Event::Key(key(KeyCode::Char('s'), KeyEventKind::Press)),
-            Event::Mouse(mouse(
+            TerminalEvent::Key(key(KeyCode::Char('s'), KeyEventKind::Press)),
+            TerminalEvent::Pointer(pointer(
                 MouseEventKind::Down(MouseButton::Left),
                 geometry.gutter.x,
                 geometry.track_end_row().saturating_sub(1),
@@ -2330,17 +2461,17 @@ mod tests {
         app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
         let (run_tx, run_rx) = mpsc::channel();
         drop(run_rx);
-        let mut events = VecDeque::from([Event::Key(key(KeyCode::Char('r'), KeyEventKind::Press))]);
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('r'),
+            KeyEventKind::Press,
+        ))]);
 
         let error =
             handle_terminal_events(&mut app, &view::RenderInfo::default(), &mut events, &run_tx)
                 .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(
-            error.to_string(),
-            "run worker request channel disconnected"
-        );
+        assert_eq!(error.to_string(), "run worker request channel disconnected");
     }
 
     #[test]
