@@ -7,7 +7,8 @@ use ratatui::text::{Line, Text};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::detail::{DetailDocument, DetailSnapshot, DetailTextSource};
+pub(super) use super::detail::RawOffset;
+use super::detail::{DetailDocument, DetailSectionKind, DetailSnapshot, DetailTextSource};
 
 pub(super) const DETAIL_CHUNK_LINES: usize = 256;
 const MATERIALIZED_CHUNK_CACHE_SIZE: usize = 3;
@@ -19,6 +20,9 @@ const NORMAL_BLOCK_MAX_RAW_BYTES: usize = GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 const FOREGROUND_STRUCTURE_SCAN_BUDGET: usize = 2 * GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 pub(super) const BACKGROUND_STRUCTURE_SCAN_BUDGET: usize = GIANT_LOGICAL_LINE_BYTE_THRESHOLD;
 const GIANT_LINE_PAGE_ROWS: usize = 128;
+// Four foreground giant-line pages keep random jumps bounded while limiting
+// exact-index metadata to one checkpoint per 512 visual rows.
+const GIANT_LINE_CHECKPOINT_STRIDE_ROWS: usize = 4 * GIANT_LINE_PAGE_ROWS;
 const GIANT_LINE_PAGE_CACHE_SIZE: usize = 3;
 const GIANT_LINE_WINDOW_MIN_BYTES: usize = 4 * 1024;
 const LAZY_DETAIL_BYTE_THRESHOLD: usize = 64 * 1024;
@@ -29,11 +33,6 @@ enum LayoutMode {
     Eager,
     Lazy,
 }
-
-// Byte position in the virtual concatenation of all detail segments. Segment
-// boundaries contribute no bytes and are not logical-line boundaries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct RawOffset(pub(super) usize);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DetailRawMap {
@@ -680,8 +679,28 @@ impl DetailDocumentStructure {
         if anchor.is_some_and(|anchor| anchor.unit_index >= self.units.len()) {
             return None;
         }
+
+        let mut targets_by_unit = vec![Vec::new(); self.units.len()];
+        for section in document.section_anchors() {
+            let unit_index = self.unit_index_for_raw_position(section.raw_position)?;
+            targets_by_unit[unit_index].push(ExactAnchorTarget {
+                kind: ExactAnchorTargetKind::Section(section.kind),
+                raw_position: section.raw_position,
+            });
+        }
+        if let Some(anchor) = anchor {
+            targets_by_unit[anchor.unit_index].push(ExactAnchorTarget {
+                kind: ExactAnchorTargetKind::WidthReconciliation,
+                raw_position: anchor.raw_position,
+            });
+        }
+
         let mut counts = Vec::with_capacity(self.chunk_count());
+        let mut prefixes = Vec::with_capacity(self.chunk_count().saturating_add(1));
+        let mut giant_checkpoints = vec![Vec::new(); self.chunk_count()];
         let mut visual_prefix = 0usize;
+        prefixes.push(visual_prefix);
+        let mut section_visual_rows = Vec::with_capacity(document.section_anchors().len());
         let mut anchor_visual_row = None;
         let mut anchor_row_raw_start = None;
 
@@ -690,13 +709,15 @@ impl DetailDocumentStructure {
                 return None;
             }
 
-            let target_raw_position = anchor
-                .filter(|anchor| anchor.unit_index == unit_index)
-                .map(|anchor| anchor.raw_position);
+            targets_by_unit[unit_index].sort_unstable_by_key(|target| target.raw_position);
+            let target_positions = targets_by_unit[unit_index]
+                .iter()
+                .map(|target| target.raw_position)
+                .collect::<Vec<_>>();
             let unit_count = match unit {
                 StructuralUnit::Normal(block) => {
                     let text = self.raw_map.bounded_text(document, block.raw_range.clone());
-                    let mut sink = CountSink::new(target_raw_position);
+                    let mut sink = CountSink::with_targets(target_positions, None);
                     if !wrap_normal_block_at(
                         &text,
                         block.logical_line_count,
@@ -718,19 +739,32 @@ impl DetailDocumentStructure {
                         &fragments,
                         width,
                         line.raw_start,
-                        target_raw_position,
+                        target_positions,
                         &mut is_cancelled,
                     )?
                 }
             };
 
-            if target_raw_position.is_some() {
-                let local_row = unit_count.anchor_local_row?;
-                anchor_visual_row = Some(visual_prefix.saturating_add(local_row));
-                anchor_row_raw_start = unit_count.anchor_row_raw_start;
+            for (target, resolution) in targets_by_unit[unit_index]
+                .iter()
+                .zip(&unit_count.target_resolutions)
+            {
+                let (local_row, row_raw_start) = resolution.as_ref().copied()?;
+                let visual_row = visual_prefix.checked_add(local_row)?;
+                match target.kind {
+                    ExactAnchorTargetKind::Section(kind) => {
+                        section_visual_rows.push(DetailSectionVisualRow { kind, visual_row });
+                    }
+                    ExactAnchorTargetKind::WidthReconciliation => {
+                        anchor_visual_row = Some(visual_row);
+                        anchor_row_raw_start = Some(row_raw_start);
+                    }
+                }
             }
+            giant_checkpoints[unit_index] = unit_count.checkpoints;
             counts.push(unit_count.visual_lines);
-            visual_prefix = visual_prefix.saturating_add(unit_count.visual_lines);
+            visual_prefix = visual_prefix.checked_add(unit_count.visual_lines)?;
+            prefixes.push(visual_prefix);
         }
 
         if anchor.is_some() && anchor_visual_row.is_none() {
@@ -738,10 +772,75 @@ impl DetailDocumentStructure {
         }
 
         Some(DetailCountComputation {
-            chunk_visual_lines: counts,
+            exact_layout_index: ExactLayoutIndex {
+                total_visual_rows: visual_prefix,
+                unit_visual_lines: counts,
+                unit_visual_prefixes: prefixes,
+                section_visual_rows,
+                giant_checkpoints,
+            },
             anchor_visual_row,
             anchor_row_raw_start,
         })
+    }
+
+    fn unit_index_for_raw_position(&self, raw_position: RawOffset) -> Option<usize> {
+        if raw_position > self.raw_map.total_len() {
+            return None;
+        }
+        self.units
+            .partition_point(|unit| unit.raw_start() <= raw_position)
+            .checked_sub(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactAnchorTargetKind {
+    Section(DetailSectionKind),
+    WidthReconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactAnchorTarget {
+    kind: ExactAnchorTargetKind,
+    raw_position: RawOffset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailSectionVisualRow {
+    pub(super) kind: DetailSectionKind,
+    pub(super) visual_row: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactLayoutIndex {
+    pub(super) total_visual_rows: usize,
+    pub(super) unit_visual_lines: Vec<usize>,
+    pub(super) unit_visual_prefixes: Vec<usize>,
+    pub(super) section_visual_rows: Vec<DetailSectionVisualRow>,
+    giant_checkpoints: Vec<Vec<WrapCheckpoint>>,
+}
+
+#[cfg(test)]
+impl ExactLayoutIndex {
+    pub(super) fn for_test(unit_visual_lines: Vec<usize>) -> Self {
+        let mut total_visual_rows = 0usize;
+        let mut unit_visual_prefixes = Vec::with_capacity(unit_visual_lines.len() + 1);
+        unit_visual_prefixes.push(0);
+        for lines in &unit_visual_lines {
+            total_visual_rows = total_visual_rows
+                .checked_add(*lines)
+                .expect("detail visual row count must fit in usize");
+            unit_visual_prefixes.push(total_visual_rows);
+        }
+        let unit_count = unit_visual_lines.len();
+        Self {
+            total_visual_rows,
+            unit_visual_lines,
+            unit_visual_prefixes,
+            section_visual_rows: Vec::new(),
+            giant_checkpoints: vec![Vec::new(); unit_count],
+        }
     }
 }
 
@@ -757,7 +856,7 @@ pub(super) struct ContentAnchor {
 }
 
 pub(super) struct DetailCountComputation {
-    pub(super) chunk_visual_lines: Vec<usize>,
+    pub(super) exact_layout_index: ExactLayoutIndex,
     pub(super) anchor_visual_row: Option<usize>,
     pub(super) anchor_row_raw_start: Option<RawOffset>,
 }
@@ -802,7 +901,7 @@ pub(crate) struct DetailCountRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct DetailCountResult {
     pub(super) identity: DetailCountIdentity,
-    pub(super) chunk_visual_lines: Vec<usize>,
+    pub(super) exact_layout_index: ExactLayoutIndex,
     pub(super) anchor: Option<ContentAnchor>,
     pub(super) anchor_visual_row: Option<usize>,
     pub(super) anchor_row_raw_start: Option<RawOffset>,
@@ -901,7 +1000,10 @@ pub(super) struct DetailLayout {
     segment_lengths: Vec<usize>,
     structure_state: Option<DetailStructureState>,
     chunks: Vec<ChunkMeta>,
+    exact_layout_index: Option<ExactLayoutIndex>,
     materialized_eager_rows: Vec<MaterializedRow>,
+    materialized_eager_width: Option<usize>,
+    materialized_eager_viewport_height: Option<usize>,
     materialized_chunks: VecDeque<MaterializedChunk>,
     materialized_giant_pages: VecDeque<MaterializedGiantPage>,
     // The provenance of the first row actually emitted by the most recent
@@ -927,12 +1029,27 @@ pub(super) struct DetailLayout {
     document_structure_builds: usize,
     #[cfg(test)]
     foreground_structural_scanned_bytes: usize,
+    #[cfg(test)]
+    eager_layout_operations: usize,
+    #[cfg(test)]
+    giant_checkpoint_lookup_steps: usize,
+    #[cfg(test)]
+    giant_checkpoint_lookups: usize,
 }
 
 pub(super) struct DetailViewport {
     pub(super) text: Text<'static>,
     pub(super) max_scroll: Option<usize>,
     pub(super) effective_scroll: usize,
+    pub(super) exact_section_visual_rows: Option<Vec<DetailSectionVisualRow>>,
+    pub(super) exact_layout_identity: Option<DetailExactLayoutIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailExactLayoutIdentity {
+    pub(super) document_generation: DetailDocumentGeneration,
+    pub(super) layout_generation: DetailLayoutGeneration,
+    pub(super) revision: u64,
 }
 
 impl DetailLayout {
@@ -1008,6 +1125,11 @@ impl DetailLayout {
             .map(|reconciliation| reconciliation.absolute_row)
     }
 
+    pub(super) fn cancel_pending_scroll_reconciliation_for_user_input(&mut self) {
+        self.pending_width_anchor = None;
+        self.pending_scroll_reconciliation = None;
+    }
+
     pub(super) fn apply_analysis_result(&mut self, result: DetailAnalysisResult) -> bool {
         match result {
             DetailAnalysisResult::StructureReady(result) => self.apply_structure_result(result),
@@ -1016,9 +1138,23 @@ impl DetailLayout {
     }
 
     pub(super) fn apply_count_result(&mut self, result: DetailCountResult) -> bool {
+        let index = &result.exact_layout_index;
         if self.mode != Some(LayoutMode::Lazy)
             || result.identity != self.count_identity()
-            || result.chunk_visual_lines.len() != self.chunks.len()
+            || index.unit_visual_lines.len() != self.chunks.len()
+            || index.unit_visual_prefixes.len() != self.chunks.len().saturating_add(1)
+            || index.giant_checkpoints.len() != self.chunks.len()
+            || index.unit_visual_prefixes.first().copied() != Some(0)
+            || index.unit_visual_prefixes.last().copied() != Some(index.total_visual_rows)
+        {
+            return false;
+        }
+
+        if index
+            .unit_visual_prefixes
+            .windows(2)
+            .zip(&index.unit_visual_lines)
+            .any(|(prefix, lines)| prefix[1].checked_sub(prefix[0]) != Some(*lines))
         {
             return false;
         }
@@ -1026,7 +1162,7 @@ impl DetailLayout {
         if self
             .chunks
             .iter()
-            .zip(&result.chunk_visual_lines)
+            .zip(&index.unit_visual_lines)
             .any(|(chunk, result)| chunk.visual_lines.is_some_and(|known| known != *result))
         {
             return false;
@@ -1048,13 +1184,11 @@ impl DetailLayout {
             else {
                 return false;
             };
-            let visual_prefix = result.chunk_visual_lines[..chunk_index]
-                .iter()
-                .fold(0usize, |total, lines| total.saturating_add(*lines));
+            let visual_prefix = index.unit_visual_prefixes[chunk_index];
             let Some(local_visual_row) = anchor_visual_row.checked_sub(visual_prefix) else {
                 return false;
             };
-            if local_visual_row >= result.chunk_visual_lines[chunk_index]
+            if local_visual_row >= index.unit_visual_lines[chunk_index]
                 || anchor_row_raw_start > pending.anchor.raw_position
             {
                 return false;
@@ -1079,13 +1213,22 @@ impl DetailLayout {
             None
         };
 
-        let mut changed = false;
-        for (chunk, visual_lines) in self.chunks.iter_mut().zip(result.chunk_visual_lines) {
+        let mut changed = self.exact_layout_index.as_ref() != Some(index);
+        for (chunk_index, (chunk, visual_lines)) in self
+            .chunks
+            .iter_mut()
+            .zip(&index.unit_visual_lines)
+            .enumerate()
+        {
             if chunk.visual_lines.is_none() {
-                chunk.visual_lines = Some(visual_lines);
+                chunk.visual_lines = Some(*visual_lines);
                 changed = true;
             }
+            if !index.giant_checkpoints[chunk_index].is_empty() {
+                chunk.checkpoints = index.giant_checkpoints[chunk_index].clone();
+            }
         }
+        self.exact_layout_index = Some(result.exact_layout_index);
 
         if let Some((
             pending,
@@ -1186,7 +1329,10 @@ impl DetailLayout {
             self.last_top_anchor = None;
             self.pending_width_anchor = None;
             self.pending_scroll_reconciliation = None;
-            let raw_bytes = segment_lengths.iter().copied().sum::<usize>();
+            let raw_bytes = segment_lengths
+                .iter()
+                .try_fold(0usize, |total, length| total.checked_add(*length))
+                .expect("detail document byte length must fit in usize");
             let (structure_state, mode) = if raw_bytes >= LAZY_DETAIL_BYTE_THRESHOLD {
                 (
                     DetailStructureState::Building(IncrementalDetailIndexBuilder::new(document)),
@@ -1221,6 +1367,9 @@ impl DetailLayout {
         };
         self.append_discovered_chunks();
         self.materialized_eager_rows.clear();
+        self.materialized_eager_width = None;
+        self.materialized_eager_viewport_height = None;
+        self.exact_layout_index = None;
         self.materialized_chunks.clear();
         self.materialized_giant_pages.clear();
         self.layout_generation = self.layout_generation.wrapping_add(1);
@@ -1262,6 +1411,9 @@ impl DetailLayout {
             self.chunk_layout_operations = 0;
             self.giant_scanned_bytes = 0;
             self.giant_page_layout_operations = 0;
+            self.eager_layout_operations = 0;
+            self.giant_checkpoint_lookup_steps = 0;
+            self.giant_checkpoint_lookups = 0;
             self.invalidations = self.invalidations.saturating_add(1);
             if document_changed {
                 self.foreground_structural_scanned_bytes = 0;
@@ -1438,6 +1590,8 @@ impl DetailLayout {
                 text: Text::from(Vec::<Line<'static>>::new()),
                 max_scroll,
                 effective_scroll,
+                exact_section_visual_rows: self.exact_section_visual_rows(),
+                exact_layout_identity: self.exact_layout_identity(),
             };
         }
 
@@ -1458,6 +1612,8 @@ impl DetailLayout {
                 text: Text::from(materialized.lines),
                 max_scroll: None,
                 effective_scroll: requested_scroll,
+                exact_section_visual_rows: None,
+                exact_layout_identity: None,
             };
         }
 
@@ -1497,6 +1653,8 @@ impl DetailLayout {
             text: Text::from(materialized.lines),
             max_scroll: exact_max,
             effective_scroll,
+            exact_section_visual_rows: self.exact_section_visual_rows(),
+            exact_layout_identity: self.exact_layout_identity(),
         }
     }
 
@@ -1507,28 +1665,49 @@ impl DetailLayout {
         viewport_height: usize,
         requested_scroll: usize,
     ) -> DetailViewport {
-        let mut rows = materialize_complete_structure_rows(
-            document,
-            self.structure(),
-            usize::from(detail_width),
-        );
-        let mut exact_max = max_scroll(rows.len(), viewport_height);
+        if self.materialized_eager_width.is_none()
+            || self.materialized_eager_viewport_height != Some(viewport_height)
+        {
+            let mut layout_width = usize::from(detail_width);
+            let mut rows =
+                materialize_complete_structure_rows(document, self.structure(), layout_width);
+            #[cfg(test)]
+            {
+                self.eager_layout_operations = self.eager_layout_operations.saturating_add(1);
+            }
 
-        if exact_max > 0 && detail_width > 1 {
-            rows = materialize_complete_structure_rows(
+            if max_scroll(rows.len(), viewport_height) > 0 && detail_width > 1 {
+                layout_width = usize::from(detail_width.saturating_sub(1));
+                rows =
+                    materialize_complete_structure_rows(document, self.structure(), layout_width);
+                #[cfg(test)]
+                {
+                    self.eager_layout_operations = self.eager_layout_operations.saturating_add(1);
+                }
+            }
+
+            self.exact_layout_index = Some(exact_index_from_materialized_rows(
                 document,
                 self.structure(),
-                usize::from(detail_width.saturating_sub(1)),
-            );
-            exact_max = max_scroll(rows.len(), viewport_height);
+                &rows,
+            ));
+            self.materialized_eager_rows = rows;
+            self.materialized_eager_width = Some(layout_width);
+            self.materialized_eager_viewport_height = Some(viewport_height);
         }
+
+        let exact_max = max_scroll(self.materialized_eager_rows.len(), viewport_height);
 
         let effective_scroll = requested_scroll.min(exact_max);
         let pending = self
             .pending_width_anchor
             .filter(|pending| pending.layout_generation == self.layout_generation);
         let anchored_row = (viewport_height > 0)
-            .then(|| pending.and_then(|pending| self.resolve_eager_anchor(&rows, pending.anchor)))
+            .then(|| {
+                pending.and_then(|pending| {
+                    self.resolve_eager_anchor(&self.materialized_eager_rows, pending.anchor)
+                })
+            })
             .flatten();
         let effective_scroll = anchored_row.unwrap_or(effective_scroll).min(exact_max);
         if let (Some(pending), Some(anchor_visual_row)) = (pending, anchored_row) {
@@ -1539,7 +1718,6 @@ impl DetailLayout {
                 layout_generation: pending.layout_generation,
             });
         }
-        self.materialized_eager_rows = rows;
         let top_anchor = if viewport_height == 0 {
             None
         } else {
@@ -1570,6 +1748,8 @@ impl DetailLayout {
             text,
             max_scroll: Some(exact_max),
             effective_scroll,
+            exact_section_visual_rows: self.exact_section_visual_rows(),
+            exact_layout_identity: self.exact_layout_identity(),
         }
     }
 
@@ -1790,6 +1970,21 @@ impl DetailLayout {
         visual_offset: usize,
         structural_budget: &mut usize,
     ) -> Option<(usize, usize)> {
+        if let Some(index) = &self.exact_layout_index {
+            if visual_offset >= index.total_visual_rows {
+                return None;
+            }
+            let chunk_index = index
+                .unit_visual_prefixes
+                .partition_point(|prefix| *prefix <= visual_offset)
+                .saturating_sub(1)
+                .min(self.chunks.len().saturating_sub(1));
+            return Some((
+                chunk_index,
+                visual_offset.saturating_sub(index.unit_visual_prefixes[chunk_index]),
+            ));
+        }
+
         loop {
             let mut prefix = 0usize;
 
@@ -1940,15 +2135,20 @@ impl DetailLayout {
             return false;
         }
 
-        loop {
-            let checkpoint = self.chunks[chunk_index]
-                .checkpoints
-                .iter()
-                .rev()
-                .find(|checkpoint| checkpoint.visual_row <= requested_row)
-                .copied()
+        let (mut checkpoint, checkpoint_lookup_steps) =
+            checkpoint_at_or_before(&self.chunks[chunk_index].checkpoints, requested_row)
                 .expect("giant detail line must have an initial checkpoint");
+        #[cfg(test)]
+        {
+            self.giant_checkpoint_lookup_steps = self
+                .giant_checkpoint_lookup_steps
+                .saturating_add(checkpoint_lookup_steps);
+            self.giant_checkpoint_lookups = self.giant_checkpoint_lookups.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = checkpoint_lookup_steps;
 
+        loop {
             if checkpoint.visual_row > requested_row {
                 return false;
             }
@@ -1995,14 +2195,27 @@ impl DetailLayout {
             }
 
             let next_checkpoint = WrapCheckpoint {
-                visual_row: checkpoint.visual_row.saturating_add(progress.rows),
+                visual_row: checkpoint
+                    .visual_row
+                    .checked_add(progress.rows)
+                    .expect("detail visual row count must fit in usize"),
                 raw_position: progress.next_raw_position,
             };
 
-            if next_checkpoint.visual_row > checkpoint.visual_row {
+            if self.exact_layout_index.is_none()
+                && next_checkpoint.visual_row > checkpoint.visual_row
+            {
                 let checkpoints = &mut self.chunks[chunk_index].checkpoints;
-                if checkpoints.last().copied() != Some(next_checkpoint) {
-                    checkpoints.push(next_checkpoint);
+                match checkpoints.binary_search_by_key(&next_checkpoint.visual_row, |checkpoint| {
+                    checkpoint.visual_row
+                }) {
+                    Ok(index) => {
+                        debug_assert_eq!(
+                            checkpoints[index].raw_position,
+                            next_checkpoint.raw_position
+                        );
+                    }
+                    Err(index) => checkpoints.insert(index, next_checkpoint),
                 }
             }
 
@@ -2031,6 +2244,7 @@ impl DetailLayout {
             if progress.finished || progress.rows == 0 {
                 return false;
             }
+            checkpoint = next_checkpoint;
         }
     }
 
@@ -2067,18 +2281,7 @@ impl DetailLayout {
     }
 
     fn unit_index_for_row_start(&self, raw_position: RawOffset) -> Option<usize> {
-        if raw_position > self.structure().raw_map.total_len() {
-            return None;
-        }
-
-        // A real materialized row start belongs to the last structural unit
-        // whose start is not after it. This makes an ordinary shared boundary
-        // select the following unit. At EOF it also selects the final normal
-        // block that owns a trailing zero-length logical row.
-        self.structure()
-            .units
-            .iter()
-            .rposition(|unit| unit.raw_start() <= raw_position)
+        self.structure().unit_index_for_raw_position(raw_position)
     }
 
     fn resolve_eager_anchor(
@@ -2112,12 +2315,33 @@ impl DetailLayout {
     }
 
     fn exact_total_height(&self) -> Option<usize> {
+        if let Some(index) = &self.exact_layout_index {
+            return Some(index.total_visual_rows);
+        }
         if !self.structure_is_complete() {
             return None;
         }
         self.chunks.iter().try_fold(0usize, |total, chunk| {
-            chunk.visual_lines.map(|lines| total.saturating_add(lines))
+            chunk
+                .visual_lines
+                .and_then(|lines| total.checked_add(lines))
         })
+    }
+
+    fn exact_section_visual_rows(&self) -> Option<Vec<DetailSectionVisualRow>> {
+        self.exact_layout_index
+            .as_ref()
+            .map(|index| index.section_visual_rows.clone())
+    }
+
+    fn exact_layout_identity(&self) -> Option<DetailExactLayoutIdentity> {
+        self.exact_layout_index
+            .as_ref()
+            .map(|_| DetailExactLayoutIdentity {
+                document_generation: self.document_generation,
+                layout_generation: self.layout_generation,
+                revision: self.revision.unwrap_or_default(),
+            })
     }
 
     #[cfg(test)]
@@ -2166,6 +2390,31 @@ impl DetailLayout {
 fn row_matches_anchor(row: &MaterializedRow, raw_position: RawOffset) -> bool {
     row.raw_range.start == raw_position
         || (row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+}
+
+fn checkpoint_at_or_before(
+    checkpoints: &[WrapCheckpoint],
+    requested_row: usize,
+) -> Option<(WrapCheckpoint, usize)> {
+    let mut start = 0usize;
+    let mut end = checkpoints.len();
+    let mut steps = 0usize;
+
+    while start < end {
+        steps = steps
+            .checked_add(1)
+            .expect("checkpoint lookup step count must fit in usize");
+        let middle = start + (end - start) / 2;
+        if checkpoints[middle].visual_row <= requested_row {
+            start = middle + 1;
+        } else {
+            end = middle;
+        }
+    }
+
+    start
+        .checked_sub(1)
+        .map(|index| (checkpoints[index], steps))
 }
 
 fn row_index_for_anchor(rows: &[MaterializedRow], raw_position: RawOffset) -> Option<usize> {
@@ -2229,6 +2478,50 @@ fn materialize_complete_structure_rows(
     }
 
     rows
+}
+
+fn exact_index_from_materialized_rows(
+    document: &impl DetailTextSource,
+    structure: &DetailDocumentStructure,
+    rows: &[MaterializedRow],
+) -> ExactLayoutIndex {
+    let mut unit_visual_lines = vec![0usize; structure.units.len()];
+    for row in rows {
+        let unit_index = structure
+            .unit_index_for_raw_position(row.raw_range.start)
+            .expect("materialized row must belong to a structural unit");
+        unit_visual_lines[unit_index] = unit_visual_lines[unit_index]
+            .checked_add(1)
+            .expect("detail visual row count must fit in usize");
+    }
+
+    let mut unit_visual_prefixes = Vec::with_capacity(unit_visual_lines.len().saturating_add(1));
+    let mut total_visual_rows = 0usize;
+    unit_visual_prefixes.push(total_visual_rows);
+    for visual_lines in &unit_visual_lines {
+        total_visual_rows = total_visual_rows
+            .checked_add(*visual_lines)
+            .expect("detail visual row count must fit in usize");
+        unit_visual_prefixes.push(total_visual_rows);
+    }
+
+    let section_visual_rows = document
+        .section_anchors()
+        .iter()
+        .map(|anchor| DetailSectionVisualRow {
+            kind: anchor.kind,
+            visual_row: row_index_for_anchor(rows, anchor.raw_position)
+                .expect("semantic detail anchor must resolve in an exact eager layout"),
+        })
+        .collect();
+
+    ExactLayoutIndex {
+        total_visual_rows,
+        unit_visual_lines,
+        unit_visual_prefixes,
+        section_visual_rows,
+        giant_checkpoints: vec![Vec::new(); structure.units.len()],
+    }
 }
 
 fn build_document_structure(document: &impl DetailTextSource) -> DetailDocumentStructure {
@@ -2414,11 +2707,12 @@ fn count_giant_logical_line_fragments(
     fragments: &[&str],
     width: usize,
     raw_offset_base: RawOffset,
-    anchor_position: Option<RawOffset>,
+    target_positions: Vec<RawOffset>,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<UnitVisualCount> {
     let mut raw_offset = 0usize;
-    let mut sink = CountSink::new(anchor_position);
+    let mut sink =
+        CountSink::with_targets(target_positions, Some(GIANT_LINE_CHECKPOINT_STRIDE_ROWS));
 
     loop {
         let rows_before = sink.lines;
@@ -3033,33 +3327,40 @@ impl WrapSink for ProvenanceMaterializeSink<'_> {
 struct CountSink {
     has_content: bool,
     lines: usize,
-    anchor_position: Option<RawOffset>,
-    anchor_local_row: Option<usize>,
-    anchor_row_raw_start: Option<RawOffset>,
+    target_positions: Vec<RawOffset>,
+    target_resolutions: Vec<Option<(usize, RawOffset)>>,
+    checkpoint_stride: Option<usize>,
+    checkpoints: Vec<WrapCheckpoint>,
 }
 
 struct UnitVisualCount {
     visual_lines: usize,
-    anchor_local_row: Option<usize>,
-    anchor_row_raw_start: Option<RawOffset>,
+    target_resolutions: Vec<Option<(usize, RawOffset)>>,
+    checkpoints: Vec<WrapCheckpoint>,
 }
 
 impl CountSink {
     fn new(anchor_position: Option<RawOffset>) -> Self {
+        Self::with_targets(anchor_position.into_iter().collect(), None)
+    }
+
+    fn with_targets(target_positions: Vec<RawOffset>, checkpoint_stride: Option<usize>) -> Self {
+        let target_resolutions = vec![None; target_positions.len()];
         Self {
             has_content: false,
             lines: 0,
-            anchor_position,
-            anchor_local_row: None,
-            anchor_row_raw_start: None,
+            target_positions,
+            target_resolutions,
+            checkpoint_stride,
+            checkpoints: Vec::new(),
         }
     }
 
     fn into_unit_count(self) -> UnitVisualCount {
         UnitVisualCount {
             visual_lines: self.lines,
-            anchor_local_row: self.anchor_local_row,
-            anchor_row_raw_start: self.anchor_row_raw_start,
+            target_resolutions: self.target_resolutions,
+            checkpoints: self.checkpoints,
         }
     }
 }
@@ -3080,18 +3381,34 @@ impl WrapSink for CountSink {
     }
 
     fn emit(&mut self, raw_range: Range<usize>) {
-        if self.anchor_local_row.is_none()
-            && let Some(anchor) = self.anchor_position
-            && (raw_range.start == anchor.0
-                || (raw_range.start < anchor.0 && anchor.0 < raw_range.end))
+        for (target, resolution) in self
+            .target_positions
+            .iter()
+            .zip(&mut self.target_resolutions)
         {
-            // A previous row ending at the anchor does not match because the
-            // interval end is exclusive. The row starting there therefore
-            // wins exact-boundary ties. This also covers zero-length rows.
-            self.anchor_local_row = Some(self.lines);
-            self.anchor_row_raw_start = Some(RawOffset(raw_range.start));
+            if resolution.is_none()
+                && (raw_range.start == target.0
+                    || (raw_range.start < target.0 && target.0 < raw_range.end))
+            {
+                // A previous row ending at the anchor does not match because
+                // the interval end is exclusive. The row starting there wins
+                // exact-boundary ties. This also covers zero-length rows.
+                *resolution = Some((self.lines, RawOffset(raw_range.start)));
+            }
         }
-        self.lines = self.lines.saturating_add(1);
+        if self
+            .checkpoint_stride
+            .is_some_and(|stride| self.lines.is_multiple_of(stride))
+        {
+            self.checkpoints.push(WrapCheckpoint {
+                visual_row: self.lines,
+                raw_position: RawOffset(raw_range.start),
+            });
+        }
+        self.lines = self
+            .lines
+            .checked_add(1)
+            .expect("detail visual row count must fit in usize");
         self.has_content = false;
     }
 
@@ -3364,7 +3681,7 @@ pub(super) fn viewport_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::detail::DetailDocument;
+    use crate::tui::detail::{DetailDocument, DetailSectionAnchor, DetailSectionKind};
     use std::fmt::Write as _;
     use std::time::Instant;
 
@@ -3650,7 +3967,7 @@ mod tests {
 
         DetailCountResult {
             identity: request.identity,
-            chunk_visual_lines: count.chunk_visual_lines,
+            exact_layout_index: count.exact_layout_index,
             anchor,
             anchor_visual_row: count.anchor_visual_row,
             anchor_row_raw_start: count.anchor_row_raw_start,
@@ -4890,12 +5207,14 @@ mod tests {
         let old_counts = structure
             .count_chunks(&document, old_width, None, || false)
             .unwrap()
-            .chunk_visual_lines;
+            .exact_layout_index
+            .unit_visual_lines;
         let target_rows = materialize_complete_structure_rows(&document, &structure, target_width);
         let target_counts = structure
             .count_chunks(&document, target_width, None, || false)
             .unwrap()
-            .chunk_visual_lines;
+            .exact_layout_index
+            .unit_visual_lines;
 
         for unit_index in [0, structure.units.len() / 2, structure.units.len() - 1] {
             let old_prefix = old_counts[..unit_index].iter().sum::<usize>();
@@ -4917,7 +5236,7 @@ mod tests {
             assert_eq!(result.anchor_visual_row, Some(expected));
             assert!(expected >= target_prefix);
             assert!(expected < target_prefix + target_counts[unit_index]);
-            assert_eq!(result.chunk_visual_lines, target_counts);
+            assert_eq!(result.exact_layout_index.unit_visual_lines, target_counts);
         }
     }
 
@@ -5418,9 +5737,14 @@ mod tests {
         let fragments = [raw.as_str()];
         let eager = eager_fragment_lines(&fragments, 11);
         let streaming = streaming_fragment_lines(&fragments, 11, 7, 17);
-        let background =
-            count_giant_logical_line_fragments(&fragments, 11, RawOffset(0), None, &mut || false)
-                .expect("background count must complete");
+        let background = count_giant_logical_line_fragments(
+            &fragments,
+            11,
+            RawOffset(0),
+            Vec::new(),
+            &mut || false,
+        )
+        .expect("background count must complete");
 
         assert_eq!(streaming, eager);
         assert_eq!(background.visual_lines, eager.len());
@@ -5613,7 +5937,8 @@ mod tests {
         let old_counts = structure
             .count_chunks(&document, old_width, None, || false)
             .unwrap()
-            .chunk_visual_lines;
+            .exact_layout_index
+            .unit_visual_lines;
         let old_prefix = old_counts[..giant_unit].iter().sum::<usize>();
         let raw_position = old_rows[old_prefix + 1_000].raw_range.start;
         let target_rows = materialize_complete_structure_rows(&document, &structure, target_width);
@@ -5630,7 +5955,7 @@ mod tests {
         ));
 
         assert_eq!(result.anchor_visual_row, Some(expected));
-        let target_prefix = result.chunk_visual_lines[..giant_unit]
+        let target_prefix = result.exact_layout_index.unit_visual_lines[..giant_unit]
             .iter()
             .sum::<usize>();
         assert_eq!(target_prefix, 1);
@@ -5741,6 +6066,34 @@ mod tests {
     }
 
     #[test]
+    fn evicted_giant_pages_do_not_duplicate_or_disorder_dynamic_checkpoints() {
+        let raw = "0123456789 ".repeat(200_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        for page in 0..=8 {
+            let viewport = layout.viewport(&document, 1, 41, 20, page * GIANT_LINE_PAGE_ROWS);
+            assert_eq!(viewport.text.height(), 20);
+        }
+        let checkpoint_count = layout.giant_checkpoint_count();
+
+        for target in [0, 8 * GIANT_LINE_PAGE_ROWS].into_iter().cycle().take(12) {
+            let viewport = layout.viewport(&document, 1, 41, 20, target);
+            assert_eq!(viewport.text.height(), 20);
+        }
+
+        assert_eq!(layout.giant_checkpoint_count(), checkpoint_count);
+        assert!(
+            layout.chunks[0]
+                .checkpoints
+                .windows(2)
+                .all(|pair| pair[0].visual_row < pair[1].visual_row)
+        );
+        assert!(layout.materialized_giant_pages.len() <= GIANT_LINE_PAGE_CACHE_SIZE);
+    }
+
+    #[test]
     fn giant_streaming_matches_eager_for_words_unicode_and_checkpoint_boundaries() {
         let unit = "word boundary 日本語 e\u{301} 👩‍💻 \u{200b} abcdefghijklmnopqrstuvwxyz ";
         let raw = unit.repeat(2_000);
@@ -5819,7 +6172,10 @@ mod tests {
         complete_structure_via_foreground(&mut layout, &document);
         let page_operations = layout.giant_page_layout_operations;
         let result = count_result(take_count_request(&mut layout, &document));
-        assert_eq!(result.chunk_visual_lines, [reference_height]);
+        assert_eq!(
+            result.exact_layout_index.unit_visual_lines,
+            [reference_height]
+        );
         assert!(layout.apply_count_result(result));
         assert_eq!(layout.giant_page_layout_operations, page_operations);
 
@@ -6473,7 +6829,10 @@ mod tests {
             .map(|chunk| chunk.visual_lines.unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(result.chunk_visual_lines, materialized_counts);
+        assert_eq!(
+            result.exact_layout_index.unit_visual_lines,
+            materialized_counts
+        );
         assert!(layout.materialized_chunks.len() <= MATERIALIZED_CHUNK_CACHE_SIZE);
     }
 
@@ -6510,7 +6869,7 @@ mod tests {
             .iter()
             .map(|chunk| chunk.visual_lines.expect("all units must be known"))
             .collect::<Vec<_>>();
-        assert_eq!(background.chunk_visual_lines, foreground);
+        assert_eq!(background.exact_layout_index.unit_visual_lines, foreground);
         assert_eq!(
             foreground.iter().sum::<usize>(),
             wrap_detail_document(&document, 20).height()
@@ -6556,15 +6915,21 @@ mod tests {
         }
 
         let mut mismatch = good.clone();
-        mismatch.chunk_visual_lines[0] += 1;
+        mismatch.exact_layout_index.unit_visual_lines[0] += 1;
         assert!(!layout.apply_count_result(mismatch));
         assert_eq!(layout.known_chunk_count(), 1);
         assert_eq!(layout.exact_total_height(), None);
 
         let mut wrong_shape = good;
-        wrong_shape.chunk_visual_lines.pop();
+        wrong_shape.exact_layout_index.unit_visual_lines.pop();
         assert!(!layout.apply_count_result(wrong_shape));
         assert_eq!(layout.exact_total_height(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "detail visual row count must fit in usize")]
+    fn exact_index_prefix_construction_never_silently_saturates() {
+        let _ = ExactLayoutIndex::for_test(vec![usize::MAX, 1]);
     }
 
     #[test]
@@ -6652,5 +7017,241 @@ mod tests {
         let new_result = count_result(new_request);
         assert!(layout.apply_count_result(new_result));
         assert!(layout.exact_total_height().is_some());
+    }
+
+    #[test]
+    fn exact_index_resolves_all_semantic_and_width_anchors_in_one_pass() {
+        let raw = format!(
+            "intro\ninput\nvalue\nexpected\nvalue\nactual\nvalue\nstderr\nvalue\n{}",
+            many_varied_lines(3_000)
+        );
+        let section_specs = [
+            (DetailSectionKind::Input, "input\n"),
+            (DetailSectionKind::Expected, "expected\n"),
+            (DetailSectionKind::Actual, "actual\n"),
+            (DetailSectionKind::Stderr, "stderr\n"),
+        ];
+        let anchors = section_specs.map(|(kind, label)| DetailSectionAnchor {
+            kind,
+            raw_position: RawOffset(raw.find(label).unwrap()),
+        });
+        let segments = [raw.as_str()];
+        let document = DetailDocument::from_borrowed_segments_with_anchors(&segments, &anchors);
+        let structure = Arc::new(build_document_structure(&document));
+
+        for width in [7usize, 19] {
+            let reference = materialize_complete_structure_rows(&document, &structure, width);
+            let content_anchor = ContentAnchor {
+                unit_index: structure
+                    .unit_index_for_raw_position(anchors[2].raw_position)
+                    .unwrap(),
+                raw_position: anchors[2].raw_position,
+            };
+            let computation = structure
+                .count_chunks(&document, width, Some(content_anchor), || false)
+                .unwrap();
+
+            assert_eq!(
+                computation.exact_layout_index.total_visual_rows,
+                reference.len()
+            );
+            assert_eq!(
+                computation.exact_layout_index.unit_visual_prefixes.len(),
+                structure.units.len() + 1
+            );
+            for (resolved, anchor) in computation
+                .exact_layout_index
+                .section_visual_rows
+                .iter()
+                .zip(anchors)
+            {
+                assert_eq!(resolved.kind, anchor.kind);
+                assert_eq!(
+                    resolved.visual_row,
+                    reference_anchor_visual_row(&reference, anchor.raw_position).unwrap()
+                );
+            }
+            assert_eq!(
+                computation.anchor_visual_row,
+                reference_anchor_visual_row(&reference, content_anchor.raw_position)
+            );
+        }
+    }
+
+    #[test]
+    fn eager_and_lazy_viewports_publish_reference_semantic_rows_only_when_exact() {
+        let prefix = "input\nvalue\nexpected\nvalue\nactual\nvalue\nstderr\nvalue\n";
+        let specs = [
+            (DetailSectionKind::Input, "input\n"),
+            (DetailSectionKind::Expected, "expected\n"),
+            (DetailSectionKind::Actual, "actual\n"),
+            (DetailSectionKind::Stderr, "stderr\n"),
+        ];
+
+        let small_raw = format!("{prefix}tail\n");
+        let small_anchors = specs.map(|(kind, label)| DetailSectionAnchor {
+            kind,
+            raw_position: RawOffset(small_raw.find(label).unwrap()),
+        });
+        let small_segments = [small_raw.as_str()];
+        let small =
+            DetailDocument::from_borrowed_segments_with_anchors(&small_segments, &small_anchors);
+        let small_structure = build_document_structure(&small);
+        let small_reference = materialize_complete_structure_rows(&small, &small_structure, 11);
+        let mut eager = DetailLayout::default();
+        let eager_viewport = eager.viewport(&small, 1, 12, 3, 0);
+        let eager_rows = eager_viewport.exact_section_visual_rows.unwrap();
+        for (resolved, anchor) in eager_rows.iter().zip(small_anchors) {
+            assert_eq!(resolved.kind, anchor.kind);
+            assert_eq!(
+                resolved.visual_row,
+                reference_anchor_visual_row(&small_reference, anchor.raw_position).unwrap()
+            );
+        }
+
+        let large_raw = format!("{prefix}{}", many_varied_lines(3_000));
+        let large_anchors = specs.map(|(kind, label)| DetailSectionAnchor {
+            kind,
+            raw_position: RawOffset(large_raw.find(label).unwrap()),
+        });
+        let large_segments = [large_raw.as_str()];
+        let large =
+            DetailDocument::from_borrowed_segments_with_anchors(&large_segments, &large_anchors);
+        let mut lazy = DetailLayout::default();
+        let initial = lazy.viewport(&large, 2, 20, 10, 0);
+        assert!(initial.exact_section_visual_rows.is_none());
+        complete_structure_via_foreground(&mut lazy, &large);
+        let exact = count_result(take_count_request(&mut lazy, &large));
+        let expected_rows = exact.exact_layout_index.section_visual_rows.clone();
+        assert!(lazy.apply_count_result(exact));
+        let published = lazy.viewport(&large, 2, 20, 10, 0);
+        assert_eq!(published.exact_section_visual_rows, Some(expected_rows));
+    }
+
+    #[test]
+    fn exact_prefixes_jump_to_far_normal_units_without_materializing_predecessors() {
+        let raw = many_lines(20_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 1, 80, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
+        let result = count_result(take_count_request(&mut layout, &document));
+        assert!(layout.apply_count_result(result));
+
+        let operations_before = layout.chunk_layout_operations;
+        let viewport = layout.viewport(&document, 1, 80, 20, 19_000);
+        assert_eq!(viewport.text.height(), 20);
+        assert!(
+            layout
+                .chunk_layout_operations
+                .saturating_sub(operations_before)
+                <= 2
+        );
+        assert!(layout.materialized_chunks.len() <= MATERIALIZED_CHUNK_CACHE_SIZE);
+    }
+
+    #[test]
+    fn exact_giant_checkpoints_bound_alternating_far_jump_work() {
+        let raw = "x".repeat(200_000);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&document, 1, 2, 20, 0);
+        complete_structure_via_foreground(&mut layout, &document);
+        let result = count_result(take_count_request(&mut layout, &document));
+        let checkpoints = &result.exact_layout_index.giant_checkpoints[0];
+        assert_eq!(checkpoints.first().unwrap().visual_row, 0);
+        assert!(checkpoints.windows(2).all(
+            |pair| pair[1].visual_row - pair[0].visual_row == GIANT_LINE_CHECKPOINT_STRIDE_ROWS
+        ));
+        assert!(checkpoints.len() <= raw.len() / GIANT_LINE_CHECKPOINT_STRIDE_ROWS + 1);
+        let checkpoint_lookup_step_bound =
+            (usize::BITS - checkpoints.len().leading_zeros()) as usize;
+        assert!(layout.apply_count_result(result));
+
+        for target in [150_000usize, 50_000, 149_000, 51_000] {
+            let operations_before = layout.giant_page_layout_operations;
+            let scanned_before = layout.giant_scanned_bytes;
+            let lookup_steps_before = layout.giant_checkpoint_lookup_steps;
+            let lookups_before = layout.giant_checkpoint_lookups;
+            let viewport = layout.viewport(&document, 1, 2, 20, target);
+            assert_eq!(viewport.text.height(), 20);
+            assert!(
+                layout
+                    .giant_page_layout_operations
+                    .saturating_sub(operations_before)
+                    <= GIANT_LINE_CHECKPOINT_STRIDE_ROWS / GIANT_LINE_PAGE_ROWS + 1
+            );
+            assert!(layout.giant_scanned_bytes.saturating_sub(scanned_before) < raw.len() / 2);
+            let lookup_steps = layout
+                .giant_checkpoint_lookup_steps
+                .saturating_sub(lookup_steps_before);
+            let lookups = layout
+                .giant_checkpoint_lookups
+                .saturating_sub(lookups_before);
+            assert!(lookups > 0);
+            assert!(lookup_steps <= lookups.saturating_mul(checkpoint_lookup_step_bound));
+            assert!(layout.materialized_giant_pages.len() <= GIANT_LINE_PAGE_CACHE_SIZE);
+        }
+    }
+
+    #[test]
+    fn checkpoint_lookup_selects_exact_and_preceding_stride_boundaries() {
+        let checkpoints = [
+            WrapCheckpoint {
+                visual_row: 0,
+                raw_position: RawOffset(0),
+            },
+            WrapCheckpoint {
+                visual_row: 512,
+                raw_position: RawOffset(1_024),
+            },
+            WrapCheckpoint {
+                visual_row: 1_024,
+                raw_position: RawOffset(2_048),
+            },
+        ];
+
+        for (requested, expected_row) in [
+            (0, 0),
+            (511, 0),
+            (512, 512),
+            (513, 512),
+            (1_023, 512),
+            (1_024, 1_024),
+            (usize::MAX, 1_024),
+        ] {
+            let (checkpoint, steps) = checkpoint_at_or_before(&checkpoints, requested).unwrap();
+            assert_eq!(checkpoint.visual_row, expected_row);
+            assert!(steps <= 2);
+        }
+    }
+
+    #[test]
+    fn eager_rows_are_reused_for_scroll_only_access_and_invalidated_by_layout_changes() {
+        let raw = many_lines(100);
+        let segments = [raw.as_str()];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        layout.viewport(&document, 1, 40, 5, 0);
+        let first_operations = layout.eager_layout_operations;
+        let first_width = layout.materialized_eager_width;
+        assert!(first_operations > 0);
+        layout.viewport(&document, 1, 40, 5, 50);
+        assert_eq!(layout.eager_layout_operations, first_operations);
+        assert_eq!(layout.materialized_eager_width, first_width);
+
+        layout.viewport(&document, 1, 30, 5, 50);
+        assert!(layout.eager_layout_operations > 0);
+        assert_ne!(layout.materialized_eager_width, first_width);
+
+        let changed_raw = format!("changed\n{raw}");
+        let changed_segments = [changed_raw.as_str()];
+        let changed = make_document(&changed_segments);
+        layout.viewport(&changed, 2, 30, 5, 0);
+        assert!(layout.eager_layout_operations > 0);
+        assert!(materialized_row_text(&layout.materialized_eager_rows[0]).contains("changed"));
     }
 }

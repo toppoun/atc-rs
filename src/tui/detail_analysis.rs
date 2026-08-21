@@ -141,7 +141,7 @@ fn count_request(
 
     Some(DetailCountResult {
         identity: request.identity,
-        chunk_visual_lines: count.chunk_visual_lines,
+        exact_layout_index: count.exact_layout_index,
         anchor,
         anchor_visual_row: count.anchor_visual_row,
         anchor_row_raw_start: count.anchor_row_raw_start,
@@ -325,7 +325,9 @@ mod tests {
 
     fn synthetic_result(request: DetailCountRequest) -> DetailCountResult {
         DetailCountResult {
-            chunk_visual_lines: vec![1; request.identity.chunk_count],
+            exact_layout_index: super::super::detail_layout::ExactLayoutIndex::for_test(
+                vec![1; request.identity.chunk_count],
+            ),
             anchor: request.anchor,
             anchor_visual_row: None,
             anchor_row_raw_start: None,
@@ -346,7 +348,7 @@ mod tests {
         let result = count_request(request, &mut || false).unwrap();
 
         assert_eq!(result.anchor_visual_row, Some(1));
-        assert_eq!(result.chunk_visual_lines, [20_000]);
+        assert_eq!(result.exact_layout_index.unit_visual_lines, [20_000]);
     }
 
     #[test]
@@ -376,8 +378,11 @@ mod tests {
         assert_eq!(Arc::strong_count(&raw), owners + 1);
 
         let result = count_request(request, &mut || false).unwrap();
-        assert_eq!(result.chunk_visual_lines.len(), result.identity.chunk_count);
-        assert_eq!(result.chunk_visual_lines.iter().sum::<usize>(), 100_001);
+        assert_eq!(
+            result.exact_layout_index.unit_visual_lines.len(),
+            result.identity.chunk_count
+        );
+        assert_eq!(result.exact_layout_index.total_visual_rows, 100_001);
         assert_eq!(result.anchor_visual_row, None);
         assert_eq!(Arc::strong_count(&raw), owners);
     }
@@ -401,7 +406,7 @@ mod tests {
 
         let result = count_request(request, &mut || false).unwrap();
         assert_eq!(
-            result.chunk_visual_lines.iter().sum::<usize>(),
+            result.exact_layout_index.total_visual_rows,
             reference_height
         );
     }
@@ -420,7 +425,10 @@ mod tests {
         assert!(request.snapshot.shares_buffer(&raw));
         let result = count_request(request, &mut || false).unwrap();
 
-        assert_eq!(result.chunk_visual_lines, [reference_height]);
+        assert_eq!(
+            result.exact_layout_index.unit_visual_lines,
+            [reference_height]
+        );
         assert_eq!(Arc::strong_count(&raw), owners);
     }
 
@@ -438,7 +446,7 @@ mod tests {
         assert!(request.identity.chunk_count > 3);
         let result = count_request(request, &mut || false).unwrap();
         assert_eq!(
-            result.chunk_visual_lines.iter().sum::<usize>(),
+            result.exact_layout_index.total_visual_rows,
             reference_height
         );
     }
@@ -608,7 +616,7 @@ mod tests {
             panic!("expected count result");
         };
         assert_eq!(result.identity.layout_generation, 9);
-        assert_eq!(result.chunk_visual_lines.iter().sum::<usize>(), 10_001);
+        assert_eq!(result.exact_layout_index.total_visual_rows, 10_001);
         worker.stop_and_join().unwrap();
     }
 

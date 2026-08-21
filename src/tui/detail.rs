@@ -3,6 +3,25 @@ use std::time::Duration;
 
 use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
 
+// Byte position in the virtual concatenation of all detail segments. Segment
+// boundaries contribute no bytes and are not logical-line boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct RawOffset(pub(super) usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum DetailSectionKind {
+    Input,
+    Expected,
+    Actual,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailSectionAnchor {
+    pub(super) kind: DetailSectionKind,
+    pub(super) raw_position: RawOffset,
+}
+
 #[derive(Debug)]
 pub(super) struct DetailSegment<'a> {
     text: DetailSegmentText<'a>,
@@ -38,6 +57,7 @@ impl DetailSegment<'_> {
 pub(super) trait DetailTextSource {
     fn segment_count(&self) -> usize;
     fn segment_text(&self, index: usize) -> Option<&str>;
+    fn section_anchors(&self) -> &[DetailSectionAnchor];
 }
 
 #[derive(Debug)]
@@ -63,6 +83,7 @@ impl DetailSnapshotSegment {
 #[allow(dead_code)]
 pub(crate) struct DetailSnapshot {
     segments: Vec<DetailSnapshotSegment>,
+    section_anchors: Vec<DetailSectionAnchor>,
 }
 
 impl DetailTextSource for DetailSnapshot {
@@ -72,6 +93,10 @@ impl DetailTextSource for DetailSnapshot {
 
     fn segment_text(&self, index: usize) -> Option<&str> {
         self.segments.get(index).map(DetailSnapshotSegment::text)
+    }
+
+    fn section_anchors(&self) -> &[DetailSectionAnchor] {
+        &self.section_anchors
     }
 }
 
@@ -87,6 +112,8 @@ impl DetailSnapshot {
 #[derive(Debug, Default)]
 pub(super) struct DetailDocument<'a> {
     segments: Vec<DetailSegment<'a>>,
+    section_anchors: Vec<DetailSectionAnchor>,
+    raw_len: usize,
 }
 
 impl<'a> DetailDocument<'a> {
@@ -126,6 +153,7 @@ impl<'a> DetailDocument<'a> {
                     }
                 })
                 .collect(),
+            section_anchors: self.section_anchors.clone(),
         }
     }
 
@@ -238,11 +266,27 @@ impl<'a> DetailDocument<'a> {
                     stress_elapsed_label(stress.elapsed),
                     stress_elapsed_label(failure.candidate_elapsed),
                 ));
-                self.push_shared_section("input", &failure.input);
-                self.push_shared_section("expected", &failure.expected);
-                self.push_shared_section("actual", &failure.actual);
+                self.push_semantic_shared_section(
+                    DetailSectionKind::Input,
+                    "input",
+                    &failure.input,
+                );
+                self.push_semantic_shared_section(
+                    DetailSectionKind::Expected,
+                    "expected",
+                    &failure.expected,
+                );
+                self.push_semantic_shared_section(
+                    DetailSectionKind::Actual,
+                    "actual",
+                    &failure.actual,
+                );
                 if !failure.stderr.is_empty() {
-                    self.push_shared_section("stderr", &failure.stderr);
+                    self.push_semantic_shared_section(
+                        DetailSectionKind::Stderr,
+                        "stderr",
+                        &failure.stderr,
+                    );
                 }
                 self.push_owned(format!("\n\nsaved\n{}", failure.saved_to.display()));
             }
@@ -320,12 +364,20 @@ impl<'a> DetailDocument<'a> {
             }
         }
 
-        self.push_optional_shared_section("expected", case.expected.as_ref());
+        self.push_optional_semantic_shared_section(
+            DetailSectionKind::Expected,
+            "expected",
+            case.expected.as_ref(),
+        );
 
-        self.push_optional_shared_section("actual", case.actual.as_ref());
+        self.push_optional_semantic_shared_section(
+            DetailSectionKind::Actual,
+            "actual",
+            case.actual.as_ref(),
+        );
 
         if let Some(stderr) = case.stderr.as_ref() {
-            self.push_shared_section("stderr", stderr);
+            self.push_semantic_shared_section(DetailSectionKind::Stderr, "stderr", stderr);
         }
     }
 
@@ -344,8 +396,8 @@ impl<'a> DetailDocument<'a> {
             verdict_label(verdict),
             elapsed_label(elapsed),
         ));
-        self.push_shared_section("input", &saved.input);
-        self.push_shared_section("expected", &saved.expected);
+        self.push_semantic_shared_section(DetailSectionKind::Input, "input", &saved.input);
+        self.push_semantic_shared_section(DetailSectionKind::Expected, "expected", &saved.expected);
 
         match verdict {
             CaseVerdict::Pending => self.push_static("\n\nPending..."),
@@ -355,20 +407,53 @@ impl<'a> DetailDocument<'a> {
         }
 
         if let Some(case) = case {
-            self.push_optional_shared_section("actual", case.actual.as_ref());
+            self.push_optional_semantic_shared_section(
+                DetailSectionKind::Actual,
+                "actual",
+                case.actual.as_ref(),
+            );
             if let Some(stderr) = case.stderr.as_ref() {
-                self.push_shared_section("stderr", stderr);
+                self.push_semantic_shared_section(DetailSectionKind::Stderr, "stderr", stderr);
             }
         }
     }
 
-    fn push_optional_shared_section(
+    fn push_optional_semantic_shared_section(
         &mut self,
+        kind: DetailSectionKind,
         label: &'static str,
         content: Option<&'a Arc<String>>,
     ) {
         if let Some(content) = content {
-            self.push_shared_section(label, content);
+            self.push_semantic_shared_section(kind, label, content);
+        }
+    }
+
+    fn push_semantic_shared_section(
+        &mut self,
+        kind: DetailSectionKind,
+        label: &'static str,
+        content: &'a Arc<String>,
+    ) {
+        self.push_static("\n\n");
+        debug_assert!(
+            !self
+                .section_anchors
+                .iter()
+                .any(|anchor| anchor.kind == kind),
+            "semantic Detail sections must be unique"
+        );
+        self.section_anchors.push(DetailSectionAnchor {
+            kind,
+            raw_position: RawOffset(self.raw_len),
+        });
+        self.push_static(label);
+        self.push_static("\n");
+
+        if content.is_empty() {
+            self.push_static("(empty)");
+        } else {
+            self.push_shared(content);
         }
     }
 
@@ -385,18 +470,30 @@ impl<'a> DetailDocument<'a> {
     }
 
     fn push_static(&mut self, text: &'static str) {
+        self.raw_len = self
+            .raw_len
+            .checked_add(text.len())
+            .expect("detail document byte length must fit in usize");
         self.segments.push(DetailSegment {
             text: DetailSegmentText::Static(text),
         });
     }
 
     fn push_shared(&mut self, text: &'a Arc<String>) {
+        self.raw_len = self
+            .raw_len
+            .checked_add(text.len())
+            .expect("detail document byte length must fit in usize");
         self.segments.push(DetailSegment {
             text: DetailSegmentText::Shared(text),
         });
     }
 
     fn push_owned(&mut self, text: String) {
+        self.raw_len = self
+            .raw_len
+            .checked_add(text.len())
+            .expect("detail document byte length must fit in usize");
         self.segments.push(DetailSegment {
             text: DetailSegmentText::Owned(text),
         });
@@ -404,6 +501,10 @@ impl<'a> DetailDocument<'a> {
 
     #[cfg(test)]
     pub(super) fn from_borrowed_segments(segments: &'a [&'a str]) -> Self {
+        let raw_len = segments
+            .iter()
+            .try_fold(0usize, |total, text| total.checked_add(text.len()))
+            .expect("detail document byte length must fit in usize");
         Self {
             segments: segments
                 .iter()
@@ -411,11 +512,37 @@ impl<'a> DetailDocument<'a> {
                     text: DetailSegmentText::SharedOwned(Arc::new((*text).to_string())),
                 })
                 .collect(),
+            section_anchors: Vec::new(),
+            raw_len,
         }
     }
 
     #[cfg(test)]
+    pub(super) fn from_borrowed_segments_with_anchors(
+        segments: &'a [&'a str],
+        section_anchors: &[DetailSectionAnchor],
+    ) -> Self {
+        let mut document = Self::from_borrowed_segments(segments);
+        debug_assert!(
+            section_anchors
+                .windows(2)
+                .all(|anchors| anchors[0].raw_position <= anchors[1].raw_position)
+        );
+        debug_assert!(
+            section_anchors
+                .iter()
+                .all(|anchor| anchor.raw_position.0 <= document.raw_len)
+        );
+        document.section_anchors = section_anchors.to_vec();
+        document
+    }
+
+    #[cfg(test)]
     pub(super) fn from_shared_segments(segments: &'a [&'a Arc<String>]) -> Self {
+        let raw_len = segments
+            .iter()
+            .try_fold(0usize, |total, text| total.checked_add(text.len()))
+            .expect("detail document byte length must fit in usize");
         Self {
             segments: segments
                 .iter()
@@ -423,6 +550,8 @@ impl<'a> DetailDocument<'a> {
                     text: DetailSegmentText::Shared(text),
                 })
                 .collect(),
+            section_anchors: Vec::new(),
+            raw_len,
         }
     }
 }
@@ -434,6 +563,10 @@ impl DetailTextSource for DetailDocument<'_> {
 
     fn segment_text(&self, index: usize) -> Option<&str> {
         self.segments.get(index).map(DetailSegment::text)
+    }
+
+    fn section_anchors(&self) -> &[DetailSectionAnchor] {
+        &self.section_anchors
     }
 }
 
@@ -469,7 +602,8 @@ mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
-    use crate::tui::message::TestEvent;
+    use crate::stress::CandidateFailureKind;
+    use crate::tui::message::{StressEvent, TestEvent};
     use std::path::PathBuf;
 
     fn contest() -> Contest {
@@ -523,6 +657,14 @@ mod tests {
         for index in 0..document.segment_count() {
             assert_eq!(snapshot.segment_text(index), document.segment_text(index));
         }
+        assert_eq!(snapshot.section_anchors(), document.section_anchors());
+    }
+
+    fn expected_anchor(text: &str, label: &str) -> RawOffset {
+        RawOffset(
+            text.find(label)
+                .unwrap_or_else(|| panic!("missing expected section header {label}")),
+        )
     }
 
     fn assert_snapshot_shares(document: &DetailDocument<'_>, state: &Arc<String>) {
@@ -587,6 +729,38 @@ mod tests {
             )
         );
         assert_snapshot_matches(&document);
+
+        let text = document_text(&document);
+        assert_eq!(
+            document.section_anchors(),
+            [
+                DetailSectionAnchor {
+                    kind: DetailSectionKind::Expected,
+                    raw_position: expected_anchor(&text, "expected\n"),
+                },
+                DetailSectionAnchor {
+                    kind: DetailSectionKind::Actual,
+                    raw_position: expected_anchor(&text, "actual\n"),
+                },
+                DetailSectionAnchor {
+                    kind: DetailSectionKind::Stderr,
+                    raw_position: expected_anchor(&text, "stderr\n"),
+                },
+            ]
+        );
+
+        let mut segment_start = 0usize;
+        for segment in document.segments() {
+            if matches!(segment.text(), "expected" | "actual" | "stderr") {
+                assert!(
+                    document
+                        .section_anchors()
+                        .iter()
+                        .any(|anchor| anchor.raw_position == RawOffset(segment_start))
+                );
+            }
+            segment_start = segment_start.checked_add(segment.text().len()).unwrap();
+        }
 
         for (raw, pointer) in [
             (expected, expected_ptr),
@@ -671,6 +845,12 @@ mod tests {
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&compile_app));
+        assert!(
+            DetailDocument::from_app(&compile_app)
+                .section_anchors()
+                .is_empty(),
+            "compiler output is not a semantic Detail section"
+        );
 
         let compile_error = compile_app
             .current_problem()
@@ -822,6 +1002,70 @@ mod tests {
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&app));
+        let document = DetailDocument::from_app(&app);
+        let text = document_text(&document);
+        assert_eq!(
+            document.section_anchors(),
+            [
+                DetailSectionAnchor {
+                    kind: DetailSectionKind::Expected,
+                    raw_position: expected_anchor(&text, "expected\n"),
+                },
+                DetailSectionAnchor {
+                    kind: DetailSectionKind::Actual,
+                    raw_position: expected_anchor(&text, "actual\n"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn live_stress_failure_records_all_semantic_sections_in_render_order() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_stress(0, 123).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Started {
+                base_seed: 123,
+                case_limit: None,
+            },
+        ));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 123,
+                seed: 456,
+                input: String::new(),
+                expected: "expected value".to_string(),
+                actual: "actual value".to_string(),
+                stderr: "diagnostic".to_string(),
+                candidate_elapsed: Duration::from_millis(1),
+                elapsed: Duration::from_millis(2),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+
+        let document = DetailDocument::from_app(&app);
+        let text = document_text(&document);
+        let expected = [
+            (DetailSectionKind::Input, "input\n"),
+            (DetailSectionKind::Expected, "expected\n"),
+            (DetailSectionKind::Actual, "actual\n"),
+            (DetailSectionKind::Stderr, "stderr\n"),
+        ];
+        assert_eq!(document.section_anchors().len(), expected.len());
+        for (anchor, (kind, label)) in document.section_anchors().iter().zip(expected) {
+            assert_eq!(anchor.kind, kind);
+            assert_eq!(anchor.raw_position, expected_anchor(&text, label));
+        }
+        assert!(text.contains("input\n(empty)"));
+        assert_snapshot_matches(&document);
     }
 
     #[test]

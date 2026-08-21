@@ -318,6 +318,7 @@ impl WatchApp {
         self.detail_revision
     }
 
+    #[cfg(test)]
     pub fn scroll_detail_up(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
 
@@ -326,11 +327,18 @@ impl WatchApp {
         self.detail_scroll != previous
     }
 
+    #[cfg(test)]
     pub fn scroll_detail_down(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
 
         self.detail_scroll = self.detail_scroll.saturating_add(lines);
 
+        self.detail_scroll != previous
+    }
+
+    pub(super) fn set_detail_scroll_from_user(&mut self, absolute_row: usize) -> bool {
+        let previous = self.detail_scroll;
+        self.detail_scroll = absolute_row;
         self.detail_scroll != previous
     }
 

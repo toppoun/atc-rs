@@ -5,23 +5,27 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
 use super::detail::DetailDocument;
 use super::detail_layout::DetailLayout;
+use super::detail_scrollbar::{
+    DetailScrollbarGeometry, DetailScrollbarInteraction, render_detail_scrollbar,
+};
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderInfo {
     pub max_detail_scroll: Option<usize>,
     pub samples_area: Option<Rect>,
     pub detail_area: Rect,
+    pub(super) detail_scrollbar: Option<DetailScrollbarInteraction>,
 }
 
 pub(super) fn render(
@@ -134,16 +138,26 @@ pub(super) fn render(
 
     frame.render_widget(detail, detail_area);
 
+    let mut detail_scrollbar = None;
     if let Some(max_detail_scroll) = detail_viewport.max_scroll
         && max_detail_scroll > 0
+        && let Some(geometry) = DetailScrollbarGeometry::new(
+            detail_area,
+            max_detail_scroll,
+            detail_viewport.effective_scroll,
+            viewport_height,
+            detail_viewport
+                .exact_section_visual_rows
+                .as_deref()
+                .unwrap_or_default(),
+        )
     {
-        let (content_length, position) =
-            scrollbar_metrics(max_detail_scroll, detail_viewport.effective_scroll);
-        let mut scrollbar_state = ScrollbarState::new(content_length).position(position);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-
-        frame.render_stateful_widget(scrollbar, detail_area, &mut scrollbar_state);
+        render_detail_scrollbar(frame, &geometry);
+        if detail_viewport.exact_section_visual_rows.is_some()
+            && let Some(identity) = detail_viewport.exact_layout_identity
+        {
+            detail_scrollbar = DetailScrollbarInteraction::new(identity, geometry);
+        }
     }
 
     let footer = Paragraph::new(
@@ -157,11 +171,8 @@ pub(super) fn render(
         max_detail_scroll: detail_viewport.max_scroll,
         samples_area,
         detail_area,
+        detail_scrollbar,
     }
-}
-
-fn scrollbar_metrics(max_scroll: usize, scroll: usize) -> (usize, usize) {
-    (max_scroll.saturating_add(1), scroll.min(max_scroll))
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -568,7 +579,7 @@ mod tests {
         assert!(
             layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
                 identity: request.identity,
-                chunk_visual_lines: count.chunk_visual_lines,
+                exact_layout_index: count.exact_layout_index,
                 anchor,
                 anchor_visual_row: count.anchor_visual_row,
                 anchor_row_raw_start: count.anchor_row_raw_start,
@@ -644,17 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_metrics_preserve_large_absolute_positions() {
-        assert_eq!(scrollbar_metrics(99_970, 0), (99_971, 0));
-        assert_eq!(scrollbar_metrics(99_970, 70_000), (99_971, 70_000));
-        assert_eq!(scrollbar_metrics(99_970, 100_000), (99_971, 99_970));
-        assert_eq!(
-            scrollbar_metrics(usize::MAX, usize::MAX),
-            (usize::MAX, usize::MAX)
-        );
-    }
-
-    #[test]
     fn rendered_max_clamps_an_absolute_scroll_that_is_past_the_new_bottom() {
         let mut app = app();
         app.scroll_detail_down(100_000);
@@ -687,6 +687,7 @@ mod tests {
             .draw(|frame| info = render(frame, &app, &mut layout))
             .unwrap();
         assert_eq!(info.max_detail_scroll, None);
+        assert!(info.detail_scrollbar.is_none());
 
         let document = DetailDocument::from_app(&app);
         layout.complete_structure_for_test(&document);
@@ -710,7 +711,7 @@ mod tests {
         assert!(
             layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
                 identity: request.identity,
-                chunk_visual_lines: count.chunk_visual_lines,
+                exact_layout_index: count.exact_layout_index,
                 anchor: request.anchor,
                 anchor_visual_row: count.anchor_visual_row,
                 anchor_row_raw_start: count.anchor_row_raw_start,
@@ -721,6 +722,7 @@ mod tests {
             .draw(|frame| info = render(frame, &app, &mut layout))
             .unwrap();
         assert!(info.max_detail_scroll.is_some());
+        assert!(info.detail_scrollbar.is_some());
     }
 
     #[test]
@@ -874,7 +876,7 @@ mod tests {
         assert!(
             layout.apply_count_result(crate::tui::detail_layout::DetailCountResult {
                 identity: request.identity,
-                chunk_visual_lines: count.chunk_visual_lines,
+                exact_layout_index: count.exact_layout_index,
                 anchor,
                 anchor_visual_row: count.anchor_visual_row,
                 anchor_row_raw_start: count.anchor_row_raw_start,

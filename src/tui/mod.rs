@@ -2,6 +2,7 @@ pub mod app;
 mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
+mod detail_scrollbar;
 pub mod message;
 pub mod reporter;
 pub mod view;
@@ -11,19 +12,50 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use message::{Message, RunRequest};
 use ratatui::DefaultTerminal;
 
 use crate::model::Contest;
 use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
+use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailScrollbarDrag {
+    identity: DetailScrollbarStableIdentity,
+    grab_offset: u16,
+}
+
+#[derive(Debug, Default)]
+struct DetailScrollbarDragState {
+    active: Option<DetailScrollbarDrag>,
+}
+
+impl DetailScrollbarDragState {
+    fn cancel(&mut self) {
+        self.active = None;
+    }
+
+    fn reconcile_render_info(&mut self, render_info: &view::RenderInfo) {
+        if self.active.is_some_and(|drag| {
+            render_info
+                .detail_scrollbar
+                .as_ref()
+                .is_none_or(|scrollbar| scrollbar.identity != drag.identity)
+        }) {
+            self.cancel();
+        }
+    }
+}
 
 fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Result<()> {
     run_tx.send(request).map_err(|_| {
@@ -223,6 +255,7 @@ pub(crate) fn run(
 
     let mut render_info = view::RenderInfo::default();
     let mut detail_layout = detail_layout::DetailLayout::default();
+    let mut detail_scrollbar_drag = DetailScrollbarDragState::default();
     let mut terminal_events = VecDeque::new();
 
     while !app.should_quit() {
@@ -236,6 +269,7 @@ pub(crate) fn run(
         }
 
         if take_leading_resizes(&mut terminal_events) {
+            detail_scrollbar_drag.cancel();
             dirty = true;
         }
 
@@ -265,6 +299,7 @@ pub(crate) fn run(
         }
 
         if take_leading_resizes(&mut terminal_events) {
+            detail_scrollbar_drag.cancel();
             dirty = true;
         }
 
@@ -276,6 +311,7 @@ pub(crate) fn run(
             })?;
 
             render_info = next_render_info;
+            detail_scrollbar_drag.reconcile_render_info(&render_info);
 
             apply_detail_scroll_reconciliation(&mut app, &mut detail_layout);
 
@@ -300,7 +336,14 @@ pub(crate) fn run(
             continue;
         }
 
-        if handle_terminal_events(&mut app, &render_info, &mut terminal_events, &run_tx)? {
+        if handle_terminal_events(
+            &mut app,
+            &mut detail_layout,
+            &mut detail_scrollbar_drag,
+            &render_info,
+            &mut terminal_events,
+            &run_tx,
+        )? {
             dirty = true;
         }
     }
@@ -365,14 +408,35 @@ fn take_leading_resizes(events: &mut VecDeque<Event>) -> bool {
 
 fn handle_terminal_events(
     app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
     render_info: &view::RenderInfo,
     events: &mut VecDeque<Event>,
     run_tx: &Sender<RunRequest>,
 ) -> io::Result<bool> {
     let mut changed = false;
+    let mut scrollbar_geometry_changed_by_drag = false;
 
-    while let Some(terminal_event) = events.pop_front() {
+    while let Some(terminal_event) = events.front() {
+        if scrollbar_geometry_changed_by_drag
+            && matches!(
+                terminal_event,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(_)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown,
+                    ..
+                })
+            )
+        {
+            break;
+        }
+
+        let terminal_event = events
+            .pop_front()
+            .expect("front terminal event must still exist");
         if matches!(terminal_event, Event::Resize(_, _)) {
+            detail_scrollbar_drag.cancel();
             changed = true;
 
             // 連続resizeは1回の再描画へまとめる。後続mouseは新しいRectが
@@ -383,7 +447,43 @@ fn handle_terminal_events(
             break;
         }
 
-        changed |= handle_terminal_event(app, terminal_event, render_info, run_tx)?;
+        let detail_revision_before = app.detail_revision();
+        let samples_pane_before = app.samples_pane_enabled();
+        let detail_scroll_before = app.detail_scroll();
+        let is_left_drag = matches!(
+            terminal_event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                ..
+            })
+        );
+        changed |= handle_terminal_event(
+            app,
+            detail_layout,
+            detail_scrollbar_drag,
+            terminal_event,
+            render_info,
+            run_tx,
+        )?;
+        if app.detail_revision() != detail_revision_before
+            || app.samples_pane_enabled() != samples_pane_before
+        {
+            // The remaining queued pointer events must see geometry rendered
+            // for the new document/mode/pane layout. Pure drag bursts do not
+            // change either stable identity input and continue to batch.
+            break;
+        }
+        if app.detail_scroll() != detail_scroll_before {
+            if is_left_drag {
+                // Absolute drag mapping depends only on stable track geometry
+                // and remains valid throughout one delivered drag burst.
+                scrollbar_geometry_changed_by_drag = true;
+            } else {
+                // A wheel/seek/cap action changes the rendered thumb. Leave
+                // later pointer events queued until that geometry is redrawn.
+                break;
+            }
+        }
     }
 
     Ok(changed)
@@ -391,6 +491,8 @@ fn handle_terminal_events(
 
 fn handle_terminal_event(
     app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
     terminal_event: Event,
     render_info: &view::RenderInfo,
     run_tx: &Sender<RunRequest>,
@@ -398,9 +500,18 @@ fn handle_terminal_event(
     match terminal_event {
         Event::Key(key) => handle_key_event(app, key, run_tx),
 
-        Event::Mouse(mouse) => Ok(handle_mouse_event(app, mouse, render_info)),
+        Event::Mouse(mouse) => Ok(handle_mouse_event(
+            app,
+            detail_layout,
+            detail_scrollbar_drag,
+            mouse,
+            render_info,
+        )),
 
-        Event::Resize(_, _) => Ok(true),
+        Event::Resize(_, _) => {
+            detail_scrollbar_drag.cancel();
+            Ok(true)
+        }
 
         _ => Ok(false),
     }
@@ -475,9 +586,48 @@ fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
 
 fn handle_mouse_event(
     app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
     mouse: MouseEvent,
     render_info: &view::RenderInfo,
 ) -> bool {
+    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+        detail_scrollbar_drag.cancel();
+        return false;
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+        // Every new press terminates a previous interaction before the new hit
+        // target is interpreted.
+        detail_scrollbar_drag.cancel();
+    }
+
+    if let MouseEventKind::Drag(MouseButton::Left) = mouse.kind {
+        let Some(drag) = detail_scrollbar_drag.active else {
+            return false;
+        };
+        let Some(scrollbar) = render_info.detail_scrollbar.as_ref() else {
+            detail_scrollbar_drag.cancel();
+            return false;
+        };
+        if scrollbar.identity != drag.identity
+            || scrollbar.identity.layout.revision != app.detail_revision()
+        {
+            detail_scrollbar_drag.cancel();
+            return false;
+        }
+
+        let target = scrollbar
+            .geometry
+            .scroll_for_drag(mouse.row, drag.grab_offset);
+        return set_detail_scroll_from_user(
+            app,
+            detail_layout,
+            target,
+            Some(scrollbar.geometry.max_scroll),
+        );
+    }
+
     if let Some(samples_area) = render_info.samples_area
         && contains(samples_area, mouse.column, mouse.row)
     {
@@ -490,20 +640,60 @@ fn handle_mouse_event(
         };
     }
 
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(scrollbar) = render_info.detail_scrollbar.as_ref()
+        && scrollbar.identity.layout.revision == app.detail_revision()
+        && let Some(hit) = scrollbar.geometry.hit_test(mouse.column, mouse.row)
+    {
+        return match hit {
+            DetailScrollbarHit::Thumb { grab_offset } => {
+                detail_scrollbar_drag.active = Some(DetailScrollbarDrag {
+                    identity: scrollbar.identity,
+                    grab_offset,
+                });
+                false
+            }
+            DetailScrollbarHit::TopCap => set_detail_scroll_from_user(
+                app,
+                detail_layout,
+                0,
+                Some(scrollbar.geometry.max_scroll),
+            ),
+            DetailScrollbarHit::BottomCap => set_detail_scroll_from_user(
+                app,
+                detail_layout,
+                scrollbar.geometry.max_scroll,
+                Some(scrollbar.geometry.max_scroll),
+            ),
+            DetailScrollbarHit::Track => set_detail_scroll_from_user(
+                app,
+                detail_layout,
+                scrollbar.geometry.scroll_for_track_click(mouse.row),
+                Some(scrollbar.geometry.max_scroll),
+            ),
+        };
+    }
+
     if contains(render_info.detail_area, mouse.column, mouse.row) {
         return match mouse.kind {
-            MouseEventKind::ScrollUp => app.scroll_detail_up(DETAIL_SCROLL_LINES),
+            MouseEventKind::ScrollUp => {
+                let target = app.detail_scroll().saturating_sub(DETAIL_SCROLL_LINES);
+                set_detail_scroll_from_user(
+                    app,
+                    detail_layout,
+                    target,
+                    render_info.max_detail_scroll,
+                )
+            }
 
             MouseEventKind::ScrollDown => {
-                let previous = app.detail_scroll();
-
-                app.scroll_detail_down(DETAIL_SCROLL_LINES);
-
-                if let Some(max_detail_scroll) = render_info.max_detail_scroll {
-                    app.clamp_detail_scroll(max_detail_scroll);
-                }
-
-                app.detail_scroll() != previous
+                let target = app.detail_scroll().saturating_add(DETAIL_SCROLL_LINES);
+                set_detail_scroll_from_user(
+                    app,
+                    detail_layout,
+                    target,
+                    render_info.max_detail_scroll,
+                )
             }
 
             _ => false,
@@ -511,6 +701,16 @@ fn handle_mouse_event(
     }
 
     false
+}
+
+fn set_detail_scroll_from_user(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    target: usize,
+    max_scroll: Option<usize>,
+) -> bool {
+    detail_layout.cancel_pending_scroll_reconciliation_for_user_input();
+    app.set_detail_scroll_from_user(max_scroll.map_or(target, |max| target.min(max)))
 }
 
 #[cfg(test)]
@@ -555,6 +755,24 @@ mod tests {
         let (run_tx, _run_rx) = mpsc::channel();
 
         handle_key_event(app, key(code, kind), &run_tx).unwrap()
+    }
+
+    fn handle_terminal_events(
+        app: &mut WatchApp,
+        render_info: &view::RenderInfo,
+        events: &mut VecDeque<Event>,
+        run_tx: &Sender<RunRequest>,
+    ) -> io::Result<bool> {
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        super::handle_terminal_events(
+            app,
+            &mut detail_layout,
+            &mut drag,
+            render_info,
+            events,
+            run_tx,
+        )
     }
 
     #[test]
@@ -641,6 +859,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
         };
 
         let mut events = VecDeque::from([
@@ -657,6 +876,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
+            detail_scrollbar: None,
         };
 
         assert!(handle_terminal_events(&mut app, &new_info, &mut events, &run_tx,).unwrap());
@@ -869,7 +1089,7 @@ mod tests {
             .unwrap();
         let result = detail_layout::DetailAnalysisResult::Count(detail_layout::DetailCountResult {
             identity: request.identity,
-            chunk_visual_lines: count.chunk_visual_lines,
+            exact_layout_index: count.exact_layout_index,
             anchor: request.anchor,
             anchor_visual_row: count.anchor_visual_row,
             anchor_row_raw_start: count.anchor_row_raw_start,
@@ -939,7 +1159,7 @@ mod tests {
             .unwrap();
         assert!(layout.apply_count_result(detail_layout::DetailCountResult {
             identity: initial_request.identity,
-            chunk_visual_lines: initial.chunk_visual_lines,
+            exact_layout_index: initial.exact_layout_index,
             anchor: initial_request.anchor,
             anchor_visual_row: initial.anchor_visual_row,
             anchor_row_raw_start: initial.anchor_row_raw_start,
@@ -971,9 +1191,12 @@ mod tests {
             max_detail_scroll: None,
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 70, 20),
+            detail_scrollbar: None,
         };
-        assert!(handle_mouse_event(
+        assert!(super::handle_mouse_event(
             &mut app,
+            &mut layout,
+            &mut DetailScrollbarDragState::default(),
             mouse(MouseEventKind::ScrollDown, 30, 5),
             &info,
         ));
@@ -983,7 +1206,7 @@ mod tests {
         layout.viewport(&document, 2, 70, 20, app.detail_scroll());
         assert!(layout.apply_count_result(detail_layout::DetailCountResult {
             identity: anchored_request.identity,
-            chunk_visual_lines: delayed.chunk_visual_lines,
+            exact_layout_index: delayed.exact_layout_index,
             anchor: anchored_request.anchor,
             anchor_visual_row: delayed.anchor_visual_row,
             anchor_row_raw_start: delayed.anchor_row_raw_start,
@@ -1182,6 +1405,112 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }
     }
+    fn handle_mouse_event(
+        app: &mut WatchApp,
+        mouse: MouseEvent,
+        render_info: &view::RenderInfo,
+    ) -> bool {
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        super::handle_mouse_event(app, &mut detail_layout, &mut drag, mouse, render_info)
+    }
+
+    fn scrollbar_info(
+        app: &WatchApp,
+        max_scroll: usize,
+        scroll: usize,
+        layout_generation: u64,
+    ) -> view::RenderInfo {
+        let detail_area = ratatui::layout::Rect::new(20, 5, 40, 20);
+        let geometry = detail_scrollbar::DetailScrollbarGeometry::new(
+            detail_area,
+            max_scroll,
+            scroll,
+            usize::from(detail_area.height),
+            &[],
+        )
+        .unwrap();
+        let interaction = detail_scrollbar::DetailScrollbarInteraction::new(
+            detail_layout::DetailExactLayoutIdentity {
+                document_generation: 1,
+                layout_generation,
+                revision: app.detail_revision(),
+            },
+            geometry,
+        )
+        .unwrap();
+        view::RenderInfo {
+            max_detail_scroll: Some(max_scroll),
+            samples_area: None,
+            detail_area,
+            detail_scrollbar: Some(interaction),
+        }
+    }
+
+    fn dispatch_mouse(
+        app: &mut WatchApp,
+        layout: &mut detail_layout::DetailLayout,
+        drag: &mut DetailScrollbarDragState,
+        info: &view::RenderInfo,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> bool {
+        super::handle_mouse_event(app, layout, drag, mouse(kind, column, row), info)
+    }
+
+    fn pending_width_layout(
+        document: &detail::DetailDocument<'_>,
+    ) -> (
+        detail_layout::DetailLayout,
+        detail_layout::DetailCountResult,
+    ) {
+        let mut layout = detail_layout::DetailLayout::default();
+        layout.viewport(document, 2, 100, 20, 0);
+        layout.complete_structure_for_test(document);
+        let initial = count_request_from_layout(&mut layout, document);
+        assert!(layout.apply_count_result(real_count_result(initial)));
+        layout.viewport(document, 2, 100, 20, 500);
+        layout.viewport(document, 2, 70, 20, 500);
+        let delayed = real_count_result(count_request_from_layout(&mut layout, document));
+        assert!(layout.has_pending_width_anchor_for_test());
+        (layout, delayed)
+    }
+
+    fn count_request_from_layout(
+        layout: &mut detail_layout::DetailLayout,
+        document: &detail::DetailDocument<'_>,
+    ) -> detail_layout::DetailCountRequest {
+        layout.stage_analysis_command(document);
+        let Some(detail_layout::DetailAnalysisCommand::Count(request)) =
+            layout.take_analysis_command()
+        else {
+            panic!("expected exact Detail count request");
+        };
+        request
+    }
+
+    fn real_count_result(
+        request: detail_layout::DetailCountRequest,
+    ) -> detail_layout::DetailCountResult {
+        let anchor = request.anchor;
+        let count = request
+            .structure
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                anchor,
+                || false,
+            )
+            .unwrap();
+        detail_layout::DetailCountResult {
+            identity: request.identity,
+            exact_layout_index: count.exact_layout_index,
+            anchor,
+            anchor_visual_row: count.anchor_visual_row,
+            anchor_row_raw_start: count.anchor_row_raw_start,
+        }
+    }
     #[test]
     fn mouse_wheel_over_samples_changes_sample() {
         let mut app = app();
@@ -1192,6 +1521,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
         };
 
         assert!(handle_mouse_event(
@@ -1211,6 +1541,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
         };
 
         assert!(handle_mouse_event(
@@ -1230,6 +1561,7 @@ mod tests {
             max_detail_scroll: None,
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+            detail_scrollbar: None,
         };
 
         assert!(handle_mouse_event(
@@ -1249,6 +1581,7 @@ mod tests {
             max_detail_scroll: Some(10),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+            detail_scrollbar: None,
         };
 
         assert!(!handle_mouse_event(
@@ -1268,6 +1601,7 @@ mod tests {
             max_detail_scroll: Some(10),
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
+            detail_scrollbar: None,
         };
 
         assert!(!handle_mouse_event(
@@ -1285,6 +1619,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
         };
 
         let mut samples_app = app();
@@ -1313,6 +1648,7 @@ mod tests {
             max_detail_scroll: Some(0),
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
         };
 
         assert!(!handle_mouse_event(
@@ -1330,6 +1666,7 @@ mod tests {
             max_detail_scroll: Some(20),
             samples_area: Some(ratatui::layout::Rect::new(0, 5, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 5, 40, 10),
+            detail_scrollbar: None,
         };
 
         assert!(!handle_mouse_event(
@@ -1340,6 +1677,522 @@ mod tests {
 
         assert_eq!(app.selected_case(), 0);
         assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn thumb_down_starts_drag_and_track_down_seeks_without_dragging() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        ));
+        assert!(drag.active.is_some());
+
+        let track_row = geometry.track_end_row().saturating_sub(1);
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            track_row,
+        ));
+        assert!(app.detail_scroll() > 0);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn cap_clicks_seek_exact_endpoints() {
+        let mut app = app();
+        app.set_detail_scroll_from_user(50);
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 50, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.top_cap_row.unwrap(),
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.bottom_cap_row.unwrap(),
+        ));
+        assert_eq!(app.detail_scroll(), 100);
+    }
+
+    #[test]
+    fn drag_preserves_grab_offset_and_continues_outside_the_gutter_and_pane() {
+        let mut app = app();
+        app.set_detail_scroll_from_user(5);
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 10, 5, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        assert!(geometry.thumb_len > 1);
+        let grab_offset = geometry.thumb_len - 1;
+        let pointer_row = geometry.thumb_start_row + grab_offset;
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            pointer_row,
+        ));
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            pointer_row,
+        ));
+        assert_eq!(app.detail_scroll(), 5);
+
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            u16::MAX,
+        ));
+        assert_eq!(app.detail_scroll(), 10);
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Drag(MouseButton::Left),
+            u16::MAX,
+            0,
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn drag_without_down_is_ignored_and_any_delivered_up_terminates_drag() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Drag(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.track_end_row(),
+        ));
+        dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+        assert!(drag.active.is_some());
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Up(MouseButton::Right),
+            0,
+            0,
+        ));
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn scroll_only_redraw_preserves_drag_but_stable_identity_changes_invalidate_it() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+
+        let moved = scrollbar_info(&app, 100, 70, 1);
+        drag.reconcile_render_info(&moved);
+        assert!(drag.active.is_some(), "thumb start is not stable identity");
+
+        let resized = scrollbar_info(&app, 100, 70, 2);
+        drag.reconcile_render_info(&resized);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn resize_disappearance_and_another_down_cancel_drag() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let start = |app: &mut WatchApp,
+                     layout: &mut detail_layout::DetailLayout,
+                     drag: &mut DetailScrollbarDragState| {
+            dispatch_mouse(
+                app,
+                layout,
+                drag,
+                &info,
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            );
+        };
+
+        start(&mut app, &mut layout, &mut drag);
+        drag.reconcile_render_info(&view::RenderInfo::default());
+        assert!(drag.active.is_none());
+
+        start(&mut app, &mut layout, &mut drag);
+        dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Right),
+            0,
+            0,
+        );
+        assert!(drag.active.is_none());
+
+        start(&mut app, &mut layout, &mut drag);
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([Event::Resize(100, 40)]);
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn stale_drag_geometry_cannot_mutate_a_new_detail_revision() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let old_info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &old_info.detail_scrollbar.as_ref().unwrap().geometry;
+        dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &old_info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+        assert!(app.next_case());
+        assert_eq!(app.detail_scroll(), 0);
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &old_info,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            u16::MAX,
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn one_event_batch_can_start_and_advance_a_valid_drag() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            )),
+            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 15)),
+            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 20)),
+        ]);
+
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(app.detail_scroll() > 0);
+        assert!(drag.active.is_some());
+    }
+
+    #[test]
+    fn non_drag_scroll_queues_later_pointer_geometry_until_redraw() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            Event::Mouse(mouse(
+                MouseEventKind::ScrollDown,
+                geometry.gutter.x.saturating_sub(1),
+                geometry.thumb_start_row,
+            )),
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            )),
+        ]);
+
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.detail_scroll(), DETAIL_SCROLL_LINES);
+        assert_eq!(events.len(), 1);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn a_new_pointer_interaction_after_drag_waits_for_redrawn_thumb_geometry() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            )),
+            Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 18)),
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.thumb_start_row,
+            )),
+        ]);
+
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(app.detail_scroll() > 0);
+        assert_eq!(events.len(), 1);
+        assert!(drag.active.is_some());
+    }
+
+    #[test]
+    fn layout_changing_key_stops_later_mouse_events_until_redraw() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            Event::Key(key(KeyCode::Char('s'), KeyEventKind::Press)),
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                geometry.gutter.x,
+                geometry.track_end_row().saturating_sub(1),
+            )),
+        ]);
+
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn problem_case_and_detail_mode_revisions_invalidate_drag_identity() {
+        let mut problem_app = app_with_problems(&[3, 3]);
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&problem_app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        dispatch_mouse(
+            &mut problem_app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+        assert!(problem_app.next_problem());
+        drag.reconcile_render_info(&scrollbar_info(&problem_app, 100, 0, 1));
+        assert!(drag.active.is_none());
+
+        let mut case_app = app();
+        let info = scrollbar_info(&case_app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        dispatch_mouse(
+            &mut case_app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+        assert!(case_app.next_case());
+        drag.reconcile_render_info(&scrollbar_info(&case_app, 100, 0, 1));
+        assert!(drag.active.is_none());
+
+        let mut mode_app = app();
+        mode_app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let info = scrollbar_info(&mode_app, 100, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        dispatch_mouse(
+            &mut mode_app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        );
+        assert!(mode_app.queue_stress(0, 1).is_some());
+        drag.reconcile_render_info(&scrollbar_info(&mode_app, 100, 0, 1));
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn track_seek_and_drag_cancel_width_reconciliation_but_keep_exact_result_useful() {
+        let raw = "long normal detail line\n".repeat(4_000);
+        let segments = [raw.as_str()];
+        let document = detail::DetailDocument::from_borrowed_segments(&segments);
+
+        for use_drag in [false, true] {
+            let (mut layout, delayed) = pending_width_layout(&document);
+            let mut app = app();
+            app.set_detail_scroll_from_user(500);
+            let info = scrollbar_info(&app, 10_000, 500, 1);
+            let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+            let mut drag = DetailScrollbarDragState::default();
+
+            if use_drag {
+                dispatch_mouse(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    MouseEventKind::Down(MouseButton::Left),
+                    geometry.gutter.x,
+                    geometry.thumb_start_row,
+                );
+                dispatch_mouse(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    0,
+                    geometry.track_end_row(),
+                );
+            } else {
+                dispatch_mouse(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    MouseEventKind::Down(MouseButton::Left),
+                    geometry.gutter.x,
+                    geometry.track_end_row().saturating_sub(1),
+                );
+            }
+
+            assert!(!layout.has_pending_width_anchor_for_test());
+            assert!(layout.apply_count_result(delayed));
+            assert!(layout.take_scroll_reconciliation().is_none());
+            let viewport = layout.viewport(&document, 2, 70, 20, app.detail_scroll());
+            assert!(viewport.exact_layout_identity.is_some());
+        }
     }
     #[test]
     fn rerun_key_queues_current_source() {
