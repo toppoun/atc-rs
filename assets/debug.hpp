@@ -11,17 +11,38 @@
 
 #include <concepts>
 #include <cstddef>
+#include <exception>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <queue>
 #include <ranges>
 #include <stack>
 #include <string>
 #include <string_view>
-#include <syncstream>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#if !defined(ATC_DEBUG_DISABLE_SYNCSTREAM)
+#if defined(__has_include)
+#if __has_include(<syncstream>)
+#include <syncstream>
+#endif
+#else
+#include <syncstream>
+#endif
+#endif
+
+#if \
+    !defined(ATC_DEBUG_DISABLE_SYNCSTREAM) \
+    && defined(__cpp_lib_syncbuf) \
+    && __cpp_lib_syncbuf >= 201803L
+#define ATC_DEBUG_HAS_SYNCSTREAM 1
+#else
+#define ATC_DEBUG_HAS_SYNCSTREAM 0
+#endif
 
 namespace atc_debug {
 namespace detail {
@@ -135,6 +156,50 @@ inline void copy_format_state(
     destination.width(source.width());
     destination.fill(source.fill());
     destination.imbue(source.getloc());
+    destination.tie(source.tie());
+}
+
+inline void copy_stream_state(
+    std::ostream& destination,
+    const std::ostream& source
+) {
+    const auto state = source.rdstate();
+    const auto exceptions = source.exceptions();
+
+    destination.exceptions(std::ios_base::goodbit);
+    destination.clear(state);
+    copy_format_state(destination, source);
+    destination.exceptions(exceptions);
+}
+
+inline void write_characters(
+    std::ostream& output,
+    const char* data,
+    std::size_t size
+) {
+    while (size > 0) {
+        std::streamsize chunk_size;
+
+        if constexpr (
+            std::numeric_limits<std::streamsize>::digits
+            >= std::numeric_limits<std::size_t>::digits
+        ) {
+            chunk_size = static_cast<std::streamsize>(size);
+        } else {
+            constexpr auto max_chunk_size = static_cast<std::size_t>(
+                std::numeric_limits<std::streamsize>::max()
+            );
+            chunk_size = static_cast<std::streamsize>(
+                size < max_chunk_size ? size : max_chunk_size
+            );
+        }
+
+        output.write(data, chunk_size);
+
+        const auto written = static_cast<std::size_t>(chunk_size);
+        data += written;
+        size -= written;
+    }
 }
 
 inline bool needs_escape(char value, char quote) {
@@ -190,9 +255,10 @@ inline void print_quoted_string(
         }
 
         if (chunk_begin < index) {
-            output.write(
+            write_characters(
+                output,
                 value.data() + chunk_begin,
-                static_cast<std::streamsize>(index - chunk_begin)
+                index - chunk_begin
             );
         }
 
@@ -201,9 +267,10 @@ inline void print_quoted_string(
     }
 
     if (chunk_begin < value.size()) {
-        output.write(
+        write_characters(
+            output,
             value.data() + chunk_begin,
-            static_cast<std::streamsize>(value.size() - chunk_begin)
+            value.size() - chunk_begin
         );
     }
 
@@ -218,17 +285,20 @@ inline void print_quoted_c_string(
 
     const char* chunk_begin = value;
     const char* current = value;
+    std::size_t chunk_size = 0;
 
     while (*current != '\0') {
         if (!needs_escape(*current, '"')) {
             ++current;
+            ++chunk_size;
             continue;
         }
 
-        if (chunk_begin != current) {
-            output.write(
+        if (chunk_size > 0) {
+            write_characters(
+                output,
                 chunk_begin,
-                static_cast<std::streamsize>(current - chunk_begin)
+                chunk_size
             );
         }
 
@@ -236,12 +306,14 @@ inline void print_quoted_c_string(
 
         ++current;
         chunk_begin = current;
+        chunk_size = 0;
     }
 
-    if (chunk_begin != current) {
-        output.write(
+    if (chunk_size > 0) {
+        write_characters(
+            output,
             chunk_begin,
-            static_cast<std::streamsize>(current - chunk_begin)
+            chunk_size
         );
     }
 
@@ -262,9 +334,10 @@ inline void print_uint128(
         value /= 10;
     } while (value != 0);
 
-    output.write(
+    write_characters(
+        output,
         current,
-        static_cast<std::streamsize>(end - current)
+        static_cast<std::size_t>(end - current)
     );
 }
 
@@ -424,13 +497,67 @@ void print_value(std::ostream& output, const T& value) {
     }
 }
 
-inline void write(std::size_t line, std::string_view) {
+inline std::recursive_mutex& write_mutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
+#if ATC_DEBUG_HAS_SYNCSTREAM
+inline void emit(std::osyncstream& output) {
+    try {
+        if (!output.rdbuf()->emit()) {
+            output.setstate(std::ios_base::badbit);
+        }
+    } catch (...) {
+        const bool should_rethrow =
+            (output.exceptions() & std::ios_base::badbit) != 0;
+        try {
+            output.setstate(std::ios_base::badbit);
+        } catch (...) {
+        }
+        if (should_rethrow) {
+            throw;
+        }
+    }
+}
+#endif
+
+template <class Writer>
+void write_synchronized(Writer&& writer) {
+#if ATC_DEBUG_HAS_SYNCSTREAM
     std::osyncstream output(std::cerr);
-    copy_format_state(output, std::cerr);
+    {
+        std::lock_guard<std::recursive_mutex> lock(write_mutex());
+        copy_stream_state(output, std::cerr);
+    }
 
-    output << "[L" << line << "]\n";
+    try {
+        writer(output);
+        emit(output);
+    } catch (...) {
+        const auto exception = std::current_exception();
+        try {
+            std::lock_guard<std::recursive_mutex> lock(write_mutex());
+            copy_stream_state(std::cerr, output);
+        } catch (...) {
+        }
+        std::rethrow_exception(exception);
+    }
 
-    copy_format_state(std::cerr, output);
+    {
+        std::lock_guard<std::recursive_mutex> lock(write_mutex());
+        copy_stream_state(std::cerr, output);
+    }
+#else
+    std::lock_guard<std::recursive_mutex> lock(write_mutex());
+    writer(std::cerr);
+#endif
+}
+
+inline void write(std::size_t line, std::string_view) {
+    write_synchronized([&](std::ostream& output) {
+        output << "[L" << line << "]\n";
+    });
 }
 
 template <class... Values>
@@ -439,22 +566,19 @@ void write(
     std::string_view expressions,
     const Values&... values
 ) {
-    std::osyncstream output(std::cerr);
-    copy_format_state(output, std::cerr);
-
-    output << "[L" << line << "] " << expressions << " = ";
-    bool first = true;
-    (
+    write_synchronized([&](std::ostream& output) {
+        output << "[L" << line << "] " << expressions << " = ";
+        bool first = true;
         (
-            output << (first ? "" : ", "),
-            first = false,
-            print_value(output, values)
-        ),
-        ...
-    );
-    output << '\n';
-
-    copy_format_state(std::cerr, output);
+            (
+                output << (first ? "" : ", "),
+                first = false,
+                print_value(output, values)
+            ),
+            ...
+        );
+        output << '\n';
+    });
 }
 
 }  // namespace detail
@@ -465,3 +589,5 @@ void write(
         __LINE__, \
         #__VA_ARGS__ __VA_OPT__(,) __VA_ARGS__ \
     )
+
+#undef ATC_DEBUG_HAS_SYNCSTREAM
