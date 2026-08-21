@@ -30,6 +30,7 @@ pub enum AtCoderError {
     Http(reqwest::Error),
     Auth(std::io::Error),
     InvalidStoredCookie,
+    UnexpectedAuthenticationStatus(StatusCode),
     Fixture {
         path: PathBuf,
         source: std::io::Error,
@@ -66,11 +67,22 @@ pub fn authentication_status() -> Result<AuthenticationStatus, AtCoderError> {
         .send()?
         .error_for_status()?;
 
-    if is_authenticated_settings_url(response.url()) {
-        Ok(AuthenticationStatus::Authenticated)
-    } else {
-        Ok(AuthenticationStatus::Unauthenticated)
+    classify_authentication_response(response.status(), response.url())
+}
+
+fn classify_authentication_response(
+    status: StatusCode,
+    url: &reqwest::Url,
+) -> Result<AuthenticationStatus, AtCoderError> {
+    if !status.is_success() {
+        return Err(AtCoderError::UnexpectedAuthenticationStatus(status));
     }
+
+    Ok(if is_authenticated_settings_url(url) {
+        AuthenticationStatus::Authenticated
+    } else {
+        AuthenticationStatus::Unauthenticated
+    })
 }
 
 fn is_authenticated_settings_url(url: &reqwest::Url) -> bool {
@@ -92,6 +104,12 @@ impl fmt::Display for AtCoderError {
 
             Self::InvalidStoredCookie => {
                 write!(formatter, "stored authentication cookie is invalid")
+            }
+            Self::UnexpectedAuthenticationStatus(status) => {
+                write!(
+                    formatter,
+                    "authentication check returned unexpected HTTP status {status}"
+                )
             }
             Self::Fixture { path, source } => {
                 write!(
@@ -119,6 +137,7 @@ impl std::error::Error for AtCoderError {
             Self::Auth(error) => Some(error),
             Self::Fixture { source, .. } => Some(source),
             Self::InvalidStoredCookie
+            | Self::UnexpectedAuthenticationStatus(_)
             | Self::Parse(_)
             | Self::InvalidIdentifier { .. }
             | Self::InvalidProblemUrl(_)
@@ -770,6 +789,30 @@ mod tests {
 
         assert!(!is_authenticated_settings_url(
             &reqwest::Url::parse("https://example.com/settings").unwrap()
+        ));
+    }
+
+    #[test]
+    fn authentication_requires_a_successful_final_settings_response() {
+        let settings = reqwest::Url::parse("https://atcoder.jp/settings").unwrap();
+        let login = reqwest::Url::parse(
+            "https://atcoder.jp/login?continue=https%3A%2F%2Fatcoder.jp%2Fsettings",
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_authentication_response(StatusCode::OK, &settings).unwrap(),
+            AuthenticationStatus::Authenticated
+        );
+        assert_eq!(
+            classify_authentication_response(StatusCode::OK, &login).unwrap(),
+            AuthenticationStatus::Unauthenticated
+        );
+        assert!(matches!(
+            classify_authentication_response(StatusCode::FOUND, &settings),
+            Err(AtCoderError::UnexpectedAuthenticationStatus(
+                StatusCode::FOUND
+            ))
         ));
     }
 }
