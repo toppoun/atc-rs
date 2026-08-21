@@ -3,6 +3,10 @@ name = "atc-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "atc"
+path = "src/main.rs"
+
 [dependencies]
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"

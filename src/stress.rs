@@ -21,6 +21,13 @@ use crate::ui::{Event, Reporter};
 use crate::workspace;
 
 const FAILURE_FORMAT_VERSION: u32 = 1;
+const FAILURE_GENERATION_FILES: [&str; 5] = [
+    "failed.in",
+    "actual.out",
+    "expected.out",
+    "stderr.txt",
+    "meta.toml",
+];
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn automatic_seed() -> io::Result<u64> {
@@ -795,14 +802,6 @@ fn persist_failure(
 }
 
 fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Result<()> {
-    const KNOWN_FILES: [&str; 5] = [
-        "failed.in",
-        "actual.out",
-        "expected.out",
-        "stderr.txt",
-        "meta.toml",
-    ];
-
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -816,7 +815,7 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
             )
         })?;
 
-        if !KNOWN_FILES.contains(&name) || !entry.file_type()?.is_file() {
+        if !FAILURE_GENERATION_FILES.contains(&name) || !entry.file_type()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -997,6 +996,10 @@ struct SavedCaseSnapshot {
 }
 
 fn open_saved_case_snapshot(generation: &CapDir) -> io::Result<Option<SavedCaseSnapshot>> {
+    if !saved_generation_entries_are_owned(generation)? {
+        return Ok(None);
+    }
+
     let Some(metadata) = open_regular_file(generation, "meta.toml")? else {
         return Ok(None);
     };
@@ -1017,6 +1020,22 @@ fn open_saved_case_snapshot(generation: &CapDir) -> io::Result<Option<SavedCaseS
         input,
         expected,
     }))
+}
+
+fn saved_generation_entries_are_owned(generation: &CapDir) -> io::Result<bool> {
+    for entry in generation.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+
+        if !FAILURE_GENERATION_FILES.contains(&name) || !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn read_saved_case_snapshot(
@@ -1409,6 +1428,43 @@ mod tests {
             "keep me\n"
         );
         assert!(!target.join("failed.in").exists());
+    }
+
+    #[test]
+    fn loader_and_writer_both_reject_a_generation_with_unowned_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join(".atc").join("stress").join("A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old input\n",
+            Some("old expected\n"),
+        );
+        fs::write(target.join("important.txt"), "user data\n").unwrap();
+
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+
+        let request = request(temp.path(), 10);
+        let replacement = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        let error = persist_failure(&request, &replacement, &|| false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(target.join("important.txt")).unwrap(),
+            "user data\n"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ const RESET: &str = "\x1b[0m";
 
 /// Fast AtCoder workflow from your terminal.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(name = "atc", version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -88,7 +88,7 @@ pub enum ContestCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum RunTestCommand {
-    /// Run sample tests
+    /// Run samples and the saved stress regression
     Test {
         problem: String,
 
@@ -205,12 +205,14 @@ fn render_help_command(command_tree: &ClapCommand) -> String {
 }
 
 fn render_help(command_tree: &ClapCommand) -> String {
+    let command_name = command_tree.get_name();
+
     format!(
         "{LOGO}
 {GRAY}Fast AtCoder workflow from your terminal.{RESET}
 
 Usage:
-  atc [options] <command>
+  {command_name} [options] <command>
 
 {}
 
@@ -264,6 +266,17 @@ mod tests {
 
         assert!(help.contains("  atc [options] <command>"));
         assert!(!help.contains("  atc <command> [options]"));
+        assert!(help.contains("test      Run samples and the saved stress regression"));
+
+        let mut stress = command_tree
+            .find_subcommand("stress")
+            .expect("stress subcommand should exist")
+            .clone();
+        let stress_help = stress.render_long_help().to_string();
+        assert!(stress_help.contains("Usage: atc stress [OPTIONS] <PROBLEM>"));
+        for option in ["--count", "--forever", "--seed"] {
+            assert!(stress_help.contains(option));
+        }
     }
 
     #[test]

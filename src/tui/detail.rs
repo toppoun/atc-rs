@@ -139,7 +139,7 @@ impl<'a> DetailDocument<'a> {
     fn push_sample_run_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
 
-        if run.phase == RunPhase::Idle
+        if run.id.is_none()
             && problem.saved_stress_case.is_some()
             && app.selected_case() >= problem.sample_cases
         {
@@ -184,7 +184,7 @@ impl<'a> DetailDocument<'a> {
                 }
             }
 
-            RunPhase::Running | RunPhase::Finished => {
+            RunPhase::Running | RunPhase::Finished | RunPhase::Cancelled => {
                 self.push_sample_detail(app, problem);
             }
         }

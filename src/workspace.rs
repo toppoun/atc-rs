@@ -2,7 +2,7 @@ use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -529,8 +529,18 @@ fn is_safe_platform_path_component(value: &str) -> bool {
 
 pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
+    let mut problem_indices = HashSet::new();
     for problem in &contest.problems {
         validate_problem_index(&problem.index)?;
+        if !problem_indices.insert(problem.index.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "duplicate problem index ignoring ASCII case: {:?}",
+                    problem.index
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1150,6 +1160,19 @@ mod tests {
         let loaded = load_metadata(temp.path()).unwrap();
 
         assert_eq!(loaded, contest);
+    }
+
+    #[test]
+    fn contest_paths_reject_case_insensitive_problem_index_collisions() {
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A"), problem("a")],
+        };
+
+        let error = validate_contest_paths(&contest).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate problem index"));
     }
 
     #[test]

@@ -147,7 +147,7 @@ pub(super) fn render(
     }
 
     let footer = Paragraph::new(
-        "s samples   S stress   d debug   r rerun   ↑↓/j k sample   ←→/h l problem   wheel scroll   q quit",
+        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit",
     )
     .block(Block::default().borders(Borders::TOP));
 
@@ -187,6 +187,7 @@ fn run_summary(problem: &ProblemState) -> String {
         RunPhase::CompileError => "CE".to_string(),
         RunPhase::CompileTimedOut => "Compile TLE".to_string(),
         RunPhase::NoSamples => "No Samples".to_string(),
+        RunPhase::Cancelled => "Cancelled".to_string(),
         RunPhase::Failed => "Failed".to_string(),
     }
 }
@@ -242,7 +243,9 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
             Style::default().fg(Color::Yellow)
         }
 
-        RunPhase::Idle | RunPhase::NoSamples => Style::default().fg(Color::DarkGray),
+        RunPhase::Idle | RunPhase::NoSamples | RunPhase::Cancelled => {
+            Style::default().fg(Color::DarkGray)
+        }
     }
 }
 
@@ -283,7 +286,7 @@ fn problem_symbol(problem: &ProblemState) -> &'static str {
     let run = &problem.run;
 
     match run.phase {
-        RunPhase::Idle => "·",
+        RunPhase::Idle | RunPhase::Cancelled => "·",
         RunPhase::Queued | RunPhase::Compiling | RunPhase::Running => "…",
         RunPhase::Finished if run.total_cases > 0 && run.accepted == run.total_cases => "✓",
         RunPhase::Finished
@@ -322,7 +325,9 @@ fn problem_style(problem: &ProblemState) -> Style {
             Style::default().fg(Color::Yellow)
         }
 
-        RunPhase::Idle | RunPhase::NoSamples => Style::default().fg(Color::DarkGray),
+        RunPhase::Idle | RunPhase::NoSamples | RunPhase::Cancelled => {
+            Style::default().fg(Color::DarkGray)
+        }
     }
 }
 
