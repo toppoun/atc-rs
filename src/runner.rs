@@ -140,15 +140,27 @@ pub(crate) fn execute_with_cancel_observer(
         return Err(clean_cancellation_io_error());
     }
 
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    let process_tree = PreparedProcessTree::prepare(&mut command)?;
+    let mut spawned_child = command.spawn()?;
+    let process_tree = match process_tree.attach(&spawned_child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let kill_error = spawned_child.kill().err();
+            let wait_error = spawned_child.wait().err();
+            let cleanup_error = wait_error.or(kill_error);
+            return Err(with_cleanup_error(error, cleanup_error));
+        }
+    };
 
     let started = Instant::now();
-    let mut child = ChildGuard::new(child);
+    let mut child = ChildGuard::new(spawned_child, process_tree);
 
     let stdin = child.take_stdin()?;
     let stdout = child.take_stdout()?;
@@ -222,6 +234,7 @@ fn wait_for_child(
 
         match child.wait_timeout(wait_for) {
             Ok(Some(status)) => {
+                child.terminate_descendants()?;
                 return Ok(ExecutionOutcome::Exited(status));
             }
 
@@ -289,13 +302,17 @@ fn with_cleanup_error(original: io::Error, cleanup: Option<io::Error>) -> io::Er
 
 struct ChildGuard {
     child: Child,
+    process_tree: ProcessTree,
+    process_tree_terminated: bool,
     reaped: bool,
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, process_tree: ProcessTree) -> Self {
         Self {
             child,
+            process_tree,
+            process_tree_terminated: false,
             reaped: false,
         }
     }
@@ -329,34 +346,235 @@ impl ChildGuard {
         Ok(status)
     }
 
+    fn terminate_descendants(&mut self) -> io::Result<()> {
+        if self.process_tree_terminated {
+            return Ok(());
+        }
+
+        self.process_tree.terminate()?;
+        self.process_tree_terminated = true;
+        Ok(())
+    }
+
     fn terminate_and_wait(&mut self) -> io::Result<()> {
+        let tree_error = self.terminate_descendants().err();
         let kill_error = self.child.kill().err();
 
         match self.child.wait() {
             Ok(_) => {
                 self.reaped = true;
+                if let Some(tree_error) = tree_error {
+                    return Err(tree_error);
+                }
                 // kill() can race with a process that exits at the timeout boundary. A successful
                 // wait proves that it has still been reaped, so that kill error is harmless.
                 Ok(())
             }
-            Err(wait_error) => Err(match kill_error {
-                Some(kill_error) => io::Error::new(
-                    wait_error.kind(),
-                    format!("failed to kill child: {kill_error}; failed to wait: {wait_error}"),
-                ),
-                None => wait_error,
-            }),
+            Err(wait_error) => {
+                let mut details = Vec::new();
+                if let Some(tree_error) = tree_error {
+                    details.push(format!("failed to terminate process tree: {tree_error}"));
+                }
+                if let Some(kill_error) = kill_error {
+                    details.push(format!("failed to kill child: {kill_error}"));
+                }
+                details.push(format!("failed to wait: {wait_error}"));
+
+                Err(io::Error::new(wait_error.kind(), details.join("; ")))
+            }
         }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        let _ = self.terminate_descendants();
         if !self.reaped {
             let _ = self.child.kill();
             if self.child.wait().is_ok() {
                 self.reaped = true;
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PreparedProcessTree;
+
+#[cfg(unix)]
+impl PreparedProcessTree {
+    fn prepare(command: &mut Command) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(0);
+        Ok(Self)
+    }
+
+    fn attach(self, child: &Child) -> io::Result<ProcessTree> {
+        Ok(ProcessTree {
+            process_group: child.id() as libc::pid_t,
+        })
+    }
+}
+
+#[cfg(unix)]
+struct ProcessTree {
+    process_group: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn terminate(&self) -> io::Result<()> {
+        // Each child is placed in its own process group before exec. A negative PID targets the
+        // entire group, including ordinary descendants that inherited the group.
+        let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PreparedProcessTree {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl PreparedProcessTree {
+    fn prepare(command: &mut Command) -> io::Result<Self> {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        // Assigning an already-running process to a job races with short-lived programs and with
+        // descendants spawned before assignment. Start suspended so the job owns the process tree
+        // before any user code can execute.
+        command.creation_flags(CREATE_SUSPENDED);
+
+        let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_job.cast()) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle().cast(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self { job })
+    }
+
+    fn attach(self, child: &Child) -> io::Result<ProcessTree> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let assigned = unsafe {
+            AssignProcessToJobObject(
+                self.job.as_raw_handle().cast(),
+                child.as_raw_handle().cast(),
+            )
+        };
+        if assigned == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        resume_suspended_process(child.id())?;
+
+        Ok(ProcessTree { job: self.job })
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    };
+
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw_snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(raw_snapshot.cast())
+    };
+
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    if unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    loop {
+        if entry.th32OwnerProcessID == process_id {
+            let raw_thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if raw_thread.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let thread = unsafe {
+                std::os::windows::io::OwnedHandle::from_raw_handle(raw_thread.cast())
+            };
+
+            if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+
+        if unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("suspended process {process_id} has no resumable thread"),
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn terminate(&self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle().cast(), 1) };
+        if terminated == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }
@@ -488,6 +706,36 @@ mod tests {
     }
 
     #[test]
+    fn timeout_terminates_descendants_that_inherit_the_output_pipes() {
+        let started = Instant::now();
+        let result = execute(
+            &std::env::current_exe().unwrap(),
+            &helper_args("spawn_descendant_and_sleep_helper"),
+            "",
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert!(matches!(result.outcome, ExecutionOutcome::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn successful_child_cannot_detach_a_descendant_that_holds_output_pipes() {
+        let started = Instant::now();
+        let result = execute(
+            &std::env::current_exe().unwrap(),
+            &helper_args("spawn_descendant_and_exit_helper"),
+            "",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(matches!(result.outcome, ExecutionOutcome::Exited(status) if status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn child_closing_stdin_early_is_not_a_runner_error() {
         let input = "i".repeat(512 * 1024);
         let result = execute(
@@ -565,6 +813,27 @@ mod tests {
     #[test]
     #[ignore = "launched as a child process by runner tests"]
     fn sleep_helper() {
+        thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by runner tests"]
+    #[allow(clippy::zombie_processes)]
+    fn spawn_descendant_and_exit_helper() {
+        Command::new(std::env::current_exe().unwrap())
+            .args(helper_args("sleep_helper"))
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by runner tests"]
+    #[allow(clippy::zombie_processes)]
+    fn spawn_descendant_and_sleep_helper() {
+        Command::new(std::env::current_exe().unwrap())
+            .args(helper_args("sleep_helper"))
+            .spawn()
+            .unwrap();
         thread::sleep(Duration::from_secs(10));
     }
 

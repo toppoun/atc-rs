@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::attempt::io_error_is_clean_cancellation;
 use crate::comparator::{self, ComparisonResult};
@@ -361,16 +361,17 @@ fn finish_failure(
         return Ok(outcome);
     }
 
-    let saved_to = persist_failure(request, &failure)?;
-
-    if is_cancelled() {
-        let outcome = StressOutcome::Cancelled {
-            cases: passed,
-            elapsed: loop_started.elapsed(),
-        };
-        report_terminal_outcome(request, &outcome, reporter);
-        return Ok(outcome);
-    }
+    let saved_to = match persist_failure(request, &failure, is_cancelled)? {
+        PersistenceOutcome::Saved(path) => path,
+        PersistenceOutcome::Cancelled => {
+            let outcome = StressOutcome::Cancelled {
+                cases: passed,
+                elapsed: loop_started.elapsed(),
+            };
+            report_terminal_outcome(request, &outcome, reporter);
+            return Ok(outcome);
+        }
+    };
 
     let outcome = StressOutcome::Failed {
         failure,
@@ -654,7 +655,30 @@ struct FailureMetadata<'a> {
     seed: u64,
 }
 
-fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Result<PathBuf> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFailureMetadata {
+    version: u32,
+    contest: String,
+    problem: String,
+    kind: String,
+    case: u64,
+    base_seed: u64,
+    seed: u64,
+}
+
+#[derive(Debug)]
+enum PersistenceOutcome {
+    Saved(PathBuf),
+    Cancelled,
+}
+
+fn persist_failure(
+    request: &StressRequest,
+    failure: &StressFailure,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<PersistenceOutcome> {
+    workspace::validate_problem_index(&request.problem_index)?;
     workspace::validate_workspace_marker(&request.destination)?;
 
     let stress_root = request.destination.join(".atc").join("stress");
@@ -662,6 +686,13 @@ fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Resu
 
     let target = stress_root.join(&request.problem_index);
     let target_exists = existing_real_directory(&target, "stress failure directory")?;
+    if target_exists {
+        validate_failure_generation(&target, request)?;
+    }
+
+    if is_cancelled() {
+        return Ok(PersistenceOutcome::Cancelled);
+    }
 
     let staging = tempfile::Builder::new()
         .prefix(".stress-staging-")
@@ -690,6 +721,13 @@ fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Resu
     };
     let metadata = toml::to_string_pretty(&metadata).map_err(io::Error::other)?;
     write_new_file(&new_generation.join("meta.toml"), &metadata)?;
+    sync_directory(&new_generation)?;
+
+    // Staging is harmless to discard. Once the old generation is moved, cancellation can no
+    // longer win without either hiding a committed failure or requiring a destructive rollback.
+    if is_cancelled() {
+        return Ok(PersistenceOutcome::Cancelled);
+    }
 
     // destructive swap直前に再検査する。symlinkやfileへ差し替わっていたら止める。
     let target_still_exists = existing_real_directory(&target, "stress failure directory")?;
@@ -705,32 +743,162 @@ fn persist_failure(request: &StressRequest, failure: &StressFailure) -> io::Resu
 
     if target_exists {
         fs::rename(&target, &previous_generation)?;
+        if let Err(error) = validate_failure_generation(&previous_generation, request) {
+            return Err(rollback_previous_generation(
+                staging,
+                &target,
+                &previous_generation,
+                error,
+            ));
+        }
     }
 
     if let Err(error) = fs::rename(&new_generation, &target) {
-        let mut rollback_error = None;
-        if target_exists
-            && let Err(error) = fs::rename(&previous_generation, &target)
-        {
-            rollback_error = Some(error);
-        }
-
-        if let Some(rollback_error) = rollback_error {
-            let recovery_path = staging.keep();
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to replace stress failure {}: {error}; rollback also failed: {rollback_error}; recovery data kept at {}",
-                    target.display(),
-                    recovery_path.display()
-                ),
+        if target_exists {
+            return Err(rollback_previous_generation(
+                staging,
+                &target,
+                &previous_generation,
+                error,
             ));
         }
 
         return Err(error);
     }
 
-    Ok(target)
+    Ok(PersistenceOutcome::Saved(target))
+}
+
+fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Result<()> {
+    const KNOWN_FILES: [&str; 5] = [
+        "failed.in",
+        "actual.out",
+        "expected.out",
+        "stderr.txt",
+        "meta.toml",
+    ];
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stress failure generation contains a non-Unicode entry: {}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+
+        if !KNOWN_FILES.contains(&name) || !entry.file_type()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stress failure generation contains an unowned entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+
+    for required in ["failed.in", "actual.out", "meta.toml"] {
+        if !existing_regular_file(&path.join(required), "stress failure file")? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stress failure generation is missing {required}: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let metadata_path = path.join("meta.toml");
+    let metadata: StoredFailureMetadata = toml::from_str(&fs::read_to_string(&metadata_path)?)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid stress metadata {}: {error}",
+                    metadata_path.display()
+                ),
+            )
+        })?;
+
+    if metadata.version != FAILURE_FORMAT_VERSION
+        || metadata.contest != request.contest_id
+        || metadata.problem != request.problem_index
+        || metadata.case == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stress failure metadata does not own generation {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let expected_seed = metadata
+        .case
+        .checked_sub(1)
+        .and_then(|offset| metadata.base_seed.checked_add(offset));
+    if expected_seed != Some(metadata.seed) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stress failure metadata has inconsistent seed mapping: {}",
+                metadata_path.display()
+            ),
+        ));
+    }
+
+    match metadata.kind.as_str() {
+        "wrong-answer" => {
+            if !existing_regular_file(&path.join("expected.out"), "stress expected output")? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "wrong-answer stress generation is missing expected.out: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        // Historical v1 RE/TLE generations did not include expected.out.
+        "runtime-error" | "timed-out" => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown stress failure kind in {}", metadata_path.display()),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn rollback_previous_generation(
+    staging: tempfile::TempDir,
+    target: &Path,
+    previous_generation: &Path,
+    original: io::Error,
+) -> io::Error {
+    if let Err(rollback_error) = fs::rename(previous_generation, target) {
+        let kind = original.kind();
+        let recovery_path = staging.keep();
+        return io::Error::new(
+            kind,
+            format!(
+                "failed to replace stress failure {}: {original}; rollback also failed: {rollback_error}; recovery data kept at {}",
+                target.display(),
+                recovery_path.display()
+            ),
+        );
+    }
+
+    original
 }
 
 pub(crate) fn load_saved_case(
@@ -806,12 +974,71 @@ fn write_new_file(path: &Path, content: &str) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(content.as_bytes())
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // std does not expose a portable way to flush a Windows directory handle. Each generation
+    // file is still flushed individually before the same-volume directory rename.
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn request(destination: &Path, base_seed: u64) -> StressRequest {
+        StressRequest {
+            destination: destination.to_path_buf(),
+            contest_id: "abc123".to_string(),
+            problem_index: "A".to_string(),
+            candidate_source: destination.join("A.cpp"),
+            candidate_language: Language::Cpp,
+            generator_source: destination.join("A_gen.py"),
+            reference_source: destination.join("A_brute.py"),
+            python: "python".to_string(),
+            cpp_compiler: "g++".to_string(),
+            cpp_flags: Vec::new(),
+            candidate_timeout: Duration::from_secs(1),
+            generator_timeout: Duration::from_secs(1),
+            reference_timeout: Duration::from_secs(1),
+            compile_timeout: Duration::from_secs(1),
+            base_seed,
+            count: NonZeroU64::new(100),
+            debug: false,
+        }
+    }
+
+    fn persisted_path(result: io::Result<PersistenceOutcome>) -> PathBuf {
+        match result.unwrap() {
+            PersistenceOutcome::Saved(path) => path,
+            PersistenceOutcome::Cancelled => panic!("persistence unexpectedly cancelled"),
+        }
+    }
+
+    #[derive(Default)]
+    struct TerminalReporter {
+        terminal: Vec<&'static str>,
+    }
+
+    impl Reporter for TerminalReporter {
+        fn report(&mut self, event: Event<'_>) {
+            match event {
+                Event::StressFailed { .. } => self.terminal.push("failed"),
+                Event::StressCancelled { .. } => self.terminal.push("cancelled"),
+                Event::StressFinished { .. } => self.terminal.push("finished"),
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn seed_is_base_plus_one_origin_case_offset() {
@@ -838,25 +1065,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join(".atc")).unwrap();
 
-        let request = StressRequest {
-            destination: temp.path().to_path_buf(),
-            contest_id: "abc123".to_string(),
-            problem_index: "A".to_string(),
-            candidate_source: temp.path().join("A.cpp"),
-            candidate_language: Language::Cpp,
-            generator_source: temp.path().join("A_gen.py"),
-            reference_source: temp.path().join("A_brute.py"),
-            python: "python".to_string(),
-            cpp_compiler: "g++".to_string(),
-            cpp_flags: Vec::new(),
-            candidate_timeout: Duration::from_secs(1),
-            generator_timeout: Duration::from_secs(1),
-            reference_timeout: Duration::from_secs(1),
-            compile_timeout: Duration::from_secs(1),
-            base_seed: 10,
-            count: NonZeroU64::new(100),
-            debug: false,
-        };
+        let request = request(temp.path(), 10);
 
         let wa = StressFailure {
             kind: CandidateFailureKind::WrongAnswer,
@@ -870,9 +1079,15 @@ mod tests {
             elapsed: Duration::from_millis(5),
         };
 
-        let target = persist_failure(&request, &wa).unwrap();
-        assert_eq!(fs::read_to_string(target.join("expected.out")).unwrap(), "2\n");
-        assert_eq!(fs::read_to_string(target.join("stderr.txt")).unwrap(), "debug\n");
+        let target = persisted_path(persist_failure(&request, &wa, &|| false));
+        assert_eq!(
+            fs::read_to_string(target.join("expected.out")).unwrap(),
+            "2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("stderr.txt")).unwrap(),
+            "debug\n"
+        );
 
         let re = StressFailure {
             kind: CandidateFailureKind::RuntimeError,
@@ -886,14 +1101,128 @@ mod tests {
             elapsed: Duration::from_millis(7),
         };
 
-        let target = persist_failure(&request, &re).unwrap();
-        assert_eq!(fs::read_to_string(target.join("expected.out")).unwrap(), "5\n");
+        let target = persisted_path(persist_failure(&request, &re, &|| false));
+        assert_eq!(
+            fs::read_to_string(target.join("expected.out")).unwrap(),
+            "5\n"
+        );
         assert!(!target.join("stderr.txt").exists());
         assert_eq!(fs::read_to_string(target.join("failed.in")).unwrap(), "4\n");
 
         let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
         assert!(metadata.contains("kind = \"runtime-error\""));
         assert!(metadata.contains("seed = 11"));
+    }
+
+    #[test]
+    fn cancellation_before_persistence_commit_preserves_the_previous_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+
+        let previous = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old input\n".to_string(),
+            expected: "old expected\n".to_string(),
+            actual: "old actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let target = persisted_path(persist_failure(&request, &previous, &|| false));
+
+        let replacement = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 2,
+            base_seed: 10,
+            seed: 11,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let checks = Cell::new(0_u8);
+        let is_cancelled = || {
+            let check = checks.get();
+            checks.set(check + 1);
+            check >= 2
+        };
+        let mut reporter = TerminalReporter::default();
+
+        let outcome = finish_failure(
+            &request,
+            replacement,
+            1,
+            Instant::now(),
+            &mut reporter,
+            &is_cancelled,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, StressOutcome::Cancelled { cases: 1, .. }));
+        assert_eq!(reporter.terminal, ["cancelled"]);
+        assert_eq!(
+            fs::read_to_string(target.join("failed.in")).unwrap(),
+            "old input\n"
+        );
+    }
+
+    #[test]
+    fn persistence_refuses_to_delete_an_unowned_target_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join(".atc").join("stress").join("A");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("important.txt"), "keep me\n").unwrap();
+
+        let request = request(temp.path(), 10);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "1\n".to_string(),
+            expected: "2\n".to_string(),
+            actual: "3\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        let error = persist_failure(&request, &failure, &|| false).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(target.join("important.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(!target.join("failed.in").exists());
+    }
+
+    #[test]
+    fn metadata_preserves_the_full_u64_seed_range() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), u64::MAX);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: u64::MAX,
+            seed: u64::MAX,
+            input: "1\n".to_string(),
+            expected: "2\n".to_string(),
+            actual: "3\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        let target = persisted_path(persist_failure(&request, &failure, &|| false));
+        validate_failure_generation(&target, &request).unwrap();
+
+        let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+        assert!(metadata.contains("base_seed = 18446744073709551615"));
+        assert!(metadata.contains("seed = 18446744073709551615"));
     }
 
     #[test]

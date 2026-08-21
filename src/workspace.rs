@@ -530,9 +530,13 @@ fn is_safe_platform_path_component(value: &str) -> bool {
 pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
     for problem in &contest.problems {
-        validate_path_component(&problem.index, "problem index")?;
+        validate_problem_index(&problem.index)?;
     }
     Ok(())
+}
+
+pub(crate) fn validate_problem_index(problem_index: &str) -> io::Result<()> {
+    validate_path_component(problem_index, "problem index")
 }
 
 pub fn validate_contest_identity(contest: &Contest, expected_contest_id: &str) -> io::Result<()> {
