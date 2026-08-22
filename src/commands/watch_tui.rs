@@ -326,9 +326,17 @@ pub(super) fn watch_tui_at(
     detail_analysis_worker.request_stop();
 
     // joinが予想外に長引いてもterminalは先に復元する。
+    let mouse_mode_label = terminal.mouse_mode_label();
+    let mouse_trace_line = terminal.mouse_trace_line();
     let restore_result = terminal.restore();
     // TerminaのDropで元のplatform mode/code pageまで戻してからjoinする。
     drop(terminal);
+    if std::env::var_os("ATC_TUI_MOUSE_TRACE").is_some() {
+        eprintln!("atc terminal mouse: {mouse_mode_label}");
+        if let Some(trace) = mouse_trace_line {
+            eprintln!("{trace}");
+        }
+    }
 
     let worker_result = run_worker.stop_and_join();
     let watcher_result = watcher_thread.stop();

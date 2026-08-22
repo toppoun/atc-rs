@@ -31,6 +31,14 @@ pub(super) struct DetailScrollbarGeometry {
     pub(super) marker_rows: Vec<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailScrollbarPixelProjection {
+    track_top_px: u64,
+    thumb_top_px: u64,
+    thumb_height_px: u64,
+    thumb_travel_px: u64,
+}
+
 impl DetailScrollbarGeometry {
     pub(super) fn new(
         area: Rect,
@@ -143,6 +151,49 @@ impl DetailScrollbarGeometry {
             .saturating_sub(grab_offset)
             .min(self.thumb_travel);
         thumb_offset_to_scroll(desired_start, self.max_scroll, self.thumb_travel)
+    }
+
+    pub(super) fn pixel_projection(
+        &self,
+        cell_height_px: u32,
+    ) -> Option<DetailScrollbarPixelProjection> {
+        if !self.is_interactive() || cell_height_px == 0 {
+            return None;
+        }
+        let cell_height_px = u64::from(cell_height_px);
+        Some(DetailScrollbarPixelProjection {
+            track_top_px: u64::from(self.track_start_row).checked_mul(cell_height_px)?,
+            thumb_top_px: u64::from(self.thumb_start_row).checked_mul(cell_height_px)?,
+            thumb_height_px: u64::from(self.thumb_len).checked_mul(cell_height_px)?,
+            thumb_travel_px: u64::from(self.thumb_travel).checked_mul(cell_height_px)?,
+        })
+    }
+
+    pub(super) fn pixel_grab_offset(
+        &self,
+        normalized_y_px: u32,
+        cell_height_px: u32,
+    ) -> Option<u64> {
+        let projection = self.pixel_projection(cell_height_px)?;
+        let pointer = u64::from(normalized_y_px);
+        let offset = pointer.checked_sub(projection.thumb_top_px)?;
+        (offset < projection.thumb_height_px).then_some(offset)
+    }
+
+    pub(super) fn scroll_for_pixel_drag(
+        &self,
+        normalized_y_px: u32,
+        grab_offset_px: u64,
+        cell_height_px: u32,
+    ) -> usize {
+        let Some(projection) = self.pixel_projection(cell_height_px) else {
+            return 0;
+        };
+        let desired_thumb_top = u64::from(normalized_y_px).saturating_sub(grab_offset_px);
+        let desired_offset = desired_thumb_top
+            .saturating_sub(projection.track_top_px)
+            .min(projection.thumb_travel_px);
+        pixel_thumb_offset_to_scroll(desired_offset, self.max_scroll, projection.thumb_travel_px)
     }
 
     fn clamped_track_offset(&self, row: u16) -> u16 {
@@ -260,6 +311,19 @@ fn thumb_offset_to_scroll(offset: u16, max_scroll: usize, travel: u16) -> usize 
     let rounded = round_ratio(
         (offset.min(travel) as u128).saturating_mul(max_scroll as u128),
         travel as u128,
+    );
+    usize::try_from(rounded)
+        .unwrap_or(max_scroll)
+        .min(max_scroll)
+}
+
+fn pixel_thumb_offset_to_scroll(offset: u64, max_scroll: usize, travel: u64) -> usize {
+    if max_scroll == 0 || travel == 0 {
+        return 0;
+    }
+    let rounded = round_ratio(
+        u128::from(offset.min(travel)).saturating_mul(max_scroll as u128),
+        u128::from(travel),
     );
     usize::try_from(rounded)
         .unwrap_or(max_scroll)
@@ -438,6 +502,41 @@ mod tests {
         let geometry = geometry(20, 1_000, 500).unwrap();
         assert_eq!(geometry.scroll_for_drag(0, 0), 0);
         assert_eq!(geometry.scroll_for_drag(u16::MAX, 0), 1_000);
+    }
+
+    #[test]
+    fn pixel_projection_preserves_grab_offset_and_adjacent_pixel_resolution() {
+        let geometry = geometry(20, 1_000_000, 0).unwrap();
+        let cell_height = 20;
+        let thumb_top = u32::from(geometry.thumb_start_row) * cell_height;
+        let grab = geometry
+            .pixel_grab_offset(thumb_top + 13, cell_height)
+            .unwrap();
+        assert_eq!(grab, 13);
+        assert_eq!(
+            geometry.scroll_for_pixel_drag(thumb_top + 13, grab, cell_height),
+            0
+        );
+        let first = geometry.scroll_for_pixel_drag(thumb_top + 14, grab, cell_height);
+        let second = geometry.scroll_for_pixel_drag(thumb_top + 15, grab, cell_height);
+        assert!(first > 0);
+        assert!(second > first);
+    }
+
+    #[test]
+    fn pixel_drag_has_exact_clamped_endpoints_for_the_largest_scroll_range() {
+        let geometry = geometry(40, usize::MAX, usize::MAX / 2).unwrap();
+        let cell_height = 20;
+        let projection = geometry.pixel_projection(cell_height).unwrap();
+        assert_eq!(geometry.scroll_for_pixel_drag(0, 0, cell_height), 0);
+        let bottom = projection
+            .track_top_px
+            .saturating_add(projection.thumb_travel_px);
+        let bottom = u32::try_from(bottom).unwrap();
+        assert_eq!(
+            geometry.scroll_for_pixel_drag(bottom, 0, cell_height),
+            usize::MAX
+        );
     }
 
     #[test]

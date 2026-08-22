@@ -1,4 +1,5 @@
 use termina::Event;
+use termina::escape::csi::{Csi, MouseButton as CsiMouseButton, MouseReport};
 use termina::event::{self, MouseEventKind};
 
 use super::terminal::{
@@ -18,10 +19,25 @@ pub(super) fn translate(event: Event) -> TerminalEvent {
                 row: event.row,
             },
             modifiers: translate_modifiers(event.modifiers),
+            pixel_generation: None,
         }),
         Event::WindowResized(size) => TerminalEvent::Resize(TerminalSize {
             columns: size.cols,
             rows: size.rows,
+        }),
+        Event::Csi(Csi::Mouse(MouseReport::Sgr1016 {
+            x_pixels,
+            y_pixels,
+            button,
+            modifiers,
+        })) => TerminalEvent::Pointer(PointerEvent {
+            kind: translate_sgr1016_kind(button),
+            position: PointerPosition::AbsolutePixels {
+                x: x_pixels,
+                y: y_pixels,
+            },
+            modifiers: translate_modifiers(modifiers),
+            pixel_generation: None,
         }),
         Event::FocusIn
         | Event::FocusOut
@@ -29,6 +45,25 @@ pub(super) fn translate(event: Event) -> TerminalEvent {
         | Event::Csi(_)
         | Event::Osc(_)
         | Event::Dcs(_) => TerminalEvent::Ignored,
+    }
+}
+
+fn translate_sgr1016_kind(button: CsiMouseButton) -> PointerKind {
+    match button {
+        CsiMouseButton::Button1Press => PointerKind::Down(PointerButton::Left),
+        CsiMouseButton::Button2Press => PointerKind::Down(PointerButton::Middle),
+        CsiMouseButton::Button3Press => PointerKind::Down(PointerButton::Right),
+        CsiMouseButton::Button1Release => PointerKind::Up(PointerButton::Left),
+        CsiMouseButton::Button2Release => PointerKind::Up(PointerButton::Middle),
+        CsiMouseButton::Button3Release => PointerKind::Up(PointerButton::Right),
+        CsiMouseButton::Button1Drag => PointerKind::Drag(PointerButton::Left),
+        CsiMouseButton::Button2Drag => PointerKind::Drag(PointerButton::Middle),
+        CsiMouseButton::Button3Drag => PointerKind::Drag(PointerButton::Right),
+        CsiMouseButton::Button4Press | CsiMouseButton::Button4Release => PointerKind::ScrollUp,
+        CsiMouseButton::Button5Press | CsiMouseButton::Button5Release => PointerKind::ScrollDown,
+        CsiMouseButton::Button6Press | CsiMouseButton::Button6Release => PointerKind::ScrollLeft,
+        CsiMouseButton::Button7Press | CsiMouseButton::Button7Release => PointerKind::ScrollRight,
+        CsiMouseButton::None => PointerKind::Move,
     }
 }
 
@@ -84,7 +119,7 @@ fn translate_modifiers(modifiers: event::Modifiers) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use termina::WindowSize;
-    use termina::escape::csi::{Csi, Cursor};
+    use termina::escape::csi::{Csi, Cursor, MouseButton as CsiMouseButton, MouseReport};
     use termina::event::{
         KeyCode as TerminaKeyCode, KeyEvent as TerminaKeyEvent,
         KeyEventKind as TerminaKeyEventKind, KeyEventState, Modifiers as TerminaModifiers,
@@ -109,6 +144,15 @@ mod tests {
             row: 9,
             modifiers,
         })
+    }
+
+    fn pixel_pointer(x: u32, y: u32, button: CsiMouseButton, modifiers: TerminaModifiers) -> Event {
+        Event::Csi(Csi::Mouse(MouseReport::Sgr1016 {
+            x_pixels: x,
+            y_pixels: y,
+            button,
+            modifiers,
+        }))
     }
 
     #[test]
@@ -336,6 +380,59 @@ mod tests {
         assert_eq!(event.kind, PointerKind::Move);
         assert!(event.modifiers.shift);
         assert!(event.modifiers.alt);
+    }
+
+    #[test]
+    fn translates_sgr1016_without_normalizing_or_truncating_raw_pixels() {
+        for (x, y) in [(0, 0), (70_000, u32::MAX)] {
+            let TerminalEvent::Pointer(event) = translate(pixel_pointer(
+                x,
+                y,
+                CsiMouseButton::Button1Press,
+                TerminaModifiers::NONE,
+            )) else {
+                panic!("SGR-Pixels input must translate to a pointer event");
+            };
+            assert_eq!(event.kind, PointerKind::Down(PointerButton::Left));
+            assert_eq!(event.position, PointerPosition::AbsolutePixels { x, y });
+            assert_eq!(event.pixel_generation, None);
+        }
+    }
+
+    #[test]
+    fn translates_sgr1016_buttons_motion_wheels_and_modifiers() {
+        for (button, expected) in [
+            (
+                CsiMouseButton::Button1Press,
+                PointerKind::Down(PointerButton::Left),
+            ),
+            (
+                CsiMouseButton::Button2Release,
+                PointerKind::Up(PointerButton::Middle),
+            ),
+            (
+                CsiMouseButton::Button3Drag,
+                PointerKind::Drag(PointerButton::Right),
+            ),
+            (CsiMouseButton::None, PointerKind::Move),
+            (CsiMouseButton::Button4Press, PointerKind::ScrollUp),
+            (CsiMouseButton::Button5Release, PointerKind::ScrollDown),
+            (CsiMouseButton::Button6Press, PointerKind::ScrollLeft),
+            (CsiMouseButton::Button7Release, PointerKind::ScrollRight),
+        ] {
+            let TerminalEvent::Pointer(event) = translate(pixel_pointer(
+                123,
+                456,
+                button,
+                TerminaModifiers::SHIFT | TerminaModifiers::CONTROL | TerminaModifiers::ALT,
+            )) else {
+                panic!("SGR-Pixels input must translate to a pointer event");
+            };
+            assert_eq!(event.kind, expected);
+            assert!(event.modifiers.shift);
+            assert!(event.modifiers.control);
+            assert!(event.modifiers.alt);
+        }
     }
 
     #[test]

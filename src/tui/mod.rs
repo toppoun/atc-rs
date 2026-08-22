@@ -4,6 +4,7 @@ pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
 pub mod message;
+mod mouse;
 pub mod reporter;
 mod termina_adapter;
 mod terminal;
@@ -19,6 +20,9 @@ use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
 use message::{Message, RunRequest};
+use mouse::{
+    MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
+};
 pub(crate) use terminal::TerminaSession;
 use terminal::{
     KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind, TerminalEvent,
@@ -33,7 +37,18 @@ const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DetailScrollbarDrag {
     identity: DetailScrollbarStableIdentity,
-    grab_offset: u16,
+    coordinate: DragCoordinate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragCoordinate {
+    Cells {
+        grab_offset: u16,
+    },
+    Pixels {
+        grab_offset_px: u64,
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -270,6 +285,8 @@ pub(crate) fn run(
 
         if take_leading_resizes(&mut terminal_events) {
             detail_scrollbar_drag.cancel();
+            discard_stale_pixel_events(&mut terminal_events);
+            terminal.note_resize_dispatched();
             dirty = true;
         }
 
@@ -300,6 +317,8 @@ pub(crate) fn run(
 
         if take_leading_resizes(&mut terminal_events) {
             detail_scrollbar_drag.cancel();
+            discard_stale_pixel_events(&mut terminal_events);
+            terminal.note_resize_dispatched();
             dirty = true;
         }
 
@@ -324,6 +343,10 @@ pub(crate) fn run(
             }
 
             dirty = false;
+            terminal.note_redraw_completed();
+            let resize_pending = resize_event_count(&terminal_events) != 0;
+            terminal.refresh_mouse_after_redraw(resize_pending)?;
+            terminal.retry_high_res_after_redraw(resize_pending)?;
         }
 
         if terminal_events.is_empty() {
@@ -336,15 +359,21 @@ pub(crate) fn run(
             continue;
         }
 
-        if handle_terminal_events(
+        let resize_count_before = resize_event_count(&terminal_events);
+        if handle_terminal_events_with_mouse_mode(
             &mut app,
             &mut detail_layout,
             &mut detail_scrollbar_drag,
             &render_info,
             &mut terminal_events,
             &run_tx,
+            terminal.mouse_mode(),
         )? {
             dirty = true;
+        }
+        if resize_event_count(&terminal_events) < resize_count_before {
+            discard_stale_pixel_events(&mut terminal_events);
+            terminal.note_resize_dispatched();
         }
     }
 
@@ -352,12 +381,51 @@ pub(crate) fn run(
 }
 
 fn read_terminal_events(
-    terminal: &TerminaSession,
+    terminal: &mut TerminaSession,
     wait: Duration,
 ) -> io::Result<VecDeque<TerminalEvent>> {
-    read_terminal_events_with(wait, |wait| terminal.poll(wait), || terminal.read())
+    let mut events = VecDeque::new();
+
+    if !terminal.poll(wait)? {
+        return Ok(events);
+    }
+
+    for index in 0..MAX_TERMINAL_EVENTS_PER_TICK {
+        let terminal_event = terminal.read()?;
+        let should_quit = is_quit_event(&terminal_event);
+        events.push_back(terminal_event);
+
+        if should_quit
+            || index + 1 == MAX_TERMINAL_EVENTS_PER_TICK
+            || !terminal.poll(Duration::ZERO)?
+        {
+            break;
+        }
+    }
+
+    Ok(events)
 }
 
+fn resize_event_count(events: &VecDeque<TerminalEvent>) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, TerminalEvent::Resize(_)))
+        .count()
+}
+
+fn discard_stale_pixel_events(events: &mut VecDeque<TerminalEvent>) {
+    events.retain(|event| {
+        !matches!(
+            event,
+            TerminalEvent::Pointer(PointerEvent {
+                position: terminal::PointerPosition::AbsolutePixels { .. },
+                ..
+            })
+        )
+    });
+}
+
+#[cfg(test)]
 fn read_terminal_events_with(
     wait: Duration,
     mut poll_event: impl FnMut(Duration) -> io::Result<bool>,
@@ -409,6 +477,7 @@ fn take_leading_resizes(events: &mut VecDeque<TerminalEvent>) -> bool {
     found
 }
 
+#[cfg(test)]
 fn handle_terminal_events(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
@@ -416,6 +485,26 @@ fn handle_terminal_events(
     render_info: &view::RenderInfo,
     events: &mut VecDeque<TerminalEvent>,
     run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
+    handle_terminal_events_with_mouse_mode(
+        app,
+        detail_layout,
+        detail_scrollbar_drag,
+        render_info,
+        events,
+        run_tx,
+        MouseMode::Cells,
+    )
+}
+
+fn handle_terminal_events_with_mouse_mode(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
+    render_info: &view::RenderInfo,
+    events: &mut VecDeque<TerminalEvent>,
+    run_tx: &Sender<RunRequest>,
+    mouse_mode: MouseMode,
 ) -> io::Result<bool> {
     let mut changed = false;
     let mut scrollbar_geometry_changed_by_drag = false;
@@ -458,13 +547,14 @@ fn handle_terminal_events(
                 ..
             })
         );
-        changed |= handle_terminal_event(
+        changed |= handle_terminal_event_with_mouse_mode(
             app,
             detail_layout,
             detail_scrollbar_drag,
             terminal_event,
             render_info,
             run_tx,
+            mouse_mode,
         )?;
         if app.detail_revision() != detail_revision_before
             || app.samples_pane_enabled() != samples_pane_before
@@ -490,23 +580,25 @@ fn handle_terminal_events(
     Ok(changed)
 }
 
-fn handle_terminal_event(
+fn handle_terminal_event_with_mouse_mode(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
     terminal_event: TerminalEvent,
     render_info: &view::RenderInfo,
     run_tx: &Sender<RunRequest>,
+    mouse_mode: MouseMode,
 ) -> io::Result<bool> {
     match terminal_event {
         TerminalEvent::Key(key) => handle_key_event(app, key, run_tx),
 
-        TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event(
+        TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event_with_mouse_mode(
             app,
             detail_layout,
             detail_scrollbar_drag,
             pointer,
             render_info,
+            mouse_mode,
         )),
 
         TerminalEvent::Resize(_) => {
@@ -585,6 +677,7 @@ fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+#[cfg(test)]
 fn handle_pointer_event(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
@@ -592,12 +685,69 @@ fn handle_pointer_event(
     pointer: PointerEvent,
     render_info: &view::RenderInfo,
 ) -> bool {
+    handle_pointer_event_with_mouse_mode(
+        app,
+        detail_layout,
+        detail_scrollbar_drag,
+        pointer,
+        render_info,
+        MouseMode::Cells,
+    )
+}
+
+fn projected_pixel_pointer(
+    pointer: PointerEvent,
+    mouse_mode: MouseMode,
+) -> Option<(u32, u32, TerminalPixelMetrics, u64)> {
+    let terminal::PointerPosition::AbsolutePixels { x, y } = pointer.position else {
+        return None;
+    };
+    let MouseMode::Pixels {
+        metrics,
+        origin,
+        generation,
+    } = mouse_mode
+    else {
+        return None;
+    };
+    if pointer.pixel_generation != Some(generation) {
+        return None;
+    }
+    let (x, y) = normalize_absolute_pixels(metrics, origin, x, y)?;
+    Some((x, y, metrics, generation))
+}
+
+fn project_pointer_to_cells(pointer: PointerEvent, mouse_mode: MouseMode) -> Option<(u16, u16)> {
+    match (pointer.position, mouse_mode) {
+        (terminal::PointerPosition::Cells { column, row }, MouseMode::Cells) => Some((column, row)),
+        (
+            terminal::PointerPosition::AbsolutePixels { x, y },
+            MouseMode::Pixels {
+                metrics,
+                origin,
+                generation,
+            },
+        ) if pointer.pixel_generation == Some(generation) => {
+            project_absolute_pixels_to_cells(metrics, origin, x, y)
+        }
+        _ => None,
+    }
+}
+
+fn handle_pointer_event_with_mouse_mode(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
+    pointer: PointerEvent,
+    render_info: &view::RenderInfo,
+    mouse_mode: MouseMode,
+) -> bool {
     if matches!(pointer.kind, PointerKind::Up(_)) {
         detail_scrollbar_drag.cancel();
         return false;
     }
 
-    let Some((column, row)) = pointer.position.cells() else {
+    let Some((column, row)) = project_pointer_to_cells(pointer, mouse_mode) else {
         return false;
     };
 
@@ -622,7 +772,32 @@ fn handle_pointer_event(
             return false;
         }
 
-        let target = scrollbar.geometry.scroll_for_drag(row, drag.grab_offset);
+        let target = match drag.coordinate {
+            DragCoordinate::Cells { grab_offset }
+                if matches!(pointer.position, terminal::PointerPosition::Cells { .. }) =>
+            {
+                scrollbar.geometry.scroll_for_drag(row, grab_offset)
+            }
+            DragCoordinate::Pixels {
+                grab_offset_px,
+                generation,
+            } => {
+                let Some((_, normalized_y, metrics, event_generation)) =
+                    projected_pixel_pointer(pointer, mouse_mode)
+                else {
+                    return false;
+                };
+                if generation != event_generation {
+                    return false;
+                }
+                scrollbar.geometry.scroll_for_pixel_drag(
+                    normalized_y,
+                    grab_offset_px,
+                    metrics.cell_height_px,
+                )
+            }
+            _ => return false,
+        };
         return set_detail_scroll_from_user(
             app,
             detail_layout,
@@ -650,9 +825,24 @@ fn handle_pointer_event(
     {
         return match hit {
             DetailScrollbarHit::Thumb { grab_offset } => {
+                let coordinate = match projected_pixel_pointer(pointer, mouse_mode) {
+                    Some((_, normalized_y, metrics, generation)) => {
+                        let Some(grab_offset_px) = scrollbar
+                            .geometry
+                            .pixel_grab_offset(normalized_y, metrics.cell_height_px)
+                        else {
+                            return false;
+                        };
+                        DragCoordinate::Pixels {
+                            grab_offset_px,
+                            generation,
+                        }
+                    }
+                    None => DragCoordinate::Cells { grab_offset },
+                };
                 detail_scrollbar_drag.active = Some(DetailScrollbarDrag {
                     identity: scrollbar.identity,
-                    grab_offset,
+                    coordinate,
                 });
                 false
             }
@@ -1465,6 +1655,28 @@ mod tests {
             kind,
             position: terminal::PointerPosition::Cells { column, row },
             modifiers: terminal::Modifiers::default(),
+            pixel_generation: None,
+        }
+    }
+
+    fn pixel_metrics() -> TerminalPixelMetrics {
+        TerminalPixelMetrics::validated(100, 40, 1_000, 800, 10, 20).unwrap()
+    }
+
+    fn pixel_mode(generation: u64) -> MouseMode {
+        MouseMode::Pixels {
+            metrics: pixel_metrics(),
+            origin: mouse::PixelCoordinateOrigin::ZeroBased,
+            generation,
+        }
+    }
+
+    fn pixel_pointer(kind: PointerKind, x: u32, y: u32, generation: Option<u64>) -> PointerEvent {
+        PointerEvent {
+            kind,
+            position: terminal::PointerPosition::AbsolutePixels { x, y },
+            modifiers: terminal::Modifiers::default(),
+            pixel_generation: generation,
         }
     }
     fn handle_pointer_event(
@@ -1519,6 +1731,31 @@ mod tests {
         row: u16,
     ) -> bool {
         super::handle_pointer_event(app, layout, drag, pointer(kind, column, row), info)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test call sites name every raw pixel input needed by each scenario"
+    )]
+    fn dispatch_pixel(
+        app: &mut WatchApp,
+        layout: &mut detail_layout::DetailLayout,
+        drag: &mut DetailScrollbarDragState,
+        info: &view::RenderInfo,
+        mode: MouseMode,
+        kind: PointerKind,
+        x: u32,
+        y: u32,
+        generation: Option<u64>,
+    ) -> bool {
+        super::handle_pointer_event_with_mouse_mode(
+            app,
+            layout,
+            drag,
+            pixel_pointer(kind, x, y, generation),
+            info,
+            mode,
+        )
     }
 
     fn pending_width_layout(
@@ -1754,6 +1991,7 @@ mod tests {
             kind: PointerKind::ScrollDown,
             position: terminal::PointerPosition::AbsolutePixels { x: 30, y: 5 },
             modifiers: terminal::Modifiers::default(),
+            pixel_generation: None,
         };
 
         assert!(!handle_pointer_event(&mut app, pointer, &info));
@@ -1880,6 +2118,276 @@ mod tests {
     }
 
     #[test]
+    fn pixel_thumb_drag_preserves_sub_cell_grab_offset_and_adjacent_pixels() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 1_000_000, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let mode = pixel_mode(7);
+        let x = u32::from(geometry.gutter.x) * 10 + 5;
+        let thumb_top = u32::from(geometry.thumb_start_row) * 20;
+        let grab_offset_px = 13;
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Down(PointerButton::Left),
+            x,
+            thumb_top + grab_offset_px,
+            Some(7),
+        ));
+        assert!(matches!(
+            drag.active,
+            Some(DetailScrollbarDrag {
+                coordinate: DragCoordinate::Pixels {
+                    grab_offset_px: 13,
+                    generation: 7,
+                },
+                ..
+            })
+        ));
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Drag(PointerButton::Left),
+            0,
+            thumb_top + grab_offset_px,
+            Some(7),
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Drag(PointerButton::Left),
+            0,
+            thumb_top + grab_offset_px + 1,
+            Some(7),
+        ));
+        let first = app.detail_scroll();
+        assert!(first > 0);
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Drag(PointerButton::Left),
+            0,
+            thumb_top + grab_offset_px + 2,
+            Some(7),
+        ));
+        assert!(app.detail_scroll() > first);
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Up(PointerButton::Left),
+            u32::MAX,
+            u32::MAX,
+            None,
+        ));
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn pixel_drag_clamps_large_ranges_and_rejects_invalid_or_stale_mapping() {
+        let mut app = app();
+        app.set_detail_scroll_from_user(usize::MAX / 2);
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, usize::MAX, usize::MAX / 2, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let mode = pixel_mode(11);
+        let x = u32::from(geometry.gutter.x) * 10 + 5;
+        let thumb_y = u32::from(geometry.thumb_start_row) * 20 + 7;
+
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Down(PointerButton::Left),
+            x,
+            thumb_y,
+            Some(11),
+        );
+        assert!(drag.active.is_some());
+
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Drag(PointerButton::Left),
+            x,
+            0,
+            Some(11),
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Drag(PointerButton::Left),
+            x,
+            799,
+            Some(11),
+        ));
+        assert_eq!(app.detail_scroll(), usize::MAX);
+
+        let unchanged = app.detail_scroll();
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            MouseMode::Disabled,
+            PointerKind::Drag(PointerButton::Left),
+            x,
+            200,
+            None,
+        ));
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(12),
+            PointerKind::Drag(PointerButton::Left),
+            x,
+            200,
+            Some(11),
+        ));
+        assert_eq!(app.detail_scroll(), unchanged);
+    }
+
+    #[test]
+    fn resize_cancels_pixel_drag_and_a_stale_report_cannot_restart_it() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 10_000, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let x = u32::from(geometry.gutter.x) * 10 + 5;
+        let y = u32::from(geometry.thumb_start_row) * 20 + 5;
+
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(21),
+            PointerKind::Down(PointerButton::Left),
+            x,
+            y,
+            Some(21),
+        );
+        assert!(drag.active.is_some());
+
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([resize(100, 40)]);
+        assert!(
+            super::handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                &run_tx,
+                MouseMode::Disabled,
+            )
+            .unwrap()
+        );
+        assert!(drag.active.is_none());
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(22),
+            PointerKind::Drag(PointerButton::Left),
+            x,
+            y + 100,
+            Some(21),
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn pixel_wheel_caps_and_track_click_match_cell_semantics() {
+        let mode = pixel_mode(3);
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let info = scrollbar_info(&app, 1_000, 0, 1);
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let gutter_x = u32::from(geometry.gutter.x) * 10 + 5;
+
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::ScrollDown,
+            u32::from(info.detail_area.x) * 10 + 5,
+            u32::from(info.detail_area.y) * 20 + 5,
+            Some(3),
+        ));
+        assert_eq!(app.detail_scroll(), DETAIL_SCROLL_LINES);
+
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            u32::from(geometry.bottom_cap_row.unwrap()) * 20 + 10,
+            Some(3),
+        ));
+        assert_eq!(app.detail_scroll(), 1_000);
+
+        app.set_detail_scroll_from_user(0);
+        let track_row = geometry.track_start_row + geometry.track_len / 2;
+        let expected = geometry.scroll_for_track_click(track_row);
+        assert!(dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            u32::from(track_row) * 20 + 19,
+            Some(3),
+        ));
+        assert_eq!(app.detail_scroll(), expected);
+    }
+
+    #[test]
     fn drag_without_start_and_pixel_down_are_ignored_but_up_terminates() {
         let mut app = app();
         let mut layout = detail_layout::DetailLayout::default();
@@ -1914,6 +2422,7 @@ mod tests {
                 kind: PointerKind::Down(PointerButton::Right),
                 position: terminal::PointerPosition::AbsolutePixels { x: 0, y: 0 },
                 modifiers: terminal::Modifiers::default(),
+                pixel_generation: None,
             },
             &info,
         ));
@@ -1926,6 +2435,7 @@ mod tests {
                 kind: PointerKind::Up(PointerButton::Right),
                 position: terminal::PointerPosition::AbsolutePixels { x: 0, y: 0 },
                 modifiers: terminal::Modifiers::default(),
+                pixel_generation: None,
             },
             &info,
         ));

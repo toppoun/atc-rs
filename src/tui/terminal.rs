@@ -1,21 +1,64 @@
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::panic::{self, PanicHookInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::backend::TerminaBackend;
 use ratatui::{Frame, Terminal as RatatuiTerminal};
-use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
+use termina::escape::csi::{Csi, DecModeSetting, DecPrivateMode, DecPrivateModeCode, Mode, Window};
 use termina::{
     Event, EventReader, PlatformHandle, PlatformTerminal, SgrMouseInput,
     Terminal as TerminaTerminal,
 };
 
+use super::mouse::{
+    HighResRetry, MouseMode, PixelCoordinateOrigin, TerminalPixelMetrics,
+    TerminalPixelMetricsError, trusted_pixel_origin,
+};
 use super::termina_adapter;
 
 type SessionRatatuiTerminal = RatatuiTerminal<TerminaBackend<SessionTerminal>>;
 type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+const INITIAL_PIXEL_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+const PIXEL_ENABLE_VERIFY_TIMEOUT: Duration = Duration::from_millis(100);
+const RESIZE_METRIC_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PixelRefresh {
+    #[default]
+    None,
+    AwaitingRedraw,
+    ReadyAfterRedraw,
+}
+
+impl PixelRefresh {
+    fn schedule_after_resize(&mut self) {
+        if *self != Self::None {
+            *self = Self::AwaitingRedraw;
+        }
+    }
+
+    fn schedule_new(&mut self) {
+        *self = Self::AwaitingRedraw;
+    }
+
+    fn observe_redraw(&mut self) {
+        if *self == Self::AwaitingRedraw {
+            *self = Self::ReadyAfterRedraw;
+        }
+    }
+
+    const fn is_ready(self) -> bool {
+        matches!(self, Self::ReadyAfterRedraw)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleStep {
@@ -453,10 +496,930 @@ fn panic_cleanup_sequence() -> String {
     .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportedPixelMode {
+    NotRecognized,
+    Set,
+    Reset,
+    PermanentlySet,
+    PermanentlyReset,
+}
+
+impl From<DecModeSetting> for ReportedPixelMode {
+    fn from(setting: DecModeSetting) -> Self {
+        match setting {
+            DecModeSetting::NotRecognized => Self::NotRecognized,
+            DecModeSetting::Set => Self::Set,
+            DecModeSetting::Reset => Self::Reset,
+            DecModeSetting::PermanentlySet => Self::PermanentlySet,
+            DecModeSetting::PermanentlyReset => Self::PermanentlyReset,
+        }
+    }
+}
+
+impl ReportedPixelMode {
+    const fn trace_label(self) -> &'static str {
+        match self {
+            Self::NotRecognized => "not-recognized",
+            Self::Set => "set",
+            Self::Reset => "reset",
+            Self::PermanentlySet => "permanently-set",
+            Self::PermanentlyReset => "permanently-reset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityReply {
+    PixelMode(ReportedPixelMode),
+    AreaPixels { width: u32, height: u32 },
+    CellPixels { width: i64, height: i64 },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CapabilityReplies {
+    pixel_mode: Option<ReportedPixelMode>,
+    area_pixels: Option<(u32, u32)>,
+    cell_pixels: Option<(i64, i64)>,
+    resize_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelNegotiationStage {
+    Initial,
+    DeferredRetry,
+    InitialPostEnable,
+    DeferredRetryPostEnable,
+    ResizeRefresh,
+}
+
+impl PixelNegotiationStage {
+    const fn trace_label(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::DeferredRetry => "deferred-retry",
+            Self::InitialPostEnable => "post-enable",
+            Self::DeferredRetryPostEnable => "deferred-retry-post-enable",
+            Self::ResizeRefresh => "resize-refresh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelCapabilitySnapshot {
+    columns: u16,
+    rows: u16,
+    pixel_mode: Option<ReportedPixelMode>,
+    area_pixels: Option<(u32, u32)>,
+    cell_pixels: Option<(i64, i64)>,
+    resize_seen: bool,
+}
+
+impl PixelCapabilitySnapshot {
+    fn new(replies: CapabilityReplies, columns: u16, rows: u16) -> Self {
+        Self {
+            columns,
+            rows,
+            pixel_mode: replies.pixel_mode,
+            area_pixels: replies.area_pixels,
+            cell_pixels: replies.cell_pixels,
+            resize_seen: replies.resize_seen,
+        }
+    }
+
+    fn with_resize_seen(mut self, resize_seen: bool) -> Self {
+        self.resize_seen = resize_seen;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelCandidate {
+    metrics: TerminalPixelMetrics,
+    origin: PixelCoordinateOrigin,
+    initial: PixelCapabilitySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PixelFallbackReason {
+    OriginPolicyRejected,
+    InitialModeTimeout {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    InitialModeUnsupported {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    UnexpectedInitialMode {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    MissingMetricResponses {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+        area_missing: bool,
+        cell_missing: bool,
+    },
+    MalformedMetrics {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    InconsistentMetrics {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    ResizeInterrupted {
+        stage: PixelNegotiationStage,
+        snapshot: PixelCapabilitySnapshot,
+    },
+    PostEnableModeTimeout {
+        stage: PixelNegotiationStage,
+        initial: PixelCapabilitySnapshot,
+    },
+    PostEnableModeNotSet {
+        stage: PixelNegotiationStage,
+        reported: ReportedPixelMode,
+        initial: PixelCapabilitySnapshot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellFallbackOutcome {
+    Succeeded,
+    Failed { error: String },
+    SkippedUnsafePixelMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredRetryDiagnostic {
+    Pending,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MouseTraceContext {
+    term_program: Option<String>,
+    term_program_version: Option<String>,
+    pixel_origin: Option<PixelCoordinateOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MouseFallbackDiagnostic {
+    context: MouseTraceContext,
+    reason: PixelFallbackReason,
+    cells_fallback: CellFallbackOutcome,
+    deferred_retry: Option<DeferredRetryDiagnostic>,
+}
+
+impl MouseFallbackDiagnostic {
+    fn new(
+        context: &MouseTraceContext,
+        reason: PixelFallbackReason,
+        cells_fallback: CellFallbackOutcome,
+    ) -> Self {
+        Self {
+            context: context.clone(),
+            reason,
+            cells_fallback,
+            deferred_retry: None,
+        }
+    }
+
+    fn with_deferred_retry(mut self, deferred_retry: DeferredRetryDiagnostic) -> Self {
+        self.deferred_retry = Some(deferred_retry);
+        self
+    }
+
+    fn format(&self) -> String {
+        let mut fields = Vec::new();
+        fields.push(format!("reason={}", self.reason.trace_label()));
+        fields.push(format!(
+            "term_program={}",
+            self.context.term_program.as_deref().unwrap_or("unset")
+        ));
+        fields.push(format!(
+            "term_program_version={}",
+            self.context
+                .term_program_version
+                .as_deref()
+                .unwrap_or("unset")
+        ));
+        fields.push(format!(
+            "origin_policy={}",
+            match self.context.pixel_origin {
+                Some(PixelCoordinateOrigin::ZeroBased) => "accepted-zero-based",
+                Some(PixelCoordinateOrigin::OneBased) => "accepted-one-based",
+                None => "rejected",
+            }
+        ));
+
+        if let Some(stage) = self.reason.stage() {
+            fields.push(format!("stage={}", stage.trace_label()));
+        }
+        if let Some(snapshot) = self.reason.snapshot() {
+            let missing_mode_label =
+                if self.reason.stage() == Some(PixelNegotiationStage::ResizeRefresh) {
+                    "not-queried"
+                } else {
+                    "timeout"
+                };
+            fields.push(format!(
+                "reported_1016={}",
+                snapshot
+                    .pixel_mode
+                    .map(ReportedPixelMode::trace_label)
+                    .unwrap_or(missing_mode_label)
+            ));
+            fields.push(format!(
+                "terminal_cells={}x{}",
+                snapshot.columns, snapshot.rows
+            ));
+            fields.push(format!(
+                "area_px={}",
+                format_optional_pair(snapshot.area_pixels)
+            ));
+            fields.push(format!(
+                "cell_px={}",
+                format_optional_pair(snapshot.cell_pixels)
+            ));
+            fields.push(format!("resize_seen={}", snapshot.resize_seen));
+        }
+        match &self.reason {
+            PixelFallbackReason::PostEnableModeTimeout { .. } => {
+                fields.push("post_enable_1016=timeout".to_string());
+            }
+            PixelFallbackReason::PostEnableModeNotSet { reported, .. } => {
+                fields.push(format!("post_enable_1016={}", reported.trace_label()));
+            }
+            _ => {}
+        }
+
+        match &self.cells_fallback {
+            CellFallbackOutcome::Succeeded => fields.push("cells_fallback=success".to_string()),
+            CellFallbackOutcome::Failed { error } => {
+                fields.push("cells_fallback=failure".to_string());
+                fields.push(format!("cells_fallback_error={error:?}"));
+            }
+            CellFallbackOutcome::SkippedUnsafePixelMode => {
+                fields.push("cells_fallback=skipped-unsafe-active-1016".to_string());
+            }
+        }
+        if let Some(deferred_retry) = self.deferred_retry {
+            fields.push(format!(
+                "deferred_retry={}",
+                match deferred_retry {
+                    DeferredRetryDiagnostic::Pending => "pending-after-resize-redraw",
+                    DeferredRetryDiagnostic::Failed => "failed",
+                }
+            ));
+        }
+
+        fields.join("; ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MouseTraceDiagnostic {
+    Fallback(MouseFallbackDiagnostic),
+    DeferredRetrySucceeded,
+}
+
+impl MouseTraceDiagnostic {
+    fn format_line(&self) -> String {
+        match self {
+            Self::Fallback(diagnostic) => {
+                format!("atc terminal mouse fallback: {}", diagnostic.format())
+            }
+            Self::DeferredRetrySucceeded => "atc terminal mouse negotiation: initial attempt \
+                 interrupted by resize; deferred retry succeeded"
+                .to_string(),
+        }
+    }
+}
+
+impl PixelFallbackReason {
+    const fn schedules_deferred_retry(&self) -> bool {
+        matches!(
+            self,
+            Self::ResizeInterrupted {
+                stage: PixelNegotiationStage::Initial | PixelNegotiationStage::InitialPostEnable,
+                ..
+            }
+        )
+    }
+
+    const fn trace_label(&self) -> &'static str {
+        match self {
+            Self::OriginPolicyRejected => "terminal-origin-policy-rejected",
+            Self::InitialModeTimeout {
+                stage: PixelNegotiationStage::DeferredRetry,
+                ..
+            } => "deferred-retry-decrqm-1016-timeout",
+            Self::InitialModeTimeout { .. } => "initial-decrqm-1016-timeout",
+            Self::InitialModeUnsupported {
+                stage: PixelNegotiationStage::DeferredRetry,
+                ..
+            } => "deferred-retry-1016-unsupported",
+            Self::InitialModeUnsupported { .. } => "initial-1016-unsupported",
+            Self::UnexpectedInitialMode {
+                stage: PixelNegotiationStage::DeferredRetry,
+                ..
+            } => "unexpected-deferred-retry-1016-mode",
+            Self::UnexpectedInitialMode { .. } => "unexpected-initial-1016-mode",
+            Self::MissingMetricResponses {
+                area_missing: true,
+                cell_missing: true,
+                ..
+            } => "missing-text-area-and-cell-pixel-responses",
+            Self::MissingMetricResponses {
+                area_missing: true, ..
+            } => "missing-text-area-pixel-response",
+            Self::MissingMetricResponses {
+                cell_missing: true, ..
+            } => "missing-cell-pixel-response",
+            Self::MissingMetricResponses { .. } => "missing-pixel-metric-response",
+            Self::MalformedMetrics { .. } => "malformed-pixel-metrics",
+            Self::InconsistentMetrics { .. } => "inconsistent-pixel-metrics",
+            Self::ResizeInterrupted { .. } => "resize-interrupted-pixel-negotiation",
+            Self::PostEnableModeTimeout { .. } => "post-enable-decrqm-1016-timeout",
+            Self::PostEnableModeNotSet { .. } => "post-enable-1016-report-not-set",
+        }
+    }
+
+    const fn stage(&self) -> Option<PixelNegotiationStage> {
+        match self {
+            Self::MissingMetricResponses { stage, .. }
+            | Self::MalformedMetrics { stage, .. }
+            | Self::InconsistentMetrics { stage, .. }
+            | Self::ResizeInterrupted { stage, .. } => Some(*stage),
+            Self::PostEnableModeTimeout { stage, .. }
+            | Self::PostEnableModeNotSet { stage, .. } => Some(*stage),
+            Self::InitialModeTimeout { stage, .. }
+            | Self::InitialModeUnsupported { stage, .. }
+            | Self::UnexpectedInitialMode { stage, .. } => Some(*stage),
+            Self::OriginPolicyRejected => Some(PixelNegotiationStage::Initial),
+        }
+    }
+
+    const fn snapshot(&self) -> Option<PixelCapabilitySnapshot> {
+        match self {
+            Self::InitialModeTimeout { snapshot, .. }
+            | Self::InitialModeUnsupported { snapshot, .. }
+            | Self::UnexpectedInitialMode { snapshot, .. }
+            | Self::MissingMetricResponses { snapshot, .. }
+            | Self::MalformedMetrics { snapshot, .. }
+            | Self::InconsistentMetrics { snapshot, .. }
+            | Self::ResizeInterrupted { snapshot, .. } => Some(*snapshot),
+            Self::PostEnableModeTimeout { initial, .. }
+            | Self::PostEnableModeNotSet { initial, .. } => Some(*initial),
+            Self::OriginPolicyRejected => None,
+        }
+    }
+}
+
+fn format_optional_pair<T: std::fmt::Display>(pair: Option<(T, T)>) -> String {
+    pair.map_or_else(
+        || "timeout".to_string(),
+        |(width, height)| format!("{width}x{height}"),
+    )
+}
+
+impl CapabilityReplies {
+    fn record(&mut self, reply: CapabilityReply) {
+        match reply {
+            CapabilityReply::PixelMode(mode) => self.pixel_mode = Some(mode),
+            CapabilityReply::AreaPixels { width, height } => {
+                self.area_pixels = Some((width, height));
+            }
+            CapabilityReply::CellPixels { width, height } => {
+                self.cell_pixels = Some((width, height));
+            }
+        }
+    }
+
+    fn initial_query_complete(self) -> bool {
+        match self.pixel_mode {
+            Some(ReportedPixelMode::Reset) => {
+                self.area_pixels.is_some() && self.cell_pixels.is_some()
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn metrics_complete(self) -> bool {
+        self.area_pixels.is_some() && self.cell_pixels.is_some()
+    }
+}
+
+fn capability_reply(event: &Event) -> Option<CapabilityReply> {
+    match event {
+        Event::Csi(Csi::Mode(Mode::ReportDecPrivateMode {
+            mode: DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse),
+            setting,
+        })) => Some(CapabilityReply::PixelMode((*setting).into())),
+        Event::Csi(Csi::Window(window)) => match window.as_ref() {
+            Window::ReportTextAreaOrWindowSizePixelsResponse { width, height } => {
+                Some(CapabilityReply::AreaPixels {
+                    width: *width,
+                    height: *height,
+                })
+            }
+            Window::ReportCellSizePixelsResponse { width, height } => {
+                Some(CapabilityReply::CellPixels {
+                    // Missing values are a parsed but unusable reply, not an application CSI event.
+                    // Preserve that distinction so atc's own malformed response never reaches the
+                    // normal event batch as `Ignored`.
+                    width: width.unwrap_or(-1),
+                    height: height.unwrap_or(-1),
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_internal_query_reply(event: &Event) -> bool {
+    capability_reply(event).is_some()
+}
+
+fn is_mouse_input(event: &Event) -> bool {
+    matches!(event, Event::Mouse(_) | Event::Csi(Csi::Mouse(_)))
+}
+
+fn preserve_unrelated_query_event(
+    event: Event,
+    pending: &mut VecDeque<TerminalEvent>,
+    replies: &mut CapabilityReplies,
+) {
+    if is_mouse_input(&event) {
+        return;
+    }
+    if matches!(event, Event::WindowResized(_)) {
+        replies.resize_seen = true;
+    }
+    pending.push_back(termina_adapter::translate(event));
+}
+
+fn collect_query_replies(
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+    timeout: Duration,
+    complete: impl Fn(CapabilityReplies) -> bool,
+) -> io::Result<CapabilityReplies> {
+    let deadline = Instant::now() + timeout;
+    let mut replies = CapabilityReplies::default();
+
+    loop {
+        if complete(replies) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !reader.poll(Some(remaining), |_| true)? {
+            break;
+        }
+
+        let event = reader.read(|_| true)?;
+        if let Some(reply) = capability_reply(&event) {
+            replies.record(reply);
+        } else {
+            preserve_unrelated_query_event(event, pending, &mut replies);
+        }
+    }
+
+    Ok(replies)
+}
+
+fn query_initial_pixel_capabilities(
+    output: &mut impl Write,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<CapabilityReplies> {
+    let pixel_mode = DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse);
+    write!(
+        output,
+        "{}{}{}",
+        Csi::Mode(Mode::QueryDecPrivateMode(pixel_mode)),
+        Csi::Window(Box::new(Window::ReportTextAreaSizePixels)),
+        Csi::Window(Box::new(Window::ReportCellSizePixels)),
+    )?;
+    output.flush()?;
+
+    collect_query_replies(
+        reader,
+        pending,
+        INITIAL_PIXEL_QUERY_TIMEOUT,
+        CapabilityReplies::initial_query_complete,
+    )
+}
+
+fn query_pixel_metrics(
+    output: &mut impl Write,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+    timeout: Duration,
+) -> io::Result<CapabilityReplies> {
+    write!(
+        output,
+        "{}{}",
+        Csi::Window(Box::new(Window::ReportTextAreaSizePixels)),
+        Csi::Window(Box::new(Window::ReportCellSizePixels)),
+    )?;
+    output.flush()?;
+
+    collect_query_replies(
+        reader,
+        pending,
+        timeout,
+        CapabilityReplies::metrics_complete,
+    )
+}
+
+fn query_pixel_mode(
+    output: &mut impl Write,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<CapabilityReplies> {
+    let pixel_mode = DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse);
+    write!(
+        output,
+        "{}",
+        Csi::Mode(Mode::QueryDecPrivateMode(pixel_mode))
+    )?;
+    output.flush()?;
+
+    collect_query_replies(reader, pending, PIXEL_ENABLE_VERIFY_TIMEOUT, |replies| {
+        replies.pixel_mode.is_some()
+    })
+}
+
+fn drain_transition_mouse_input(
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<bool> {
+    let mut resize_seen = false;
+    while reader.poll(Some(Duration::ZERO), |_| true)? {
+        let event = reader.read(|_| true)?;
+        if is_mouse_input(&event) || is_internal_query_reply(&event) {
+            continue;
+        }
+        resize_seen |= matches!(event, Event::WindowResized(_));
+        pending.push_back(termina_adapter::translate(event));
+    }
+    Ok(resize_seen)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseTransitionStep {
+    DisableTracking,
+    DisableCells,
+    DisablePixels,
+    DrainInput,
+    ParserCells,
+    ParserPixels,
+    EnableCells,
+    EnablePixels,
+    EnableTracking,
+}
+
+const CELLS_TRANSITION: &[MouseTransitionStep] = &[
+    MouseTransitionStep::DisableTracking,
+    MouseTransitionStep::DisablePixels,
+    MouseTransitionStep::DisableCells,
+    MouseTransitionStep::DrainInput,
+    MouseTransitionStep::ParserCells,
+    MouseTransitionStep::EnableCells,
+    MouseTransitionStep::EnableTracking,
+];
+
+const PIXELS_TRANSITION_BEGIN: &[MouseTransitionStep] = &[
+    MouseTransitionStep::DisableTracking,
+    MouseTransitionStep::DisableCells,
+    MouseTransitionStep::DisablePixels,
+    MouseTransitionStep::DrainInput,
+    MouseTransitionStep::ParserPixels,
+    MouseTransitionStep::EnablePixels,
+];
+
+const DEFERRED_RETRY_BASELINE: &[MouseTransitionStep] = &[
+    MouseTransitionStep::DisableTracking,
+    MouseTransitionStep::DisableCells,
+    MouseTransitionStep::DisablePixels,
+    MouseTransitionStep::DrainInput,
+    MouseTransitionStep::ParserCells,
+];
+
+const DISABLED_TRANSITION: &[MouseTransitionStep] = &[
+    MouseTransitionStep::DisableTracking,
+    MouseTransitionStep::DisableCells,
+    MouseTransitionStep::DisablePixels,
+    MouseTransitionStep::DrainInput,
+    MouseTransitionStep::ParserPixels,
+];
+
+fn run_transition_plan<E>(
+    steps: &[MouseTransitionStep],
+    mut apply: impl FnMut(MouseTransitionStep) -> Result<bool, E>,
+) -> Result<bool, E> {
+    let mut resize_seen = false;
+    for &step in steps {
+        resize_seen |= apply(step)?;
+    }
+    Ok(resize_seen)
+}
+
+fn execute_transition(
+    steps: &[MouseTransitionStep],
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<bool> {
+    run_transition_plan(steps, |step| match step {
+        MouseTransitionStep::DisableTracking => output
+            .ensure_mode_disabled(
+                LifecycleStep::ButtonEventMouse,
+                DecPrivateModeCode::ButtonEventMouse,
+            )
+            .map(|()| false),
+        MouseTransitionStep::DisableCells => output
+            .ensure_mode_disabled(LifecycleStep::SgrMouse, DecPrivateModeCode::SGRMouse)
+            .map(|()| false),
+        MouseTransitionStep::DisablePixels => output
+            .ensure_mode_disabled(
+                LifecycleStep::SgrPixelsMouseMayBeActive,
+                DecPrivateModeCode::SGRPixelsMouse,
+            )
+            .map(|()| false),
+        MouseTransitionStep::DrainInput => drain_transition_mouse_input(reader, pending),
+        MouseTransitionStep::ParserCells => reader
+            .set_sgr_mouse_input(SgrMouseInput::Cells1006)
+            .map(|()| false),
+        MouseTransitionStep::ParserPixels => reader
+            .set_sgr_mouse_input(SgrMouseInput::Pixels1016)
+            .map(|()| false),
+        MouseTransitionStep::EnableCells => output
+            .change_mode(LifecycleStep::SgrMouse, DecPrivateModeCode::SGRMouse, true)
+            .map(|()| false),
+        MouseTransitionStep::EnablePixels => output
+            .change_mode(
+                LifecycleStep::SgrPixelsMouseMayBeActive,
+                DecPrivateModeCode::SGRPixelsMouse,
+                true,
+            )
+            .map(|()| false),
+        MouseTransitionStep::EnableTracking => output
+            .change_mode(
+                LifecycleStep::ButtonEventMouse,
+                DecPrivateModeCode::ButtonEventMouse,
+                true,
+            )
+            .map(|()| false),
+    })
+}
+
+fn transition_to_cells(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<()> {
+    execute_transition(CELLS_TRANSITION, output, reader, pending).map(|_| ())
+}
+
+fn transition_to_disabled(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<()> {
+    // Tracking is off, so the parser is normally dormant. The pixel configuration is intentional
+    // for the permanently-active-1016 case: even if a terminal also violates the 1002 reset, any
+    // report is decoded without truncation and rejected while `MouseMode::Disabled`.
+    execute_transition(DISABLED_TRANSITION, output, reader, pending).map(|_| ())
+}
+
+fn begin_transition_to_pixels(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<bool> {
+    execute_transition(PIXELS_TRANSITION_BEGIN, output, reader, pending)
+}
+
+fn normalize_for_deferred_pixel_retry(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+) -> io::Result<bool> {
+    execute_transition(DEFERRED_RETRY_BASELINE, output, reader, pending)
+}
+
+fn finish_transition_to_pixels(output: &mut SessionTerminal) -> io::Result<()> {
+    output.change_mode(
+        LifecycleStep::ButtonEventMouse,
+        DecPrivateModeCode::ButtonEventMouse,
+        true,
+    )
+}
+
+fn classify_pixel_metrics(
+    replies: CapabilityReplies,
+    columns: u16,
+    rows: u16,
+    stage: PixelNegotiationStage,
+) -> Result<(TerminalPixelMetrics, PixelCapabilitySnapshot), PixelFallbackReason> {
+    let snapshot = PixelCapabilitySnapshot::new(replies, columns, rows);
+    if replies.resize_seen {
+        return Err(PixelFallbackReason::ResizeInterrupted { stage, snapshot });
+    }
+
+    let area_missing = replies.area_pixels.is_none();
+    let cell_missing = replies.cell_pixels.is_none();
+    if area_missing || cell_missing {
+        return Err(PixelFallbackReason::MissingMetricResponses {
+            stage,
+            snapshot,
+            area_missing,
+            cell_missing,
+        });
+    }
+
+    let (area_width, area_height) = replies
+        .area_pixels
+        .expect("presence checked before metric classification");
+    let (cell_width, cell_height) = replies
+        .cell_pixels
+        .expect("presence checked before metric classification");
+    let (Ok(cell_width), Ok(cell_height)) = (u32::try_from(cell_width), u32::try_from(cell_height))
+    else {
+        return Err(PixelFallbackReason::MalformedMetrics { stage, snapshot });
+    };
+
+    match TerminalPixelMetrics::validate(
+        columns,
+        rows,
+        area_width,
+        area_height,
+        cell_width,
+        cell_height,
+    ) {
+        Ok(metrics) => Ok((metrics, snapshot)),
+        Err(TerminalPixelMetricsError::Malformed) => {
+            Err(PixelFallbackReason::MalformedMetrics { stage, snapshot })
+        }
+        Err(TerminalPixelMetricsError::Inconsistent) => {
+            Err(PixelFallbackReason::InconsistentMetrics { stage, snapshot })
+        }
+    }
+}
+
+fn classify_initial_pixel_candidate(
+    replies: CapabilityReplies,
+    columns: u16,
+    rows: u16,
+    origin: PixelCoordinateOrigin,
+    stage: PixelNegotiationStage,
+) -> Result<PixelCandidate, PixelFallbackReason> {
+    let snapshot = PixelCapabilitySnapshot::new(replies, columns, rows);
+    if replies.resize_seen {
+        return Err(PixelFallbackReason::ResizeInterrupted { stage, snapshot });
+    }
+    match replies.pixel_mode {
+        None => return Err(PixelFallbackReason::InitialModeTimeout { stage, snapshot }),
+        Some(ReportedPixelMode::NotRecognized | ReportedPixelMode::PermanentlyReset) => {
+            return Err(PixelFallbackReason::InitialModeUnsupported { stage, snapshot });
+        }
+        Some(ReportedPixelMode::Reset) => {}
+        Some(_) => return Err(PixelFallbackReason::UnexpectedInitialMode { stage, snapshot }),
+    }
+
+    let (metrics, initial) = classify_pixel_metrics(replies, columns, rows, stage)?;
+    Ok(PixelCandidate {
+        metrics,
+        origin,
+        initial,
+    })
+}
+
+fn classify_post_enable_verification(
+    replies: CapabilityReplies,
+    initial: PixelCapabilitySnapshot,
+    stage: PixelNegotiationStage,
+) -> Result<(), PixelFallbackReason> {
+    if replies.resize_seen {
+        return Err(PixelFallbackReason::ResizeInterrupted {
+            stage,
+            snapshot: initial.with_resize_seen(true),
+        });
+    }
+
+    match replies.pixel_mode {
+        Some(ReportedPixelMode::Set) => Ok(()),
+        None => Err(PixelFallbackReason::PostEnableModeTimeout { stage, initial }),
+        Some(reported) => Err(PixelFallbackReason::PostEnableModeNotSet {
+            stage,
+            reported,
+            initial,
+        }),
+    }
+}
+
+fn cell_fallback_is_safe(replies: CapabilityReplies) -> bool {
+    !matches!(replies.pixel_mode, Some(ReportedPixelMode::PermanentlySet))
+}
+
+fn pixel_mouse_mode(candidate: PixelCandidate, generation: u64) -> MouseMode {
+    MouseMode::Pixels {
+        metrics: candidate.metrics,
+        origin: candidate.origin,
+        generation,
+    }
+}
+
+const fn fallback_mouse_mode(cell_fallback_safe: bool) -> MouseMode {
+    if cell_fallback_safe {
+        MouseMode::Cells
+    } else {
+        MouseMode::Disabled
+    }
+}
+
+fn establish_startup_fallback(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+    context: &MouseTraceContext,
+    reason: PixelFallbackReason,
+    cell_fallback_safe: bool,
+) -> io::Result<(
+    MouseMode,
+    Option<PixelCoordinateOrigin>,
+    MouseFallbackDiagnostic,
+)> {
+    if cell_fallback_safe {
+        transition_to_cells(output, reader, pending)?;
+        Ok((
+            fallback_mouse_mode(true),
+            None,
+            MouseFallbackDiagnostic::new(context, reason, CellFallbackOutcome::Succeeded),
+        ))
+    } else {
+        transition_to_disabled(output, reader, pending)?;
+        Ok((
+            fallback_mouse_mode(false),
+            None,
+            MouseFallbackDiagnostic::new(
+                context,
+                reason,
+                CellFallbackOutcome::SkippedUnsafePixelMode,
+            ),
+        ))
+    }
+}
+
+fn establish_initial_attempt_fallback(
+    output: &mut SessionTerminal,
+    reader: &EventReader,
+    pending: &mut VecDeque<TerminalEvent>,
+    context: &MouseTraceContext,
+    reason: PixelFallbackReason,
+    cell_fallback_safe: bool,
+) -> io::Result<(
+    MouseMode,
+    Option<PixelCoordinateOrigin>,
+    MouseTraceDiagnostic,
+    HighResRetry,
+)> {
+    let schedule_retry = reason.schedules_deferred_retry() && cell_fallback_safe;
+    let (mode, origin, diagnostic) =
+        establish_startup_fallback(output, reader, pending, context, reason, cell_fallback_safe)?;
+    let mut high_res_retry = HighResRetry::None;
+    let diagnostic = if schedule_retry && mode == MouseMode::Cells {
+        high_res_retry.schedule_after_initial_resize();
+        diagnostic.with_deferred_retry(DeferredRetryDiagnostic::Pending)
+    } else {
+        diagnostic
+    };
+    Ok((
+        mode,
+        origin,
+        MouseTraceDiagnostic::Fallback(diagnostic),
+        high_res_retry,
+    ))
+}
+
 /// Sole owner of rendering, input, and terminal lifecycle for the watch TUI.
 pub(crate) struct TerminaSession {
     terminal: SessionRatatuiTerminal,
     reader: EventReader,
+    pending_events: VecDeque<TerminalEvent>,
+    mouse_mode: MouseMode,
+    pixel_origin: Option<PixelCoordinateOrigin>,
+    pixel_generation: u64,
+    pixel_refresh: PixelRefresh,
+    high_res_retry: HighResRetry,
+    mouse_trace_context: MouseTraceContext,
+    mouse_trace_diagnostic: Option<MouseTraceDiagnostic>,
     _panic_hook: ScopedPanicHook,
 }
 
@@ -471,6 +1434,7 @@ impl TerminaSession {
         // Configure the sole shared parser before enabling SGR mouse reporting or reading input.
         let reader = output.event_reader();
         reader.set_sgr_mouse_input(SgrMouseInput::Cells1006)?;
+        let mut pending_events = VecDeque::new();
 
         output.change_mode(
             LifecycleStep::AlternateScreen,
@@ -478,18 +1442,102 @@ impl TerminaSession {
             true,
         )?;
 
-        // 1006 and 1016 have the same wire grammar. Explicitly keep 1016 off before selecting the
-        // cell-coordinate format, then enable drag/button tracking without unpressed motion.
+        // Negotiate from a mouse-disabled baseline. Since 1006 and 1016 have the same wire
+        // grammar, no tracking is enabled until the parser and coordinate mode agree.
+        output.ensure_mode_disabled(
+            LifecycleStep::ButtonEventMouse,
+            DecPrivateModeCode::ButtonEventMouse,
+        )?;
+        output.ensure_mode_disabled(LifecycleStep::SgrMouse, DecPrivateModeCode::SGRMouse)?;
         output.ensure_mode_disabled(
             LifecycleStep::SgrPixelsMouseMayBeActive,
             DecPrivateModeCode::SGRPixelsMouse,
         )?;
-        output.change_mode(LifecycleStep::SgrMouse, DecPrivateModeCode::SGRMouse, true)?;
-        output.change_mode(
-            LifecycleStep::ButtonEventMouse,
-            DecPrivateModeCode::ButtonEventMouse,
-            true,
-        )?;
+
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let trusted_origin = trusted_pixel_origin(term_program.as_deref());
+        let mouse_trace_context = MouseTraceContext {
+            term_program,
+            term_program_version: std::env::var("TERM_PROGRAM_VERSION").ok(),
+            pixel_origin: trusted_origin,
+        };
+        let dimensions = output.get_dimensions()?;
+        let (initial_selection, cell_fallback_safe) = if let Some(origin) = trusted_origin {
+            let replies =
+                query_initial_pixel_capabilities(&mut output, &reader, &mut pending_events)?;
+            (
+                classify_initial_pixel_candidate(
+                    replies,
+                    dimensions.cols,
+                    dimensions.rows,
+                    origin,
+                    PixelNegotiationStage::Initial,
+                ),
+                cell_fallback_is_safe(replies),
+            )
+        } else {
+            (Err(PixelFallbackReason::OriginPolicyRejected), true)
+        };
+
+        let pixel_generation = 1;
+        let (mouse_mode, pixel_origin, mouse_trace_diagnostic, high_res_retry) =
+            match initial_selection {
+                Ok(candidate) => {
+                    let resize_seen =
+                        begin_transition_to_pixels(&mut output, &reader, &mut pending_events)?;
+                    let mut verification = if resize_seen {
+                        CapabilityReplies {
+                            resize_seen: true,
+                            ..CapabilityReplies::default()
+                        }
+                    } else {
+                        query_pixel_mode(&mut output, &reader, &mut pending_events)?
+                    };
+                    verification.resize_seen |=
+                        drain_transition_mouse_input(&reader, &mut pending_events)?;
+
+                    match classify_post_enable_verification(
+                        verification,
+                        candidate.initial,
+                        PixelNegotiationStage::InitialPostEnable,
+                    ) {
+                        Ok(()) => {
+                            finish_transition_to_pixels(&mut output)?;
+                            (
+                                pixel_mouse_mode(candidate, pixel_generation),
+                                Some(candidate.origin),
+                                None,
+                                HighResRetry::None,
+                            )
+                        }
+                        Err(reason) => {
+                            let (mode, origin, diagnostic, high_res_retry) =
+                                establish_initial_attempt_fallback(
+                                    &mut output,
+                                    &reader,
+                                    &mut pending_events,
+                                    &mouse_trace_context,
+                                    reason,
+                                    cell_fallback_is_safe(verification),
+                                )?;
+                            (mode, origin, Some(diagnostic), high_res_retry)
+                        }
+                    }
+                }
+                Err(reason) => {
+                    let (mode, origin, diagnostic, high_res_retry) =
+                        establish_initial_attempt_fallback(
+                            &mut output,
+                            &reader,
+                            &mut pending_events,
+                            &mouse_trace_context,
+                            reason,
+                            cell_fallback_safe,
+                        )?;
+                    (mode, origin, Some(diagnostic), high_res_retry)
+                }
+            };
+
         output.change_mode(
             LifecycleStep::CursorHidden,
             DecPrivateModeCode::ShowCursor,
@@ -502,6 +1550,14 @@ impl TerminaSession {
         Ok(Self {
             terminal,
             reader,
+            pending_events,
+            mouse_mode,
+            pixel_origin,
+            pixel_generation,
+            pixel_refresh: PixelRefresh::None,
+            high_res_retry,
+            mouse_trace_context,
+            mouse_trace_diagnostic,
             _panic_hook: panic_hook,
         })
     }
@@ -510,15 +1566,376 @@ impl TerminaSession {
         self.terminal.draw(render).map(|_| ())
     }
 
-    pub(super) fn poll(&self, wait: Duration) -> io::Result<bool> {
-        self.reader.poll(Some(wait), |_| true)
+    pub(super) fn poll(&mut self, wait: Duration) -> io::Result<bool> {
+        if !self.pending_events.is_empty() {
+            return Ok(true);
+        }
+
+        let deadline = Instant::now() + wait;
+        let mut remaining = wait;
+        loop {
+            if !self.reader.poll(Some(remaining), |_| true)? {
+                return Ok(false);
+            }
+            let event = self.reader.read(|_| true)?;
+            if let Some(event) = self.application_event(event) {
+                self.pending_events.push_back(event);
+                return Ok(true);
+            }
+            remaining = deadline.saturating_duration_since(Instant::now());
+        }
     }
 
-    pub(super) fn read(&self) -> io::Result<TerminalEvent> {
+    pub(super) fn read(&mut self) -> io::Result<TerminalEvent> {
         // Termina may discard unsupported byte sequences inside its parser. Do not synthesize
         // events for those bytes; every event Termina does emit occupies exactly one application
-        // batch slot, including emitted-but-unused events translated to `Ignored`.
-        self.reader.read(|_| true).map(termina_adapter::translate)
+        // batch slot, including emitted-but-unused events translated to `Ignored`. Replies to
+        // atc's own bounded queries are consumed internally and do not occupy a batch slot.
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
+        loop {
+            let event = self.reader.read(|_| true)?;
+            if let Some(event) = self.application_event(event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn application_event(&mut self, event: Event) -> Option<TerminalEvent> {
+        if is_internal_query_reply(&event) {
+            return None;
+        }
+
+        if matches!(event, Event::WindowResized(_)) {
+            self.invalidate_pixel_metrics();
+        }
+
+        let mut event = termina_adapter::translate(event);
+        if let TerminalEvent::Pointer(PointerEvent {
+            position: PointerPosition::AbsolutePixels { .. },
+            pixel_generation,
+            ..
+        }) = &mut event
+        {
+            *pixel_generation = match self.mouse_mode {
+                MouseMode::Pixels { generation, .. } => Some(generation),
+                MouseMode::Disabled | MouseMode::Cells => None,
+            };
+        }
+        Some(event)
+    }
+
+    fn invalidate_pixel_metrics(&mut self) {
+        if matches!(self.mouse_mode, MouseMode::Pixels { .. }) {
+            self.pixel_generation = self.pixel_generation.saturating_add(1);
+            self.mouse_mode = MouseMode::Disabled;
+            self.pixel_refresh.schedule_new();
+        } else {
+            // A second Resize can be read while the first one is waiting for its redraw. The
+            // eventual refresh must correspond to the last dispatched geometry, not an earlier
+            // redraw in the same burst.
+            self.pixel_refresh.schedule_after_resize();
+        }
+    }
+
+    pub(super) fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    pub(crate) fn mouse_mode_label(&self) -> &'static str {
+        self.mouse_mode.label()
+    }
+
+    pub(crate) fn mouse_trace_line(&self) -> Option<String> {
+        self.mouse_trace_diagnostic
+            .as_ref()
+            .map(MouseTraceDiagnostic::format_line)
+    }
+
+    pub(super) fn note_resize_dispatched(&mut self) {
+        self.pixel_refresh.schedule_after_resize();
+        self.high_res_retry.observe_resize_boundary();
+    }
+
+    pub(super) fn note_redraw_completed(&mut self) {
+        self.pixel_refresh.observe_redraw();
+    }
+
+    fn resize_work_is_blocked(&self, application_resize_pending: bool) -> bool {
+        application_resize_pending
+            || self
+                .pending_events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Resize(_)))
+    }
+
+    fn pending_quit(&self) -> bool {
+        self.pending_events.iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::Key(KeyEvent {
+                    code: KeyCode::Char('q'),
+                    kind: KeyEventKind::Press,
+                    ..
+                })
+            )
+        })
+    }
+
+    fn buffer_available_application_events(&mut self) -> io::Result<()> {
+        while self.reader.poll(Some(Duration::ZERO), |_| true)? {
+            let event = self.reader.read(|_| true)?;
+            if let Some(event) = self.application_event(event) {
+                self.pending_events.push_back(event);
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_deferred_retry_fallback(
+        &mut self,
+        reason: PixelFallbackReason,
+        cell_fallback_safe: bool,
+    ) -> io::Result<()> {
+        let fallback = if cell_fallback_safe {
+            transition_to_cells(
+                self.terminal.backend_mut().terminal_mut(),
+                &self.reader,
+                &mut self.pending_events,
+            )
+        } else {
+            transition_to_disabled(
+                self.terminal.backend_mut().terminal_mut(),
+                &self.reader,
+                &mut self.pending_events,
+            )
+        };
+
+        match fallback {
+            Ok(()) => {
+                self.mouse_mode = fallback_mouse_mode(cell_fallback_safe);
+                self.pixel_origin = None;
+                let outcome = if cell_fallback_safe {
+                    CellFallbackOutcome::Succeeded
+                } else {
+                    CellFallbackOutcome::SkippedUnsafePixelMode
+                };
+                self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::Fallback(
+                    MouseFallbackDiagnostic::new(&self.mouse_trace_context, reason, outcome)
+                        .with_deferred_retry(DeferredRetryDiagnostic::Failed),
+                ));
+                Ok(())
+            }
+            Err(error) => {
+                self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::Fallback(
+                    MouseFallbackDiagnostic::new(
+                        &self.mouse_trace_context,
+                        reason,
+                        CellFallbackOutcome::Failed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .with_deferred_retry(DeferredRetryDiagnostic::Failed),
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn retry_high_res_after_redraw(
+        &mut self,
+        application_resize_pending: bool,
+    ) -> io::Result<()> {
+        if self.high_res_retry != HighResRetry::ReadyAfterRedraw {
+            return Ok(());
+        }
+        // A Resize can arrive during the redraw and already be buffered in the sole EventReader
+        // without appearing in either application queue yet. Preserve all such input before
+        // deciding whether this is the settled boundary for the one allowed retry.
+        self.buffer_available_application_events()?;
+        let resize_pending = self.resize_work_is_blocked(application_resize_pending);
+        if self.pending_quit() || !self.high_res_retry.take_after_redraw(resize_pending) {
+            return Ok(());
+        }
+
+        debug_assert_eq!(self.mouse_mode, MouseMode::Cells);
+        self.pending_events
+            .retain(|event| !matches!(event, TerminalEvent::Pointer(_)));
+        let dimensions = self.terminal.backend().terminal().get_dimensions()?;
+        let origin = self
+            .mouse_trace_context
+            .pixel_origin
+            .ok_or_else(|| io::Error::other("deferred pixel retry lost its trusted origin"))?;
+        let (initial_selection, cell_fallback_safe) = {
+            let output = self.terminal.backend_mut().terminal_mut();
+            let resize_seen =
+                normalize_for_deferred_pixel_retry(output, &self.reader, &mut self.pending_events)?;
+            let replies = if resize_seen {
+                CapabilityReplies {
+                    resize_seen: true,
+                    ..CapabilityReplies::default()
+                }
+            } else {
+                query_initial_pixel_capabilities(output, &self.reader, &mut self.pending_events)?
+            };
+            (
+                classify_initial_pixel_candidate(
+                    replies,
+                    dimensions.cols,
+                    dimensions.rows,
+                    origin,
+                    PixelNegotiationStage::DeferredRetry,
+                ),
+                cell_fallback_is_safe(replies),
+            )
+        };
+
+        let candidate = match initial_selection {
+            Ok(candidate) => candidate,
+            Err(reason) => {
+                return self.complete_deferred_retry_fallback(reason, cell_fallback_safe);
+            }
+        };
+
+        let verification = {
+            let output = self.terminal.backend_mut().terminal_mut();
+            let resize_seen =
+                begin_transition_to_pixels(output, &self.reader, &mut self.pending_events)?;
+            let mut verification = if resize_seen {
+                CapabilityReplies {
+                    resize_seen: true,
+                    ..CapabilityReplies::default()
+                }
+            } else {
+                query_pixel_mode(output, &self.reader, &mut self.pending_events)?
+            };
+            verification.resize_seen |=
+                drain_transition_mouse_input(&self.reader, &mut self.pending_events)?;
+            verification
+        };
+
+        if let Err(reason) = classify_post_enable_verification(
+            verification,
+            candidate.initial,
+            PixelNegotiationStage::DeferredRetryPostEnable,
+        ) {
+            return self
+                .complete_deferred_retry_fallback(reason, cell_fallback_is_safe(verification));
+        }
+
+        finish_transition_to_pixels(self.terminal.backend_mut().terminal_mut())?;
+        self.mouse_mode = pixel_mouse_mode(candidate, self.pixel_generation);
+        self.pixel_origin = Some(candidate.origin);
+        self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::DeferredRetrySucceeded);
+        Ok(())
+    }
+
+    pub(super) fn refresh_mouse_after_redraw(
+        &mut self,
+        application_resize_pending: bool,
+    ) -> io::Result<()> {
+        if !self.pixel_refresh.is_ready() {
+            return Ok(());
+        }
+        self.buffer_available_application_events()?;
+        if self.pending_quit()
+            || !self.pixel_refresh.is_ready()
+            || self.resize_work_is_blocked(application_resize_pending)
+        {
+            return Ok(());
+        }
+
+        self.pending_events.retain(|event| {
+            !matches!(
+                event,
+                TerminalEvent::Pointer(PointerEvent {
+                    position: PointerPosition::AbsolutePixels { .. },
+                    ..
+                })
+            )
+        });
+
+        let dimensions = self.terminal.backend().terminal().get_dimensions()?;
+        let origin = self.pixel_origin;
+        let refreshed = {
+            let output = self.terminal.backend_mut().terminal_mut();
+            output.ensure_mode_disabled(
+                LifecycleStep::ButtonEventMouse,
+                DecPrivateModeCode::ButtonEventMouse,
+            )?;
+            let resize_seen = drain_transition_mouse_input(&self.reader, &mut self.pending_events)?;
+            let replies = if resize_seen {
+                CapabilityReplies {
+                    resize_seen: true,
+                    ..CapabilityReplies::default()
+                }
+            } else {
+                query_pixel_metrics(
+                    output,
+                    &self.reader,
+                    &mut self.pending_events,
+                    RESIZE_METRIC_QUERY_TIMEOUT,
+                )?
+            };
+            classify_pixel_metrics(
+                replies,
+                dimensions.cols,
+                dimensions.rows,
+                PixelNegotiationStage::ResizeRefresh,
+            )
+            .and_then(|(metrics, _)| {
+                origin
+                    .map(|origin| (metrics, origin))
+                    .ok_or(PixelFallbackReason::OriginPolicyRejected)
+            })
+        };
+
+        match refreshed {
+            Ok((metrics, origin)) => {
+                finish_transition_to_pixels(self.terminal.backend_mut().terminal_mut())?;
+                self.mouse_mode = MouseMode::Pixels {
+                    metrics,
+                    origin,
+                    generation: self.pixel_generation,
+                };
+                self.mouse_trace_diagnostic = None;
+            }
+            Err(reason) => {
+                let fallback = transition_to_cells(
+                    self.terminal.backend_mut().terminal_mut(),
+                    &self.reader,
+                    &mut self.pending_events,
+                );
+                match fallback {
+                    Ok(()) => {
+                        self.mouse_mode = MouseMode::Cells;
+                        self.pixel_origin = None;
+                        self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::Fallback(
+                            MouseFallbackDiagnostic::new(
+                                &self.mouse_trace_context,
+                                reason,
+                                CellFallbackOutcome::Succeeded,
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::Fallback(
+                            MouseFallbackDiagnostic::new(
+                                &self.mouse_trace_context,
+                                reason,
+                                CellFallbackOutcome::Failed {
+                                    error: error.to_string(),
+                                },
+                            ),
+                        ));
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.pixel_refresh.clear();
+        Ok(())
     }
 
     pub(crate) fn restore(&mut self) -> io::Result<()> {
@@ -582,6 +1999,7 @@ pub(super) struct PointerEvent {
     pub(super) kind: PointerKind,
     pub(super) position: PointerPosition,
     pub(super) modifiers: Modifiers,
+    pub(super) pixel_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,29 +2023,676 @@ pub(super) enum PointerButton {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PointerPosition {
-    Cells {
-        column: u16,
-        row: u16,
-    },
-    #[allow(dead_code, reason = "reserved for the later pixel-input adapter")]
-    AbsolutePixels {
-        x: u32,
-        y: u32,
-    },
-}
-
-impl PointerPosition {
-    pub(super) fn cells(self) -> Option<(u16, u16)> {
-        match self {
-            Self::Cells { column, row } => Some((column, row)),
-            Self::AbsolutePixels { .. } => None,
-        }
-    }
+    Cells { column: u16, row: u16 },
+    AbsolutePixels { x: u32, y: u32 },
 }
 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    fn complete_replies() -> CapabilityReplies {
+        CapabilityReplies {
+            pixel_mode: Some(ReportedPixelMode::Reset),
+            area_pixels: Some((800, 480)),
+            cell_pixels: Some((10, 20)),
+            resize_seen: false,
+        }
+    }
+
+    fn classify_initial(replies: CapabilityReplies) -> Result<PixelCandidate, PixelFallbackReason> {
+        classify_initial_pixel_candidate(
+            replies,
+            80,
+            24,
+            PixelCoordinateOrigin::ZeroBased,
+            PixelNegotiationStage::Initial,
+        )
+    }
+
+    #[test]
+    fn capability_diagnostics_classify_every_initial_fallback_reason() {
+        let origin = PixelCoordinateOrigin::ZeroBased;
+        let candidate = classify_initial(complete_replies())
+            .expect("complete consistent replies should select a pixel candidate");
+        assert_eq!(candidate.metrics.area_width_px, 800);
+        assert_eq!(candidate.origin, origin);
+
+        let mut unsupported = complete_replies();
+        unsupported.pixel_mode = Some(ReportedPixelMode::NotRecognized);
+        let unsupported = classify_initial(unsupported).unwrap_err();
+        assert!(matches!(
+            unsupported,
+            PixelFallbackReason::InitialModeUnsupported { .. }
+        ));
+        assert!(!unsupported.schedules_deferred_retry());
+
+        let timeout = CapabilityReplies::default();
+        assert!(matches!(
+            classify_initial(timeout),
+            Err(PixelFallbackReason::InitialModeTimeout { .. })
+        ));
+
+        let mut permanently_reset = complete_replies();
+        permanently_reset.pixel_mode = Some(ReportedPixelMode::PermanentlyReset);
+        assert!(matches!(
+            classify_initial(permanently_reset),
+            Err(PixelFallbackReason::InitialModeUnsupported { .. })
+        ));
+
+        let mut unexpected = complete_replies();
+        unexpected.pixel_mode = Some(ReportedPixelMode::Set);
+        assert!(matches!(
+            classify_initial(unexpected),
+            Err(PixelFallbackReason::UnexpectedInitialMode { .. })
+        ));
+
+        let mut area_timeout = complete_replies();
+        area_timeout.area_pixels = None;
+        assert!(matches!(
+            classify_initial(area_timeout),
+            Err(PixelFallbackReason::MissingMetricResponses {
+                area_missing: true,
+                cell_missing: false,
+                ..
+            })
+        ));
+
+        let mut cell_timeout = complete_replies();
+        cell_timeout.cell_pixels = None;
+        assert!(matches!(
+            classify_initial(cell_timeout),
+            Err(PixelFallbackReason::MissingMetricResponses {
+                area_missing: false,
+                cell_missing: true,
+                ..
+            })
+        ));
+
+        let mut malformed = complete_replies();
+        malformed.cell_pixels = Some((-1, 20));
+        assert!(matches!(
+            classify_initial(malformed),
+            Err(PixelFallbackReason::MalformedMetrics { .. })
+        ));
+
+        let mut inconsistent = complete_replies();
+        inconsistent.area_pixels = Some((801, 480));
+        assert!(matches!(
+            classify_initial(inconsistent),
+            Err(PixelFallbackReason::InconsistentMetrics { .. })
+        ));
+
+        let mut resized = complete_replies();
+        resized.resize_seen = true;
+        let interrupted = classify_initial(resized).unwrap_err();
+        assert!(matches!(
+            interrupted,
+            PixelFallbackReason::ResizeInterrupted {
+                stage: PixelNegotiationStage::Initial,
+                ..
+            }
+        ));
+        assert!(interrupted.schedules_deferred_retry());
+        let snapshot = interrupted.snapshot().unwrap();
+        assert_eq!(snapshot.area_pixels, Some((800, 480)));
+        assert_eq!(snapshot.cell_pixels, Some((10, 20)));
+        assert!(snapshot.resize_seen);
+    }
+
+    #[test]
+    fn only_an_initial_resize_schedules_the_deferred_retry() {
+        let mut replies = complete_replies();
+        replies.resize_seen = true;
+
+        let initial = classify_initial(replies).unwrap_err();
+        assert!(initial.schedules_deferred_retry());
+
+        let retry = classify_initial_pixel_candidate(
+            replies,
+            80,
+            24,
+            PixelCoordinateOrigin::ZeroBased,
+            PixelNegotiationStage::DeferredRetry,
+        )
+        .unwrap_err();
+        assert!(!retry.schedules_deferred_retry());
+
+        let refresh = classify_pixel_metrics(replies, 80, 24, PixelNegotiationStage::ResizeRefresh)
+            .unwrap_err();
+        assert!(!refresh.schedules_deferred_retry());
+
+        let post_enable = classify_post_enable_verification(
+            CapabilityReplies {
+                resize_seen: true,
+                ..CapabilityReplies::default()
+            },
+            PixelCapabilitySnapshot::new(complete_replies(), 80, 24),
+            PixelNegotiationStage::InitialPostEnable,
+        )
+        .unwrap_err();
+        assert!(post_enable.schedules_deferred_retry());
+
+        let deferred_post_enable = classify_post_enable_verification(
+            CapabilityReplies {
+                resize_seen: true,
+                ..CapabilityReplies::default()
+            },
+            PixelCapabilitySnapshot::new(complete_replies(), 80, 24),
+            PixelNegotiationStage::DeferredRetryPostEnable,
+        )
+        .unwrap_err();
+        assert!(!deferred_post_enable.schedules_deferred_retry());
+    }
+
+    #[test]
+    fn pixel_refresh_requires_a_redraw_and_rearms_for_each_resize_in_the_burst() {
+        let mut refresh = PixelRefresh::None;
+        refresh.schedule_new();
+        assert_eq!(refresh, PixelRefresh::AwaitingRedraw);
+        assert!(!refresh.is_ready());
+
+        refresh.observe_redraw();
+        assert!(refresh.is_ready());
+
+        refresh.schedule_after_resize();
+        assert_eq!(refresh, PixelRefresh::AwaitingRedraw);
+        assert!(!refresh.is_ready());
+        refresh.observe_redraw();
+        assert!(refresh.is_ready());
+
+        refresh.clear();
+        refresh.schedule_after_resize();
+        assert_eq!(refresh, PixelRefresh::None);
+    }
+
+    #[test]
+    fn post_enable_diagnostics_accept_only_set_and_classify_every_failure() {
+        let initial = PixelCapabilitySnapshot::new(complete_replies(), 80, 24);
+        let set = CapabilityReplies {
+            pixel_mode: Some(ReportedPixelMode::Set),
+            ..CapabilityReplies::default()
+        };
+        assert_eq!(
+            classify_post_enable_verification(
+                set,
+                initial,
+                PixelNegotiationStage::InitialPostEnable,
+            ),
+            Ok(())
+        );
+
+        assert!(matches!(
+            classify_post_enable_verification(
+                CapabilityReplies::default(),
+                initial,
+                PixelNegotiationStage::InitialPostEnable,
+            ),
+            Err(PixelFallbackReason::PostEnableModeTimeout { .. })
+        ));
+
+        for pixel_mode in [
+            Some(ReportedPixelMode::NotRecognized),
+            Some(ReportedPixelMode::Reset),
+            Some(ReportedPixelMode::PermanentlySet),
+            Some(ReportedPixelMode::PermanentlyReset),
+        ] {
+            assert!(matches!(
+                classify_post_enable_verification(
+                    CapabilityReplies {
+                        pixel_mode,
+                        ..CapabilityReplies::default()
+                    },
+                    initial,
+                    PixelNegotiationStage::InitialPostEnable,
+                ),
+                Err(PixelFallbackReason::PostEnableModeNotSet { .. })
+            ));
+        }
+        assert!(matches!(
+            classify_post_enable_verification(
+                CapabilityReplies {
+                    resize_seen: true,
+                    ..set
+                },
+                initial,
+                PixelNegotiationStage::InitialPostEnable,
+            ),
+            Err(PixelFallbackReason::ResizeInterrupted {
+                stage: PixelNegotiationStage::InitialPostEnable,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_trace_formats_identity_mode_metrics_reason_and_success() {
+        let context = MouseTraceContext {
+            term_program: Some("vscode".to_string()),
+            term_program_version: Some("1.134.0".to_string()),
+            pixel_origin: Some(PixelCoordinateOrigin::ZeroBased),
+        };
+        let mut replies = complete_replies();
+        replies.area_pixels = Some((801, 480));
+        let snapshot = PixelCapabilitySnapshot::new(replies, 80, 24);
+        let diagnostic = MouseFallbackDiagnostic::new(
+            &context,
+            PixelFallbackReason::InconsistentMetrics {
+                stage: PixelNegotiationStage::Initial,
+                snapshot,
+            },
+            CellFallbackOutcome::Succeeded,
+        );
+
+        assert_eq!(
+            diagnostic.format(),
+            "reason=inconsistent-pixel-metrics; term_program=vscode; \
+             term_program_version=1.134.0; origin_policy=accepted-zero-based; \
+             stage=initial; reported_1016=reset; \
+             terminal_cells=80x24; area_px=801x480; cell_px=10x20; \
+             resize_seen=false; cells_fallback=success"
+        );
+    }
+
+    #[test]
+    fn fallback_trace_distinguishes_timeouts_reports_policy_and_cell_failure() {
+        let context = MouseTraceContext {
+            term_program: Some("vscode".to_string()),
+            term_program_version: Some("1.134.0".to_string()),
+            pixel_origin: Some(PixelCoordinateOrigin::ZeroBased),
+        };
+        let initial = PixelCapabilitySnapshot::new(complete_replies(), 80, 24);
+
+        let timeout = MouseFallbackDiagnostic::new(
+            &context,
+            PixelFallbackReason::PostEnableModeTimeout {
+                stage: PixelNegotiationStage::InitialPostEnable,
+                initial,
+            },
+            CellFallbackOutcome::Succeeded,
+        )
+        .format();
+        assert!(timeout.contains("reason=post-enable-decrqm-1016-timeout"));
+        assert!(timeout.contains("post_enable_1016=timeout"));
+
+        let not_set = MouseFallbackDiagnostic::new(
+            &context,
+            PixelFallbackReason::PostEnableModeNotSet {
+                stage: PixelNegotiationStage::InitialPostEnable,
+                reported: ReportedPixelMode::Reset,
+                initial,
+            },
+            CellFallbackOutcome::Succeeded,
+        )
+        .format();
+        assert!(not_set.contains("reason=post-enable-1016-report-not-set"));
+        assert!(not_set.contains("post_enable_1016=reset"));
+
+        let rejected_context = MouseTraceContext {
+            pixel_origin: None,
+            ..context.clone()
+        };
+        let policy = MouseFallbackDiagnostic::new(
+            &rejected_context,
+            PixelFallbackReason::OriginPolicyRejected,
+            CellFallbackOutcome::Succeeded,
+        )
+        .format();
+        assert!(policy.contains("reason=terminal-origin-policy-rejected"));
+        assert!(policy.contains("origin_policy=rejected"));
+
+        let failure = MouseFallbackDiagnostic::new(
+            &rejected_context,
+            PixelFallbackReason::OriginPolicyRejected,
+            CellFallbackOutcome::Failed {
+                error: "1006 setup failed".to_string(),
+            },
+        )
+        .format();
+        assert!(failure.contains("cells_fallback=failure"));
+        assert!(failure.contains("cells_fallback_error=\"1006 setup failed\""));
+    }
+
+    #[test]
+    fn deferred_retry_trace_distinguishes_pending_success_and_failure() {
+        let context = MouseTraceContext {
+            term_program: Some("vscode".to_string()),
+            term_program_version: Some("1.134.0".to_string()),
+            pixel_origin: Some(PixelCoordinateOrigin::ZeroBased),
+        };
+        let mut replies = complete_replies();
+        replies.resize_seen = true;
+        let reason = classify_initial(replies).unwrap_err();
+
+        let pending =
+            MouseFallbackDiagnostic::new(&context, reason.clone(), CellFallbackOutcome::Succeeded)
+                .with_deferred_retry(DeferredRetryDiagnostic::Pending)
+                .format();
+        assert!(pending.contains("deferred_retry=pending-after-resize-redraw"));
+
+        assert_eq!(
+            MouseTraceDiagnostic::DeferredRetrySucceeded.format_line(),
+            "atc terminal mouse negotiation: initial attempt interrupted by resize; deferred retry succeeded"
+        );
+
+        let failed = MouseTraceDiagnostic::Fallback(
+            MouseFallbackDiagnostic::new(&context, reason, CellFallbackOutcome::Succeeded)
+                .with_deferred_retry(DeferredRetryDiagnostic::Failed),
+        )
+        .format_line();
+        assert!(failed.starts_with("atc terminal mouse fallback: reason="));
+        assert!(failed.contains("deferred_retry=failed"));
+    }
+
+    #[test]
+    fn metric_fallback_trace_preserves_missing_and_malformed_report_values() {
+        let context = MouseTraceContext {
+            term_program: Some("vscode".to_string()),
+            term_program_version: Some("1.134.0".to_string()),
+            pixel_origin: Some(PixelCoordinateOrigin::ZeroBased),
+        };
+        let mut area_missing = complete_replies();
+        area_missing.area_pixels = None;
+        let area_reason = classify_initial(area_missing).unwrap_err();
+        let area_trace =
+            MouseFallbackDiagnostic::new(&context, area_reason, CellFallbackOutcome::Succeeded)
+                .format();
+        assert!(area_trace.contains("reason=missing-text-area-pixel-response"));
+        assert!(area_trace.contains("area_px=timeout"));
+        assert!(area_trace.contains("cell_px=10x20"));
+
+        let mut cell_missing = complete_replies();
+        cell_missing.cell_pixels = None;
+        let cell_reason = classify_initial(cell_missing).unwrap_err();
+        let cell_trace =
+            MouseFallbackDiagnostic::new(&context, cell_reason, CellFallbackOutcome::Succeeded)
+                .format();
+        assert!(cell_trace.contains("reason=missing-cell-pixel-response"));
+        assert!(cell_trace.contains("area_px=800x480"));
+        assert!(cell_trace.contains("cell_px=timeout"));
+
+        let mut malformed = complete_replies();
+        malformed.cell_pixels = Some((-1, 20));
+        let malformed_reason = classify_initial(malformed).unwrap_err();
+        let malformed_trace = MouseFallbackDiagnostic::new(
+            &context,
+            malformed_reason,
+            CellFallbackOutcome::Succeeded,
+        )
+        .format();
+        assert!(malformed_trace.contains("reason=malformed-pixel-metrics"));
+        assert!(malformed_trace.contains("cell_px=-1x20"));
+    }
+
+    #[test]
+    fn only_permanently_active_pixel_mode_makes_cell_fallback_unsafe() {
+        for pixel_mode in [
+            None,
+            Some(ReportedPixelMode::NotRecognized),
+            Some(ReportedPixelMode::Set),
+            Some(ReportedPixelMode::Reset),
+            Some(ReportedPixelMode::PermanentlyReset),
+        ] {
+            assert!(cell_fallback_is_safe(CapabilityReplies {
+                pixel_mode,
+                ..CapabilityReplies::default()
+            }));
+        }
+
+        assert!(!cell_fallback_is_safe(CapabilityReplies {
+            pixel_mode: Some(ReportedPixelMode::PermanentlySet),
+            ..CapabilityReplies::default()
+        }));
+    }
+
+    #[test]
+    fn set_then_resize_can_fall_back_to_cells_and_arm_the_initial_retry() {
+        let verification = CapabilityReplies {
+            pixel_mode: Some(ReportedPixelMode::Set),
+            resize_seen: true,
+            ..CapabilityReplies::default()
+        };
+        let reason = classify_post_enable_verification(
+            verification,
+            PixelCapabilitySnapshot::new(complete_replies(), 80, 24),
+            PixelNegotiationStage::InitialPostEnable,
+        )
+        .unwrap_err();
+
+        assert!(reason.schedules_deferred_retry());
+        assert!(cell_fallback_is_safe(verification));
+    }
+
+    #[test]
+    fn transition_plans_keep_parser_and_protocol_changes_in_safe_order() {
+        assert_eq!(
+            CELLS_TRANSITION,
+            [
+                MouseTransitionStep::DisableTracking,
+                MouseTransitionStep::DisablePixels,
+                MouseTransitionStep::DisableCells,
+                MouseTransitionStep::DrainInput,
+                MouseTransitionStep::ParserCells,
+                MouseTransitionStep::EnableCells,
+                MouseTransitionStep::EnableTracking,
+            ]
+        );
+        assert_eq!(
+            PIXELS_TRANSITION_BEGIN,
+            [
+                MouseTransitionStep::DisableTracking,
+                MouseTransitionStep::DisableCells,
+                MouseTransitionStep::DisablePixels,
+                MouseTransitionStep::DrainInput,
+                MouseTransitionStep::ParserPixels,
+                MouseTransitionStep::EnablePixels,
+            ]
+        );
+        assert_eq!(
+            DEFERRED_RETRY_BASELINE,
+            [
+                MouseTransitionStep::DisableTracking,
+                MouseTransitionStep::DisableCells,
+                MouseTransitionStep::DisablePixels,
+                MouseTransitionStep::DrainInput,
+                MouseTransitionStep::ParserCells,
+            ]
+        );
+        assert_eq!(
+            DISABLED_TRANSITION,
+            [
+                MouseTransitionStep::DisableTracking,
+                MouseTransitionStep::DisableCells,
+                MouseTransitionStep::DisablePixels,
+                MouseTransitionStep::DrainInput,
+                MouseTransitionStep::ParserPixels,
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_retry_protocol_is_coherent_on_success_and_cell_fallback() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ParserMode {
+            Cells,
+            Pixels,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct ProtocolState {
+            tracking_1002: bool,
+            cells_1006: bool,
+            pixels_1016: bool,
+            parser: ParserMode,
+        }
+
+        impl ProtocolState {
+            fn apply(&mut self, step: MouseTransitionStep) {
+                match step {
+                    MouseTransitionStep::DisableTracking => self.tracking_1002 = false,
+                    MouseTransitionStep::DisableCells => self.cells_1006 = false,
+                    MouseTransitionStep::DisablePixels => self.pixels_1016 = false,
+                    MouseTransitionStep::DrainInput => {}
+                    MouseTransitionStep::ParserCells => self.parser = ParserMode::Cells,
+                    MouseTransitionStep::ParserPixels => self.parser = ParserMode::Pixels,
+                    MouseTransitionStep::EnableCells => self.cells_1006 = true,
+                    MouseTransitionStep::EnablePixels => self.pixels_1016 = true,
+                    MouseTransitionStep::EnableTracking => self.tracking_1002 = true,
+                }
+                assert!(!(self.cells_1006 && self.pixels_1016));
+            }
+
+            fn apply_all(&mut self, steps: &[MouseTransitionStep]) {
+                for &step in steps {
+                    self.apply(step);
+                }
+            }
+        }
+
+        let waiting = ProtocolState {
+            tracking_1002: true,
+            cells_1006: true,
+            pixels_1016: false,
+            parser: ParserMode::Cells,
+        };
+
+        let mut successful = waiting;
+        successful.apply_all(DEFERRED_RETRY_BASELINE);
+        assert_eq!(
+            successful,
+            ProtocolState {
+                tracking_1002: false,
+                cells_1006: false,
+                pixels_1016: false,
+                parser: ParserMode::Cells,
+            }
+        );
+        successful.apply_all(PIXELS_TRANSITION_BEGIN);
+        successful.apply(MouseTransitionStep::EnableTracking);
+        assert_eq!(
+            successful,
+            ProtocolState {
+                tracking_1002: true,
+                cells_1006: false,
+                pixels_1016: true,
+                parser: ParserMode::Pixels,
+            }
+        );
+
+        let candidate = classify_initial_pixel_candidate(
+            complete_replies(),
+            80,
+            24,
+            PixelCoordinateOrigin::ZeroBased,
+            PixelNegotiationStage::DeferredRetry,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_post_enable_verification(
+                CapabilityReplies {
+                    pixel_mode: Some(ReportedPixelMode::Set),
+                    ..CapabilityReplies::default()
+                },
+                candidate.initial,
+                PixelNegotiationStage::DeferredRetryPostEnable,
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            pixel_mouse_mode(candidate, 7),
+            MouseMode::Pixels { generation: 7, .. }
+        ));
+
+        let mut failed = waiting;
+        failed.apply_all(DEFERRED_RETRY_BASELINE);
+        failed.apply_all(CELLS_TRANSITION);
+        assert_eq!(failed, waiting);
+        assert_eq!(fallback_mouse_mode(true), MouseMode::Cells);
+    }
+
+    #[test]
+    fn failed_cell_setup_stops_before_tracking_can_be_enabled() {
+        let mut visited = Vec::new();
+        let error = run_transition_plan(CELLS_TRANSITION, |step| {
+            visited.push(step);
+            if step == MouseTransitionStep::EnableCells {
+                Err(io::Error::other("1006 setup failed"))
+            } else {
+                Ok(false)
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "1006 setup failed");
+        assert_eq!(visited, CELLS_TRANSITION[..CELLS_TRANSITION.len() - 1]);
+        assert!(!visited.contains(&MouseTransitionStep::EnableTracking));
+    }
+
+    #[test]
+    fn resize_interrupted_negotiation_preserves_q_and_resize_in_order() {
+        use termina::event::{
+            KeyCode as TerminaKeyCode, KeyEvent as TerminaKeyEvent,
+            KeyEventKind as TerminaKeyEventKind, KeyEventState, Modifiers as TerminaModifiers,
+            MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let key = Event::Key(TerminaKeyEvent {
+            code: TerminaKeyCode::Char('q'),
+            kind: TerminaKeyEventKind::Press,
+            modifiers: TerminaModifiers::NONE,
+            state: KeyEventState::NONE,
+        });
+        let resize = Event::WindowResized(termina::WindowSize {
+            cols: 100,
+            rows: 40,
+            pixel_width: None,
+            pixel_height: None,
+        });
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 2,
+            modifiers: TerminaModifiers::NONE,
+        });
+        let mut replies = complete_replies();
+        let mut pending = VecDeque::new();
+
+        preserve_unrelated_query_event(key, &mut pending, &mut replies);
+        preserve_unrelated_query_event(mouse, &mut pending, &mut replies);
+        preserve_unrelated_query_event(resize, &mut pending, &mut replies);
+
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            pending[0],
+            TerminalEvent::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                kind: KeyEventKind::Press,
+                ..
+            })
+        ));
+        assert!(matches!(pending[1], TerminalEvent::Resize(_)));
+        assert!(replies.resize_seen);
+        let interrupted = classify_initial(replies).unwrap_err();
+        assert!(interrupted.schedules_deferred_retry());
+    }
+
+    #[test]
+    fn own_metric_replies_include_unusable_values_and_never_become_ignored_events() {
+        let malformed = Event::Csi(Csi::Window(Box::new(
+            Window::ReportCellSizePixelsResponse {
+                width: None,
+                height: Some(20),
+            },
+        )));
+        assert_eq!(
+            capability_reply(&malformed),
+            Some(CapabilityReply::CellPixels {
+                width: -1,
+                height: 20,
+            })
+        );
+        assert!(is_internal_query_reply(&malformed));
+    }
 
     #[test]
     fn cleanup_order_is_mouse_cursor_screen_then_platform() {
