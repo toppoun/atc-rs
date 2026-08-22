@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::detail::DetailSectionKind;
 use super::message::{RunId, RunKind, RunRequest, StressEvent, TestEvent};
 use crate::language::Language;
 use crate::model::{Contest, Sample};
@@ -57,10 +58,47 @@ pub struct WatchApp {
 
     detail_scroll: usize,
     detail_revision: u64,
+    detail_folds: DetailFoldState,
 
     next_run_id: RunId,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DetailFoldState {
+    input_collapsed: bool,
+    expected_collapsed: bool,
+    actual_collapsed: bool,
+    stderr_collapsed: bool,
+}
+
+impl DetailFoldState {
+    pub(super) fn is_collapsed(self, kind: DetailSectionKind) -> bool {
+        match kind {
+            DetailSectionKind::Input => self.input_collapsed,
+            DetailSectionKind::Expected => self.expected_collapsed,
+            DetailSectionKind::Actual => self.actual_collapsed,
+            DetailSectionKind::Stderr => self.stderr_collapsed,
+        }
+    }
+
+    fn toggle(&mut self, kind: DetailSectionKind) {
+        let collapsed = match kind {
+            DetailSectionKind::Input => &mut self.input_collapsed,
+            DetailSectionKind::Expected => &mut self.expected_collapsed,
+            DetailSectionKind::Actual => &mut self.actual_collapsed,
+            DetailSectionKind::Stderr => &mut self.stderr_collapsed,
+        };
+        *collapsed = !*collapsed;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayedDetailCase {
+    problem: usize,
+    mode: DetailMode,
+    sample_case: Option<usize>,
+    persisted_stress_case: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailMode {
@@ -271,6 +309,7 @@ impl WatchApp {
             selected_case: 0,
             detail_scroll: 0,
             detail_revision: 0,
+            detail_folds: DetailFoldState::default(),
             next_run_id: 1,
         })
     }
@@ -318,6 +357,15 @@ impl WatchApp {
         self.detail_revision
     }
 
+    pub(super) fn detail_fold_state(&self) -> DetailFoldState {
+        self.detail_folds
+    }
+
+    pub(super) fn toggle_detail_section(&mut self, kind: DetailSectionKind) {
+        self.detail_folds.toggle(kind);
+        self.invalidate_detail();
+    }
+
     #[cfg(test)]
     pub fn scroll_detail_up(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;
@@ -360,6 +408,30 @@ impl WatchApp {
         self.detail_revision = self.detail_revision.wrapping_add(1);
     }
 
+    fn displayed_detail_case(&self) -> Option<DisplayedDetailCase> {
+        let problem = self.current_problem()?;
+        let sample_case =
+            (problem.detail_mode == DetailMode::Samples).then_some(self.selected_case);
+        Some(DisplayedDetailCase {
+            problem: self.selected_problem,
+            mode: problem.detail_mode,
+            sample_case,
+            persisted_stress_case: problem.detail_mode == DetailMode::Samples
+                && problem.saved_stress_case.is_some()
+                && self.selected_case >= problem.sample_cases,
+        })
+    }
+
+    fn reset_detail_folds(&mut self) {
+        self.detail_folds = DetailFoldState::default();
+    }
+
+    fn reset_folds_if_displayed_case_changed(&mut self, previous: Option<DisplayedDetailCase>) {
+        if self.displayed_detail_case() != previous {
+            self.reset_detail_folds();
+        }
+    }
+
     fn current_case_count(&self) -> usize {
         self.current_problem()
             .map(|problem| problem.total_cases)
@@ -386,8 +458,10 @@ impl WatchApp {
             return false;
         }
 
+        let previous_detail_case = self.displayed_detail_case();
         self.selected_problem = index;
         self.selected_case = 0;
+        self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
         true
@@ -432,8 +506,10 @@ impl WatchApp {
         if next == self.selected_case && !mode_changed {
             return false;
         }
+        let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.selected_case = next;
+        self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
         true
@@ -456,8 +532,10 @@ impl WatchApp {
         if previous == self.selected_case && !mode_changed {
             return false;
         }
+        let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.selected_case = previous;
+        self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
         true
@@ -467,6 +545,7 @@ impl WatchApp {
             return false;
         }
 
+        let previous_detail_case = self.displayed_detail_case();
         let source = SourceState { path, language };
         debug_assert_eq!(
             source.path.extension(),
@@ -476,6 +555,7 @@ impl WatchApp {
         self.problems[problem].detail_mode = DetailMode::Samples;
         self.selected_problem = problem;
         self.selected_case = 0;
+        self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
 
@@ -505,7 +585,6 @@ impl WatchApp {
             let source = problem_state.source.as_ref()?;
             (source.language, problem_state.total_cases)
         };
-
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
@@ -532,9 +611,9 @@ impl WatchApp {
             error: None,
             cases: vec![CaseState::default(); total_cases],
         };
-
         self.reset_detail_scroll();
         if self.selected_problem == problem {
+            self.reset_detail_folds();
             self.invalidate_detail();
         }
 
@@ -549,7 +628,6 @@ impl WatchApp {
 
     pub fn queue_stress(&mut self, problem: usize, base_seed: u64) -> Option<RunRequest> {
         let language = self.problems.get(problem)?.source.as_ref()?.language;
-
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
@@ -582,9 +660,9 @@ impl WatchApp {
             failure: None,
             error: None,
         };
-
         self.reset_detail_scroll();
         if self.selected_problem == problem {
+            self.reset_detail_folds();
             self.invalidate_detail();
         }
 
@@ -705,6 +783,7 @@ impl WatchApp {
                 self.selected_case = 0;
             }
             self.reset_detail_scroll();
+            self.reset_detail_folds();
             self.invalidate_detail();
         }
 
@@ -717,20 +796,29 @@ impl WatchApp {
         sample_cases: usize,
         stress_case: Option<Sample>,
     ) -> bool {
+        let previous_detail_case = self.displayed_detail_case();
         let affects_current_detail = self.selected_problem == problem;
         let Some(problem_state) = self.problems.get_mut(problem) else {
             return false;
         };
         if problem_state.run.id != Some(run_id)
             || problem_state.run.test_run_started
-            || !matches!(problem_state.run.phase, RunPhase::Compiling | RunPhase::Running)
+            || !matches!(
+                problem_state.run.phase,
+                RunPhase::Compiling | RunPhase::Running
+            )
         {
             return false;
         }
 
         problem_state.sample_cases = sample_cases;
         problem_state.saved_stress_case = stress_case.map(SavedStressCaseState::from);
-        let total_cases = sample_cases + if problem_state.saved_stress_case.is_some() { 1 } else { 0 };
+        let total_cases = sample_cases
+            + if problem_state.saved_stress_case.is_some() {
+                1
+            } else {
+                0
+            };
         problem_state.total_cases = total_cases;
         problem_state.run.total_cases = total_cases;
         problem_state.run.cases = vec![CaseState::default(); total_cases];
@@ -740,6 +828,7 @@ impl WatchApp {
                 self.selected_case = 0;
             }
             self.reset_detail_scroll();
+            self.reset_folds_if_displayed_case_changed(previous_detail_case);
             self.invalidate_detail();
         }
 
@@ -775,6 +864,7 @@ impl WatchApp {
             TestEvent::NoSamples => Some(0),
             _ => None,
         };
+        let previous_detail_case = self.displayed_detail_case();
 
         let Some(run) = self.current_run_mut(problem, run_id) else {
             return false;
@@ -940,6 +1030,7 @@ impl WatchApp {
             {
                 self.selected_case = 0;
             }
+            self.reset_folds_if_displayed_case_changed(previous_detail_case);
             self.reset_detail_scroll();
         }
 
@@ -1040,6 +1131,7 @@ impl WatchApp {
         }
 
         if affects_current_detail {
+            self.reset_detail_folds();
             self.invalidate_detail();
         }
 
@@ -1094,7 +1186,11 @@ impl WatchApp {
             StressEvent::Started {
                 base_seed,
                 case_limit,
-            } if matches!(stress.phase, StressPhase::Queued | StressPhase::Compiling | StressPhase::Running) => {
+            } if matches!(
+                stress.phase,
+                StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
+            ) =>
+            {
                 stress.phase = StressPhase::Running;
                 stress.base_seed = Some(base_seed);
                 stress.case_limit = case_limit;
@@ -1155,7 +1251,10 @@ impl WatchApp {
     }
 
     pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
-        let detail_mode = self.problems.get(problem).map(|problem| problem.detail_mode);
+        let detail_mode = self
+            .problems
+            .get(problem)
+            .map(|problem| problem.detail_mode);
         let affects_current_detail = self.selected_problem == problem;
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
@@ -1206,7 +1305,10 @@ impl WatchApp {
     }
 
     pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
-        let detail_mode = self.problems.get(problem).map(|problem| problem.detail_mode);
+        let detail_mode = self
+            .problems
+            .get(problem)
+            .map(|problem| problem.detail_mode);
         let affects_current_detail = self.selected_problem == problem;
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
@@ -1309,6 +1411,144 @@ mod tests {
             .segments()
             .map(|segment| segment.text())
             .collect()
+    }
+
+    fn assert_all_folds_expanded(app: &WatchApp) {
+        for kind in [
+            DetailSectionKind::Input,
+            DetailSectionKind::Expected,
+            DetailSectionKind::Actual,
+            DetailSectionKind::Stderr,
+        ] {
+            assert!(!app.detail_fold_state().is_collapsed(kind), "{kind:?}");
+        }
+    }
+
+    fn collapse_all_folds(app: &mut WatchApp) {
+        for kind in [
+            DetailSectionKind::Input,
+            DetailSectionKind::Expected,
+            DetailSectionKind::Actual,
+            DetailSectionKind::Stderr,
+        ] {
+            app.toggle_detail_section(kind);
+            assert!(app.detail_fold_state().is_collapsed(kind), "{kind:?}");
+        }
+    }
+
+    fn foldable_sample_app(language: Language) -> WatchApp {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        let path = match language {
+            Language::Cpp => PathBuf::from("A.cpp"),
+            Language::Python => PathBuf::from("A.py"),
+        };
+        assert!(app.source_changed(0, path, language));
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                expected: "expected".to_string(),
+                actual: "actual".to_string(),
+            },
+        ));
+        app
+    }
+
+    #[test]
+    fn fold_state_starts_expanded() {
+        let app = WatchApp::new(&contest(1), vec![2]).unwrap();
+        assert_all_folds_expanded(&app);
+    }
+
+    #[test]
+    fn explicit_rerun_replaces_the_displayed_result_and_resets_all_folds() {
+        let mut app = foldable_sample_app(Language::Python);
+        collapse_all_folds(&mut app);
+
+        assert!(app.queue_run(0).is_some());
+
+        assert_all_folds_expanded(&app);
+        assert!(detail_text(&app).contains("Queued..."));
+    }
+
+    #[test]
+    fn source_save_rerun_resets_all_folds_when_it_replaces_the_current_result() {
+        let mut app = foldable_sample_app(Language::Python);
+        collapse_all_folds(&mut app);
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Actual)
+        );
+
+        assert!(app.queue_run(0).is_some());
+
+        assert_all_folds_expanded(&app);
+    }
+
+    #[test]
+    fn sample_problem_and_samples_stress_navigation_reset_all_folds() {
+        let mut app = WatchApp::new_with_stress_cases(
+            &contest(2),
+            vec![2, 1],
+            vec![
+                Some(Sample {
+                    input: "persisted input".to_string(),
+                    output: "persisted output".to_string(),
+                }),
+                None,
+            ],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+
+        collapse_all_folds(&mut app);
+        assert!(app.next_case());
+        assert_all_folds_expanded(&app);
+
+        collapse_all_folds(&mut app);
+        assert!(app.select_problem(1));
+        assert_all_folds_expanded(&app);
+
+        assert!(app.select_problem(0));
+        collapse_all_folds(&mut app);
+        assert!(app.queue_stress(0, 123).is_some());
+        assert_all_folds_expanded(&app);
+
+        collapse_all_folds(&mut app);
+        assert!(app.next_case());
+        assert_all_folds_expanded(&app);
+
+        collapse_all_folds(&mut app);
+        assert!(app.previous_case());
+        assert_all_folds_expanded(&app);
+        assert_eq!(app.selected_case(), 0);
+
+        collapse_all_folds(&mut app);
+        assert!(app.previous_case());
+        assert_eq!(app.selected_case(), 2, "persisted Stress case is last");
+        assert_all_folds_expanded(&app);
+
+        collapse_all_folds(&mut app);
+        assert!(app.next_case());
+        assert_eq!(app.selected_case(), 0);
+        assert_all_folds_expanded(&app);
     }
 
     #[test]
@@ -2268,6 +2508,18 @@ mod tests {
     }
 
     #[test]
+    fn replacement_by_a_requeued_execution_attempt_resets_all_folds() {
+        let (mut app, run_id) = queued_cpp_app(1);
+        assert!(app.run_started(0, run_id));
+        assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 1 },));
+        collapse_all_folds(&mut app);
+
+        assert!(app.run_requeued(0, run_id));
+
+        assert_all_folds_expanded(&app);
+    }
+
+    #[test]
     fn requeue_clears_all_partial_attempt_state_and_invalidates_selected_detail() {
         let (mut app, run_id) = queued_cpp_app(2);
         assert!(app.run_started(0, run_id));
@@ -2310,7 +2562,7 @@ mod tests {
         assert!(app.next_case());
         assert!(app.scroll_detail_down(50_000));
         let revision = app.detail_revision();
-        assert!(detail_text(&app).contains("actual\n"));
+        assert!(detail_text(&app).contains("▼ Actual\n"));
 
         assert!(app.run_requeued(0, run_id));
 
@@ -2332,7 +2584,7 @@ mod tests {
         assert!(app.detail_revision() > revision);
         let detail = detail_text(&app);
         assert!(detail.contains("Queued..."));
-        assert!(!detail.contains("actual\n"));
+        assert!(!detail.contains("▼ Actual\n"));
         assert!(!detail.contains("old stderr\n"));
     }
 
@@ -2431,11 +2683,7 @@ mod tests {
             let stress = app.queue_stress(0, 100).unwrap();
             assert!(app.run_started(0, stress.run_id));
 
-            assert!(app.run_failed(
-                0,
-                stress.run_id,
-                "reference program failed".to_string(),
-            ));
+            assert!(app.run_failed(0, stress.run_id, "reference program failed".to_string(),));
 
             assert_eq!(app.problems[0].stress.phase, StressPhase::Error);
             assert_eq!(
@@ -2534,7 +2782,10 @@ mod tests {
         ));
 
         assert_eq!(app.problems[0].run.cases[0].verdict, CaseVerdict::Accepted);
-        assert_eq!(app.problems[0].run.cases[1].verdict, CaseVerdict::WrongAnswer);
+        assert_eq!(
+            app.problems[0].run.cases[1].verdict,
+            CaseVerdict::WrongAnswer
+        );
         assert_eq!(app.problems[0].sample_cases, 1);
         assert_eq!(app.problems[0].total_cases, 2);
         assert_eq!(
@@ -2547,9 +2798,9 @@ mod tests {
         assert_eq!(app.problems[0].stress.phase, StressPhase::Failed);
         let detail = detail_text(&app);
         assert!(detail.contains("STRESS WA   case 14   seed 113"));
-        assert!(detail.contains("input\n2\n1 2\n"));
-        assert!(detail.contains("expected\nNo\n"));
-        assert!(detail.contains("actual\nYes\n"));
+        assert!(detail.contains("▼ Input\n2\n1 2\n"));
+        assert!(detail.contains("▼ Expected\nNo\n"));
+        assert!(detail.contains("▼ Actual\nYes\n"));
     }
 
     #[test]
@@ -2605,9 +2856,9 @@ mod tests {
         assert!(app.next_case());
         let detail = detail_text(&app);
         assert!(detail.contains("stress 1 / 1   WA"));
-        assert!(detail.contains("input\n9\n"));
-        assert!(detail.contains("expected\n10\n"));
-        assert!(detail.contains("actual\n11\n"));
+        assert!(detail.contains("▼ Input\n9\n"));
+        assert!(detail.contains("▼ Expected\n10\n"));
+        assert!(detail.contains("▼ Actual\n11\n"));
     }
 
     #[test]
@@ -2632,8 +2883,8 @@ mod tests {
         assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
         let detail = detail_text(&app);
         assert!(detail.contains("stress 1 / 1   Pending"));
-        assert!(detail.contains("input\nsaved input\n"));
-        assert!(detail.contains("expected\nsaved expected\n"));
+        assert!(detail.contains("▼ Input\nsaved input\n"));
+        assert!(detail.contains("▼ Expected\nsaved expected\n"));
         assert!(!detail.contains("STRESS RUNNING"));
     }
 
@@ -2707,6 +2958,46 @@ mod tests {
         assert_eq!(problem.run.accepted, 1);
         assert_eq!(problem.run.total_cases, 2);
         assert_eq!(problem.run.cases[1].verdict, CaseVerdict::WrongAnswer);
+    }
+
+    #[test]
+    fn live_stress_result_and_same_domain_rerun_each_reset_all_folds() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let stress = app.queue_stress(0, 200).unwrap();
+        assert!(app.run_started(0, stress.run_id));
+        assert!(app.stress_event(
+            0,
+            stress.run_id,
+            StressEvent::Started {
+                base_seed: 200,
+                case_limit: None,
+            },
+        ));
+        collapse_all_folds(&mut app);
+
+        assert!(app.stress_event(
+            0,
+            stress.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 200,
+                seed: 201,
+                input: "input\n".to_string(),
+                expected: "expected\n".to_string(),
+                actual: "actual\n".to_string(),
+                stderr: "stderr\n".to_string(),
+                candidate_elapsed: Duration::from_millis(2),
+                elapsed: Duration::from_millis(5),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+        assert_all_folds_expanded(&app);
+
+        collapse_all_folds(&mut app);
+        assert!(app.queue_stress(0, 300).is_some());
+        assert_all_folds_expanded(&app);
     }
 
     #[test]
@@ -2799,9 +3090,9 @@ mod tests {
         assert_eq!(after_lengths, before_lengths);
         assert_ne!(app.detail_revision(), revision);
         let detail = detail_text(&app);
-        assert!(detail.contains("input\nnew input\n"));
-        assert!(detail.contains("expected\nnew expected\n"));
-        assert!(detail.contains("actual\nnew actual\n"));
+        assert!(detail.contains("▼ Input\nnew input\n"));
+        assert!(detail.contains("▼ Expected\nnew expected\n"));
+        assert!(detail.contains("▼ Actual\nnew actual\n"));
         assert!(!detail.contains("old input"));
     }
 
@@ -2846,8 +3137,8 @@ mod tests {
         assert!(app.next_case());
         let detail = detail_text(&app);
         assert!(detail.contains("stress 1 / 1   RE"));
-        assert!(detail.contains("input\npromoted input\n"));
-        assert!(detail.contains("expected\ntrusted expected\n"));
+        assert!(detail.contains("▼ Input\npromoted input\n"));
+        assert!(detail.contains("▼ Expected\ntrusted expected\n"));
         assert!(!detail.contains("No samples"));
     }
 

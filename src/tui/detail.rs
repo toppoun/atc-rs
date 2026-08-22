@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
+use super::app::{
+    CaseVerdict, DetailFoldState, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp,
+};
 
 // Byte position in the virtual concatenation of all detail segments. Segment
 // boundaries contribute no bytes and are not logical-line boundaries.
@@ -160,7 +162,7 @@ impl<'a> DetailDocument<'a> {
     fn push_problem_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         match problem.detail_mode {
             DetailMode::Samples => self.push_sample_run_detail(app, problem),
-            DetailMode::Stress => self.push_stress_detail(problem),
+            DetailMode::Stress => self.push_stress_detail(app, problem),
         }
     }
 
@@ -218,7 +220,7 @@ impl<'a> DetailDocument<'a> {
         }
     }
 
-    fn push_stress_detail(&mut self, problem: &'a ProblemState) {
+    fn push_stress_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let stress = &problem.stress;
 
         match stress.phase {
@@ -246,8 +248,14 @@ impl<'a> DetailDocument<'a> {
                 if let Some(seed) = stress.seed.or(stress.base_seed) {
                     self.push_owned(format!("\nseed       {seed}"));
                 }
-                self.push_owned(format!("\nelapsed    {}", stress_elapsed_label(stress.elapsed)));
-                self.push_owned(format!("\nrate       {:.1} cases/s", stress.cases_per_second));
+                self.push_owned(format!(
+                    "\nelapsed    {}",
+                    stress_elapsed_label(stress.elapsed)
+                ));
+                self.push_owned(format!(
+                    "\nrate       {:.1} cases/s",
+                    stress.cases_per_second
+                ));
             }
             StressPhase::Failed => {
                 let Some(failure) = stress.failure.as_ref() else {
@@ -268,24 +276,28 @@ impl<'a> DetailDocument<'a> {
                 ));
                 self.push_semantic_shared_section(
                     DetailSectionKind::Input,
-                    "input",
+                    "Input",
                     &failure.input,
+                    app.detail_fold_state(),
                 );
                 self.push_semantic_shared_section(
                     DetailSectionKind::Expected,
-                    "expected",
+                    "Expected",
                     &failure.expected,
+                    app.detail_fold_state(),
                 );
                 self.push_semantic_shared_section(
                     DetailSectionKind::Actual,
-                    "actual",
+                    "Actual",
                     &failure.actual,
+                    app.detail_fold_state(),
                 );
                 if !failure.stderr.is_empty() {
                     self.push_semantic_shared_section(
                         DetailSectionKind::Stderr,
-                        "stderr",
+                        "Stderr",
                         &failure.stderr,
+                        app.detail_fold_state(),
                     );
                 }
                 self.push_owned(format!("\n\nsaved\n{}", failure.saved_to.display()));
@@ -366,18 +378,25 @@ impl<'a> DetailDocument<'a> {
 
         self.push_optional_semantic_shared_section(
             DetailSectionKind::Expected,
-            "expected",
+            "Expected",
             case.expected.as_ref(),
+            app.detail_fold_state(),
         );
 
         self.push_optional_semantic_shared_section(
             DetailSectionKind::Actual,
-            "actual",
+            "Actual",
             case.actual.as_ref(),
+            app.detail_fold_state(),
         );
 
         if let Some(stderr) = case.stderr.as_ref() {
-            self.push_semantic_shared_section(DetailSectionKind::Stderr, "stderr", stderr);
+            self.push_semantic_shared_section(
+                DetailSectionKind::Stderr,
+                "Stderr",
+                stderr,
+                app.detail_fold_state(),
+            );
         }
     }
 
@@ -388,7 +407,9 @@ impl<'a> DetailDocument<'a> {
         };
 
         let case = app.selected_case_state();
-        let verdict = case.map(|case| case.verdict).unwrap_or(CaseVerdict::Pending);
+        let verdict = case
+            .map(|case| case.verdict)
+            .unwrap_or(CaseVerdict::Pending);
         let elapsed = case.and_then(|case| case.elapsed);
 
         self.push_owned(format!(
@@ -396,8 +417,18 @@ impl<'a> DetailDocument<'a> {
             verdict_label(verdict),
             elapsed_label(elapsed),
         ));
-        self.push_semantic_shared_section(DetailSectionKind::Input, "input", &saved.input);
-        self.push_semantic_shared_section(DetailSectionKind::Expected, "expected", &saved.expected);
+        self.push_semantic_shared_section(
+            DetailSectionKind::Input,
+            "Input",
+            &saved.input,
+            app.detail_fold_state(),
+        );
+        self.push_semantic_shared_section(
+            DetailSectionKind::Expected,
+            "Expected",
+            &saved.expected,
+            app.detail_fold_state(),
+        );
 
         match verdict {
             CaseVerdict::Pending => self.push_static("\n\nPending..."),
@@ -409,11 +440,17 @@ impl<'a> DetailDocument<'a> {
         if let Some(case) = case {
             self.push_optional_semantic_shared_section(
                 DetailSectionKind::Actual,
-                "actual",
+                "Actual",
                 case.actual.as_ref(),
+                app.detail_fold_state(),
             );
             if let Some(stderr) = case.stderr.as_ref() {
-                self.push_semantic_shared_section(DetailSectionKind::Stderr, "stderr", stderr);
+                self.push_semantic_shared_section(
+                    DetailSectionKind::Stderr,
+                    "Stderr",
+                    stderr,
+                    app.detail_fold_state(),
+                );
             }
         }
     }
@@ -423,9 +460,10 @@ impl<'a> DetailDocument<'a> {
         kind: DetailSectionKind,
         label: &'static str,
         content: Option<&'a Arc<String>>,
+        folds: DetailFoldState,
     ) {
         if let Some(content) = content {
-            self.push_semantic_shared_section(kind, label, content);
+            self.push_semantic_shared_section(kind, label, content, folds);
         }
     }
 
@@ -434,6 +472,7 @@ impl<'a> DetailDocument<'a> {
         kind: DetailSectionKind,
         label: &'static str,
         content: &'a Arc<String>,
+        folds: DetailFoldState,
     ) {
         self.push_static("\n\n");
         debug_assert!(
@@ -447,9 +486,17 @@ impl<'a> DetailDocument<'a> {
             kind,
             raw_position: RawOffset(self.raw_len),
         });
+        if folds.is_collapsed(kind) {
+            self.push_static("▶ ");
+        } else {
+            self.push_static("▼ ");
+        }
         self.push_static(label);
-        self.push_static("\n");
+        if folds.is_collapsed(kind) {
+            return;
+        }
 
+        self.push_static("\n");
         if content.is_empty() {
             self.push_static("(empty)");
         } else {
@@ -580,7 +627,6 @@ fn verdict_label(verdict: CaseVerdict) -> &'static str {
     }
 }
 
-
 fn stress_elapsed_label(elapsed: Duration) -> String {
     if elapsed.as_secs() >= 1 {
         format!("{:.2}s", elapsed.as_secs_f64())
@@ -661,8 +707,9 @@ mod tests {
     }
 
     fn expected_anchor(text: &str, label: &str) -> RawOffset {
+        let header = format!("▼ {label}");
         RawOffset(
-            text.find(label)
+            text.find(&header)
                 .unwrap_or_else(|| panic!("missing expected section header {label}")),
         )
     }
@@ -723,9 +770,9 @@ mod tests {
             concat!(
                 "A - Problem A\n\n",
                 "sample 1 / 1   WA   1.0 ms",
-                "\n\nexpected\n  58\n\n日本語 e\u{301} 👩‍💻\n",
-                "\n\nactual\n58 \n",
-                "\n\nstderr\n debug \n\n",
+                "\n\n▼ Expected\n  58\n\n日本語 e\u{301} 👩‍💻\n",
+                "\n\n▼ Actual\n58 \n",
+                "\n\n▼ Stderr\n debug \n\n",
             )
         );
         assert_snapshot_matches(&document);
@@ -736,22 +783,22 @@ mod tests {
             [
                 DetailSectionAnchor {
                     kind: DetailSectionKind::Expected,
-                    raw_position: expected_anchor(&text, "expected\n"),
+                    raw_position: expected_anchor(&text, "Expected\n"),
                 },
                 DetailSectionAnchor {
                     kind: DetailSectionKind::Actual,
-                    raw_position: expected_anchor(&text, "actual\n"),
+                    raw_position: expected_anchor(&text, "Actual\n"),
                 },
                 DetailSectionAnchor {
                     kind: DetailSectionKind::Stderr,
-                    raw_position: expected_anchor(&text, "stderr\n"),
+                    raw_position: expected_anchor(&text, "Stderr\n"),
                 },
             ]
         );
 
         let mut segment_start = 0usize;
         for segment in document.segments() {
-            if matches!(segment.text(), "expected" | "actual" | "stderr") {
+            if segment.text() == "▼ " {
                 assert!(
                     document
                         .section_anchors()
@@ -801,7 +848,7 @@ mod tests {
                 "A - Problem A\n\n",
                 "sample 1 / 1   RE   2.0 ms",
                 "\n\nRuntime Error",
-                "\n\nstderr\nruntime stderr\n",
+                "\n\n▼ Stderr\nruntime stderr\n",
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&runtime_app));
@@ -899,7 +946,7 @@ mod tests {
                 "A - Problem A\n\n",
                 "sample 1 / 1   AC   4.0 ms",
                 "\n\nAccepted",
-                "\n\nstderr\naccepted stderr",
+                "\n\n▼ Stderr\naccepted stderr",
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&accepted_app));
@@ -940,9 +987,9 @@ mod tests {
                 "A - Problem A\n\n",
                 "sample 1 / 1   AC   4.0 ms",
                 "\n\nAccepted",
-                "\n\nexpected\nexpected\n",
-                "\n\nactual\nactual\n",
-                "\n\nstderr\ndebug output\n",
+                "\n\n▼ Expected\nexpected\n",
+                "\n\n▼ Actual\nactual\n",
+                "\n\n▼ Stderr\ndebug output\n",
             )
         );
     }
@@ -997,8 +1044,8 @@ mod tests {
             concat!(
                 "A - Problem A\n\n",
                 "sample 1 / 1   WA   0.0 ms",
-                "\n\nexpected\n(empty)",
-                "\n\nactual\n(empty)",
+                "\n\n▼ Expected\n(empty)",
+                "\n\n▼ Actual\n(empty)",
             )
         );
         assert_snapshot_matches(&DetailDocument::from_app(&app));
@@ -1009,11 +1056,11 @@ mod tests {
             [
                 DetailSectionAnchor {
                     kind: DetailSectionKind::Expected,
-                    raw_position: expected_anchor(&text, "expected\n"),
+                    raw_position: expected_anchor(&text, "Expected\n"),
                 },
                 DetailSectionAnchor {
                     kind: DetailSectionKind::Actual,
-                    raw_position: expected_anchor(&text, "actual\n"),
+                    raw_position: expected_anchor(&text, "Actual\n"),
                 },
             ]
         );
@@ -1054,18 +1101,147 @@ mod tests {
         let document = DetailDocument::from_app(&app);
         let text = document_text(&document);
         let expected = [
-            (DetailSectionKind::Input, "input\n"),
-            (DetailSectionKind::Expected, "expected\n"),
-            (DetailSectionKind::Actual, "actual\n"),
-            (DetailSectionKind::Stderr, "stderr\n"),
+            (DetailSectionKind::Input, "Input\n"),
+            (DetailSectionKind::Expected, "Expected\n"),
+            (DetailSectionKind::Actual, "Actual\n"),
+            (DetailSectionKind::Stderr, "Stderr\n"),
         ];
         assert_eq!(document.section_anchors().len(), expected.len());
         for (anchor, (kind, label)) in document.section_anchors().iter().zip(expected) {
             assert_eq!(anchor.kind, kind);
             assert_eq!(anchor.raw_position, expected_anchor(&text, label));
         }
-        assert!(text.contains("input\n(empty)"));
+        assert!(text.contains("▼ Input\n(empty)"));
         assert_snapshot_matches(&document);
+    }
+
+    #[test]
+    fn collapsing_omits_the_shared_body_but_keeps_header_anchor_and_expand_restores_it() {
+        let (mut app, run_id) = running_app();
+        let actual = (0..4_000)
+            .map(|line| format!("unique-actual-line-{line}\n"))
+            .collect::<String>();
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                expected: "trusted\n".to_string(),
+                actual,
+            },
+        ));
+
+        let actual_state = app.current_problem().unwrap().run.cases[0]
+            .actual
+            .as_ref()
+            .unwrap();
+        let actual_pointer = actual_state.as_ptr();
+        let expanded = DetailDocument::from_app(&app);
+        let expanded_text = document_text(&expanded);
+        assert!(expanded_text.contains("▼ Actual\nunique-actual-line-0\n"));
+        assert!(
+            expanded
+                .segments()
+                .any(|segment| segment.text().as_ptr() == actual_pointer)
+        );
+        let expanded_len = expanded.raw_len;
+        drop(expanded);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let collapsed = DetailDocument::from_app(&app);
+        let collapsed_text = document_text(&collapsed);
+        assert!(collapsed_text.contains("▶ Actual"));
+        assert!(!collapsed_text.contains("unique-actual-line-0"));
+        assert!(collapsed.raw_len < expanded_len);
+        assert!(
+            !collapsed
+                .segments()
+                .any(|segment| segment.text().as_ptr() == actual_pointer)
+        );
+        let actual_anchor = collapsed
+            .section_anchors()
+            .iter()
+            .find(|anchor| anchor.kind == DetailSectionKind::Actual)
+            .unwrap();
+        assert_eq!(
+            actual_anchor.raw_position,
+            RawOffset(collapsed_text.find("▶ Actual").unwrap())
+        );
+        drop(collapsed);
+
+        let rebuilt_while_collapsed = DetailDocument::from_app(&app);
+        assert!(document_text(&rebuilt_while_collapsed).contains("▶ Actual"));
+        assert!(!document_text(&rebuilt_while_collapsed).contains("unique-actual-line-0"));
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Actual)
+        );
+        drop(rebuilt_while_collapsed);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let restored = DetailDocument::from_app(&app);
+        assert_eq!(document_text(&restored), expanded_text);
+        assert!(
+            restored
+                .segments()
+                .any(|segment| segment.text().as_ptr() == actual_pointer)
+        );
+    }
+
+    #[test]
+    fn multiple_fold_toggles_preserve_unrelated_folds_across_document_rebuilds() {
+        let (mut app, run_id) = running_app();
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                expected: "trusted\n".to_string(),
+                actual: "candidate\n".to_string(),
+            },
+        ));
+
+        app.toggle_detail_section(DetailSectionKind::Expected);
+        let expected_collapsed = DetailDocument::from_app(&app);
+        assert!(document_text(&expected_collapsed).contains("▶ Expected"));
+        drop(expected_collapsed);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let both_collapsed = DetailDocument::from_app(&app);
+        let both_text = document_text(&both_collapsed);
+        assert!(both_text.contains("▶ Expected"));
+        assert!(both_text.contains("▶ Actual"));
+        drop(both_collapsed);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let actual_expanded = DetailDocument::from_app(&app);
+        let actual_expanded_text = document_text(&actual_expanded);
+        assert!(actual_expanded_text.contains("▶ Expected"));
+        assert!(actual_expanded_text.contains("▼ Actual\ncandidate\n"));
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Expected)
+        );
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Actual)
+        );
     }
 
     #[test]

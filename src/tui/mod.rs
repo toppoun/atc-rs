@@ -867,6 +867,15 @@ fn handle_pointer_event_with_mouse_mode(
         };
     }
 
+    if let PointerKind::Down(PointerButton::Left) = pointer.kind
+        && let Some(header) = render_info.detail_section_headers.iter().find(|header| {
+            header.detail_revision == app.detail_revision() && contains(header.area, column, row)
+        })
+    {
+        app.toggle_detail_section(header.kind);
+        return true;
+    }
+
     if contains(render_info.detail_area, column, row) {
         return match pointer.kind {
             PointerKind::ScrollUp => {
@@ -911,6 +920,8 @@ mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
+    use crate::stress::CandidateFailureKind;
+    use ratatui::{Terminal, backend::TestBackend};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
@@ -938,6 +949,50 @@ mod tests {
             sample_counts.to_vec(),
         )
         .unwrap()
+    }
+
+    fn foldable_app(actual: String) -> WatchApp {
+        let mut app = app_with_problems(&[1]);
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_stress(0, 123).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            message::StressEvent::Started {
+                base_seed: 123,
+                case_limit: None,
+            },
+        ));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            message::StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 123,
+                seed: 456,
+                input: "input body".to_string(),
+                expected: "expected body".to_string(),
+                actual,
+                stderr: "stderr body".to_string(),
+                candidate_elapsed: Duration::from_millis(1),
+                elapsed: Duration::from_millis(2),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+        app
+    }
+
+    fn rendered_fold_info(app: &WatchApp, width: u16, height: u16) -> view::RenderInfo {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut info = view::RenderInfo::default();
+        terminal
+            .draw(|frame| info = view::render(frame, app, &mut layout))
+            .unwrap();
+        info
     }
 
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
@@ -1113,6 +1168,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         let mut events = VecDeque::from([
@@ -1130,6 +1186,7 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(handle_terminal_events(&mut app, &new_info, &mut events, &run_tx,).unwrap());
@@ -1445,6 +1502,7 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 70, 20),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
         assert!(super::handle_pointer_event(
             &mut app,
@@ -1718,6 +1776,7 @@ mod tests {
             samples_area: None,
             detail_area,
             detail_scrollbar: Some(interaction),
+            detail_section_headers: Vec::new(),
         }
     }
 
@@ -1756,6 +1815,220 @@ mod tests {
             info,
             mode,
         )
+    }
+
+    #[test]
+    fn left_down_toggles_each_visible_semantic_header_and_drag_does_not_repeat() {
+        for kind in [
+            detail::DetailSectionKind::Input,
+            detail::DetailSectionKind::Expected,
+            detail::DetailSectionKind::Actual,
+            detail::DetailSectionKind::Stderr,
+        ] {
+            let mut app = foldable_app("actual body".to_string());
+            let info = rendered_fold_info(&app, 100, 40);
+            let target = *info
+                .detail_section_headers
+                .iter()
+                .find(|target| target.kind == kind)
+                .unwrap();
+            let mut layout = detail_layout::DetailLayout::default();
+            let mut drag = DetailScrollbarDragState::default();
+
+            assert!(dispatch_mouse(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                PointerKind::Down(PointerButton::Left),
+                target.area.x.saturating_add(1),
+                target.area.y,
+            ));
+            assert!(app.detail_fold_state().is_collapsed(kind));
+
+            assert!(!dispatch_mouse(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                PointerKind::Drag(PointerButton::Left),
+                target.area.x.saturating_add(1),
+                target.area.y,
+            ));
+            assert!(app.detail_fold_state().is_collapsed(kind));
+        }
+    }
+
+    #[test]
+    fn body_non_left_and_wheel_events_do_not_toggle_fold_headers() {
+        let mut app = foldable_app("actual body".to_string());
+        let info = rendered_fold_info(&app, 100, 40);
+        let target = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Input)
+            .unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let column = target.area.x.saturating_add(1);
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            PointerKind::Down(PointerButton::Left),
+            column,
+            target.area.y.saturating_add(1),
+        ));
+        for kind in [
+            PointerKind::Down(PointerButton::Right),
+            PointerKind::Down(PointerButton::Middle),
+            PointerKind::ScrollUp,
+            PointerKind::ScrollDown,
+        ] {
+            dispatch_mouse(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                kind,
+                column,
+                target.area.y,
+            );
+        }
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Input)
+        );
+    }
+
+    #[test]
+    fn stale_fold_header_targets_cannot_toggle_after_a_detail_revision_change() {
+        let mut app = foldable_app("actual body".to_string());
+        let info = rendered_fold_info(&app, 100, 40);
+        let actual = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Actual)
+            .unwrap();
+        let expected = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Expected)
+            .unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+
+        assert!(dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            PointerKind::Down(PointerButton::Left),
+            actual.area.x.saturating_add(1),
+            actual.area.y,
+        ));
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            PointerKind::Down(PointerButton::Left),
+            expected.area.x.saturating_add(1),
+            expected.area.y,
+        ));
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Actual)
+        );
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Expected)
+        );
+    }
+
+    #[test]
+    fn scrollbar_gutter_has_priority_over_fold_headers_in_cells_and_pixels() {
+        for pixels in [false, true] {
+            let mut app = foldable_app("actual body\n".repeat(1_000));
+            let info = rendered_fold_info(&app, 100, 40);
+            let target = *info
+                .detail_section_headers
+                .iter()
+                .find(|target| target.kind == detail::DetailSectionKind::Actual)
+                .unwrap();
+            let scrollbar = info.detail_scrollbar.as_ref().unwrap();
+            let gutter = scrollbar.geometry.gutter.x;
+            assert!(scrollbar.geometry.hit_test(gutter, target.area.y).is_some());
+            let mut layout = detail_layout::DetailLayout::default();
+            let mut drag = DetailScrollbarDragState::default();
+
+            if pixels {
+                dispatch_pixel(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    pixel_mode(7),
+                    PointerKind::Down(PointerButton::Left),
+                    u32::from(gutter) * 10 + 5,
+                    u32::from(target.area.y) * 20 + 10,
+                    Some(7),
+                );
+            } else {
+                dispatch_mouse(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    PointerKind::Down(PointerButton::Left),
+                    gutter,
+                    target.area.y,
+                );
+            }
+            assert!(
+                !app.detail_fold_state()
+                    .is_collapsed(detail::DetailSectionKind::Actual)
+            );
+
+            let mut app = foldable_app("actual body\n".repeat(1_000));
+            let info = rendered_fold_info(&app, 100, 40);
+            let target = *info
+                .detail_section_headers
+                .iter()
+                .find(|target| target.kind == detail::DetailSectionKind::Actual)
+                .unwrap();
+            let mut layout = detail_layout::DetailLayout::default();
+            let mut drag = DetailScrollbarDragState::default();
+            if pixels {
+                assert!(dispatch_pixel(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    pixel_mode(7),
+                    PointerKind::Down(PointerButton::Left),
+                    u32::from(target.area.x.saturating_add(1)) * 10 + 5,
+                    u32::from(target.area.y) * 20 + 10,
+                    Some(7),
+                ));
+            } else {
+                assert!(dispatch_mouse(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    &info,
+                    PointerKind::Down(PointerButton::Left),
+                    target.area.x.saturating_add(1),
+                    target.area.y,
+                ));
+            }
+            assert!(
+                app.detail_fold_state()
+                    .is_collapsed(detail::DetailSectionKind::Actual)
+            );
+        }
     }
 
     fn pending_width_layout(
@@ -1821,6 +2094,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(handle_pointer_event(
@@ -1841,6 +2115,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(handle_pointer_event(
@@ -1861,6 +2136,7 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(handle_pointer_event(
@@ -1881,6 +2157,7 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(!handle_pointer_event(
@@ -1901,6 +2178,7 @@ mod tests {
             samples_area: None,
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(!handle_pointer_event(
@@ -1919,6 +2197,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         let mut samples_app = app();
@@ -1948,6 +2227,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(!handle_pointer_event(
@@ -1966,6 +2246,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 5, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 5, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
 
         assert!(!handle_pointer_event(
@@ -1986,6 +2267,7 @@ mod tests {
             samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
         };
         let pointer = PointerEvent {
             kind: PointerKind::ScrollDown,
@@ -2987,10 +3269,34 @@ mod tests {
     }
 
     #[test]
-    fn debug_toggle_reruns_cpp_with_new_debug_state() {
+    fn debug_toggle_reruns_cpp_with_new_debug_state_and_resets_all_folds() {
         let mut app = app();
 
         app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let initial = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, initial.run_id));
+        assert!(app.run_event(
+            0,
+            initial.run_id,
+            message::TestEvent::TestRunStarted { total_cases: 3 },
+        ));
+        assert!(app.run_event(
+            0,
+            initial.run_id,
+            message::TestEvent::TestCaseComparison {
+                number: 1,
+                expected: "expected".to_string(),
+                actual: "actual".to_string(),
+            },
+        ));
+        for kind in [
+            detail::DetailSectionKind::Input,
+            detail::DetailSectionKind::Expected,
+            detail::DetailSectionKind::Actual,
+            detail::DetailSectionKind::Stderr,
+        ] {
+            app.toggle_detail_section(kind);
+        }
 
         let (run_tx, run_rx) = mpsc::channel();
 
@@ -3010,6 +3316,14 @@ mod tests {
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
         assert!(request.debug);
+        for kind in [
+            detail::DetailSectionKind::Input,
+            detail::DetailSectionKind::Expected,
+            detail::DetailSectionKind::Actual,
+            detail::DetailSectionKind::Stderr,
+        ] {
+            assert!(!app.detail_fold_state().is_collapsed(kind), "{kind:?}");
+        }
 
         assert!(
             handle_key_event(

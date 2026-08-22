@@ -812,6 +812,12 @@ pub(super) struct DetailSectionVisualRow {
     pub(super) visual_row: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VisibleDetailSectionHeader {
+    pub(super) kind: DetailSectionKind,
+    pub(super) viewport_row: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExactLayoutIndex {
     pub(super) total_visual_rows: usize,
@@ -974,7 +980,7 @@ struct MaterializedGiantPage {
 
 #[derive(Debug, Default)]
 struct MaterializedViewport {
-    lines: Vec<Line<'static>>,
+    rows: Vec<MaterializedRow>,
     top_anchor: Option<ContentAnchor>,
 }
 
@@ -1041,6 +1047,7 @@ pub(super) struct DetailViewport {
     pub(super) text: Text<'static>,
     pub(super) max_scroll: Option<usize>,
     pub(super) effective_scroll: usize,
+    pub(super) visible_section_headers: Vec<VisibleDetailSectionHeader>,
     pub(super) exact_section_visual_rows: Option<Vec<DetailSectionVisualRow>>,
     pub(super) exact_layout_identity: Option<DetailExactLayoutIdentity>,
 }
@@ -1590,6 +1597,7 @@ impl DetailLayout {
                 text: Text::from(Vec::<Line<'static>>::new()),
                 max_scroll,
                 effective_scroll,
+                visible_section_headers: Vec::new(),
                 exact_section_visual_rows: self.exact_section_visual_rows(),
                 exact_layout_identity: self.exact_layout_identity(),
             };
@@ -1608,10 +1616,18 @@ impl DetailLayout {
             if let Some(top_anchor) = materialized.top_anchor {
                 self.last_top_anchor = Some(top_anchor);
             }
+            let visible_section_headers = visible_section_headers(document, &materialized.rows);
             return DetailViewport {
-                text: Text::from(materialized.lines),
+                text: Text::from(
+                    materialized
+                        .rows
+                        .into_iter()
+                        .map(|row| row.line)
+                        .collect::<Vec<_>>(),
+                ),
                 max_scroll: None,
                 effective_scroll: requested_scroll,
+                visible_section_headers,
                 exact_section_visual_rows: None,
                 exact_layout_identity: None,
             };
@@ -1648,11 +1664,19 @@ impl DetailLayout {
         if let Some(top_anchor) = materialized.top_anchor {
             self.last_top_anchor = Some(top_anchor);
         }
+        let visible_section_headers = visible_section_headers(document, &materialized.rows);
 
         DetailViewport {
-            text: Text::from(materialized.lines),
+            text: Text::from(
+                materialized
+                    .rows
+                    .into_iter()
+                    .map(|row| row.line)
+                    .collect::<Vec<_>>(),
+            ),
             max_scroll: exact_max,
             effective_scroll,
+            visible_section_headers,
             exact_section_visual_rows: self.exact_section_visual_rows(),
             exact_layout_identity: self.exact_layout_identity(),
         }
@@ -1732,12 +1756,18 @@ impl DetailLayout {
                         })
                 })
         };
+        let visible_rows = self
+            .materialized_eager_rows
+            .iter()
+            .skip(effective_scroll)
+            .take(viewport_height)
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_section_headers = visible_section_headers(document, &visible_rows);
         let text = Text::from(
-            self.materialized_eager_rows
-                .iter()
-                .skip(effective_scroll)
-                .take(viewport_height)
-                .map(|row| row.line.clone())
+            visible_rows
+                .into_iter()
+                .map(|row| row.line)
                 .collect::<Vec<_>>(),
         );
         if let Some(top_anchor) = top_anchor {
@@ -1748,6 +1778,7 @@ impl DetailLayout {
             text,
             max_scroll: Some(exact_max),
             effective_scroll,
+            visible_section_headers,
             exact_section_visual_rows: self.exact_section_visual_rows(),
             exact_layout_identity: self.exact_layout_identity(),
         }
@@ -1784,7 +1815,7 @@ impl DetailLayout {
         structural_budget: &mut usize,
     ) -> MaterializedViewport {
         let mut viewport = MaterializedViewport {
-            lines: Vec::with_capacity(viewport_height),
+            rows: Vec::with_capacity(viewport_height),
             top_anchor: None,
         };
 
@@ -1808,14 +1839,14 @@ impl DetailLayout {
         structural_budget: &mut usize,
         viewport: &mut MaterializedViewport,
     ) {
-        while viewport.lines.len() < viewport_height {
+        while viewport.rows.len() < viewport_height {
             if chunk_index >= self.chunks.len() {
                 if self.advance_structure(document, structural_budget) {
                     continue;
                 }
                 break;
             }
-            let remaining = viewport_height.saturating_sub(viewport.lines.len());
+            let remaining = viewport_height.saturating_sub(viewport.rows.len());
             if self.chunk_is_giant(chunk_index) {
                 self.append_giant_viewport(
                     document,
@@ -1845,11 +1876,9 @@ impl DetailLayout {
                         raw_position: row.raw_range.start,
                     });
                 }
-                viewport.lines.extend(
-                    chunk_lines.rows[offset_in_chunk..end]
-                        .iter()
-                        .map(|row| row.line.clone()),
-                );
+                viewport
+                    .rows
+                    .extend(chunk_lines.rows[offset_in_chunk..end].iter().cloned());
             }
 
             chunk_index = chunk_index.saturating_add(1);
@@ -1945,12 +1974,9 @@ impl DetailLayout {
             unit_index: self.chunks[chunk_index].unit_index,
             raw_position: row.raw_range.start,
         });
-        let mut viewport = MaterializedViewport {
-            lines: rows.into_iter().map(|row| row.line).collect(),
-            top_anchor,
-        };
+        let mut viewport = MaterializedViewport { rows, top_anchor };
 
-        if progress.finished && viewport.lines.len() < viewport_height {
+        if progress.finished && viewport.rows.len() < viewport_height {
             self.append_viewport_from_chunk(
                 document,
                 chunk_index.saturating_add(1),
@@ -2082,9 +2108,9 @@ impl DetailLayout {
         row_count: usize,
         viewport: &mut MaterializedViewport,
     ) {
-        let target_len = viewport.lines.len().saturating_add(row_count);
+        let target_len = viewport.rows.len().saturating_add(row_count);
 
-        while viewport.lines.len() < target_len
+        while viewport.rows.len() < target_len
             && self.ensure_giant_page(document, chunk_index, visual_row)
         {
             let page = self
@@ -2097,7 +2123,7 @@ impl DetailLayout {
                 })
                 .expect("requested giant detail row must be materialized");
             let page_offset = visual_row.saturating_sub(page.start_row);
-            let remaining = target_len.saturating_sub(viewport.lines.len());
+            let remaining = target_len.saturating_sub(viewport.rows.len());
             let end = page_offset.saturating_add(remaining).min(page.rows.len());
             if viewport.top_anchor.is_none()
                 && let Some(row) = page.rows.get(page_offset)
@@ -2108,11 +2134,9 @@ impl DetailLayout {
                     raw_position: row.raw_range.start,
                 });
             }
-            viewport.lines.extend(
-                page.rows[page_offset..end]
-                    .iter()
-                    .map(|row| row.line.clone()),
-            );
+            viewport
+                .rows
+                .extend(page.rows[page_offset..end].iter().cloned());
             visual_row = visual_row.saturating_add(end.saturating_sub(page_offset));
         }
     }
@@ -2390,6 +2414,24 @@ impl DetailLayout {
 fn row_matches_anchor(row: &MaterializedRow, raw_position: RawOffset) -> bool {
     row.raw_range.start == raw_position
         || (row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+}
+
+fn visible_section_headers(
+    document: &impl DetailTextSource,
+    rows: &[MaterializedRow],
+) -> Vec<VisibleDetailSectionHeader> {
+    document
+        .section_anchors()
+        .iter()
+        .filter_map(|section| {
+            rows.iter()
+                .position(|row| row_matches_anchor(row, section.raw_position))
+                .map(|viewport_row| VisibleDetailSectionHeader {
+                    kind: section.kind,
+                    viewport_row,
+                })
+        })
+        .collect()
 }
 
 fn checkpoint_at_or_before(

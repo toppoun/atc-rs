@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
-use super::detail::DetailDocument;
+use super::detail::{DetailDocument, DetailSectionKind};
 use super::detail_layout::DetailLayout;
 use super::detail_scrollbar::{
     DetailScrollbarGeometry, DetailScrollbarInteraction, render_detail_scrollbar,
@@ -20,12 +20,20 @@ const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailSectionHeaderTarget {
+    pub(super) kind: DetailSectionKind,
+    pub(super) area: Rect,
+    pub(super) detail_revision: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderInfo {
     pub max_detail_scroll: Option<usize>,
     pub samples_area: Option<Rect>,
     pub detail_area: Rect,
     pub(super) detail_scrollbar: Option<DetailScrollbarInteraction>,
+    pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
 }
 
 pub(super) fn render(
@@ -134,6 +142,23 @@ pub(super) fn render(
         app.detail_scroll(),
     );
     detail_layout.stage_analysis_command(&detail_document);
+    let detail_section_headers = detail_viewport
+        .visible_section_headers
+        .iter()
+        .filter_map(|header| {
+            let viewport_row = u16::try_from(header.viewport_row).ok()?;
+            Some(DetailSectionHeaderTarget {
+                kind: header.kind,
+                area: Rect::new(
+                    detail_area.x,
+                    detail_area.y.saturating_add(viewport_row),
+                    detail_area.width,
+                    1,
+                ),
+                detail_revision: app.detail_revision(),
+            })
+        })
+        .collect();
     let detail = Paragraph::new(detail_viewport.text);
 
     frame.render_widget(detail, detail_area);
@@ -172,6 +197,7 @@ pub(super) fn render(
         samples_area,
         detail_area,
         detail_scrollbar,
+        detail_section_headers,
     }
 }
 
@@ -486,8 +512,9 @@ mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
+    use crate::stress::CandidateFailureKind;
     use crate::tui::detail_layout::{max_scroll, viewport_text, wrap_detail_document};
-    use crate::tui::message::TestEvent;
+    use crate::tui::message::{StressEvent, TestEvent};
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
 
@@ -601,6 +628,39 @@ mod tests {
             0,
             request.run_id,
             TestEvent::CompileFailed { stderr: output },
+        ));
+        app
+    }
+
+    fn foldable_app(actual: String) -> WatchApp {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_stress(0, 123).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Started {
+                base_seed: 123,
+                case_limit: None,
+            },
+        ));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 123,
+                seed: 456,
+                input: "input body".to_string(),
+                expected: "expected body".to_string(),
+                actual,
+                stderr: "stderr body".to_string(),
+                candidate_elapsed: Duration::from_millis(1),
+                elapsed: Duration::from_millis(2),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
         ));
         app
     }
@@ -723,6 +783,133 @@ mod tests {
             .unwrap();
         assert!(info.max_detail_scroll.is_some());
         assert!(info.detail_scrollbar.is_some());
+    }
+
+    #[test]
+    fn visible_fold_headers_come_from_the_materialized_lazy_viewport_before_exact_count() {
+        let mut app = foldable_app("actual body\n".repeat(3_000));
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+
+        let expanded = render_with_layout(&mut terminal, &app, &mut layout);
+        assert_eq!(expanded.max_detail_scroll, None);
+        assert!(
+            expanded
+                .detail_section_headers
+                .iter()
+                .any(|header| header.kind == DetailSectionKind::Actual)
+        );
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let collapsed = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(
+            collapsed
+                .detail_section_headers
+                .iter()
+                .any(|header| header.kind == DetailSectionKind::Stderr)
+        );
+    }
+
+    #[test]
+    fn collapsing_a_large_actual_reduces_exact_scroll_range() {
+        let mut app = foldable_app("actual body\n".repeat(1_000));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+
+        let expanded = render_with_layout(&mut terminal, &app, &mut layout);
+        let expanded_max = expanded.max_detail_scroll.unwrap();
+        assert!(expanded_max > 900);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let collapsed = render_with_layout(&mut terminal, &app, &mut layout);
+        let collapsed_max = collapsed.max_detail_scroll.unwrap();
+        assert!(collapsed_max < expanded_max);
+    }
+
+    #[test]
+    fn collapsed_sections_keep_exact_semantic_markers() {
+        let mut app = foldable_app("actual body".to_string());
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let document = DetailDocument::from_app(&app);
+        let mut layout = DetailLayout::default();
+        let viewport = layout.viewport(&document, app.detail_revision(), 80, 20, 0);
+
+        assert!(
+            viewport
+                .exact_section_visual_rows
+                .unwrap()
+                .iter()
+                .any(|section| section.kind == DetailSectionKind::Actual)
+        );
+    }
+
+    #[test]
+    fn toggles_preserve_scroll_until_existing_render_clamp_applies() {
+        let mut app = foldable_app("actual body\n".repeat(1_000));
+        app.scroll_detail_down(500);
+        let before = app.detail_scroll();
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        assert_eq!(app.detail_scroll(), before);
+        let info = render_info(&app, 80, 20);
+        let collapsed_max = info.max_detail_scroll.unwrap();
+        assert!(collapsed_max < before);
+        app.clamp_detail_scroll(collapsed_max);
+        assert_eq!(app.detail_scroll(), collapsed_max);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        assert_eq!(app.detail_scroll(), collapsed_max);
+    }
+
+    #[test]
+    fn expanded_background_count_cannot_publish_after_actual_is_collapsed() {
+        let mut app = foldable_app("actual body\n".repeat(3_000));
+        let expanded_document = DetailDocument::from_app(&app);
+        let mut layout = DetailLayout::default();
+        layout.viewport(&expanded_document, app.detail_revision(), 80, 20, 0);
+        layout.stage_analysis_command(&expanded_document);
+        let crate::tui::detail_layout::DetailAnalysisCommand::Count(request) =
+            layout.take_analysis_command().unwrap()
+        else {
+            panic!("expanded lazy document must stage exact counting");
+        };
+        let anchor = request.anchor;
+        let count = request
+            .structure
+            .count_chunks(
+                &request.snapshot,
+                request.identity.layout_width,
+                anchor,
+                || false,
+            )
+            .unwrap();
+        let stale = crate::tui::detail_layout::DetailCountResult {
+            identity: request.identity,
+            exact_layout_index: count.exact_layout_index,
+            anchor,
+            anchor_visual_row: count.anchor_visual_row,
+            anchor_row_raw_start: count.anchor_row_raw_start,
+        };
+        drop(expanded_document);
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let collapsed_document = DetailDocument::from_app(&app);
+        let collapsed = layout.viewport(&collapsed_document, app.detail_revision(), 80, 20, 0);
+        assert!(collapsed.max_scroll.is_some());
+        assert!(!layout.apply_count_result(stale));
+        let after_stale = layout.viewport(&collapsed_document, app.detail_revision(), 80, 20, 0);
+        assert_eq!(after_stale.max_scroll, collapsed.max_scroll);
+    }
+
+    #[test]
+    fn triangle_headers_use_terminal_cell_width_not_utf8_byte_length() {
+        let app = foldable_app("body".to_string());
+        let document = DetailDocument::from_app(&app);
+        let lines = text_lines(&wrap_detail_document(&document, 8));
+
+        assert!(lines.iter().any(|line| line == "▼ Actual"));
     }
 
     #[test]
