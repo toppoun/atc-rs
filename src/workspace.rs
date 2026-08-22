@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn rejects_non_utf8_file_name_in_sample_directory() {
         use std::os::unix::ffi::OsStringExt;
@@ -1374,6 +1374,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let test_dir = temp.path().join("tests").join("A");
         fs::create_dir_all(&test_dir).unwrap();
+
         let invalid_name = std::ffi::OsString::from_vec(vec![0xff]);
         fs::write(test_dir.join(invalid_name), "invalid").unwrap();
 
