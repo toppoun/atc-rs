@@ -324,9 +324,15 @@ pub(crate) fn run(
 
         if dirty {
             let mut next_render_info = view::RenderInfo::default();
+            let render_mouse_mode = terminal.mouse_mode();
 
             terminal.draw(|frame| {
-                next_render_info = view::render(frame, &app, &mut detail_layout);
+                next_render_info = view::render_with_mouse_mode(
+                    frame,
+                    &app,
+                    &mut detail_layout,
+                    render_mouse_mode,
+                );
             })?;
 
             render_info = next_render_info;
@@ -347,6 +353,12 @@ pub(crate) fn run(
             let resize_pending = resize_event_count(&terminal_events) != 0;
             terminal.refresh_mouse_after_redraw(resize_pending)?;
             terminal.retry_high_res_after_redraw(resize_pending)?;
+            if terminal.mouse_mode() != render_mouse_mode {
+                // Pixel metrics become authoritative only after the settled resize/redraw
+                // boundary. Draw once more so the published thumb geometry uses that mode.
+                dirty = true;
+                continue;
+            }
         }
 
         if terminal_events.is_empty() {
@@ -821,50 +833,63 @@ fn handle_pointer_event_with_mouse_mode(
     if let PointerKind::Down(PointerButton::Left) = pointer.kind
         && let Some(scrollbar) = render_info.detail_scrollbar.as_ref()
         && scrollbar.identity.layout.revision == app.detail_revision()
-        && let Some(hit) = scrollbar.geometry.hit_test(column, row)
     {
-        return match hit {
-            DetailScrollbarHit::Thumb { grab_offset } => {
-                let coordinate = match projected_pixel_pointer(pointer, mouse_mode) {
-                    Some((_, normalized_y, metrics, generation)) => {
-                        let Some(grab_offset_px) = scrollbar
-                            .geometry
-                            .pixel_grab_offset(normalized_y, metrics.cell_height_px)
-                        else {
-                            return false;
-                        };
-                        DragCoordinate::Pixels {
-                            grab_offset_px,
-                            generation,
-                        }
-                    }
-                    None => DragCoordinate::Cells { grab_offset },
-                };
-                detail_scrollbar_drag.active = Some(DetailScrollbarDrag {
-                    identity: scrollbar.identity,
-                    coordinate,
-                });
-                false
-            }
-            DetailScrollbarHit::TopCap => set_detail_scroll_from_user(
-                app,
-                detail_layout,
-                0,
-                Some(scrollbar.geometry.max_scroll),
+        let projected_pixel = projected_pixel_pointer(pointer, mouse_mode);
+        let hit = match projected_pixel {
+            Some((_, normalized_y, metrics, generation)) => scrollbar.hit_test_pixels(
+                column,
+                row,
+                normalized_y,
+                metrics.cell_height_px,
+                generation,
             ),
-            DetailScrollbarHit::BottomCap => set_detail_scroll_from_user(
-                app,
-                detail_layout,
-                scrollbar.geometry.max_scroll,
-                Some(scrollbar.geometry.max_scroll),
-            ),
-            DetailScrollbarHit::Track => set_detail_scroll_from_user(
-                app,
-                detail_layout,
-                scrollbar.geometry.scroll_for_track_click(row),
-                Some(scrollbar.geometry.max_scroll),
-            ),
+            None => scrollbar.geometry.hit_test(column, row),
         };
+        if let Some(hit) = hit {
+            return match hit {
+                DetailScrollbarHit::Thumb { grab_offset } => {
+                    let coordinate = match projected_pixel {
+                        Some((_, normalized_y, metrics, generation)) => {
+                            let Some(grab_offset_px) = scrollbar.pixel_grab_offset(
+                                normalized_y,
+                                metrics.cell_height_px,
+                                generation,
+                            ) else {
+                                return false;
+                            };
+                            DragCoordinate::Pixels {
+                                grab_offset_px,
+                                generation,
+                            }
+                        }
+                        None => DragCoordinate::Cells { grab_offset },
+                    };
+                    detail_scrollbar_drag.active = Some(DetailScrollbarDrag {
+                        identity: scrollbar.identity,
+                        coordinate,
+                    });
+                    false
+                }
+                DetailScrollbarHit::TopCap => set_detail_scroll_from_user(
+                    app,
+                    detail_layout,
+                    0,
+                    Some(scrollbar.geometry.max_scroll),
+                ),
+                DetailScrollbarHit::BottomCap => set_detail_scroll_from_user(
+                    app,
+                    detail_layout,
+                    scrollbar.geometry.max_scroll,
+                    Some(scrollbar.geometry.max_scroll),
+                ),
+                DetailScrollbarHit::Track => set_detail_scroll_from_user(
+                    app,
+                    detail_layout,
+                    scrollbar.geometry.scroll_for_track_click(row),
+                    Some(scrollbar.geometry.max_scroll),
+                ),
+            };
+        }
     }
 
     if let PointerKind::Down(PointerButton::Left) = pointer.kind
@@ -1753,6 +1778,16 @@ mod tests {
         scroll: usize,
         layout_generation: u64,
     ) -> view::RenderInfo {
+        scrollbar_info_with_pixels(app, max_scroll, scroll, layout_generation, None)
+    }
+
+    fn scrollbar_info_with_pixels(
+        app: &WatchApp,
+        max_scroll: usize,
+        scroll: usize,
+        layout_generation: u64,
+        pixels: Option<(u32, u64)>,
+    ) -> view::RenderInfo {
         let detail_area = ratatui::layout::Rect::new(20, 5, 40, 20);
         let geometry = detail_scrollbar::DetailScrollbarGeometry::new(
             detail_area,
@@ -1762,6 +1797,13 @@ mod tests {
             &[],
         )
         .unwrap();
+        let pixel_geometry = pixels.and_then(|(cell_height_px, generation)| {
+            detail_scrollbar::DetailScrollbarPixelGeometry::new(
+                &geometry,
+                cell_height_px,
+                generation,
+            )
+        });
         let interaction = detail_scrollbar::DetailScrollbarInteraction::new(
             detail_layout::DetailExactLayoutIdentity {
                 document_generation: 1,
@@ -1769,6 +1811,7 @@ mod tests {
                 revision: app.detail_revision(),
             },
             geometry,
+            pixel_geometry,
         )
         .unwrap();
         view::RenderInfo {
@@ -2484,6 +2527,174 @@ mod tests {
             None,
         ));
         assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn fractional_pixel_down_hit_and_grab_use_the_published_exact_interval() {
+        let maximum = 1_000;
+        let generation = 31;
+        let representable_scroll = (1..maximum)
+            .find(|scroll| {
+                let info =
+                    scrollbar_info_with_pixels(&app(), maximum, *scroll, 1, Some((20, generation)));
+                let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+                let projection = geometry.pixel_projection(20).unwrap();
+                !projection.thumb_top_px().is_multiple_of(20)
+                    && geometry.scroll_for_pixel_drag(
+                        u32::try_from(projection.thumb_top_px()).unwrap(),
+                        0,
+                        20,
+                    ) == *scroll
+            })
+            .unwrap();
+
+        let mut app = app();
+        app.set_detail_scroll_from_user(representable_scroll);
+        let info = scrollbar_info_with_pixels(
+            &app,
+            maximum,
+            representable_scroll,
+            1,
+            Some((20, generation)),
+        );
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let projection = geometry.pixel_projection(20).unwrap();
+        let gutter_x = u32::from(geometry.gutter.x) * 10 + 5;
+        let top = u32::try_from(projection.thumb_top_px()).unwrap();
+        let bottom = u32::try_from(projection.thumb_bottom_px()).unwrap();
+        let top_row = u16::try_from(top / 20).unwrap();
+        assert_eq!(top_row, u16::try_from((top - 1) / 20).unwrap());
+
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            top + 3,
+            Some(generation),
+        ));
+        assert!(matches!(
+            drag.active,
+            Some(DetailScrollbarDrag {
+                coordinate: DragCoordinate::Pixels {
+                    grab_offset_px: 3,
+                    generation: 31,
+                },
+                ..
+            })
+        ));
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Drag(PointerButton::Left),
+            0,
+            top + 3,
+            Some(generation),
+        ));
+        assert_eq!(app.detail_scroll(), representable_scroll);
+
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Up(PointerButton::Left),
+            gutter_x,
+            top,
+            Some(generation),
+        );
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            bottom - 1,
+            Some(generation),
+        ));
+        assert!(matches!(
+            drag.active,
+            Some(DetailScrollbarDrag {
+                coordinate: DragCoordinate::Pixels { grab_offset_px, .. },
+                ..
+            }) if grab_offset_px == u64::from(bottom - top - 1)
+        ));
+
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Up(PointerButton::Left),
+            gutter_x,
+            top,
+            Some(generation),
+        );
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation),
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            top - 1,
+            Some(generation),
+        );
+        assert!(drag.active.is_none());
+
+        dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            pixel_mode(generation + 1),
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            top,
+            Some(generation + 1),
+        );
+        assert!(drag.active.is_none());
+    }
+
+    #[test]
+    fn cells_thumb_hit_remains_whole_cell_based_even_when_pixel_geometry_exists() {
+        let mut app = app();
+        app.set_detail_scroll_from_user(150);
+        let info = scrollbar_info_with_pixels(&app, 10_000, 150, 1, Some((20, 5)));
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            PointerKind::Down(PointerButton::Left),
+            geometry.gutter.x,
+            geometry.thumb_start_row,
+        ));
+        assert!(matches!(
+            drag.active,
+            Some(DetailScrollbarDrag {
+                coordinate: DragCoordinate::Cells { grab_offset: 0 },
+                ..
+            })
+        ));
     }
 
     #[test]

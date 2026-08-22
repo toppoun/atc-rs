@@ -12,8 +12,10 @@ use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, W
 use super::detail::{DetailDocument, DetailSectionKind};
 use super::detail_layout::DetailLayout;
 use super::detail_scrollbar::{
-    DetailScrollbarGeometry, DetailScrollbarInteraction, render_detail_scrollbar,
+    DetailScrollbarGeometry, DetailScrollbarInteraction, DetailScrollbarPixelGeometry,
+    render_detail_scrollbar,
 };
+use super::mouse::MouseMode;
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
@@ -36,10 +38,20 @@ pub struct RenderInfo {
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
 }
 
+#[cfg(test)]
 pub(super) fn render(
     frame: &mut Frame,
     app: &WatchApp,
     detail_layout: &mut DetailLayout,
+) -> RenderInfo {
+    render_with_mouse_mode(frame, app, detail_layout, MouseMode::Cells)
+}
+
+pub(super) fn render_with_mouse_mode(
+    frame: &mut Frame,
+    app: &WatchApp,
+    detail_layout: &mut DetailLayout,
+    mouse_mode: MouseMode,
 ) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
@@ -177,11 +189,19 @@ pub(super) fn render(
                 .unwrap_or_default(),
         )
     {
-        render_detail_scrollbar(frame, &geometry);
+        let pixel_geometry = match mouse_mode {
+            MouseMode::Pixels {
+                metrics,
+                generation,
+                ..
+            } => DetailScrollbarPixelGeometry::new(&geometry, metrics.cell_height_px, generation),
+            MouseMode::Disabled | MouseMode::Cells => None,
+        };
+        render_detail_scrollbar(frame, &geometry, pixel_geometry);
         if detail_viewport.exact_section_visual_rows.is_some()
             && let Some(identity) = detail_viewport.exact_layout_identity
         {
-            detail_scrollbar = DetailScrollbarInteraction::new(identity, geometry);
+            detail_scrollbar = DetailScrollbarInteraction::new(identity, geometry, pixel_geometry);
         }
     }
 
@@ -515,6 +535,7 @@ mod tests {
     use crate::stress::CandidateFailureKind;
     use crate::tui::detail_layout::{max_scroll, viewport_text, wrap_detail_document};
     use crate::tui::message::{StressEvent, TestEvent};
+    use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
 
@@ -826,6 +847,210 @@ mod tests {
         let collapsed = render_with_layout(&mut terminal, &app, &mut layout);
         let collapsed_max = collapsed.max_detail_scroll.unwrap();
         assert!(collapsed_max < expanded_max);
+    }
+
+    #[test]
+    fn pixels_mode_renders_fractional_thumb_while_cells_mode_keeps_whole_cells() {
+        let mut app = foldable_app("actual body\n".repeat(100));
+        let mut probe_terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut probe_layout = DetailLayout::default();
+        let probe = render_with_layout(&mut probe_terminal, &app, &mut probe_layout);
+        let maximum = probe.max_detail_scroll.unwrap();
+        let detail_area = probe.detail_area;
+        let scroll = (1..maximum)
+            .find(|scroll| {
+                let geometry = DetailScrollbarGeometry::new(
+                    detail_area,
+                    maximum,
+                    *scroll,
+                    usize::from(detail_area.height),
+                    &[],
+                )
+                .unwrap();
+                let projection = geometry.pixel_projection(17).unwrap();
+                !projection.thumb_top_px().is_multiple_of(17)
+                    && geometry.thumb_start_row
+                        == u16::try_from(projection.thumb_top_px() / 17).unwrap()
+            })
+            .unwrap();
+        app.set_detail_scroll_from_user(scroll);
+
+        let mut cells_terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut cells_layout = DetailLayout::default();
+        let cells_info = render_with_layout(&mut cells_terminal, &app, &mut cells_layout);
+        let cells_geometry = &cells_info.detail_scrollbar.as_ref().unwrap().geometry;
+        assert!(
+            cells_info
+                .detail_scrollbar
+                .as_ref()
+                .unwrap()
+                .pixel_geometry
+                .is_none()
+        );
+        assert_eq!(
+            cells_terminal
+                .backend()
+                .buffer()
+                .cell((cells_geometry.gutter.x, cells_geometry.thumb_start_row))
+                .unwrap()
+                .symbol(),
+            "█"
+        );
+
+        let metrics = TerminalPixelMetrics::validated(80, 20, 800, 340, 10, 17).unwrap();
+        let mut pixels_terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut pixels_layout = DetailLayout::default();
+        let mut pixels_info = RenderInfo::default();
+        pixels_terminal
+            .draw(|frame| {
+                pixels_info = render_with_mouse_mode(
+                    frame,
+                    &app,
+                    &mut pixels_layout,
+                    MouseMode::Pixels {
+                        metrics,
+                        origin: PixelCoordinateOrigin::ZeroBased,
+                        generation: 7,
+                    },
+                );
+            })
+            .unwrap();
+        let pixels_scrollbar = pixels_info.detail_scrollbar.as_ref().unwrap();
+        assert!(pixels_scrollbar.pixel_geometry.is_some());
+        let projection = pixels_scrollbar.geometry.pixel_projection(17).unwrap();
+        let top_row = u16::try_from(projection.thumb_top_px() / 17).unwrap();
+        let bottom_row = u16::try_from(projection.thumb_bottom_px() / 17).unwrap();
+        let top_cell = pixels_terminal
+            .backend()
+            .buffer()
+            .cell((pixels_scrollbar.geometry.gutter.x, top_row))
+            .unwrap();
+        let bottom_cell = pixels_terminal
+            .backend()
+            .buffer()
+            .cell((pixels_scrollbar.geometry.gutter.x, bottom_row))
+            .unwrap();
+        let block_symbols = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+        assert_ne!(top_cell.symbol(), "█");
+        assert!(block_symbols.contains(&top_cell.symbol()));
+        assert!(block_symbols.contains(&bottom_cell.symbol()));
+        assert!(bottom_cell.modifier.contains(Modifier::REVERSED));
+
+        let transitioned_x = pixels_scrollbar.geometry.gutter.x;
+        pixels_terminal
+            .draw(|frame| {
+                pixels_info =
+                    render_with_mouse_mode(frame, &app, &mut pixels_layout, MouseMode::Cells);
+            })
+            .unwrap();
+        let cells_scrollbar = pixels_info.detail_scrollbar.as_ref().unwrap();
+        assert!(cells_scrollbar.pixel_geometry.is_none());
+        assert_eq!(cells_scrollbar.geometry.gutter.x, transitioned_x);
+        let transitioned_buffer = pixels_terminal.backend().buffer();
+        assert_eq!(
+            transitioned_buffer
+                .cell((transitioned_x, cells_scrollbar.geometry.thumb_start_row))
+                .unwrap()
+                .symbol(),
+            "█"
+        );
+        for row in
+            cells_scrollbar.geometry.track_start_row..cells_scrollbar.geometry.track_end_row()
+        {
+            assert!(
+                !transitioned_buffer
+                    .cell((transitioned_x, row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+    }
+
+    #[test]
+    fn fold_hides_and_restores_scrollbar_without_stale_gutter_cells() {
+        let mut app = foldable_app("actual body\n".repeat(100));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let mut layout = DetailLayout::default();
+
+        let expanded = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(expanded.detail_scrollbar.is_some());
+
+        for kind in [
+            DetailSectionKind::Input,
+            DetailSectionKind::Expected,
+            DetailSectionKind::Actual,
+            DetailSectionKind::Stderr,
+        ] {
+            app.toggle_detail_section(kind);
+        }
+        let collapsed = render_with_layout(&mut terminal, &app, &mut layout);
+        assert_eq!(collapsed.max_detail_scroll, Some(0));
+        assert!(collapsed.detail_scrollbar.is_none());
+
+        let mut fresh_terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let mut fresh_layout = DetailLayout::default();
+        let fresh_collapsed = render_with_layout(&mut fresh_terminal, &app, &mut fresh_layout);
+        assert!(fresh_collapsed.detail_scrollbar.is_none());
+        assert_eq!(
+            terminal.backend().buffer(),
+            fresh_terminal.backend().buffer()
+        );
+
+        app.toggle_detail_section(DetailSectionKind::Actual);
+        let reexpanded = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(reexpanded.detail_scrollbar.is_some());
+
+        let maximum = reexpanded.max_detail_scroll.unwrap();
+        let detail_area = reexpanded.detail_area;
+        let scroll = (1..maximum)
+            .find(|scroll| {
+                let geometry = DetailScrollbarGeometry::new(
+                    detail_area,
+                    maximum,
+                    *scroll,
+                    usize::from(detail_area.height),
+                    &[],
+                )
+                .unwrap();
+                !geometry
+                    .pixel_projection(17)
+                    .unwrap()
+                    .thumb_top_px()
+                    .is_multiple_of(17)
+            })
+            .unwrap();
+        app.set_detail_scroll_from_user(scroll);
+
+        let metrics = TerminalPixelMetrics::validated(80, 40, 800, 680, 10, 17).unwrap();
+        let mut fractional = RenderInfo::default();
+        terminal
+            .draw(|frame| {
+                fractional = render_with_mouse_mode(
+                    frame,
+                    &app,
+                    &mut layout,
+                    MouseMode::Pixels {
+                        metrics,
+                        origin: PixelCoordinateOrigin::ZeroBased,
+                        generation: 19,
+                    },
+                );
+            })
+            .unwrap();
+        let scrollbar = fractional.detail_scrollbar.as_ref().unwrap();
+        assert!(scrollbar.pixel_geometry.is_some());
+        assert!(
+            (scrollbar.geometry.track_start_row..scrollbar.geometry.track_end_row()).any(|row| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((scrollbar.geometry.gutter.x, row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+        );
     }
 
     #[test]
