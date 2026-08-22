@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +19,75 @@ use crate::watcher;
 use super::watch_source::{build_watched_sources, resolve_watched_source};
 
 const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Debug)]
+struct WatchCleanupError {
+    primary_name: Option<&'static str>,
+    primary: io::Error,
+    cleanup: Vec<(&'static str, io::Error)>,
+}
+
+impl fmt::Display for WatchCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(name) = self.primary_name {
+            write!(formatter, "{name} failed: {}", self.primary)?;
+        } else {
+            write!(formatter, "{}", self.primary)?;
+        }
+        for (name, error) in &self.cleanup {
+            write!(formatter, "; {name} also failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WatchCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn with_cleanup_errors(
+    primary_name: Option<&'static str>,
+    primary: io::Error,
+    cleanup: Vec<(&'static str, io::Error)>,
+) -> io::Error {
+    io::Error::new(
+        primary.kind(),
+        WatchCleanupError {
+            primary_name,
+            primary,
+            cleanup,
+        },
+    )
+}
+
+fn combine_primary_and_cleanup_results<const N: usize>(
+    primary: io::Result<()>,
+    cleanup_results: [(&'static str, io::Result<()>); N],
+) -> io::Result<()> {
+    let cleanup_errors = cleanup_results
+        .into_iter()
+        .filter_map(|(name, result)| result.err().map(|error| (name, error)))
+        .collect::<Vec<_>>();
+
+    match primary {
+        Err(primary) if cleanup_errors.is_empty() => Err(primary),
+        Err(primary) => Err(with_cleanup_errors(None, primary, cleanup_errors)),
+        Ok(()) => {
+            let mut errors = cleanup_errors.into_iter();
+            let Some((first_name, first_error)) = errors.next() else {
+                return Ok(());
+            };
+            let Some(second) = errors.next() else {
+                return Err(first_error);
+            };
+
+            let cleanup = std::iter::once(second).chain(errors).collect();
+            Err(with_cleanup_errors(Some(first_name), first_error, cleanup))
+        }
+    }
+}
 
 struct WatcherThread {
     shutdown: Arc<AtomicBool>,
@@ -227,11 +297,15 @@ pub(super) fn watch_tui_at(
             let watcher_result = watcher_thread.stop();
             let detail_analysis_result = detail_analysis_worker.stop_and_join();
 
-            worker_result?;
-            watcher_result?;
-            detail_analysis_result?;
-
-            return Err(error.into());
+            return combine_primary_and_cleanup_results(
+                Err(error),
+                [
+                    ("run worker shutdown", worker_result),
+                    ("filesystem watcher shutdown", watcher_result),
+                    ("detail analysis worker shutdown", detail_analysis_result),
+                ],
+            )
+            .map_err(AppError::from);
         }
     };
 
@@ -260,13 +334,16 @@ pub(super) fn watch_tui_at(
     let watcher_result = watcher_thread.stop();
     let detail_analysis_result = detail_analysis_worker.stop_and_join();
 
-    result?;
-    worker_result?;
-    watcher_result?;
-    detail_analysis_result?;
-    restore_result?;
-
-    Ok(())
+    combine_primary_and_cleanup_results(
+        result,
+        [
+            ("terminal restoration", restore_result),
+            ("run worker shutdown", worker_result),
+            ("filesystem watcher shutdown", watcher_result),
+            ("detail analysis worker shutdown", detail_analysis_result),
+        ],
+    )
+    .map_err(AppError::from)
 }
 
 fn load_watch_input(
@@ -501,5 +578,84 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn terminal_operation_error_remains_primary_when_cleanup_also_fails() {
+        let error = combine_primary_and_cleanup_results(
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "terminal input failed",
+            )),
+            [
+                (
+                    "terminal restoration",
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "mouse reset failed",
+                    )),
+                ),
+                ("worker shutdown", Ok(())),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().starts_with("terminal input failed;"));
+        assert!(
+            error
+                .to_string()
+                .contains("terminal restoration also failed")
+        );
+        assert!(error.to_string().contains("mouse reset failed"));
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "terminal input failed"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_is_returned_after_successful_terminal_run() {
+        let error = combine_primary_and_cleanup_results(
+            Ok(()),
+            [
+                ("terminal restoration", Ok(())),
+                (
+                    "worker shutdown",
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker did not stop",
+                    )),
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "worker did not stop");
+    }
+
+    #[test]
+    fn multiple_cleanup_failures_are_all_reported_in_execution_order() {
+        let error = combine_primary_and_cleanup_results(
+            Ok(()),
+            [
+                (
+                    "terminal restoration",
+                    Err(io::Error::other("cursor restore failed")),
+                ),
+                (
+                    "worker shutdown",
+                    Err(io::Error::other("worker join failed")),
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "terminal restoration failed: cursor restore failed; worker shutdown also failed: worker join failed"
+        );
     }
 }
