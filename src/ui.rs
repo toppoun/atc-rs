@@ -31,6 +31,12 @@ pub enum Event<'a> {
     WorkspaceRefreshed {
         destination: &'a Path,
     },
+    WorkspaceInitialized {
+        path: &'a Path,
+    },
+    WorkspaceAlreadyInitialized {
+        path: &'a Path,
+    },
     NoSamples {
         problem_index: &'a str,
     },
@@ -250,6 +256,12 @@ impl Reporter for TerminalReporter {
 
             Event::WorkspaceRefreshed { destination } => {
                 eprintln!("Refreshed {}", destination.display());
+            }
+            Event::WorkspaceInitialized { path } => {
+                eprintln!("Initialized atc workspace: {}", path.display());
+            }
+            Event::WorkspaceAlreadyInitialized { path } => {
+                eprintln!("Workspace already initialized: {}", path.display());
             }
             Event::NoSamples { problem_index } => {
                 self.current_test = None;

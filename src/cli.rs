@@ -41,6 +41,9 @@ impl Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     #[command(flatten)]
+    Workspace(WorkspaceCommand),
+
+    #[command(flatten)]
     Contest(ContestCommand),
 
     #[command(flatten)]
@@ -51,6 +54,16 @@ pub enum Command {
 
     #[command(flatten)]
     Account(AccountCommand),
+}
+
+// ============================================================
+// Workspace
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum WorkspaceCommand {
+    /// Initialize an atc workspace
+    Init,
 }
 
 // ============================================================
@@ -224,10 +237,13 @@ Usage:
 
 {}
 
+{}
+
 Options
   -h, --help       Show help
   -V, --version    Show version
 ",
+        render_category::<WorkspaceCommand>("Workspace", command_tree).trim_end(),
         render_category::<ContestCommand>("Contest", command_tree).trim_end(),
         render_category::<RunTestCommand>("Run & Test", command_tree).trim_end(),
         render_category::<FileCommand>("Files", command_tree).trim_end(),
@@ -267,6 +283,7 @@ mod tests {
         assert!(help.contains("  atc [options] <command>"));
         assert!(!help.contains("  atc <command> [options]"));
         assert!(help.contains("test      Run samples and the saved stress regression"));
+        assert!(help.contains("init      Initialize an atc workspace"));
 
         let mut stress = command_tree
             .find_subcommand("stress")
@@ -277,6 +294,17 @@ mod tests {
         for option in ["--count", "--forever", "--seed"] {
             assert!(stress_help.contains(option));
         }
+    }
+
+    #[test]
+    fn parses_init_without_arguments() {
+        let cli = Cli::try_parse_from(["atc", "init"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Workspace(WorkspaceCommand::Init)
+        ));
+        assert!(Cli::try_parse_from(["atc", "init", "extra"]).is_err());
     }
 
     #[test]

@@ -137,6 +137,12 @@ impl Reporter for RecordingReporter {
             Event::WorkspaceRefreshed { destination } => {
                 format!("refreshed:{}", destination.display())
             }
+            Event::WorkspaceInitialized { path } => {
+                format!("workspace-initialized:{}", path.display())
+            }
+            Event::WorkspaceAlreadyInitialized { path } => {
+                format!("workspace-already-initialized:{}", path.display())
+            }
             Event::NoSamples { problem_index } => {
                 format!("no-samples:{problem_index}")
             }
@@ -933,6 +939,47 @@ fn new_at_creates_a_missing_mapped_parent_directory() {
     )
     .unwrap();
 
+    assert_eq!(
+        workspace::load_metadata(&destination).unwrap().contest_id,
+        "abc466"
+    );
+}
+
+#[test]
+fn workspace_new_flow_creates_a_nested_mapped_parent_hierarchy() {
+    let mut reporter = NullReporter;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join(".atc-workspace.toml"),
+        concat!(
+            "version = 1\n",
+            "[[paths]]\n",
+            "pattern = \"^abc[0-9]+$\"\n",
+            "path = \"AtCoder/Contests/ABC\"\n",
+        ),
+    )
+    .unwrap();
+    let destination = workspace::resolve_contest_path(temp.path(), "abc466").unwrap();
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+
+    new_at_in_workspace(
+        temp.path(),
+        &destination,
+        "abc466",
+        Language::Cpp,
+        &client,
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        destination,
+        temp.path()
+            .join("AtCoder")
+            .join("Contests")
+            .join("ABC")
+            .join("abc466")
+    );
     assert_eq!(
         workspace::load_metadata(&destination).unwrap().contest_id,
         "abc466"

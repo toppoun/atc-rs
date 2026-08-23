@@ -1,11 +1,17 @@
 use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_std::ambient_authority;
+#[cfg(windows)]
+use cap_std::fs::MetadataExt as _;
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
@@ -13,6 +19,35 @@ const METADATA_VERSION: u32 = 1;
 
 const WORKSPACE_CONFIG_FILE: &str = ".atc-workspace.toml";
 const WORKSPACE_CONFIG_VERSION: u32 = 1;
+
+const DEFAULT_WORKSPACE_CONFIG: &str = concat!(
+    "# atc workspace configuration\n",
+    "#\n",
+    "# 各 contest ID を以下の pattern と照合し、保存先を振り分けます。\n",
+    "#\n",
+    "# 例:\n",
+    "#   abc123 -> ABC/abc123\n",
+    "#\n",
+    "# 1つの pattern に一致した場合、その `path` 配下に contest を配置します。\n",
+    "# どの pattern にも一致しない場合は、workspace 直下に配置します。\n",
+    "# 複数の pattern に一致した場合はエラーになります。\n",
+    "#\n",
+    "# 不要な振り分けは、対応する [[paths]] を削除またはコメントアウトしてください。\n",
+    "\n",
+    "version = 1\n",
+    "\n",
+    "[[paths]]\n",
+    "pattern = \"^abc[0-9]+$\"\n",
+    "path = \"ABC\"\n",
+    "\n",
+    "[[paths]]\n",
+    "pattern = \"^arc[0-9]+$\"\n",
+    "path = \"ARC\"\n",
+    "\n",
+    "[[paths]]\n",
+    "pattern = \"^agc[0-9]+$\"\n",
+    "path = \"AGC\"\n",
+);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,40 +71,274 @@ pub enum ContestMetadataHealth {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceConfig {
+struct WorkspaceConfigFile {
     version: u32,
-    paths: Vec<WorkspacePathRule>,
+    paths: Vec<WorkspacePathRuleFile>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkspacePathRule {
+struct WorkspacePathRuleFile {
     pattern: String,
     path: String,
+}
+
+struct WorkspaceConfig {
+    paths: Vec<WorkspacePathRule>,
+}
+
+struct WorkspacePathRule {
+    pattern: Regex,
+    path: WorkspaceRelativePath,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceRelativePath {
+    components: Vec<String>,
+}
+
+impl WorkspaceRelativePath {
+    fn parse(value: &str) -> io::Result<Self> {
+        if value.is_empty() {
+            return Err(invalid_workspace_path(
+                value,
+                None,
+                "path must not be empty",
+            ));
+        }
+
+        let components = value
+            .split('/')
+            .map(|component| {
+                validate_workspace_path_component(component)
+                    .map_err(|reason| invalid_workspace_path(value, Some(component), reason))?;
+                Ok(component.to_owned())
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        Ok(Self { components })
+    }
+
+    fn append_to(&self, root: &Path) -> PathBuf {
+        let mut path = root.to_path_buf();
+        for component in &self.components {
+            path.push(component);
+        }
+        path
+    }
+
+    fn components(&self) -> impl Iterator<Item = &str> {
+        self.components.iter().map(String::as_str)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkspaceInitialization {
+    Created(PathBuf),
+    AlreadyInitialized(PathBuf),
+}
+
+#[derive(Debug)]
+struct WorkspaceConfigContext {
+    action: &'static str,
+    path: PathBuf,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl std::fmt::Display for WorkspaceConfigContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to {} workspace config {}: {}",
+            self.action,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl Error for WorkspaceConfigContext {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn workspace_config_error(
+    path: &Path,
+    action: &'static str,
+    kind: io::ErrorKind,
+    source: impl Error + Send + Sync + 'static,
+) -> io::Error {
+    io::Error::new(
+        kind,
+        WorkspaceConfigContext {
+            action,
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        },
+    )
+}
+
+fn parse_workspace_config(path: &Path, content: &str) -> io::Result<WorkspaceConfig> {
+    let config: WorkspaceConfigFile = toml::from_str(content).map_err(|error| {
+        workspace_config_error(path, "parse", io::ErrorKind::InvalidData, error)
+    })?;
+
+    if config.version != WORKSPACE_CONFIG_VERSION {
+        return Err(workspace_config_error(
+            path,
+            "validate",
+            io::ErrorKind::InvalidData,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported workspace config version: {} (expected {WORKSPACE_CONFIG_VERSION})",
+                    config.version
+                ),
+            ),
+        ));
+    }
+
+    let paths = config
+        .paths
+        .into_iter()
+        .map(|rule| {
+            let workspace_path = WorkspaceRelativePath::parse(&rule.path).map_err(|error| {
+                workspace_config_error(path, "validate", io::ErrorKind::InvalidData, error)
+            })?;
+
+            let pattern = Regex::new(&rule.pattern).map_err(|error| {
+                workspace_config_error(path, "validate", io::ErrorKind::InvalidData, error)
+            })?;
+
+            Ok(WorkspacePathRule {
+                pattern,
+                path: workspace_path,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    Ok(WorkspaceConfig { paths })
+}
+
+fn load_workspace_config_file(path: &Path) -> io::Result<WorkspaceConfig> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| workspace_config_error(path, "read", error.kind(), error))?;
+
+    parse_workspace_config(path, &content)
 }
 
 fn load_workspace_config(root: &Path) -> io::Result<Option<WorkspaceConfig>> {
     let path = root.join(WORKSPACE_CONFIG_FILE);
 
-    if !existing_regular_file(&path, "workspace config")? {
+    if !existing_regular_file(&path, "workspace config")
+        .map_err(|error| workspace_config_error(&path, "inspect", error.kind(), error))?
+    {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&path)?;
-    let config: WorkspaceConfig = toml::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    load_workspace_config_file(&path).map(Some)
+}
 
-    if config.version != WORKSPACE_CONFIG_VERSION {
+fn load_existing_workspace_config(
+    root: &Path,
+    directory: &CapDir,
+) -> io::Result<Option<WorkspaceConfig>> {
+    let path = root.join(WORKSPACE_CONFIG_FILE);
+
+    match directory.symlink_metadata(WORKSPACE_CONFIG_FILE) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("workspace config is not a regular file: {}", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(workspace_config_error(
+                &path,
+                "inspect",
+                error.kind(),
+                error,
+            ));
+        }
+    }
+
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+
+    let mut file = match directory.open_with(WORKSPACE_CONFIG_FILE, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(workspace_config_error(&path, "open", error.kind(), error));
+        }
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| workspace_config_error(&path, "inspect open", error.kind(), error))?;
+    if !metadata.file_type().is_file() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported workspace config version: {} (expected {WORKSPACE_CONFIG_VERSION})",
-                config.version
-            ),
+            io::ErrorKind::InvalidInput,
+            format!("workspace config is not a regular file: {}", path.display()),
         ));
     }
 
-    Ok(Some(config))
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| workspace_config_error(&path, "read", error.kind(), error))?;
+
+    parse_workspace_config(&path, &content).map(Some)
+}
+
+fn create_default_workspace_config(root: &Path, path: &Path) -> io::Result<()> {
+    // Build and flush the complete file beside its destination before installing it. The
+    // no-clobber persist closes the check/create race without ever truncating the final path.
+    let mut staging = tempfile::Builder::new()
+        .prefix(".atc-workspace-")
+        .tempfile_in(root)
+        .map_err(|error| workspace_config_error(path, "stage", error.kind(), error))?;
+
+    staging
+        .write_all(DEFAULT_WORKSPACE_CONFIG.as_bytes())
+        .map_err(|error| workspace_config_error(path, "write", error.kind(), error))?;
+    staging
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| workspace_config_error(path, "flush", error.kind(), error))?;
+
+    match staging.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let tempfile::PersistError { error, file } = error;
+            drop(file);
+            Err(workspace_config_error(path, "create", error.kind(), error))
+        }
+    }
+}
+
+pub fn initialize_workspace(root: &Path) -> io::Result<WorkspaceInitialization> {
+    let path = root.join(WORKSPACE_CONFIG_FILE);
+    let directory = CapDir::open_ambient_dir(root, ambient_authority()).map_err(|error| {
+        workspace_config_error(&path, "open parent directory for", error.kind(), error)
+    })?;
+
+    if load_existing_workspace_config(root, &directory)?.is_some() {
+        return Ok(WorkspaceInitialization::AlreadyInitialized(path));
+    }
+
+    match create_default_workspace_config(root, &path) {
+        Ok(()) => Ok(WorkspaceInitialization::Created(path)),
+        Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
+            match load_existing_workspace_config(root, &directory)? {
+                Some(_) => Ok(WorkspaceInitialization::AlreadyInitialized(path)),
+                None => Err(create_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf> {
@@ -79,25 +348,95 @@ pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf
         return contest_path(root, contest_id);
     };
 
-    // rulesを検証・match
-    let mut matched_path: Option<&str> = None;
+    match matching_workspace_path(&config, contest_id)? {
+        Some(path) => {
+            walk_workspace_mapping(root, path, false)?;
+            contest_path(&path.append_to(root), contest_id)
+        }
+        None => contest_path(root, contest_id),
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceDirectoryContext {
+    action: &'static str,
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl std::fmt::Display for WorkspaceDirectoryContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to {} {}: {}",
+            self.action,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl Error for WorkspaceDirectoryContext {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn workspace_directory_error(path: &Path, action: &'static str, source: io::Error) -> io::Error {
+    let kind = source.kind();
+    io::Error::new(
+        kind,
+        WorkspaceDirectoryContext {
+            action,
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+pub fn ensure_workspace_contest_parent(
+    root: &Path,
+    contest_id: &str,
+    expected_destination: &Path,
+) -> io::Result<()> {
+    validate_path_component(contest_id, "contest ID")?;
+
+    let config = load_workspace_config(root)?;
+    let mapping = match config.as_ref() {
+        Some(config) => matching_workspace_path(config, contest_id)?,
+        None => None,
+    };
+
+    let actual_destination = match mapping {
+        Some(path) => contest_path(&path.append_to(root), contest_id)?,
+        None => contest_path(root, contest_id)?,
+    };
+    if actual_destination != expected_destination {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workspace config changed while preparing contest {contest_id:?}: expected {}, now resolves to {}",
+                expected_destination.display(),
+                actual_destination.display()
+            ),
+        ));
+    }
+
+    if let Some(path) = mapping {
+        walk_workspace_mapping(root, path, true)?;
+    }
+
+    Ok(())
+}
+
+fn matching_workspace_path<'a>(
+    config: &'a WorkspaceConfig,
+    contest_id: &str,
+) -> io::Result<Option<&'a WorkspaceRelativePath>> {
+    let mut matched_path = None;
 
     for rule in &config.paths {
-        validate_path_component(&rule.path, "workspace path").map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid workspace path {:?}: {error}", rule.path),
-            )
-        })?;
-
-        let regex = Regex::new(&rule.pattern).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid workspace regex {:?}: {error}", rule.pattern),
-            )
-        })?;
-
-        if !regex.is_match(contest_id) {
+        if !rule.pattern.is_match(contest_id) {
             continue;
         }
 
@@ -110,14 +449,94 @@ pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf
 
         matched_path = Some(&rule.path);
     }
-    let path = matched_path.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("no workspace path rule matches contest ID {contest_id:?}"),
-        )
-    })?;
 
-    contest_path(&root.join(path), contest_id)
+    Ok(matched_path)
+}
+
+fn walk_workspace_mapping(
+    root: &Path,
+    mapping: &WorkspaceRelativePath,
+    create_missing: bool,
+) -> io::Result<()> {
+    let mut current = CapDir::open_ambient_dir(root, ambient_authority())
+        .map_err(|error| workspace_directory_error(root, "open workspace root", error))?;
+    let mut current_path = root.to_path_buf();
+
+    for component in mapping.components() {
+        current_path.push(component);
+
+        #[cfg(windows)]
+        reject_windows_reparse_point(&current, component, &current_path)?;
+
+        match current.open_dir_nofollow(component) {
+            Ok(directory) => {
+                current = directory;
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match current.create_dir(component) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(workspace_directory_error(
+                            &current_path,
+                            "create workspace mapping directory",
+                            error,
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(workspace_directory_error(
+                    &current_path,
+                    "open workspace mapping directory without following links",
+                    error,
+                ));
+            }
+        }
+
+        #[cfg(windows)]
+        reject_windows_reparse_point(&current, component, &current_path)?;
+
+        current = current.open_dir_nofollow(component).map_err(|error| {
+            workspace_directory_error(
+                &current_path,
+                "open workspace mapping directory without following links",
+                error,
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reject_windows_reparse_point(parent: &CapDir, component: &str, path: &Path) -> io::Result<()> {
+    // FILE_ATTRIBUTE_REPARSE_POINT. Keep the numeric value local so the existing
+    // windows-sys feature set does not need to expand for one stable attribute bit.
+    const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
+
+    match parent.symlink_metadata(component) {
+        Ok(metadata) if metadata.file_attributes() & REPARSE_POINT_ATTRIBUTE != 0 => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace mapping directory must not be a reparse point: {}",
+                    path.display()
+                ),
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(workspace_directory_error(
+            path,
+            "inspect workspace mapping directory for reparse points",
+            error,
+        )),
+    }
 }
 
 pub fn resolve_contest_target(root: &Path, contest_id: Option<&str>) -> io::Result<PathBuf> {
@@ -493,6 +912,82 @@ fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
     ))
 }
 
+fn invalid_workspace_path(value: &str, component: Option<&str>, reason: &'static str) -> io::Error {
+    let message = match component {
+        Some(component) => {
+            format!("invalid workspace path component {component:?} in {value:?}: {reason}")
+        }
+        None => format!("invalid workspace path {value:?}: {reason}"),
+    };
+
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn validate_workspace_path_component(component: &str) -> Result<(), &'static str> {
+    if component.is_empty() {
+        return Err("components must not be empty");
+    }
+    if matches!(component, "." | "..") {
+        return Err("components must not be `.` or `..`");
+    }
+    if component.contains(['/', '\\']) {
+        return Err("`/` is the only separator and cannot appear inside a component");
+    }
+    if component
+        .chars()
+        .any(|character| character <= '\u{1f}' || r#"<>:\"|?*"#.contains(character))
+    {
+        return Err("component contains a character that is not portable to Windows");
+    }
+    if component.ends_with([' ', '.']) {
+        return Err("components must not end with a space or period");
+    }
+
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || matches!(
+        // Windows recognizes the ISO-8859-1 superscript digits as COM/LPT
+        // device-number aliases as well.
+        stem.as_str(),
+        "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+    ) || matches!(
+        stem.as_str(),
+        "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    ) {
+        return Err("component uses a reserved Windows device name");
+    }
+
+    Ok(())
+}
+
 fn is_safe_platform_path_component(value: &str) -> bool {
     #[cfg(not(windows))]
     {
@@ -810,8 +1305,31 @@ fn refresh_update_error(
 mod tests {
     use super::*;
 
+    #[derive(Serialize)]
+    struct TestWorkspaceConfig<'a> {
+        version: u32,
+        paths: Vec<TestWorkspacePathRule<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct TestWorkspacePathRule<'a> {
+        pattern: &'a str,
+        path: &'a str,
+    }
+
     fn write_workspace_config(root: &Path, body: &str) {
         fs::write(root.join(WORKSPACE_CONFIG_FILE), body).unwrap();
+    }
+
+    fn workspace_config_with_path(path: &str) -> String {
+        toml::to_string(&TestWorkspaceConfig {
+            version: WORKSPACE_CONFIG_VERSION,
+            paths: vec![TestWorkspacePathRule {
+                pattern: "^abc[0-9]+$",
+                path,
+            }],
+        })
+        .unwrap()
     }
 
     fn write_metadata_text(destination: &Path, body: &str) {
@@ -892,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn contest_resolver_requires_exactly_one_authoritative_mapping() {
+    fn contest_resolver_falls_back_without_a_match_and_rejects_ambiguity() {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_config(
             temp.path(),
@@ -906,17 +1424,309 @@ mod tests {
             resolve_contest_path(temp.path(), "abc466").unwrap(),
             temp.path().join("abc").join("abc466")
         );
-        assert!(resolve_contest_path(temp.path(), "agc001").is_err());
+        assert_eq!(
+            resolve_contest_path(temp.path(), "agc001").unwrap(),
+            temp.path().join("agc001")
+        );
 
         write_workspace_config(
             temp.path(),
             concat!(
                 "version = 1\n",
-                "[[paths]]\npattern = \"abc\"\npath = \"first\"\n",
-                "[[paths]]\npattern = \"^abc466$\"\npath = \"second\"\n",
+                "[[paths]]\npattern = \"abc\"\npath = \"same\"\n",
+                "[[paths]]\npattern = \"^abc466$\"\npath = \"same\"\n",
             ),
         );
-        assert!(resolve_contest_path(temp.path(), "abc466").is_err());
+        assert!(
+            resolve_contest_path(temp.path(), "abc466").is_err(),
+            "multiple matching rules remain ambiguous even when their paths are equal"
+        );
+    }
+
+    #[test]
+    fn contest_resolver_supports_portable_nested_workspace_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_config(
+            temp.path(),
+            &workspace_config_with_path("AtCoder/Contests/ABC"),
+        );
+
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc123").unwrap(),
+            temp.path()
+                .join("AtCoder")
+                .join("Contests")
+                .join("ABC")
+                .join("abc123")
+        );
+        assert!(
+            !temp.path().join("AtCoder").exists(),
+            "resolution alone must not create mapped directories"
+        );
+
+        write_workspace_config(temp.path(), &workspace_config_with_path("競技/ABC"));
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc123").unwrap(),
+            temp.path().join("競技").join("ABC").join("abc123")
+        );
+    }
+
+    #[test]
+    fn workspace_parser_rejects_nonportable_mapping_paths_on_every_os() {
+        for mapping in [
+            "",
+            ".",
+            "..",
+            "../ABC",
+            "ABC/../ARC",
+            "ABC/./ARC",
+            "/ABC",
+            "ABC/",
+            "ABC//ARC",
+            "ABC\\Nested",
+            "\\ABC",
+            "\\\\server\\share",
+            "//server/share",
+            "C:/ABC",
+            "C:ABC",
+            "NUL",
+            "NUL.txt",
+            "CON",
+            "con.cpp",
+            "COM1",
+            "COM¹",
+            "com².txt",
+            "COM³",
+            "LPT¹",
+            "lpt².log",
+            "LPT³",
+            "LPT9.log",
+            "CONIN$",
+            "CONOUT$.txt",
+            "name.",
+            "name ",
+            "name<bad",
+            "control\u{1f}name",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+            let bytes = workspace_config_with_path(mapping).into_bytes();
+            fs::write(&path, &bytes).unwrap();
+
+            let error = resolve_contest_path(temp.path(), "abc123")
+                .expect_err("nonportable mappings must fail during normal resolution");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "mapping {mapping:?}"
+            );
+            assert!(error.to_string().contains(&path.display().to_string()));
+            assert!(error.to_string().contains(&format!("{mapping:?}")));
+
+            assert_eq!(
+                initialize_workspace(temp.path()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "mapping {mapping:?}"
+            );
+            assert_eq!(fs::read(path).unwrap(), bytes, "mapping {mapping:?}");
+        }
+    }
+
+    #[test]
+    fn workspace_initializer_creates_the_exact_default_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+
+        assert_eq!(
+            initialize_workspace(temp.path()).unwrap(),
+            WorkspaceInitialization::Created(path.clone())
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            DEFAULT_WORKSPACE_CONFIG.as_bytes()
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert!(!bytes.contains(&b'\r'));
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("#   abc123 -> ABC/abc123\n")
+        );
+
+        let raw: WorkspaceConfigFile = toml::from_str(DEFAULT_WORKSPACE_CONFIG).unwrap();
+        assert_eq!(raw.version, WORKSPACE_CONFIG_VERSION);
+        assert_eq!(raw.paths.len(), 3);
+        assert_eq!(raw.paths[0].pattern, "^abc[0-9]+$");
+        assert_eq!(raw.paths[0].path, "ABC");
+        assert_eq!(raw.paths[1].pattern, "^arc[0-9]+$");
+        assert_eq!(raw.paths[1].path, "ARC");
+        assert_eq!(raw.paths[2].pattern, "^agc[0-9]+$");
+        assert_eq!(raw.paths[2].path, "AGC");
+
+        for (contest_id, relative) in [
+            ("abc123", PathBuf::from("ABC").join("abc123")),
+            ("arc123", PathBuf::from("ARC").join("arc123")),
+            ("agc123", PathBuf::from("AGC").join("agc123")),
+            ("typical90", PathBuf::from("typical90")),
+        ] {
+            assert_eq!(
+                resolve_contest_path(temp.path(), contest_id).unwrap(),
+                temp.path().join(relative)
+            );
+        }
+
+        let entries = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [OsStr::new(WORKSPACE_CONFIG_FILE)]);
+    }
+
+    #[test]
+    fn workspace_initializer_is_idempotent_without_changing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+
+        assert!(matches!(
+            initialize_workspace(temp.path()).unwrap(),
+            WorkspaceInitialization::Created(_)
+        ));
+        let original = fs::read(&path).unwrap();
+        assert_eq!(
+            initialize_workspace(temp.path()).unwrap(),
+            WorkspaceInitialization::AlreadyInitialized(path.clone())
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn workspace_initializer_preserves_custom_valid_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        let custom = concat!(
+            "# user customization\n",
+            "version = 1\n",
+            "[[paths]]\n",
+            "pattern = \"^abc[0-9]+$\"\n",
+            "path = \"AtCoder/ABC\"\n",
+        );
+        fs::write(&path, custom).unwrap();
+
+        assert_eq!(
+            initialize_workspace(temp.path()).unwrap(),
+            WorkspaceInitialization::AlreadyInitialized(path.clone())
+        );
+        assert_eq!(fs::read(&path).unwrap(), custom.as_bytes());
+        assert_eq!(
+            resolve_contest_path(temp.path(), "agc123").unwrap(),
+            temp.path().join("agc123")
+        );
+    }
+
+    #[test]
+    fn workspace_initializer_rejects_invalid_toml_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        let invalid = b"version = [\n";
+        fs::write(&path, invalid).unwrap();
+
+        let error = initialize_workspace(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&path.display().to_string()));
+        let context = error
+            .get_ref()
+            .expect("the path context should be retained");
+        assert!(
+            context.source().is_some(),
+            "the parser error should remain in the source chain"
+        );
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn workspace_initializer_rejects_unsupported_version_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        let unsupported = b"version = 999\npaths = []\n";
+        fs::write(&path, unsupported).unwrap();
+
+        let error = initialize_workspace(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported workspace config version: 999")
+        );
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert_eq!(fs::read(path).unwrap(), unsupported);
+    }
+
+    #[test]
+    fn workspace_initializer_rejects_invalid_mapping_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        let invalid = b"version = 1\n[[paths]]\npattern = \"[\"\npath = \"ABC\"\n";
+        fs::write(&path, invalid).unwrap();
+
+        assert_eq!(
+            initialize_workspace(temp.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn workspace_initializer_rejects_a_directory_target_without_touching_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        fs::create_dir(&path).unwrap();
+
+        let error = initialize_workspace(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(path.is_dir());
+        assert!(fs::read_dir(path).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn workspace_initializer_rejects_a_symlink_target_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        fs::write(external.path(), "external user data").unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        if !create_file_symlink(external.path(), &path) {
+            return;
+        }
+
+        let error = initialize_workspace(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read_to_string(external.path()).unwrap(),
+            "external user data"
+        );
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn default_creation_primitive_never_clobbers_an_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(WORKSPACE_CONFIG_FILE);
+        let existing = b"user data that must not be truncated";
+        fs::write(&path, existing).unwrap();
+
+        let error = create_default_workspace_config(temp.path(), &path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), existing);
+        let entries = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [OsStr::new(WORKSPACE_CONFIG_FILE)]);
     }
 
     #[test]
@@ -1131,6 +1941,120 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!external.path().join("abc466").exists());
+    }
+
+    #[test]
+    fn workspace_parent_preparation_creates_a_fully_missing_nested_hierarchy() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_config(
+            temp.path(),
+            &workspace_config_with_path("AtCoder/Contests/ABC"),
+        );
+        let destination = temp
+            .path()
+            .join("AtCoder")
+            .join("Contests")
+            .join("ABC")
+            .join("abc123");
+
+        ensure_workspace_contest_parent(temp.path(), "abc123", &destination).unwrap();
+
+        for directory in [
+            temp.path().join("AtCoder"),
+            temp.path().join("AtCoder").join("Contests"),
+            temp.path().join("AtCoder").join("Contests").join("ABC"),
+        ] {
+            assert!(
+                fs::symlink_metadata(directory)
+                    .unwrap()
+                    .file_type()
+                    .is_dir()
+            );
+        }
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn workspace_parent_preparation_accepts_partial_and_complete_real_hierarchies() {
+        for existing_components in [1, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            write_workspace_config(
+                temp.path(),
+                &workspace_config_with_path("AtCoder/Contests/ABC"),
+            );
+            let mapped = temp.path().join("AtCoder").join("Contests").join("ABC");
+            let existing = match existing_components {
+                1 => temp.path().join("AtCoder"),
+                3 => mapped.clone(),
+                _ => unreachable!(),
+            };
+            fs::create_dir_all(existing).unwrap();
+            let destination = mapped.join("abc123");
+
+            ensure_workspace_contest_parent(temp.path(), "abc123", &destination).unwrap();
+
+            assert!(fs::symlink_metadata(&mapped).unwrap().file_type().is_dir());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn workspace_parent_preparation_rejects_an_intermediate_file() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_config(
+            temp.path(),
+            &workspace_config_with_path("AtCoder/Contests/ABC"),
+        );
+        fs::create_dir(temp.path().join("AtCoder")).unwrap();
+        let blocking_file = temp.path().join("AtCoder").join("Contests");
+        fs::write(&blocking_file, "user data").unwrap();
+        let destination = blocking_file.join("ABC").join("abc123");
+
+        let resolution_error = resolve_contest_path(temp.path(), "abc123")
+            .expect_err("resolution must reject an existing intermediate file");
+        assert!(
+            resolution_error
+                .to_string()
+                .contains(&blocking_file.display().to_string())
+        );
+
+        let error = ensure_workspace_contest_parent(temp.path(), "abc123", &destination)
+            .expect_err("an intermediate file must not be traversed or replaced");
+
+        assert!(
+            error
+                .to_string()
+                .contains(&blocking_file.display().to_string())
+        );
+        assert_eq!(fs::read_to_string(blocking_file).unwrap(), "user data");
+    }
+
+    #[test]
+    fn workspace_mapping_rejects_an_existing_intermediate_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        write_workspace_config(
+            temp.path(),
+            &workspace_config_with_path("AtCoder/Contests/ABC"),
+        );
+        let mapped_link = temp.path().join("AtCoder");
+        if !create_directory_symlink(external.path(), &mapped_link) {
+            return;
+        }
+        let destination = mapped_link.join("Contests").join("ABC").join("abc123");
+
+        resolve_contest_path(temp.path(), "abc123")
+            .expect_err("resolution must reject an existing mapped symlink");
+        ensure_workspace_contest_parent(temp.path(), "abc123", &destination)
+            .expect_err("preparation must reject an existing mapped symlink");
+
+        assert!(fs::read_dir(external.path()).unwrap().next().is_none());
+        assert!(
+            fs::symlink_metadata(mapped_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

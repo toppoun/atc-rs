@@ -41,6 +41,10 @@ fn run() -> Result<(), AppError> {
     let mut reporter = TerminalReporter::default();
 
     match cli.command {
+        cli::Command::Workspace(cli::WorkspaceCommand::Init) => {
+            commands::init(&mut reporter)?;
+        }
+
         cli::Command::Contest(cli::ContestCommand::New { contest, language }) => {
             commands::new(&contest, language, &mut reporter)?;
         }

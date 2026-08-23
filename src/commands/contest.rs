@@ -17,7 +17,7 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
         contest_id,
         reporter,
         |destination| confirm_repair(destination).map_err(AppError::from),
-        create_contest,
+        |destination, contest_id, reporter| create_contest(&cwd, destination, contest_id, reporter),
         repair_contest,
         |destination, contest_id, _| super::watch_tui::watch_tui_at(destination, Some(contest_id)),
     )
@@ -72,6 +72,7 @@ where
 }
 
 fn create_contest(
+    root: &Path,
     destination: &Path,
     contest_id: &str,
     reporter: &mut dyn Reporter,
@@ -80,7 +81,7 @@ fn create_contest(
     let language = resolve_language(None, &config);
     let atcoder = create_atcoder_client()?;
 
-    super::new::new_at(destination, contest_id, language, &atcoder, reporter)
+    super::new::new_at_in_workspace(root, destination, contest_id, language, &atcoder, reporter)
 }
 
 fn repair_contest(

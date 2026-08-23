@@ -40,6 +40,42 @@ pub(super) fn new_at(
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
+    new_at_with_parent_preparation(
+        destination,
+        contest_id,
+        language,
+        atcoder,
+        reporter,
+        workspace::ensure_contest_parent,
+    )
+}
+
+pub(super) fn new_at_in_workspace(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    new_at_with_parent_preparation(
+        destination,
+        contest_id,
+        language,
+        atcoder,
+        reporter,
+        |destination| workspace::ensure_workspace_contest_parent(root, contest_id, destination),
+    )
+}
+
+fn new_at_with_parent_preparation(
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+    prepare_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), AppError> {
     if existing_contest_is_noop(destination)? {
         return Ok(());
     }
@@ -52,7 +88,7 @@ pub(super) fn new_at(
     } = fetch_contest_data(contest_id, atcoder, reporter)?;
     workspace::validate_contest_identity(&contest, contest_id)?;
 
-    workspace::ensure_contest_parent(destination)?;
+    prepare_parent(destination)?;
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

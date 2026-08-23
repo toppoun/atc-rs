@@ -1,6 +1,7 @@
 mod attempt_executor;
 mod contest;
 mod create;
+mod init;
 mod login;
 mod new;
 mod refresh;
@@ -14,6 +15,7 @@ mod watch_worker;
 
 pub(crate) use contest::contest;
 pub(crate) use create::create;
+pub(crate) use init::init;
 pub(crate) use login::login;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
@@ -32,7 +34,7 @@ use crate::ui::{Event, Reporter};
 #[cfg(test)]
 use create::create_at;
 #[cfg(test)]
-use new::new_at;
+use new::{new_at, new_at_in_workspace};
 #[cfg(test)]
 use refresh::{refresh_at, resolve_refresh_contest_id};
 #[cfg(test)]
