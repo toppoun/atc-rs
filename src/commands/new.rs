@@ -3,7 +3,7 @@ use crate::atcoder;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::language::Language;
-use crate::template::builtin_template;
+use crate::template::resolve_source_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use std::fs;
@@ -18,11 +18,15 @@ pub(crate) fn new(
     let cwd = std::env::current_dir()?;
     let destination = workspace::contest_path(&cwd, contest_id)?;
 
-    if existing_contest_is_noop(&destination)? {
+    let Some((language, template)) = prepare_new(
+        &destination,
+        cli_language,
+        Config::load,
+        resolve_source_template,
+    )?
+    else {
         return Ok(());
-    }
-    let config = Config::load()?;
-    let language = resolve_language(cli_language, &config);
+    };
 
     let atcoder = if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         atcoder::AtCoderClient::fixture(path)
@@ -30,13 +34,42 @@ pub(crate) fn new(
         atcoder::AtCoderClient::new()?
     };
 
-    new_at(&destination, contest_id, language, &atcoder, reporter)
+    new_at(
+        &destination,
+        contest_id,
+        language,
+        &template,
+        &atcoder,
+        reporter,
+    )
+}
+
+pub(super) fn prepare_new<L, R>(
+    destination: &Path,
+    cli_language: Option<Language>,
+    load_config: L,
+    resolve_template: R,
+) -> Result<Option<(Language, String)>, AppError>
+where
+    L: FnOnce() -> Result<Config, AppError>,
+    R: FnOnce(Language) -> Result<String, AppError>,
+{
+    if existing_contest_is_noop(destination)? {
+        return Ok(None);
+    }
+
+    let config = load_config()?;
+    let language = resolve_language(cli_language, &config);
+    let template = resolve_template(language)?;
+
+    Ok(Some((language, template)))
 }
 
 pub(super) fn new_at(
     destination: &Path,
     contest_id: &str,
     language: Language,
+    template: &str,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
@@ -44,6 +77,7 @@ pub(super) fn new_at(
         destination,
         contest_id,
         language,
+        template,
         atcoder,
         reporter,
         workspace::ensure_contest_parent,
@@ -55,6 +89,7 @@ pub(super) fn new_at_in_workspace(
     destination: &Path,
     contest_id: &str,
     language: Language,
+    template: &str,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
@@ -62,6 +97,7 @@ pub(super) fn new_at_in_workspace(
         destination,
         contest_id,
         language,
+        template,
         atcoder,
         reporter,
         |destination| workspace::ensure_workspace_contest_parent(root, contest_id, destination),
@@ -72,6 +108,7 @@ fn new_at_with_parent_preparation(
     destination: &Path,
     contest_id: &str,
     language: Language,
+    template: &str,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
     prepare_parent: impl FnOnce(&Path) -> io::Result<()>,
@@ -79,8 +116,6 @@ fn new_at_with_parent_preparation(
     if existing_contest_is_noop(destination)? {
         return Ok(());
     }
-
-    let template = builtin_template(language);
 
     let FetchedContestData {
         contest,

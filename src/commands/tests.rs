@@ -11,6 +11,10 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+fn builtin_source_template(language: Language) -> Result<String, AppError> {
+    Ok(builtin_template(language).to_owned())
+}
+
 fn create_directory_symlink(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);
@@ -309,9 +313,18 @@ fn language_resolution_uses_cli_then_config_then_builtin_default() {
 #[test]
 fn create_cpp_source_outside_a_workspace_uses_the_builtin_default() {
     let temp = tempfile::tempdir().unwrap();
+    let templates_dir = temp.path().join("missing-templates");
     let mut reporter = RecordingReporter::default();
 
-    create_at(temp.path(), "A", None, &Config::default(), &mut reporter).unwrap();
+    create_at(
+        temp.path(),
+        "A",
+        None,
+        &Config::default(),
+        |language| resolve_source_template_in(&templates_dir, language),
+        &mut reporter,
+    )
+    .unwrap();
 
     let source = temp.path().join("A.cpp");
     assert_eq!(
@@ -330,11 +343,20 @@ fn create_cpp_source_outside_a_workspace_uses_the_builtin_default() {
 #[test]
 fn create_python_source_uses_config_and_the_builtin_template() {
     let temp = tempfile::tempdir().unwrap();
+    let templates_dir = temp.path().join("missing-templates");
     let mut config = Config::default();
     config.defaults.language = Language::Python;
     let mut reporter = RecordingReporter::default();
 
-    create_at(temp.path(), "A", None, &config, &mut reporter).unwrap();
+    create_at(
+        temp.path(),
+        "A",
+        None,
+        &config,
+        |language| resolve_source_template_in(&templates_dir, language),
+        &mut reporter,
+    )
+    .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(temp.path().join("A.py")).unwrap(),
@@ -355,12 +377,39 @@ fn create_cli_language_overrides_config_language() {
         "A",
         Some(Language::Cpp),
         &config,
+        builtin_source_template,
         &mut reporter,
     )
     .unwrap();
 
     assert!(temp.path().join("A.cpp").is_file());
     assert!(!temp.path().join("A.py").exists());
+}
+
+#[test]
+fn create_uses_the_selected_override_and_ignores_a_broken_unselected_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let templates_dir = temp.path().join("templates");
+    std::fs::create_dir(&templates_dir).unwrap();
+    std::fs::create_dir(templates_dir.join("cpp.cpp")).unwrap();
+    std::fs::write(templates_dir.join("python.py"), "print('custom create')\n").unwrap();
+    let mut reporter = RecordingReporter::default();
+
+    create_at(
+        temp.path(),
+        "A",
+        Some(Language::Python),
+        &Config::default(),
+        |language| resolve_source_template_in(&templates_dir, language),
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("A.py")).unwrap(),
+        "print('custom create')\n"
+    );
+    assert!(!temp.path().join("A.cpp").exists());
 }
 
 #[test]
@@ -381,6 +430,7 @@ fn create_does_not_read_or_modify_workspace_data() {
         "not-in-metadata",
         None,
         &Config::default(),
+        builtin_source_template,
         &mut reporter,
     )
     .unwrap();
@@ -400,8 +450,15 @@ fn create_preserves_an_existing_source_and_reports_only_success() {
     std::fs::write(&source, "user source").unwrap();
     let mut reporter = RecordingReporter::default();
 
-    let error = create_at(temp.path(), "A", None, &Config::default(), &mut reporter)
-        .expect_err("an existing source must not be overwritten");
+    let error = create_at(
+        temp.path(),
+        "A",
+        None,
+        &Config::default(),
+        builtin_source_template,
+        &mut reporter,
+    )
+    .expect_err("an existing source must not be overwritten");
 
     assert!(matches!(
         error,
@@ -429,8 +486,15 @@ fn create_rejects_unsafe_names_without_writing_outside_the_destination() {
     let mut reporter = RecordingReporter::default();
 
     for name in unsafe_names {
-        let error = create_at(&destination, &name, None, &Config::default(), &mut reporter)
-            .expect_err("an unsafe name must be rejected");
+        let error = create_at(
+            &destination,
+            &name,
+            None,
+            &Config::default(),
+            builtin_source_template,
+            &mut reporter,
+        )
+        .expect_err("an unsafe name must be rejected");
         assert!(matches!(
             error,
             AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
@@ -896,12 +960,15 @@ fn new_flow_runs_entirely_from_fixtures() {
     let mut reporter = NullReporter;
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("abc466");
+    let templates_dir = temp.path().join("missing-templates");
+    let template = resolve_source_template_in(&templates_dir, Language::Cpp).unwrap();
     let client = atcoder::AtCoderClient::fixture(fixture_root());
 
     new_at(
         &destination,
         "abc466",
         Language::Cpp,
+        &template,
         &client,
         &mut reporter,
     )
@@ -943,6 +1010,7 @@ fn new_at_creates_a_missing_mapped_parent_directory() {
         &destination,
         "abc466",
         Language::Cpp,
+        builtin_template(Language::Cpp),
         &client,
         &mut reporter,
     )
@@ -976,6 +1044,7 @@ fn workspace_new_flow_creates_a_nested_mapped_parent_hierarchy() {
         &destination,
         "abc466",
         Language::Cpp,
+        builtin_template(Language::Cpp),
         &client,
         &mut reporter,
     )
@@ -1010,6 +1079,7 @@ fn new_at_rejects_a_symlinked_contest_destination() {
         &destination,
         "abc466",
         Language::Cpp,
+        builtin_template(Language::Cpp),
         &client,
         &mut reporter,
     )
@@ -1033,6 +1103,7 @@ fn new_flow_creates_python_sources_from_the_builtin_template() {
         &destination,
         "abc466",
         Language::Python,
+        builtin_template(Language::Python),
         &client,
         &mut reporter,
     )
@@ -1051,6 +1122,81 @@ fn new_flow_creates_python_sources_from_the_builtin_template() {
 }
 
 #[test]
+fn new_flow_uses_the_cli_selected_override_and_ignores_a_broken_unselected_override() {
+    let mut reporter = NullReporter;
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc500");
+    let templates_dir = temp.path().join("templates");
+    std::fs::create_dir(&templates_dir).unwrap();
+    std::fs::create_dir(templates_dir.join("cpp.cpp")).unwrap();
+    std::fs::write(templates_dir.join("python.py"), "print('custom new')\n").unwrap();
+    let prepared = prepare_new(
+        &destination,
+        Some(Language::Python),
+        || Ok(Config::default()),
+        |language| resolve_source_template_in(&templates_dir, language),
+    )
+    .unwrap()
+    .expect("missing destination should be prepared");
+    let fixtures = temp.path().join("fixtures");
+    create_single_problem_fixture(&fixtures, "abc500");
+    let client = atcoder::AtCoderClient::fixture(&fixtures);
+
+    new_at(
+        &destination,
+        "abc500",
+        prepared.0,
+        &prepared.1,
+        &client,
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(destination.join("A.py")).unwrap(),
+        "print('custom new')\n"
+    );
+    assert!(!destination.join("A.cpp").exists());
+}
+
+#[test]
+fn new_selected_broken_override_errors_during_local_preparation() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc500");
+    let templates_dir = temp.path().join("templates");
+    std::fs::create_dir(&templates_dir).unwrap();
+    std::fs::create_dir(templates_dir.join("cpp.cpp")).unwrap();
+
+    let error = prepare_new(
+        &destination,
+        None,
+        || Ok(Config::default()),
+        |language| resolve_source_template_in(&templates_dir, language),
+    )
+    .expect_err("broken selected override must fail before a client is created");
+
+    assert!(error.to_string().contains("regular file"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn new_existing_destination_short_circuits_before_config_and_template_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc500");
+    std::fs::create_dir(&destination).unwrap();
+
+    let prepared = prepare_new(
+        &destination,
+        None,
+        || -> Result<Config, AppError> { panic!("config must not be loaded") },
+        |_| -> Result<String, AppError> { panic!("template must not be resolved") },
+    )
+    .unwrap();
+
+    assert!(prepared.is_none());
+}
+
+#[test]
 fn existing_contest_is_a_noop_before_fixture_access() {
     let mut reporter = NullReporter;
     let temp = tempfile::tempdir().expect("temporary directory should be created");
@@ -1064,6 +1210,7 @@ fn existing_contest_is_a_noop_before_fixture_access() {
         &destination,
         "abc466",
         Language::Cpp,
+        builtin_template(Language::Cpp),
         &client,
         &mut reporter,
     )
@@ -1098,6 +1245,7 @@ fn failed_workspace_build_does_not_leave_partial_contest() {
         &destination,
         "broken",
         Language::Cpp,
+        builtin_template(Language::Cpp),
         &client,
         &mut reporter,
     )

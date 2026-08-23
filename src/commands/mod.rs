@@ -34,7 +34,7 @@ use crate::ui::{Event, Reporter};
 #[cfg(test)]
 use create::create_at;
 #[cfg(test)]
-use new::{new_at, new_at_in_workspace};
+use new::{new_at, new_at_in_workspace, prepare_new};
 #[cfg(test)]
 use refresh::{refresh_at, resolve_refresh_contest_id};
 #[cfg(test)]
@@ -48,7 +48,7 @@ use crate::config::RunnerConfig;
 #[cfg(test)]
 use crate::runner::{self, ExecutionOutcome};
 #[cfg(test)]
-use crate::template::builtin_template;
+use crate::template::{builtin_template, resolve_source_template_in};
 #[cfg(test)]
 use std::io;
 #[cfg(test)]

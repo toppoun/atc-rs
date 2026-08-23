@@ -2,6 +2,7 @@ use super::resolve_language;
 use crate::atcoder;
 use crate::config::Config;
 use crate::error::AppError;
+use crate::template::resolve_source_template;
 use crate::ui::Reporter;
 use crate::workspace::{self, ContestMetadataHealth};
 use std::io::{self, BufRead, Write};
@@ -77,11 +78,45 @@ fn create_contest(
     contest_id: &str,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    let config = Config::load()?;
-    let language = resolve_language(None, &config);
-    let atcoder = create_atcoder_client()?;
+    create_contest_with(
+        root,
+        destination,
+        contest_id,
+        reporter,
+        Config::load,
+        resolve_source_template,
+        create_atcoder_client,
+    )
+}
 
-    super::new::new_at_in_workspace(root, destination, contest_id, language, &atcoder, reporter)
+fn create_contest_with<L, R, C>(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    reporter: &mut dyn Reporter,
+    load_config: L,
+    resolve_template: R,
+    create_client: C,
+) -> Result<(), AppError>
+where
+    L: FnOnce() -> Result<Config, AppError>,
+    R: FnOnce(crate::language::Language) -> Result<String, AppError>,
+    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+{
+    let config = load_config()?;
+    let language = resolve_language(None, &config);
+    let template = resolve_template(language)?;
+    let atcoder = create_client()?;
+
+    super::new::new_at_in_workspace(
+        root,
+        destination,
+        contest_id,
+        language,
+        &template,
+        &atcoder,
+        reporter,
+    )
 }
 
 fn repair_contest(
@@ -135,6 +170,7 @@ mod tests {
     use crate::ui::NullReporter;
     use std::cell::RefCell;
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::rc::Rc;
 
     fn save_contest(destination: &Path, contest_id: &str) {
@@ -258,6 +294,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.borrow().as_slice(), ["create", "watch"]);
+    }
+
+    #[test]
+    fn missing_contest_creation_uses_the_source_template_resolver() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let templates_dir = temp.path().join("templates");
+        std::fs::create_dir(&templates_dir).unwrap();
+        std::fs::write(templates_dir.join("cpp.cpp"), "// contest custom\n").unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut reporter = NullReporter;
+
+        create_contest_with(
+            temp.path(),
+            &destination,
+            "abc466",
+            &mut reporter,
+            || Ok(Config::default()),
+            |language| crate::template::resolve_source_template_in(&templates_dir, language),
+            || Ok(atcoder::AtCoderClient::fixture(&fixtures)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("A.cpp")).unwrap(),
+            "// contest custom\n"
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use etcetera::{BaseStrategy, choose_base_strategy};
 use std::path::PathBuf;
 
+use crate::error::AppError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CookieLocation {
     pub(crate) platform_base: PathBuf,
@@ -14,6 +16,10 @@ pub fn config_dir() -> Result<PathBuf, etcetera::HomeDirError> {
 
 pub fn config_file() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+pub(crate) fn source_templates_dir() -> Result<PathBuf, AppError> {
+    Ok(config_dir()?.join("templates"))
 }
 
 pub fn cache_dir() -> Result<PathBuf, etcetera::HomeDirError> {
@@ -63,10 +69,12 @@ mod tests {
     fn config_file_is_under_atc_config_directory() {
         let directory = config_dir().unwrap();
         let file = config_file().unwrap();
+        let templates = source_templates_dir().unwrap();
 
         assert!(directory.is_absolute());
         assert_eq!(directory.file_name().unwrap(), "atc");
         assert_eq!(file, directory.join("config.toml"));
+        assert_eq!(templates, directory.join("templates"));
     }
 
     #[test]
