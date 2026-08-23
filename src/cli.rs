@@ -1,6 +1,6 @@
 use crate::language::Language;
+use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::num::NonZeroU64;
-use clap::{Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 const LOGO: &str = r#"
 
@@ -125,27 +125,67 @@ pub enum RunTestCommand {
     },
 
     /// Find counterexamples with stress testing
-    Stress {
-        problem: String,
+    Stress(StressArgs),
+}
 
-        #[arg(short = 'c', long)]
-        contest: Option<String>,
+#[derive(Args, Debug)]
+#[command(
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    disable_help_subcommand = true
+)]
+pub struct StressArgs {
+    #[command(subcommand)]
+    pub command: Option<StressSubcommand>,
 
-        #[arg(short = 'l', long = "language")]
-        language: Option<Language>,
+    #[command(flatten)]
+    pub run: StressRunArgs,
+}
 
-        #[arg(short, long)]
-        debug: bool,
+#[derive(Subcommand, Debug)]
+pub enum StressSubcommand {
+    /// Initialize generator and brute-force helper files
+    Init(StressInitArgs),
+}
 
-        #[arg(long, conflicts_with = "forever")]
-        count: Option<NonZeroU64>,
+#[derive(Args, Debug)]
+pub struct StressInitArgs {
+    pub problem: String,
 
-        #[arg(long, conflicts_with = "count")]
-        forever: bool,
+    #[arg(short = 'c', long)]
+    pub contest: Option<String>,
+}
 
-        #[arg(long)]
-        seed: Option<u64>,
-    },
+#[derive(Args, Debug)]
+pub struct StressRunArgs {
+    #[arg(required = true, value_parser = parse_stress_run_problem)]
+    pub problem: Option<String>,
+
+    #[arg(short = 'c', long)]
+    pub contest: Option<String>,
+
+    #[arg(short = 'l', long = "language")]
+    pub language: Option<Language>,
+
+    #[arg(short, long)]
+    pub debug: bool,
+
+    #[arg(long, conflicts_with = "forever")]
+    pub count: Option<NonZeroU64>,
+
+    #[arg(long, conflicts_with = "count")]
+    pub forever: bool,
+
+    #[arg(long)]
+    pub seed: Option<u64>,
+}
+
+fn parse_stress_run_problem(value: &str) -> Result<String, String> {
+    if value == "init" {
+        return Err("`init` is reserved for `atc stress init <PROBLEM>`".to_string());
+    }
+
+    Ok(value.to_string())
 }
 
 // ============================================================
@@ -291,8 +331,21 @@ mod tests {
             .clone();
         let stress_help = stress.render_long_help().to_string();
         assert!(stress_help.contains("Usage: atc stress [OPTIONS] <PROBLEM>"));
+        assert!(stress_help.contains("atc stress <COMMAND>"));
+        assert!(stress_help.contains("init"));
         for option in ["--count", "--forever", "--seed"] {
             assert!(stress_help.contains(option));
+        }
+
+        let mut init = stress
+            .find_subcommand("init")
+            .expect("stress init subcommand should exist")
+            .clone();
+        let init_help = init.render_long_help().to_string();
+        assert!(init_help.contains("Usage: atc stress init [OPTIONS] <PROBLEM>"));
+        assert!(init_help.contains("-c, --contest <CONTEST>"));
+        for run_option in ["--language", "--debug", "--count", "--forever", "--seed"] {
+            assert!(!init_help.contains(run_option));
         }
     }
 
@@ -520,66 +573,155 @@ mod tests {
     #[test]
     fn parses_stress_options() {
         let cli = Cli::try_parse_from(["atc-rs", "stress", "A"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::RunTest(RunTestCommand::Stress {
-                problem,
-                contest: None,
-                language: None,
-                debug: false,
-                count: None,
-                forever: false,
-                seed: None,
-            }) if problem == "A"
-        ));
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(args.command.is_none());
+        assert_eq!(args.run.problem.as_deref(), Some("A"));
+        assert_eq!(args.run.contest, None);
+        assert_eq!(args.run.language, None);
+        assert!(!args.run.debug);
+        assert_eq!(args.run.count, None);
+        assert!(!args.run.forever);
+        assert_eq!(args.run.seed, None);
 
         let cli = Cli::try_parse_from([
-            "atc-rs",
-            "stress",
-            "B",
-            "-c",
-            "abc466",
-            "-l",
-            "cpp",
-            "--debug",
-            "--count",
-            "1000",
-            "--seed",
-            "42",
+            "atc-rs", "stress", "B", "-c", "abc466", "-l", "cpp", "--debug", "--count", "1000",
+            "--seed", "42",
         ])
         .unwrap();
 
-        assert!(matches!(
-            cli.command,
-            Command::RunTest(RunTestCommand::Stress {
-                problem,
-                contest: Some(contest),
-                language: Some(Language::Cpp),
-                debug: true,
-                count: Some(count),
-                forever: false,
-                seed: Some(42),
-            }) if problem == "B" && contest == "abc466" && count.get() == 1000
-        ));
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(args.command.is_none());
+        assert_eq!(args.run.problem.as_deref(), Some("B"));
+        assert_eq!(args.run.contest.as_deref(), Some("abc466"));
+        assert_eq!(args.run.language, Some(Language::Cpp));
+        assert!(args.run.debug);
+        assert_eq!(args.run.count.map(NonZeroU64::get), Some(1000));
+        assert!(!args.run.forever);
+        assert_eq!(args.run.seed, Some(42));
     }
 
     #[test]
     fn stress_count_and_forever_are_exclusive_and_count_must_be_nonzero() {
         assert!(
-            Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "10", "--forever"])
-                .is_err()
+            Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "10", "--forever"]).is_err()
         );
         assert!(Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "0"]).is_err());
 
         let cli = Cli::try_parse_from(["atc-rs", "stress", "A", "--forever"]).unwrap();
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(args.run.forever);
+        assert_eq!(args.run.count, None);
+    }
+
+    #[test]
+    fn parses_stress_init_and_reserves_init_as_the_first_token() {
+        let cli = Cli::try_parse_from(["atc", "stress", "init", "A"]).unwrap();
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(args.run.problem.is_none());
         assert!(matches!(
-            cli.command,
-            Command::RunTest(RunTestCommand::Stress {
-                forever: true,
-                count: None,
-                ..
-            })
+            args.command,
+            Some(StressSubcommand::Init(StressInitArgs {
+                problem,
+                contest: None,
+            })) if problem == "A"
         ));
+
+        let cli =
+            Cli::try_parse_from(["atc", "stress", "init", "a", "--contest", "abc466"]).unwrap();
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(matches!(
+            args.command,
+            Some(StressSubcommand::Init(StressInitArgs {
+                problem,
+                contest: Some(contest),
+            })) if problem == "a" && contest == "abc466"
+        ));
+
+        assert!(Cli::try_parse_from(["atc", "stress", "init"]).is_err());
+    }
+
+    #[test]
+    fn stress_init_rejects_run_options_in_every_position() {
+        for suffix in [
+            &["--count", "10"][..],
+            &["--forever"][..],
+            &["--seed", "1"][..],
+            &["--language", "cpp"][..],
+            &["--debug"][..],
+        ] {
+            let mut args = vec!["atc", "stress", "init", "A"];
+            args.extend_from_slice(suffix);
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "run option leaked into init mode: {args:?}"
+            );
+        }
+
+        for prefix in [
+            &["--count", "10"][..],
+            &["--forever"][..],
+            &["--seed", "1"][..],
+            &["--language", "cpp"][..],
+            &["--debug"][..],
+            &["--contest", "abc466"][..],
+        ] {
+            let mut args = vec!["atc", "stress"];
+            args.extend_from_slice(prefix);
+            args.extend_from_slice(&["init", "A"]);
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "parent option leaked into init mode: {args:?}"
+            );
+        }
+
+        for prefix in [
+            &["--count", "10"][..],
+            &["--forever"][..],
+            &["--seed", "1"][..],
+            &["--language", "cpp"][..],
+            &["--debug"][..],
+            &["--contest", "abc466"][..],
+        ] {
+            let mut args = vec!["atc", "stress"];
+            args.extend_from_slice(prefix);
+            args.push("init");
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "parent option made reserved `init` a run problem: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stress_help_modes_are_unambiguous_without_reserving_help() {
+        let cli = Cli::try_parse_from(["atc", "stress", "help"]).unwrap();
+        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+            panic!("expected stress command");
+        };
+        assert!(args.command.is_none());
+        assert_eq!(args.run.problem.as_deref(), Some("help"));
+
+        for args in [
+            &["atc", "stress", "--help"][..],
+            &["atc", "stress", "init", "--help"][..],
+        ] {
+            let error = Cli::command()
+                .try_get_matches_from(args)
+                .expect_err("help should stop in clap");
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert_eq!(error.exit_code(), 0);
+            assert!(!error.use_stderr());
+        }
     }
 
     #[test]

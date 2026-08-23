@@ -1,5 +1,6 @@
 use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
+use crate::safe_file;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::ambient_authority;
 #[cfg(windows)]
@@ -293,30 +294,9 @@ fn load_existing_workspace_config(
     parse_workspace_config(&path, &content).map(Some)
 }
 
-fn create_default_workspace_config(root: &Path, path: &Path) -> io::Result<()> {
-    // Build and flush the complete file beside its destination before installing it. The
-    // no-clobber persist closes the check/create race without ever truncating the final path.
-    let mut staging = tempfile::Builder::new()
-        .prefix(".atc-workspace-")
-        .tempfile_in(root)
-        .map_err(|error| workspace_config_error(path, "stage", error.kind(), error))?;
-
-    staging
-        .write_all(DEFAULT_WORKSPACE_CONFIG.as_bytes())
-        .map_err(|error| workspace_config_error(path, "write", error.kind(), error))?;
-    staging
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| workspace_config_error(path, "flush", error.kind(), error))?;
-
-    match staging.persist_noclobber(path) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let tempfile::PersistError { error, file } = error;
-            drop(file);
-            Err(workspace_config_error(path, "create", error.kind(), error))
-        }
-    }
+fn create_default_workspace_config(path: &Path) -> io::Result<()> {
+    safe_file::install_noclobber(path, DEFAULT_WORKSPACE_CONFIG.as_bytes(), ".atc-workspace-")
+        .map_err(|error| workspace_config_error(path, "create", error.kind(), error))
 }
 
 pub fn initialize_workspace(root: &Path) -> io::Result<WorkspaceInitialization> {
@@ -329,7 +309,7 @@ pub fn initialize_workspace(root: &Path) -> io::Result<WorkspaceInitialization> 
         return Ok(WorkspaceInitialization::AlreadyInitialized(path));
     }
 
-    match create_default_workspace_config(root, &path) {
+    match create_default_workspace_config(&path) {
         Ok(()) => Ok(WorkspaceInitialization::Created(path)),
         Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
             match load_existing_workspace_config(root, &directory)? {
@@ -1718,7 +1698,7 @@ mod tests {
         let existing = b"user data that must not be truncated";
         fs::write(&path, existing).unwrap();
 
-        let error = create_default_workspace_config(temp.path(), &path).unwrap_err();
+        let error = create_default_workspace_config(&path).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&path).unwrap(), existing);

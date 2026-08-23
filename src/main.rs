@@ -16,6 +16,7 @@ mod language;
 mod model;
 mod paths;
 mod runner;
+mod safe_file;
 mod stress;
 mod template;
 mod tui;
@@ -74,26 +75,27 @@ fn run() -> Result<(), AppError> {
             }
         }
 
-        cli::Command::RunTest(cli::RunTestCommand::Stress {
-            problem,
-            contest,
-            language,
-            debug,
-            count,
-            forever,
-            seed,
-        }) => {
-            commands::stress(
-                &problem,
-                contest.as_deref(),
-                language,
-                debug,
-                count,
-                forever,
-                seed,
-                &mut reporter,
-            )?;
-        }
+        cli::Command::RunTest(cli::RunTestCommand::Stress(args)) => match args.command {
+            Some(cli::StressSubcommand::Init(init)) => {
+                commands::stress_init(&init.problem, init.contest.as_deref(), &mut reporter)?;
+            }
+            None => {
+                let problem = args
+                    .run
+                    .problem
+                    .expect("clap requires a problem when no stress subcommand is selected");
+                commands::stress(
+                    &problem,
+                    args.run.contest.as_deref(),
+                    args.run.language,
+                    args.run.debug,
+                    args.run.count,
+                    args.run.forever,
+                    args.run.seed,
+                    &mut reporter,
+                )?;
+            }
+        },
 
         cli::Command::Files(cli::FileCommand::Create { name, language }) => {
             commands::create(&name, language, &mut reporter)?;

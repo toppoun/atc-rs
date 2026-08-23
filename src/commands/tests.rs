@@ -172,6 +172,15 @@ impl Reporter for RecordingReporter {
             Event::SourceCreated { path } => {
                 format!("source-created:{}", path.display())
             }
+            Event::StressFileCreated { path } => {
+                format!("stress-file-created:{}", path.display())
+            }
+            Event::StressFileExists { path } => {
+                format!("stress-file-exists:{}", path.display())
+            }
+            Event::StressFilesAlreadyInitialized { problem_index } => {
+                format!("stress-files-already-initialized:{problem_index}")
+            }
             Event::WatchStarted { destination } => {
                 format!("watch-started:{}", destination.display())
             }

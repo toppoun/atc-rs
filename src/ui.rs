@@ -98,6 +98,15 @@ pub enum Event<'a> {
     SourceCreated {
         path: &'a Path,
     },
+    StressFileCreated {
+        path: &'a Path,
+    },
+    StressFileExists {
+        path: &'a Path,
+    },
+    StressFilesAlreadyInitialized {
+        problem_index: &'a str,
+    },
     WatchStarted {
         destination: &'a Path,
     },
@@ -348,6 +357,15 @@ impl Reporter for TerminalReporter {
             }
             Event::SourceCreated { path } => {
                 println!("Created {}", path.display());
+            }
+            Event::StressFileCreated { path } => {
+                println!("Created {}", path.display());
+            }
+            Event::StressFileExists { path } => {
+                println!("Exists {}", path.display());
+            }
+            Event::StressFilesAlreadyInitialized { problem_index } => {
+                println!("Stress files already initialized for {problem_index}.");
             }
             Event::WatchStarted { destination } => {
                 println!("Watching {}", destination.display());

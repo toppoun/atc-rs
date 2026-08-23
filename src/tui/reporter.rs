@@ -204,6 +204,9 @@ impl Reporter for ChannelReporter {
             | Event::WorkspaceInitialized { .. }
             | Event::WorkspaceAlreadyInitialized { .. }
             | Event::SourceCreated { .. }
+            | Event::StressFileCreated { .. }
+            | Event::StressFileExists { .. }
+            | Event::StressFilesAlreadyInitialized { .. }
             | Event::WatchStarted { .. }
             | Event::WatchSourceChanged { .. } => {}
         }
