@@ -206,6 +206,8 @@ impl Reporter for ChannelReporter {
             | Event::SourceCreated { .. }
             | Event::TemplateFileCreated { .. }
             | Event::TemplateFileExists { .. }
+            | Event::ConfigFileCreated { .. }
+            | Event::ConfigFileExists { .. }
             | Event::StressFileCreated { .. }
             | Event::StressFileExists { .. }
             | Event::StressFilesAlreadyInitialized { .. }
@@ -253,13 +255,15 @@ mod tests {
     }
 
     #[test]
-    fn ignores_cli_only_template_initialization_events() {
+    fn ignores_cli_only_initialization_events() {
         let (tx, rx) = mpsc::channel();
         let mut reporter = ChannelReporter::new(1, 0, tx);
         let path = std::path::Path::new("templates/cpp.cpp");
 
         reporter.report(Event::TemplateFileCreated { path });
         reporter.report(Event::TemplateFileExists { path });
+        reporter.report(Event::ConfigFileCreated { path });
+        reporter.report(Event::ConfigFileExists { path });
 
         assert!(rx.try_recv().is_err());
         reporter.finish().unwrap();

@@ -40,11 +40,19 @@ pub(crate) fn optional_directory_exists(path: &Path, kind: &str) -> Result<bool,
 }
 
 pub(crate) fn ensure_directory(path: &Path, kind: &str) -> Result<(), AppError> {
+    ensure_directory_with(path, kind, &mut |path| fs::create_dir_all(path))
+}
+
+fn ensure_directory_with(
+    path: &Path,
+    kind: &str,
+    create: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> Result<(), AppError> {
     if optional_directory_exists(path, kind)? {
         return Ok(());
     }
 
-    if let Err(create_error) = fs::create_dir_all(path) {
+    if let Err(create_error) = create(path) {
         match optional_directory_exists(path, kind) {
             Ok(true) => return Ok(()),
             Err(validation_error) => return Err(validation_error),
@@ -132,5 +140,85 @@ impl fmt::Display for ContextualIoError {
 impl std::error::Error for ContextualIoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create directory symlink: {error}"),
+        }
+    }
+
+    #[test]
+    fn directory_creation_race_accepts_a_directory_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("atc");
+        let mut create = |path: &Path| {
+            fs::create_dir(path).unwrap();
+            Err(io::ErrorKind::AlreadyExists.into())
+        };
+
+        ensure_directory_with(&directory, "test directory", &mut create).unwrap();
+
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn directory_creation_race_accepts_a_link_to_directory_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("managed");
+        let directory = temp.path().join("atc");
+        fs::create_dir(&target).unwrap();
+        let probe = temp.path().join("symlink-probe");
+        if !create_directory_symlink(&target, &probe) {
+            return;
+        }
+        fs::remove_dir(&probe).unwrap();
+        let mut create = |path: &Path| {
+            assert!(create_directory_symlink(&target, path));
+            Err(io::ErrorKind::AlreadyExists.into())
+        };
+
+        ensure_directory_with(&directory, "test directory", &mut create).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&directory)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn directory_creation_race_rejects_and_preserves_a_wrong_type_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("atc");
+        let mut create = |path: &Path| {
+            fs::write(path, b"race winner").unwrap();
+            Err(io::ErrorKind::AlreadyExists.into())
+        };
+
+        let error = ensure_directory_with(&directory, "test directory", &mut create).unwrap_err();
+
+        assert!(error.to_string().contains("must resolve to a directory"));
+        assert_eq!(fs::read(directory).unwrap(), b"race winner");
     }
 }

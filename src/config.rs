@@ -5,7 +5,12 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(Debug, Deserialize)]
+pub(crate) const INITIAL_CONFIG: &str = "# atc configuration\n\
+#\n\
+# Add only the settings you want to override.\n\
+# See the configuration documentation for available settings.\n";
+
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
 pub struct Config {
@@ -16,7 +21,7 @@ pub struct Config {
     pub runner: RunnerConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     #[serde(
@@ -47,7 +52,7 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunnerConfig {
     pub python: String,
@@ -90,16 +95,18 @@ impl Config {
         let text =
             std::fs::read_to_string(path).map_err(|err| config_io_error(path, "read", err))?;
 
-        let config = toml::from_str::<Config>(&text).map_err(|err| {
+        Self::parse(&text).map_err(|err| config_io_error(path, "parse and validate", err).into())
+    }
+
+    pub(crate) fn parse(contents: &str) -> io::Result<Self> {
+        let config = toml::from_str::<Config>(contents).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("failed to parse config {}: {err}", path.display()),
+                format!("failed to parse config: {err}"),
             )
         })?;
 
-        config
-            .validate()
-            .map_err(|err| config_io_error(path, "validate", err))?;
+        config.validate()?;
 
         Ok(config)
     }
@@ -160,6 +167,19 @@ mod tests {
         let config = Config::load_from(&temp.path().join("config.toml")).unwrap();
 
         assert_eq!(config.defaults.language, Language::Cpp);
+    }
+
+    #[test]
+    fn initial_comments_only_config_has_exact_bytes_and_effective_defaults() {
+        assert_eq!(
+            INITIAL_CONFIG.as_bytes(),
+            b"# atc configuration\n\
+#\n\
+# Add only the settings you want to override.\n\
+# See the configuration documentation for available settings.\n"
+        );
+        assert!(!INITIAL_CONFIG.as_bytes().contains(&b'\r'));
+        assert_eq!(Config::parse(INITIAL_CONFIG).unwrap(), Config::default());
     }
 
     #[test]
@@ -253,6 +273,21 @@ mod tests {
         );
         assert_eq!(config.runner.timeout_seconds, 3.5);
         assert_eq!(config.runner.compile_timeout_seconds, 10.0);
+    }
+
+    #[test]
+    fn dotted_and_table_overrides_parse_equivalently() {
+        let dotted =
+            Config::parse("defaults.language = \"python\"\nrunner.timeout_seconds = 3.0\n")
+                .unwrap();
+        let tables =
+            Config::parse("[defaults]\nlanguage = \"python\"\n[runner]\ntimeout_seconds = 3.0\n")
+                .unwrap();
+
+        assert_eq!(dotted, tables);
+        assert_eq!(dotted.defaults.language, Language::Python);
+        assert_eq!(dotted.runner.timeout_seconds, 3.0);
+        assert_eq!(dotted.runner.python, RunnerConfig::default().python);
     }
 
     #[test]

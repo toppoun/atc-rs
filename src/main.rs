@@ -47,6 +47,12 @@ fn run() -> Result<(), AppError> {
             commands::init(&mut reporter)?;
         }
 
+        cli::Command::Configuration(cli::ConfigurationCommand::Config {
+            command: cli::ConfigCommand::Init,
+        }) => {
+            commands::config_init(&mut reporter)?;
+        }
+
         cli::Command::Contest(cli::ContestCommand::New { contest, language }) => {
             commands::new(&contest, language, &mut reporter)?;
         }

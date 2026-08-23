@@ -44,6 +44,9 @@ pub enum Command {
     Workspace(WorkspaceCommand),
 
     #[command(flatten)]
+    Configuration(ConfigurationCommand),
+
+    #[command(flatten)]
     Contest(ContestCommand),
 
     #[command(flatten)]
@@ -63,6 +66,25 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum WorkspaceCommand {
     /// Initialize an atc workspace
+    Init,
+}
+
+// ============================================================
+// Configuration
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigurationCommand {
+    /// Manage global configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Create the global config file without changing built-in defaults
     Init,
 }
 
@@ -291,11 +313,14 @@ Usage:
 
 {}
 
+{}
+
 Options
   -h, --help       Show help
   -V, --version    Show version
 ",
         render_category::<WorkspaceCommand>("Workspace", command_tree).trim_end(),
+        render_category::<ConfigurationCommand>("Configuration", command_tree).trim_end(),
         render_category::<ContestCommand>("Contest", command_tree).trim_end(),
         render_category::<RunTestCommand>("Run & Test", command_tree).trim_end(),
         render_category::<FileCommand>("Files", command_tree).trim_end(),
@@ -336,6 +361,7 @@ mod tests {
         assert!(!help.contains("  atc <command> [options]"));
         assert!(help.contains("test      Run samples and the saved stress regression"));
         assert!(help.contains("init      Initialize an atc workspace"));
+        assert!(help.contains("config    Manage global configuration"));
         assert!(help.contains("template  Manage source templates"));
 
         let mut stress = command_tree
@@ -371,6 +397,79 @@ mod tests {
             Command::Workspace(WorkspaceCommand::Init)
         ));
         assert!(Cli::try_parse_from(["atc", "init", "extra"]).is_err());
+    }
+
+    #[test]
+    fn parses_only_the_supported_config_init_shape() {
+        let cli = Cli::try_parse_from(["atc", "config", "init"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Configuration(ConfigurationCommand::Config {
+                command: ConfigCommand::Init,
+            })
+        ));
+
+        for args in [
+            &["atc", "config", "init", "extra"][..],
+            &["atc", "config", "init", "--force"][..],
+            &["atc", "config", "path"][..],
+            &["atc", "config", "example"][..],
+            &["atc", "config", "defaults"][..],
+            &["atc", "config", "list"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_help_is_coherent_at_each_level() {
+        for args in [
+            &["atc", "--help"][..],
+            &["atc", "config", "--help"][..],
+            &["atc", "config", "init", "--help"][..],
+        ] {
+            let error = Cli::command()
+                .try_get_matches_from(args)
+                .expect_err("help should stop in clap");
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert_eq!(error.exit_code(), 0);
+            assert!(!error.use_stderr());
+        }
+
+        let missing_subcommand = Cli::command()
+            .try_get_matches_from(["atc", "config"])
+            .expect_err("config without a subcommand should stop in clap");
+        assert_eq!(
+            missing_subcommand.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(missing_subcommand.exit_code(), 2);
+        assert!(missing_subcommand.use_stderr());
+
+        let mut command = Cli::command();
+        let config = command
+            .find_subcommand_mut("config")
+            .expect("config subcommand should exist");
+        let config_help = config.render_long_help().to_string();
+        assert!(config_help.contains("Manage global configuration"));
+        assert!(config_help.contains("config <COMMAND>"));
+        assert!(config_help.contains("init"));
+
+        let init = config
+            .find_subcommand_mut("init")
+            .expect("config init subcommand should exist");
+        let init_help = init.render_long_help().to_string();
+        assert!(
+            init_help.contains("Create the global config file without changing built-in defaults")
+        );
+        assert!(init_help.contains("Usage: init"));
+        for unrelated in ["--force", "--debug", "--language", "--count", "--forever"] {
+            assert!(!init_help.contains(unrelated));
+        }
     }
 
     #[test]

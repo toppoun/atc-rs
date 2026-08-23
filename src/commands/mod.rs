@@ -1,4 +1,5 @@
 mod attempt_executor;
+mod config;
 mod contest;
 mod create;
 mod init;
@@ -14,6 +15,7 @@ mod watch_source;
 mod watch_tui;
 mod watch_worker;
 
+pub(crate) use config::config_init;
 pub(crate) use contest::contest;
 pub(crate) use create::create;
 pub(crate) use init::init;
