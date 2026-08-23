@@ -67,7 +67,7 @@ fn parse_cookie_file(contents: &str) -> io::Result<String> {
 fn is_cookie_octet(byte: u8) -> bool {
     matches!(
         byte,
-        b'!' | b'#'..=b'$' | b'&'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
+        b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
     )
 }
 
@@ -362,6 +362,14 @@ mod tests {
     }
 
     #[test]
+    fn cookie_value_can_contain_percent() {
+        assert_eq!(
+            parse_cookie_file("REVEL_SESSION=secret%value").unwrap(),
+            "REVEL_SESSION=secret%value"
+        );
+    }
+
+    #[test]
     fn cookie_file_requires_exact_revel_session_format() {
         assert_eq!(
             parse_cookie_file("REVEL_SESSION=secret").unwrap(),
@@ -390,6 +398,8 @@ mod tests {
             "REVEL_SESSION=secret; OTHER_COOKIE=value",
             "REVEL_SESSION=secret value",
             "REVEL_SESSION=secret\tvalue",
+            "REVEL_SESSION=secret\0value",
+            "REVEL_SESSION=secret\u{7f}value",
             "REVEL_SESSION=secret,OTHER_COOKIE=value",
             "REVEL_SESSION=\"secret\"",
             "REVEL_SESSION=secret\\value",
