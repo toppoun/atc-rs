@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::num::NonZeroU64;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::resolve_language;
@@ -23,6 +23,23 @@ const STRESS_INIT_TEMPORARY_PREFIX: &str = ".atc-stress-init-";
 enum StressFileState {
     Missing,
     Exists,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StressFilesStatus {
+    pub(crate) generator_missing: bool,
+    pub(crate) brute_missing: bool,
+}
+
+impl StressFilesStatus {
+    pub(crate) fn is_ready(self) -> bool {
+        !self.generator_missing && !self.brute_missing
+    }
+}
+
+struct StressFileTargets {
+    generator: PathBuf,
+    brute: PathBuf,
 }
 
 pub(crate) fn stress_init(
@@ -72,16 +89,16 @@ fn initialize_stress_files_at_with(
     reporter: &mut dyn Reporter,
     installer: &mut dyn FnMut(&Path, &[u8]) -> io::Result<()>,
 ) -> Result<(), AppError> {
-    workspace::validate_problem_index(&problem.index)?;
+    let targets = stress_file_targets_at(destination, problem)?;
 
     let targets = [
         (
-            destination.join(format!("{}_gen.py", problem.index)),
+            targets.generator,
             stress_generator_template().as_bytes(),
             "stress generator",
         ),
         (
-            destination.join(format!("{}_brute.py", problem.index)),
+            targets.brute,
             stress_brute_template().as_bytes(),
             "stress brute-force solution",
         ),
@@ -122,6 +139,32 @@ fn initialize_stress_files_at_with(
     }
 
     Ok(())
+}
+
+pub(crate) fn inspect_stress_files_at(
+    destination: &Path,
+    problem: &Problem,
+) -> Result<StressFilesStatus, AppError> {
+    let targets = stress_file_targets_at(destination, problem)?;
+    let generator = inspect_stress_file(&targets.generator, "stress generator")?;
+    let brute = inspect_stress_file(&targets.brute, "stress brute-force solution")?;
+
+    Ok(StressFilesStatus {
+        generator_missing: generator == StressFileState::Missing,
+        brute_missing: brute == StressFileState::Missing,
+    })
+}
+
+fn stress_file_targets_at(
+    destination: &Path,
+    problem: &Problem,
+) -> Result<StressFileTargets, AppError> {
+    workspace::validate_problem_index(&problem.index)?;
+
+    Ok(StressFileTargets {
+        generator: destination.join(format!("{}_gen.py", problem.index)),
+        brute: destination.join(format!("{}_brute.py", problem.index)),
+    })
 }
 
 fn inspect_stress_file(path: &Path, kind: &str) -> io::Result<StressFileState> {
@@ -344,6 +387,25 @@ mod tests {
         }
     }
 
+    fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create directory symlink: {error}"),
+        }
+    }
+
     fn assert_invalid_input(error: AppError) {
         assert!(matches!(
             error,
@@ -363,6 +425,132 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains("stress generator not found"));
+    }
+
+    #[test]
+    fn inspection_reports_the_regular_file_readiness_matrix() {
+        for (generator_exists, brute_exists, expected) in [
+            (
+                false,
+                false,
+                StressFilesStatus {
+                    generator_missing: true,
+                    brute_missing: true,
+                },
+            ),
+            (
+                true,
+                false,
+                StressFilesStatus {
+                    generator_missing: false,
+                    brute_missing: true,
+                },
+            ),
+            (
+                false,
+                true,
+                StressFilesStatus {
+                    generator_missing: true,
+                    brute_missing: false,
+                },
+            ),
+            (
+                true,
+                true,
+                StressFilesStatus {
+                    generator_missing: false,
+                    brute_missing: false,
+                },
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (generator, brute) = stress_paths(temp.path(), "A");
+            if generator_exists {
+                fs::write(generator, b"generator").unwrap();
+            }
+            if brute_exists {
+                fs::write(brute, b"brute").unwrap();
+            }
+
+            let status = inspect_stress_files_at(temp.path(), &problem("A")).unwrap();
+
+            assert_eq!(status, expected);
+            assert_eq!(status.is_ready(), generator_exists && brute_exists);
+        }
+    }
+
+    #[test]
+    fn inspection_uses_the_canonical_problem_index_and_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_destination = temp.path().join("does-not-exist");
+
+        let status = inspect_stress_files_at(&missing_destination, &problem("Z")).unwrap();
+
+        assert_eq!(
+            status,
+            StressFilesStatus {
+                generator_missing: true,
+                brute_missing: true,
+            }
+        );
+        assert!(!missing_destination.exists());
+        assert!(!temp.path().join("A_gen.py").exists());
+        assert!(!temp.path().join("A_brute.py").exists());
+    }
+
+    #[test]
+    fn inspection_rejects_directories_and_symlinks_without_following_them() {
+        for invalid_kind in [
+            "directory",
+            "file-symlink",
+            "directory-symlink",
+            "dangling-symlink",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (generator, _) = stress_paths(temp.path(), "A");
+            let created = match invalid_kind {
+                "directory" => {
+                    fs::create_dir(&generator).unwrap();
+                    true
+                }
+                "file-symlink" => {
+                    let target = temp.path().join("external-file");
+                    fs::write(&target, b"external").unwrap();
+                    create_file_symlink(&target, &generator)
+                }
+                "directory-symlink" => {
+                    let target = temp.path().join("external-directory");
+                    fs::create_dir(&target).unwrap();
+                    create_directory_symlink(&target, &generator)
+                }
+                "dangling-symlink" => {
+                    create_file_symlink(&temp.path().join("missing-target"), &generator)
+                }
+                _ => unreachable!(),
+            };
+            if !created {
+                continue;
+            }
+
+            let error = inspect_stress_files_at(temp.path(), &problem("A")).unwrap_err();
+
+            assert_invalid_input(error);
+            assert!(fs::symlink_metadata(&generator).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_rejects_a_special_filesystem_object() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (generator, _) = stress_paths(temp.path(), "A");
+        let _listener = UnixListener::bind(&generator).unwrap();
+
+        let error = inspect_stress_files_at(temp.path(), &problem("A")).unwrap_err();
+
+        assert_invalid_input(error);
     }
 
     #[test]

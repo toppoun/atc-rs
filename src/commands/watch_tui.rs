@@ -311,7 +311,7 @@ pub(super) fn watch_tui_at(
 
     let result = crate::tui::run(
         &mut terminal,
-        &contest,
+        crate::tui::StressSetupContext::new(destination, &contest),
         sample_counts,
         stress_cases,
         message_rx,

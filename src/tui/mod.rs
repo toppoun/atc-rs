@@ -13,9 +13,11 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use std::collections::VecDeque;
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::model::Contest;
+use crate::ui::{Event, Reporter};
 use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
@@ -33,6 +35,49 @@ const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Clone, Copy)]
+pub(crate) struct StressSetupContext<'a> {
+    destination: &'a Path,
+    contest: &'a Contest,
+}
+
+impl<'a> StressSetupContext<'a> {
+    pub(crate) fn new(destination: &'a Path, contest: &'a Contest) -> Self {
+        Self {
+            destination,
+            contest,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalInputContext<'a> {
+    run_tx: &'a Sender<RunRequest>,
+    stress_setup: Option<StressSetupContext<'a>>,
+}
+
+impl<'a> TerminalInputContext<'a> {
+    fn new(run_tx: &'a Sender<RunRequest>, stress_setup: Option<StressSetupContext<'a>>) -> Self {
+        Self {
+            run_tx,
+            stress_setup,
+        }
+    }
+}
+
+struct StressInitializationReporter;
+
+impl Reporter for StressInitializationReporter {
+    fn report(&mut self, event: Event<'_>) {
+        match event {
+            Event::StressFileCreated { .. }
+            | Event::StressFileExists { .. }
+            | Event::StressFilesAlreadyInitialized { .. } => {}
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DetailScrollbarDrag {
@@ -100,15 +145,77 @@ fn queue_problem_stress(
     app: &mut WatchApp,
     problem: usize,
     run_tx: &Sender<RunRequest>,
+    setup: StressSetupContext<'_>,
 ) -> io::Result<bool> {
-    let base_seed = crate::stress::automatic_seed()?;
+    queue_problem_stress_with_seed(app, problem, run_tx, setup, crate::stress::automatic_seed)
+}
+
+fn queue_problem_stress_with_seed(
+    app: &mut WatchApp,
+    problem: usize,
+    run_tx: &Sender<RunRequest>,
+    setup: StressSetupContext<'_>,
+    automatic_seed: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<bool> {
+    let Some(canonical_problem) = setup.contest.problems.get(problem) else {
+        return Ok(app.set_stress_setup_error(
+            problem,
+            "selected problem is missing from contest metadata".to_string(),
+        ));
+    };
+
+    let status = match crate::commands::stress::inspect_stress_files_at(
+        setup.destination,
+        canonical_problem,
+    ) {
+        Ok(status) => status,
+        Err(error) => return Ok(app.set_stress_setup_error(problem, error.to_string())),
+    };
+
+    if !status.is_ready() {
+        return Ok(app.set_stress_setup_required(
+            problem,
+            status.generator_missing,
+            status.brute_missing,
+        ));
+    }
+
+    let setup_cleared = app.clear_stress_setup(problem);
+    let base_seed = automatic_seed()?;
     let Some(request) = app.queue_stress(problem, base_seed) else {
-        return Ok(false);
+        return Ok(setup_cleared);
     };
 
     send_run_request(run_tx, request)?;
 
     Ok(true)
+}
+
+fn initialize_problem_stress(
+    app: &mut WatchApp,
+    problem: usize,
+    setup: StressSetupContext<'_>,
+) -> bool {
+    if !app.stress_setup_required(problem) {
+        return false;
+    }
+
+    let Some(canonical_problem) = setup.contest.problems.get(problem) else {
+        return app.set_stress_setup_error(
+            problem,
+            "selected problem is missing from contest metadata".to_string(),
+        );
+    };
+
+    let mut reporter = StressInitializationReporter;
+    match crate::commands::stress::initialize_stress_files_at(
+        setup.destination,
+        canonical_problem,
+        &mut reporter,
+    ) {
+        Ok(()) => app.set_stress_setup_initialized(problem),
+        Err(error) => app.set_stress_setup_error(problem, error.to_string()),
+    }
 }
 
 fn handle_messages(
@@ -256,7 +363,7 @@ fn send_detail_analysis_command(
 
 pub(crate) fn run(
     terminal: &mut TerminaSession,
-    contest: &Contest,
+    stress_setup: StressSetupContext<'_>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
     message_rx: Receiver<Message>,
@@ -264,7 +371,8 @@ pub(crate) fn run(
     detail_analysis_tx: Sender<DetailAnalysisCommand>,
     detail_analysis_rx: Receiver<DetailAnalysisResult>,
 ) -> io::Result<()> {
-    let mut app = WatchApp::new_with_stress_cases(contest, sample_counts, stress_cases)?;
+    let mut app =
+        WatchApp::new_with_stress_cases(stress_setup.contest, sample_counts, stress_cases)?;
 
     let mut dirty = true;
 
@@ -378,8 +486,8 @@ pub(crate) fn run(
             &mut detail_scrollbar_drag,
             &render_info,
             &mut terminal_events,
-            &run_tx,
             terminal.mouse_mode(),
+            TerminalInputContext::new(&run_tx, Some(stress_setup)),
         )? {
             dirty = true;
         }
@@ -504,8 +612,8 @@ fn handle_terminal_events(
         detail_scrollbar_drag,
         render_info,
         events,
-        run_tx,
         MouseMode::Cells,
+        TerminalInputContext::new(run_tx, None),
     )
 }
 
@@ -515,8 +623,8 @@ fn handle_terminal_events_with_mouse_mode(
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
     render_info: &view::RenderInfo,
     events: &mut VecDeque<TerminalEvent>,
-    run_tx: &Sender<RunRequest>,
     mouse_mode: MouseMode,
+    input: TerminalInputContext<'_>,
 ) -> io::Result<bool> {
     let mut changed = false;
     let mut scrollbar_geometry_changed_by_drag = false;
@@ -565,8 +673,8 @@ fn handle_terminal_events_with_mouse_mode(
             detail_scrollbar_drag,
             terminal_event,
             render_info,
-            run_tx,
             mouse_mode,
+            input,
         )?;
         if app.detail_revision() != detail_revision_before
             || app.samples_pane_enabled() != samples_pane_before
@@ -598,11 +706,13 @@ fn handle_terminal_event_with_mouse_mode(
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
     terminal_event: TerminalEvent,
     render_info: &view::RenderInfo,
-    run_tx: &Sender<RunRequest>,
     mouse_mode: MouseMode,
+    input: TerminalInputContext<'_>,
 ) -> io::Result<bool> {
     match terminal_event {
-        TerminalEvent::Key(key) => handle_key_event(app, key, run_tx),
+        TerminalEvent::Key(key) => {
+            handle_key_event_with_stress_context(app, key, input.run_tx, input.stress_setup)
+        }
 
         TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event_with_mouse_mode(
             app,
@@ -622,10 +732,20 @@ fn handle_terminal_event_with_mouse_mode(
     }
 }
 
+#[cfg(test)]
 fn handle_key_event(
     app: &mut WatchApp,
     key: KeyEvent,
     run_tx: &Sender<RunRequest>,
+) -> io::Result<bool> {
+    handle_key_event_with_stress_context(app, key, run_tx, None)
+}
+
+fn handle_key_event_with_stress_context(
+    app: &mut WatchApp,
+    key: KeyEvent,
+    run_tx: &Sender<RunRequest>,
+    stress_setup: Option<StressSetupContext<'_>>,
 ) -> io::Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
@@ -661,8 +781,22 @@ fn handle_key_event(
             let Some(problem) = app.selected_problem() else {
                 return Ok(false);
             };
+            let Some(stress_setup) = stress_setup else {
+                return Ok(false);
+            };
 
-            queue_problem_stress(app, problem, run_tx)
+            queue_problem_stress(app, problem, run_tx, stress_setup)
+        }
+
+        KeyCode::Char('i') if key.kind == KeyEventKind::Press => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+            let Some(stress_setup) = stress_setup else {
+                return Ok(false);
+            };
+
+            Ok(initialize_problem_stress(app, problem, stress_setup))
         }
 
         KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
@@ -947,7 +1081,8 @@ mod tests {
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;
     use ratatui::{Terminal, backend::TestBackend};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use terminal::{PointerButton as MouseButton, PointerKind as MouseEventKind};
@@ -958,22 +1093,44 @@ mod tests {
 
     fn app_with_problems(sample_counts: &[usize]) -> WatchApp {
         WatchApp::new(
-            &Contest {
-                contest_id: "abc123".to_string(),
-                problems: sample_counts
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| Problem {
-                        index: char::from(b'A' + index as u8).to_string(),
-                        title: format!("Problem {index}"),
-                        task_id: format!("abc123_{index}"),
-                        url: format!("https://example.invalid/{index}"),
-                    })
-                    .collect(),
-            },
+            &contest_with_problems(sample_counts),
             sample_counts.to_vec(),
         )
         .unwrap()
+    }
+
+    fn contest_with_problems(sample_counts: &[usize]) -> Contest {
+        Contest {
+            contest_id: "abc123".to_string(),
+            problems: sample_counts
+                .iter()
+                .enumerate()
+                .map(|(index, _)| Problem {
+                    index: char::from(b'A' + index as u8).to_string(),
+                    title: format!("Problem {index}"),
+                    task_id: format!("abc123_{index}"),
+                    url: format!("https://example.invalid/{index}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn handle_stress_setup_key(
+        app: &mut WatchApp,
+        code: KeyCode,
+        destination: &Path,
+        contest: &Contest,
+        run_tx: &Sender<RunRequest>,
+    ) -> io::Result<bool> {
+        handle_key_event_with_stress_context(
+            app,
+            key(code, KeyEventKind::Press),
+            run_tx,
+            Some(StressSetupContext {
+                destination,
+                contest,
+            }),
+        )
     }
 
     fn foldable_app(actual: String) -> WatchApp {
@@ -2805,8 +2962,8 @@ mod tests {
                 &mut drag,
                 &info,
                 &mut events,
-                &run_tx,
                 MouseMode::Disabled,
+                TerminalInputContext::new(&run_tx, None),
             )
             .unwrap()
         );
@@ -3355,18 +3512,76 @@ mod tests {
     }
 
     #[test]
+    fn stress_inspection_precedes_seed_generation_and_ready_request_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        let candidate = temp.path().join("A.cpp");
+        fs::write(&candidate, b"candidate").unwrap();
+        assert!(app.source_changed(0, candidate, Language::Cpp));
+        app.toggle_debug();
+        let (run_tx, run_rx) = mpsc::channel();
+        let setup = StressSetupContext::new(temp.path(), &contest);
+        let seed_calls = Cell::new(0);
+
+        assert!(
+            queue_problem_stress_with_seed(&mut app, 0, &run_tx, setup, || {
+                seed_calls.set(seed_calls.get() + 1);
+                Ok(987)
+            })
+            .unwrap()
+        );
+        assert_eq!(seed_calls.get(), 0);
+        assert!(run_rx.try_recv().is_err());
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Required {
+                generator_missing: true,
+                brute_missing: true,
+            }
+        );
+
+        fs::write(temp.path().join("A_gen.py"), b"generator").unwrap();
+        fs::write(temp.path().join("A_brute.py"), b"brute").unwrap();
+        assert!(
+            queue_problem_stress_with_seed(&mut app, 0, &run_tx, setup, || {
+                seed_calls.set(seed_calls.get() + 1);
+                Ok(987)
+            })
+            .unwrap()
+        );
+
+        assert_eq!(seed_calls.get(), 1);
+        let request = run_rx.try_recv().unwrap();
+        assert_eq!(request.run_id, 1);
+        assert_eq!(request.problem, 0);
+        assert_eq!(request.language, Language::Cpp);
+        assert!(request.debug);
+        assert!(matches!(
+            request.kind,
+            message::RunKind::Stress {
+                base_seed: 987,
+                count: None,
+            }
+        ));
+        assert!(run_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn stress_key_queues_unbounded_stress_for_current_source() {
-        let mut app = app();
-        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[3]);
+        let mut app = WatchApp::new(&contest, vec![3]).unwrap();
+        let candidate = temp.path().join("A.cpp");
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::write(temp.path().join("A_gen.py"), b"generator").unwrap();
+        fs::write(temp.path().join("A_brute.py"), b"brute").unwrap();
+        app.source_changed(0, candidate, Language::Cpp);
         let (run_tx, run_rx) = mpsc::channel();
 
         assert!(
-            handle_key_event(
-                &mut app,
-                key(KeyCode::Char('S'), KeyEventKind::Press),
-                &run_tx,
-            )
-            .unwrap()
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
         );
 
         let request = run_rx.try_recv().unwrap();
@@ -3379,6 +3594,339 @@ mod tests {
         assert_eq!(
             app.current_problem().unwrap().detail_mode,
             app::DetailMode::Stress
+        );
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::None
+        );
+    }
+
+    #[test]
+    fn stress_key_reports_missing_helpers_before_candidate_requirements() {
+        for (generator_exists, brute_exists, generator_missing, brute_missing) in [
+            (false, false, true, true),
+            (true, false, false, true),
+            (false, true, true, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let contest = contest_with_problems(&[1]);
+            let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+            if generator_exists {
+                fs::write(temp.path().join("A_gen.py"), b"generator").unwrap();
+            }
+            if brute_exists {
+                fs::write(temp.path().join("A_brute.py"), b"brute").unwrap();
+            }
+            let (run_tx, run_rx) = mpsc::channel();
+
+            assert!(
+                handle_stress_setup_key(
+                    &mut app,
+                    KeyCode::Char('S'),
+                    temp.path(),
+                    &contest,
+                    &run_tx,
+                )
+                .unwrap()
+            );
+
+            assert!(run_rx.try_recv().is_err());
+            let problem = app.current_problem().unwrap();
+            assert_eq!(problem.detail_mode, app::DetailMode::Stress);
+            assert_eq!(problem.stress.phase, app::StressPhase::Idle);
+            assert_eq!(
+                problem.stress_setup,
+                app::StressSetupState::Required {
+                    generator_missing,
+                    brute_missing,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stress_key_keeps_invalid_targets_local_to_the_tui() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        fs::create_dir(temp.path().join("A_gen.py")).unwrap();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+
+        assert!(run_rx.try_recv().is_err());
+        let problem = app.current_problem().unwrap();
+        assert_eq!(problem.detail_mode, app::DetailMode::Stress);
+        assert!(matches!(
+            &problem.stress_setup,
+            app::StressSetupState::Error { message }
+                if message.contains("stress generator target is not a regular file")
+        ));
+        assert_eq!(problem.stress.phase, app::StressPhase::Idle);
+    }
+
+    #[test]
+    fn ready_helpers_without_a_candidate_preserve_the_existing_no_request_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        fs::write(temp.path().join("A_gen.py"), b"generator").unwrap();
+        fs::write(temp.path().join("A_brute.py"), b"brute").unwrap();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            !handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+
+        assert!(run_rx.try_recv().is_err());
+        assert_eq!(
+            app.current_problem().unwrap().stress.phase,
+            app::StressPhase::Idle
+        );
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::None
+        );
+    }
+
+    #[test]
+    fn initialize_key_uses_production_initialization_without_candidate_or_run_request() {
+        for existing_generator in [None, Some(&b"user generator\0\xff"[..])] {
+            let temp = tempfile::tempdir().unwrap();
+            let contest = contest_with_problems(&[1]);
+            let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+            let generator = temp.path().join("A_gen.py");
+            let brute = temp.path().join("A_brute.py");
+            if let Some(contents) = existing_generator {
+                fs::write(&generator, contents).unwrap();
+            }
+            let (run_tx, run_rx) = mpsc::channel();
+
+            assert!(
+                handle_stress_setup_key(
+                    &mut app,
+                    KeyCode::Char('S'),
+                    temp.path(),
+                    &contest,
+                    &run_tx,
+                )
+                .unwrap()
+            );
+            assert!(
+                handle_stress_setup_key(
+                    &mut app,
+                    KeyCode::Char('i'),
+                    temp.path(),
+                    &contest,
+                    &run_tx,
+                )
+                .unwrap()
+            );
+
+            assert_eq!(
+                fs::read(&generator).unwrap(),
+                existing_generator
+                    .unwrap_or_else(|| { crate::template::stress_generator_template().as_bytes() })
+            );
+            assert_eq!(
+                fs::read(&brute).unwrap(),
+                crate::template::stress_brute_template().as_bytes()
+            );
+            assert!(run_rx.try_recv().is_err());
+            let problem = app.current_problem().unwrap();
+            assert!(problem.source.is_none());
+            assert_eq!(problem.stress.phase, app::StressPhase::Idle);
+            assert_eq!(problem.detail_mode, app::DetailMode::Stress);
+            assert_eq!(problem.stress_setup, app::StressSetupState::Initialized);
+        }
+    }
+
+    #[test]
+    fn setup_actions_do_not_hide_or_replace_an_already_queued_stress() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        let candidate = temp.path().join("A.py");
+        let generator = temp.path().join("A_gen.py");
+        let brute = temp.path().join("A_brute.py");
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::write(&generator, b"generator").unwrap();
+        fs::write(&brute, b"brute").unwrap();
+        assert!(app.source_changed(0, candidate, Language::Python));
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        let queued = run_rx.try_recv().unwrap();
+        assert_eq!(
+            app.current_problem().unwrap().stress.phase,
+            app::StressPhase::Queued
+        );
+
+        fs::remove_file(&generator).unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(run_rx.try_recv().is_err());
+        assert_eq!(
+            app.current_problem().unwrap().stress.id,
+            Some(queued.run_id)
+        );
+        assert!(matches!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Required { .. }
+        ));
+        let required_detail: String = detail::DetailDocument::from_app(&app)
+            .segments()
+            .map(|segment| segment.text())
+            .collect();
+        assert!(required_detail.contains("STRESS QUEUED"));
+        let queued_heading = required_detail.find("STRESS QUEUED").unwrap();
+        let setup_heading = required_detail.find("STRESS SETUP REQUIRED").unwrap();
+        assert!(queued_heading < setup_heading);
+
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('i'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(run_rx.try_recv().is_err());
+        assert_eq!(
+            app.current_problem().unwrap().stress.id,
+            Some(queued.run_id)
+        );
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Initialized
+        );
+        let initialized_detail: String = detail::DetailDocument::from_app(&app)
+            .segments()
+            .map(|segment| segment.text())
+            .collect();
+        assert!(initialized_detail.contains("STRESS QUEUED"));
+        assert!(!initialized_detail.contains("STRESS FILES INITIALIZED"));
+    }
+
+    #[test]
+    fn initialize_key_is_a_no_op_outside_required_state_and_keeps_errors_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            !handle_stress_setup_key(&mut app, KeyCode::Char('i'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(!temp.path().join("A_gen.py").exists());
+        assert!(!temp.path().join("A_brute.py").exists());
+
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        fs::create_dir(temp.path().join("A_gen.py")).unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('i'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+
+        assert!(run_rx.try_recv().is_err());
+        assert!(matches!(
+            &app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Error { message }
+                if message.contains("stress generator target is not a regular file")
+        ));
+        assert!(!temp.path().join("A_brute.py").exists());
+        assert!(
+            !handle_stress_setup_key(&mut app, KeyCode::Char('i'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn every_stress_key_press_rechecks_the_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = contest_with_problems(&[1]);
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        let candidate = temp.path().join("A.py");
+        fs::write(&candidate, b"candidate").unwrap();
+        app.source_changed(0, candidate, Language::Python);
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        fs::write(temp.path().join("A_gen.py"), b"generator").unwrap();
+        fs::write(temp.path().join("A_brute.py"), b"brute").unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(matches!(
+            run_rx.try_recv().unwrap().kind,
+            message::RunKind::Stress { count: None, .. }
+        ));
+
+        let mut app = WatchApp::new(&contest, vec![1]).unwrap();
+        app.source_changed(0, temp.path().join("A.py"), Language::Python);
+        fs::remove_file(temp.path().join("A_gen.py")).unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('i'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Initialized
+        );
+
+        fs::remove_file(temp.path().join("A_gen.py")).unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Required {
+                generator_missing: true,
+                brute_missing: false,
+            }
+        );
+
+        fs::create_dir(temp.path().join("A_gen.py")).unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(matches!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::Error { .. }
+        ));
+
+        fs::remove_dir(temp.path().join("A_gen.py")).unwrap();
+        fs::write(temp.path().join("A_gen.py"), b"repaired generator").unwrap();
+        assert!(
+            handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
+                .unwrap()
+        );
+        assert!(matches!(
+            run_rx.try_recv().unwrap().kind,
+            message::RunKind::Stress { count: None, .. }
+        ));
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            app::StressSetupState::None
         );
     }
 

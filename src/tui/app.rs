@@ -41,6 +41,7 @@ pub struct ProblemState {
     pub source: Option<SourceState>,
     pub run: RunState,
     pub stress: StressState,
+    pub stress_setup: StressSetupState,
     pub detail_mode: DetailMode,
 }
 
@@ -116,6 +117,20 @@ pub enum StressPhase {
     Finished,
     Cancelled,
     Error,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StressSetupState {
+    #[default]
+    None,
+    Required {
+        generator_missing: bool,
+        brute_missing: bool,
+    },
+    Initialized,
+    Error {
+        message: Arc<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +309,7 @@ impl WatchApp {
                     source: None,
                     run: RunState::default(),
                     stress: StressState::default(),
+                    stress_setup: StressSetupState::None,
                     detail_mode: DetailMode::Samples,
                 }
             })
@@ -451,6 +467,77 @@ impl WatchApp {
             .source
             .as_ref()
             .map(|source| source.language)
+    }
+
+    pub fn stress_setup_required(&self, problem: usize) -> bool {
+        self.problems.get(problem).is_some_and(|problem| {
+            matches!(&problem.stress_setup, StressSetupState::Required { .. })
+        })
+    }
+
+    pub fn set_stress_setup_required(
+        &mut self,
+        problem: usize,
+        generator_missing: bool,
+        brute_missing: bool,
+    ) -> bool {
+        self.set_stress_setup_state(
+            problem,
+            StressSetupState::Required {
+                generator_missing,
+                brute_missing,
+            },
+        )
+    }
+
+    pub fn set_stress_setup_initialized(&mut self, problem: usize) -> bool {
+        self.set_stress_setup_state(problem, StressSetupState::Initialized)
+    }
+
+    pub fn set_stress_setup_error(&mut self, problem: usize, message: String) -> bool {
+        self.set_stress_setup_state(
+            problem,
+            StressSetupState::Error {
+                message: Arc::new(message),
+            },
+        )
+    }
+
+    pub fn clear_stress_setup(&mut self, problem: usize) -> bool {
+        let Some(problem_state) = self.problems.get_mut(problem) else {
+            return false;
+        };
+        if problem_state.stress_setup == StressSetupState::None {
+            return false;
+        }
+
+        problem_state.stress_setup = StressSetupState::None;
+        if self.selected_problem == problem {
+            self.reset_detail_scroll();
+            self.reset_detail_folds();
+            self.invalidate_detail();
+        }
+        true
+    }
+
+    fn set_stress_setup_state(&mut self, problem: usize, state: StressSetupState) -> bool {
+        let Some(problem_state) = self.problems.get_mut(problem) else {
+            return false;
+        };
+        let changed =
+            problem_state.detail_mode != DetailMode::Stress || problem_state.stress_setup != state;
+        if !changed {
+            return false;
+        }
+
+        problem_state.detail_mode = DetailMode::Stress;
+        problem_state.stress_setup = state;
+        if self.selected_problem == problem {
+            self.reset_detail_scroll();
+            self.reset_detail_folds();
+            self.invalidate_detail();
+        }
+        true
     }
 
     pub fn select_problem(&mut self, index: usize) -> bool {
@@ -660,6 +747,7 @@ impl WatchApp {
             failure: None,
             error: None,
         };
+        self.problems[problem].stress_setup = StressSetupState::None;
         self.reset_detail_scroll();
         if self.selected_problem == problem {
             self.reset_detail_folds();
@@ -745,6 +833,10 @@ impl WatchApp {
                 }
             }
         };
+
+        if changed && mode == DetailMode::Stress {
+            self.problems[problem].stress_setup = StressSetupState::None;
+        }
 
         if changed && affects_current_detail {
             self.invalidate_detail();
@@ -1081,6 +1173,7 @@ impl WatchApp {
         let stderr = Arc::new(stderr);
 
         problem_state.stress.phase = StressPhase::Failed;
+        problem_state.stress_setup = StressSetupState::None;
         problem_state.stress.base_seed = Some(base_seed);
         problem_state.stress.case_number = case_number;
         problem_state.stress.seed = Some(seed);
@@ -1243,6 +1336,10 @@ impl WatchApp {
             _ => false,
         };
 
+        if changed {
+            self.problems[problem].stress_setup = StressSetupState::None;
+        }
+
         if changed && affects_current_detail {
             self.invalidate_detail();
         }
@@ -1297,6 +1394,10 @@ impl WatchApp {
             }
         };
 
+        if changed && mode == DetailMode::Stress {
+            self.problems[problem].stress_setup = StressSetupState::None;
+        }
+
         if changed && affects_current_detail && detail_mode == Some(mode) {
             self.invalidate_detail();
         }
@@ -1346,6 +1447,10 @@ impl WatchApp {
                 }
             }
         };
+
+        if changed && mode == DetailMode::Stress {
+            self.problems[problem].stress_setup = StressSetupState::None;
+        }
 
         if changed && affects_current_detail && detail_mode == Some(mode) {
             self.invalidate_detail();
@@ -1422,6 +1527,44 @@ mod tests {
         ] {
             assert!(!app.detail_fold_state().is_collapsed(kind), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn stress_setup_state_is_per_problem_and_does_not_allocate_a_run() {
+        let mut app = WatchApp::new(&contest(2), vec![1, 1]).unwrap();
+
+        assert!(app.set_stress_setup_required(0, true, false));
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Stress);
+        assert_eq!(app.problems[0].stress.id, None);
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Idle);
+        assert_eq!(app.problems[1].stress_setup, StressSetupState::None);
+
+        assert!(app.select_problem(1));
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            StressSetupState::None
+        );
+        assert!(app.select_problem(0));
+        assert_eq!(
+            app.current_problem().unwrap().stress_setup,
+            StressSetupState::Required {
+                generator_missing: true,
+                brute_missing: false,
+            }
+        );
+    }
+
+    #[test]
+    fn queuing_real_stress_clears_setup_guidance_and_uses_the_first_real_run_id() {
+        let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+        assert!(app.set_stress_setup_initialized(0));
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+
+        let request = app.queue_stress(0, 123).unwrap();
+
+        assert_eq!(request.run_id, 1);
+        assert_eq!(app.problems[0].stress_setup, StressSetupState::None);
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Queued);
     }
 
     fn collapse_all_folds(app: &mut WatchApp) {

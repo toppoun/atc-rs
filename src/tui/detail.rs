@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::app::{
-    CaseVerdict, DetailFoldState, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp,
+    CaseVerdict, DetailFoldState, DetailMode, ProblemState, RunPhase, StressPhase,
+    StressSetupState, WatchApp,
 };
 
 // Byte position in the virtual concatenation of all detail segments. Segment
@@ -225,7 +226,10 @@ impl<'a> DetailDocument<'a> {
 
         match stress.phase {
             StressPhase::Idle => {
-                self.push_static("Stress has not been started.");
+                if !self.push_stress_setup_detail(problem) {
+                    self.push_static("Stress has not been started.");
+                }
+                return;
             }
             StressPhase::Queued => {
                 self.push_static("STRESS QUEUED");
@@ -322,6 +326,46 @@ impl<'a> DetailDocument<'a> {
                     self.push_shared_section("error", error);
                 }
             }
+        }
+
+        if matches!(
+            &problem.stress_setup,
+            StressSetupState::Required { .. } | StressSetupState::Error { .. }
+        ) {
+            self.push_static("\n\n");
+            self.push_stress_setup_detail(problem);
+        }
+    }
+
+    fn push_stress_setup_detail(&mut self, problem: &'a ProblemState) -> bool {
+        match &problem.stress_setup {
+            StressSetupState::Required {
+                generator_missing,
+                brute_missing,
+            } => {
+                let mut text = String::from("STRESS SETUP REQUIRED\n\nMissing:");
+                if *generator_missing {
+                    text.push_str(&format!("\n  {}_gen.py", problem.index));
+                }
+                if *brute_missing {
+                    text.push_str(&format!("\n  {}_brute.py", problem.index));
+                }
+                text.push_str("\n\nPress i to initialize.");
+                self.push_owned(text);
+                true
+            }
+            StressSetupState::Initialized => {
+                self.push_owned(format!(
+                    "STRESS FILES INITIALIZED\n\n{}_gen.py\n{}_brute.py\n\nEdit the files, then press S to run stress.",
+                    problem.index, problem.index,
+                ));
+                true
+            }
+            StressSetupState::Error { message } => {
+                self.push_owned(format!("STRESS SETUP ERROR\n\n{message}"));
+                true
+            }
+            StressSetupState::None => false,
         }
     }
 
@@ -728,6 +772,72 @@ mod tests {
 
         assert_eq!(shared.as_ptr(), state.as_ptr());
         assert_eq!(Arc::strong_count(state), owners + 1);
+    }
+
+    #[test]
+    fn stress_setup_required_document_lists_only_missing_canonical_files() {
+        for (generator_missing, brute_missing, expected_missing) in [
+            (true, true, "  A_gen.py\n  A_brute.py"),
+            (true, false, "  A_gen.py"),
+            (false, true, "  A_brute.py"),
+        ] {
+            let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+            assert!(app.set_stress_setup_required(0, generator_missing, brute_missing));
+
+            assert_eq!(
+                document_text(&DetailDocument::from_app(&app)),
+                format!(
+                    "A - Problem A\n\nSTRESS SETUP REQUIRED\n\nMissing:\n{expected_missing}\n\nPress i to initialize."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn initialized_and_setup_error_documents_are_distinct_from_real_stress_errors() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        assert!(app.set_stress_setup_initialized(0));
+        assert_eq!(
+            document_text(&DetailDocument::from_app(&app)),
+            concat!(
+                "A - Problem A\n\n",
+                "STRESS FILES INITIALIZED\n\n",
+                "A_gen.py\n",
+                "A_brute.py\n\n",
+                "Edit the files, then press S to run stress."
+            )
+        );
+
+        assert!(app.set_stress_setup_error(0, "A_gen.py is a directory".to_string()));
+        assert_eq!(
+            document_text(&DetailDocument::from_app(&app)),
+            "A - Problem A\n\nSTRESS SETUP ERROR\n\nA_gen.py is a directory"
+        );
+        assert!(!document_text(&DetailDocument::from_app(&app)).contains("STRESS ERROR"));
+    }
+
+    #[test]
+    fn real_stress_queue_and_error_precede_later_setup_presentation() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let request = app.queue_stress(0, 123).unwrap();
+        assert!(app.set_stress_setup_initialized(0));
+
+        let queued = document_text(&DetailDocument::from_app(&app));
+        assert!(queued.contains("STRESS QUEUED"));
+        assert!(!queued.contains("STRESS FILES INITIALIZED"));
+
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_failed(0, request.run_id, "candidate source failed".to_string(),));
+        assert!(app.set_stress_setup_error(0, "invalid helper target".to_string()));
+
+        let failed = document_text(&DetailDocument::from_app(&app));
+        assert!(failed.contains("STRESS ERROR"));
+        assert!(failed.contains("candidate source failed"));
+        let real_error = failed.find("STRESS ERROR").unwrap();
+        let setup_error = failed.find("STRESS SETUP ERROR").unwrap();
+        assert!(real_error < setup_error);
+        assert!(failed.contains("invalid helper target"));
     }
 
     #[test]

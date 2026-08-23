@@ -8,7 +8,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use super::app::{CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, WatchApp};
+use super::app::{
+    CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
+};
 use super::detail::{DetailDocument, DetailSectionKind};
 use super::detail_layout::DetailLayout;
 use super::detail_scrollbar::{
@@ -205,10 +207,14 @@ pub(super) fn render_with_mouse_mode(
         }
     }
 
-    let footer = Paragraph::new(
-        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit",
-    )
-    .block(Block::default().borders(Borders::TOP));
+    let footer_text = if current_problem
+        .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
+    {
+        "s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit"
+    } else {
+        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit"
+    };
+    let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
 
     frame.render_widget(footer, rows[2]);
 
@@ -229,8 +235,13 @@ fn language_label(language: Language) -> &'static str {
 }
 
 fn run_summary(problem: &ProblemState) -> String {
-    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
-        return stress_summary(problem);
+    if problem.detail_mode == DetailMode::Stress {
+        if problem.stress.phase != StressPhase::Idle {
+            return stress_summary(problem);
+        }
+        if let Some(summary) = stress_setup_summary(problem) {
+            return summary;
+        }
     }
 
     let run = &problem.run;
@@ -246,6 +257,15 @@ fn run_summary(problem: &ProblemState) -> String {
         RunPhase::NoSamples => "No Samples".to_string(),
         RunPhase::Cancelled => "Cancelled".to_string(),
         RunPhase::Failed => "Failed".to_string(),
+    }
+}
+
+fn stress_setup_summary(problem: &ProblemState) -> Option<String> {
+    match &problem.stress_setup {
+        StressSetupState::None => None,
+        StressSetupState::Required { .. } => Some("STRESS Setup required".to_string()),
+        StressSetupState::Initialized => Some("STRESS Initialized".to_string()),
+        StressSetupState::Error { .. } => Some("STRESS Setup error".to_string()),
     }
 }
 
@@ -273,15 +293,26 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
         return Style::default();
     };
 
-    if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
-        return match problem.stress.phase {
-            StressPhase::Failed | StressPhase::Error => Style::default().fg(Color::Red),
-            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => {
-                Style::default().fg(Color::Yellow)
-            }
-            StressPhase::Finished => Style::default().fg(Color::Green),
-            StressPhase::Idle | StressPhase::Cancelled => Style::default().fg(Color::DarkGray),
+    if problem.detail_mode == DetailMode::Stress {
+        if problem.stress.phase != StressPhase::Idle {
+            return match problem.stress.phase {
+                StressPhase::Failed | StressPhase::Error => Style::default().fg(Color::Red),
+                StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => {
+                    Style::default().fg(Color::Yellow)
+                }
+                StressPhase::Finished => Style::default().fg(Color::Green),
+                StressPhase::Idle | StressPhase::Cancelled => Style::default().fg(Color::DarkGray),
+            };
+        }
+        let setup_style = match &problem.stress_setup {
+            StressSetupState::None => None,
+            StressSetupState::Required { .. } => Some(Style::default().fg(Color::Yellow)),
+            StressSetupState::Initialized => Some(Style::default().fg(Color::Green)),
+            StressSetupState::Error { .. } => Some(Style::default().fg(Color::Red)),
         };
+        if let Some(style) = setup_style {
+            return style;
+        }
     }
 
     match problem.run.phase {
@@ -331,6 +362,11 @@ fn problem_status_line(app: &WatchApp) -> Line<'static> {
 }
 
 fn problem_symbol(problem: &ProblemState) -> &'static str {
+    match &problem.stress_setup {
+        StressSetupState::Required { .. } | StressSetupState::Error { .. } => return "!",
+        StressSetupState::None | StressSetupState::Initialized => {}
+    }
+
     if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
         return match problem.stress.phase {
             StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => "…",
@@ -355,6 +391,12 @@ fn problem_symbol(problem: &ProblemState) -> &'static str {
 }
 
 fn problem_style(problem: &ProblemState) -> Style {
+    match &problem.stress_setup {
+        StressSetupState::Required { .. } => return Style::default().fg(Color::Yellow),
+        StressSetupState::Error { .. } => return Style::default().fg(Color::Red),
+        StressSetupState::None | StressSetupState::Initialized => {}
+    }
+
     if problem.detail_mode == DetailMode::Stress && problem.stress.phase != StressPhase::Idle {
         return match problem.stress.phase {
             StressPhase::Failed | StressPhase::Error => Style::default().fg(Color::Red),
@@ -570,6 +612,27 @@ mod tests {
         info
     }
 
+    fn rendered_buffer_text(app: &WatchApp, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render(frame, app, &mut detail_layout);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn render_with_layout(
         terminal: &mut Terminal<TestBackend>,
         app: &WatchApp,
@@ -684,6 +747,158 @@ mod tests {
             },
         ));
         app
+    }
+
+    fn finished_sample_app(accepted: bool) -> WatchApp {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        let verdict_recorded = if accepted {
+            app.run_event(
+                0,
+                request.run_id,
+                TestEvent::TestCaseAccepted {
+                    number: 1,
+                    elapsed: Duration::from_millis(1),
+                },
+            )
+        } else {
+            app.run_event(
+                0,
+                request.run_id,
+                TestEvent::TestCaseWrongAnswer {
+                    number: 1,
+                    elapsed: Duration::from_millis(1),
+                },
+            )
+        };
+        assert!(verdict_recorded);
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunFinished {
+                accepted: usize::from(accepted),
+                total_cases: 1,
+            },
+        ));
+        app
+    }
+
+    #[test]
+    fn stress_setup_attention_glyphs_and_header_styles_are_distinct() {
+        let mut app = app();
+
+        assert!(app.set_stress_setup_required(0, true, true));
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Setup required");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Yellow));
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Yellow));
+
+        assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Setup error");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Red));
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn stress_setup_attention_glyphs_survive_switching_to_sample_detail() {
+        let mut app = app();
+
+        assert!(app.set_stress_setup_required(0, true, true));
+        assert!(app.next_case());
+        let problem = app.current_problem().unwrap();
+        assert_eq!(problem.detail_mode, DetailMode::Samples);
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Yellow));
+
+        assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
+        assert!(app.next_case());
+        let problem = app.current_problem().unwrap();
+        assert_eq!(problem.detail_mode, DetailMode::Samples);
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn real_stress_phase_precedes_setup_header_but_not_setup_attention_glyph() {
+        let mut app = app();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(app.queue_stress(0, 123).is_some());
+        assert!(app.set_stress_setup_initialized(0));
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Queued");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Yellow));
+        assert_eq!(problem_symbol(problem), "…");
+        assert_eq!(problem_style(problem).fg, Some(Color::Yellow));
+
+        assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Queued");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Yellow));
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn initialized_without_execution_keeps_the_neutral_problem_glyph() {
+        let mut app = app();
+        assert!(app.set_stress_setup_initialized(0));
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Initialized");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Green));
+        assert_eq!(problem_symbol(problem), "·");
+        assert_ne!(problem_symbol(problem), "✓");
+        assert_eq!(problem_style(problem).fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn initialized_preserves_an_existing_wrong_answer_glyph_and_style() {
+        let mut app = finished_sample_app(false);
+        assert_eq!(problem_symbol(app.current_problem().unwrap()), "✗");
+        assert!(app.set_stress_setup_initialized(0));
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Initialized");
+        assert_eq!(problem_symbol(problem), "✗");
+        assert_eq!(problem_style(problem).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn initialized_preserves_a_real_success_glyph_and_style() {
+        let mut app = finished_sample_app(true);
+        assert_eq!(problem_symbol(app.current_problem().unwrap()), "✓");
+        assert!(app.set_stress_setup_initialized(0));
+
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "STRESS Initialized");
+        assert_eq!(problem_symbol(problem), "✓");
+        assert_eq!(problem_style(problem).fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn footer_advertises_initialize_only_while_setup_is_required() {
+        let mut app = app();
+        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+
+        assert!(app.set_stress_setup_required(0, true, true));
+        assert!(rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+
+        assert!(app.set_stress_setup_initialized(0));
+        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+
+        assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
+        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {
