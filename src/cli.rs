@@ -201,6 +201,18 @@ pub enum FileCommand {
         #[arg(short = 'l', long)]
         language: Option<Language>,
     },
+
+    /// Manage source templates
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TemplateCommand {
+    /// Initialize active user source templates from the built-ins
+    Init { language: Option<Language> },
 }
 
 // ============================================================
@@ -324,6 +336,7 @@ mod tests {
         assert!(!help.contains("  atc <command> [options]"));
         assert!(help.contains("test      Run samples and the saved stress regression"));
         assert!(help.contains("init      Initialize an atc workspace"));
+        assert!(help.contains("template  Manage source templates"));
 
         let mut stress = command_tree
             .find_subcommand("stress")
@@ -747,6 +760,81 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["atc-rs", "create", "A", "-l", "py"]).is_err());
+    }
+
+    #[test]
+    fn parses_template_init_with_optional_canonical_language() {
+        let cli = Cli::try_parse_from(["atc", "template", "init"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Files(FileCommand::Template {
+                command: TemplateCommand::Init { language: None },
+            })
+        ));
+
+        for (argument, expected) in [("cpp", Language::Cpp), ("python", Language::Python)] {
+            let cli = Cli::try_parse_from(["atc", "template", "init", argument]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Files(FileCommand::Template {
+                    command: TemplateCommand::Init {
+                        language: Some(language),
+                    },
+                }) if language == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn template_init_rejects_unsupported_shapes_and_unrelated_options() {
+        for args in [
+            &["atc", "template", "init", "py"][..],
+            &["atc", "template", "init", "rust"][..],
+            &["atc", "template", "init", "cpp", "python"][..],
+            &["atc", "template", "cpp"][..],
+            &["atc", "template", "init", "--debug"][..],
+            &["atc", "template", "init", "--language", "cpp"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_help_is_coherent_at_each_level() {
+        for args in [
+            &["atc", "--help"][..],
+            &["atc", "template", "--help"][..],
+            &["atc", "template", "init", "--help"][..],
+        ] {
+            let error = Cli::command()
+                .try_get_matches_from(args)
+                .expect_err("help should stop in clap");
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert_eq!(error.exit_code(), 0);
+            assert!(!error.use_stderr());
+        }
+
+        let mut command = Cli::command();
+        let template = command
+            .find_subcommand_mut("template")
+            .expect("template subcommand should exist");
+        let template_help = template.render_long_help().to_string();
+        assert!(template_help.contains("Manage source templates"));
+        assert!(template_help.contains("template <COMMAND>"));
+        assert!(template_help.contains("init"));
+
+        let init = template
+            .find_subcommand_mut("init")
+            .expect("template init subcommand should exist");
+        let init_help = init.render_long_help().to_string();
+        assert!(init_help.contains("Initialize active user source templates from the built-ins"));
+        assert!(init_help.contains("init [LANGUAGE]"));
+        for unrelated in ["--debug", "--language", "--count", "--forever", "--seed"] {
+            assert!(!init_help.contains(unrelated));
+        }
     }
 
     #[test]

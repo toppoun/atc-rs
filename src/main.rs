@@ -21,6 +21,7 @@ mod stress;
 mod template;
 mod tui;
 mod ui;
+mod user_config_fs;
 mod watcher;
 mod workspace;
 use crate::error::AppError;
@@ -99,6 +100,12 @@ fn run() -> Result<(), AppError> {
 
         cli::Command::Files(cli::FileCommand::Create { name, language }) => {
             commands::create(&name, language, &mut reporter)?;
+        }
+
+        cli::Command::Files(cli::FileCommand::Template {
+            command: cli::TemplateCommand::Init { language },
+        }) => {
+            commands::template_init(language, &mut reporter)?;
         }
 
         cli::Command::Account(cli::AccountCommand::Login) => {

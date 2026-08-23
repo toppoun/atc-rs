@@ -176,6 +176,12 @@ impl Reporter for RecordingReporter {
             Event::SourceCreated { path } => {
                 format!("source-created:{}", path.display())
             }
+            Event::TemplateFileCreated { path } => {
+                format!("template-file-created:{}", path.display())
+            }
+            Event::TemplateFileExists { path } => {
+                format!("template-file-exists:{}", path.display())
+            }
             Event::StressFileCreated { path } => {
                 format!("stress-file-created:{}", path.display())
             }

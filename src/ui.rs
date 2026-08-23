@@ -98,6 +98,12 @@ pub enum Event<'a> {
     SourceCreated {
         path: &'a Path,
     },
+    TemplateFileCreated {
+        path: &'a Path,
+    },
+    TemplateFileExists {
+        path: &'a Path,
+    },
     StressFileCreated {
         path: &'a Path,
     },
@@ -357,6 +363,12 @@ impl Reporter for TerminalReporter {
             }
             Event::SourceCreated { path } => {
                 println!("Created {}", path.display());
+            }
+            Event::TemplateFileCreated { path } => {
+                println!("Created {}", path.display());
+            }
+            Event::TemplateFileExists { path } => {
+                println!("Exists {}", path.display());
             }
             Event::StressFileCreated { path } => {
                 println!("Created {}", path.display());

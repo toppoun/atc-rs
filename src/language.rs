@@ -7,6 +7,8 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ALL: [Self; 2] = [Self::Cpp, Self::Python];
+
     pub fn extension(self) -> &'static str {
         match self {
             Self::Cpp => "cpp",
@@ -65,5 +67,10 @@ mod tests {
     fn returns_extension() {
         assert_eq!(Language::Cpp.extension(), "cpp");
         assert_eq!(Language::Python.extension(), "py");
+    }
+
+    #[test]
+    fn all_contains_exactly_the_supported_normal_source_languages() {
+        assert_eq!(Language::ALL, [Language::Cpp, Language::Python]);
     }
 }

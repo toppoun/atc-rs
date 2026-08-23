@@ -1,8 +1,6 @@
 use crate::error::AppError;
 use crate::language::Language;
-use std::fmt;
-use std::fs;
-use std::io;
+use crate::user_config_fs::{self, OptionalUtf8File};
 use std::path::Path;
 
 const CPP_TEMPLATE: &str = include_str!("../assets/templates/default.cpp");
@@ -20,7 +18,7 @@ pub fn builtin_template(language: Language) -> &'static str {
     }
 }
 
-fn source_template_filename(language: Language) -> &'static str {
+pub(crate) fn source_template_filename(language: Language) -> &'static str {
     match language {
         Language::Cpp => "cpp.cpp",
         Language::Python => "python.py",
@@ -36,120 +34,14 @@ pub(crate) fn resolve_source_template_in(
     templates_dir: &Path,
     language: Language,
 ) -> Result<String, AppError> {
-    if !optional_directory_exists(templates_dir)? {
+    if !user_config_fs::optional_directory_exists(templates_dir, "source template directory")? {
         return Ok(builtin_template(language).to_owned());
     }
 
     let template_path = templates_dir.join(source_template_filename(language));
-    if !optional_regular_file_exists(&template_path)? {
-        return Ok(builtin_template(language).to_owned());
-    }
-
-    fs::read_to_string(&template_path)
-        .map_err(|error| {
-            contextual_io_error(
-                error,
-                format!(
-                    "failed to read source template as UTF-8: {}",
-                    template_path.display()
-                ),
-            )
-        })
-        .map_err(AppError::from)
-}
-
-fn optional_directory_exists(path: &Path) -> Result<bool, AppError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(contextual_io_error(
-                error,
-                format!(
-                    "failed to inspect source template directory: {}",
-                    path.display()
-                ),
-            )
-            .into());
-        }
-    }
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!(
-                "failed to follow source template directory: {}",
-                path.display()
-            ),
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "source template directory must resolve to a directory: {}",
-                path.display()
-            ),
-        )
-        .into());
-    }
-
-    Ok(true)
-}
-
-fn optional_regular_file_exists(path: &Path) -> Result<bool, AppError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(contextual_io_error(
-                error,
-                format!("failed to inspect source template: {}", path.display()),
-            )
-            .into());
-        }
-    }
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to follow source template: {}", path.display()),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "source template must resolve to a regular file: {}",
-                path.display()
-            ),
-        )
-        .into());
-    }
-
-    Ok(true)
-}
-
-fn contextual_io_error(source: io::Error, context: String) -> io::Error {
-    let kind = source.kind();
-    io::Error::new(kind, ContextualIoError { context, source })
-}
-
-#[derive(Debug)]
-struct ContextualIoError {
-    context: String,
-    source: io::Error,
-}
-
-impl fmt::Display for ContextualIoError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.context, self.source)
-    }
-}
-
-impl std::error::Error for ContextualIoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+    match user_config_fs::read_optional_utf8_file(&template_path, "source template")? {
+        OptionalUtf8File::Missing => Ok(builtin_template(language).to_owned()),
+        OptionalUtf8File::Present(contents) => Ok(contents),
     }
 }
 
@@ -164,6 +56,7 @@ pub(crate) fn stress_brute_template() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io};
 
     fn create_file_symlink(target: &Path, link: &Path) -> bool {
         #[cfg(unix)]
