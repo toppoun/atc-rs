@@ -137,7 +137,6 @@ pub enum StressSetupState {
 pub struct StressFailureState {
     pub kind: CandidateFailureKind,
     pub case_number: u64,
-    pub base_seed: u64,
     pub seed: u64,
     pub input: Arc<String>,
     pub expected: Arc<String>,
@@ -262,6 +261,7 @@ fn case_mut(run: &mut RunState, number: usize) -> Option<&mut CaseState> {
 }
 
 impl WatchApp {
+    #[cfg(test)]
     pub fn new(contest: &Contest, sample_counts: Vec<usize>) -> io::Result<Self> {
         let stress_cases = vec![None; contest.problems.len()];
         Self::new_with_stress_cases(contest, sample_counts, stress_cases)
@@ -1181,7 +1181,6 @@ impl WatchApp {
         problem_state.stress.failure = Some(StressFailureState {
             kind,
             case_number,
-            base_seed,
             seed,
             input: Arc::clone(&input),
             expected: Arc::clone(&expected),
