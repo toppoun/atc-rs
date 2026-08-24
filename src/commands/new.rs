@@ -3,6 +3,7 @@ use crate::atcoder;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::language::Language;
+use crate::safe_file;
 use crate::template::resolve_source_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
@@ -113,6 +114,29 @@ fn new_at_with_parent_preparation(
     reporter: &mut dyn Reporter,
     prepare_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), AppError> {
+    new_at_with_parent_preparation_and_hook(
+        destination,
+        contest_id,
+        language,
+        template,
+        atcoder,
+        reporter,
+        prepare_parent,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_at_with_parent_preparation_and_hook(
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    template: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+    prepare_parent: impl FnOnce(&Path) -> io::Result<()>,
+    before_install: impl FnOnce(),
+) -> Result<(), AppError> {
     if existing_contest_is_noop(destination)? {
         return Ok(());
     }
@@ -145,23 +169,38 @@ fn new_at_with_parent_preparation(
     }
     workspace::save_metadata(staging.path(), &contest)?;
 
-    // Another process may have created the contest while fixtures/HTTP were read.
-    if existing_contest_is_noop(destination)? {
-        return Ok(());
-    }
+    before_install();
 
-    match fs::rename(staging.path(), destination) {
+    match safe_file::rename_noclobber(staging.path(), destination) {
         Ok(()) => {
             drop(staging.keep());
             reporter.report(Event::WorkspaceCreated { destination });
             Ok(())
         }
-        Err(rename_error) => match existing_contest_is_noop(destination) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(rename_error.into()),
-            Err(safety_error) => Err(safety_error.into()),
-        },
+        Err(rename_error) => Err(rename_error.into()),
     }
+}
+
+#[cfg(test)]
+pub(super) fn new_at_with_install_hook(
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    template: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+    before_install: impl FnOnce(),
+) -> Result<(), AppError> {
+    new_at_with_parent_preparation_and_hook(
+        destination,
+        contest_id,
+        language,
+        template,
+        atcoder,
+        reporter,
+        workspace::ensure_contest_parent,
+        before_install,
+    )
 }
 
 fn existing_contest_is_noop(destination: &Path) -> std::io::Result<bool> {

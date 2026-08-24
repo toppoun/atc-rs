@@ -17,7 +17,6 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
 const METADATA_VERSION: u32 = 1;
-
 const WORKSPACE_CONFIG_FILE: &str = ".atc-workspace.toml";
 const WORKSPACE_CONFIG_VERSION: u32 = 1;
 
@@ -717,17 +716,18 @@ fn parse_sample_filename(name: &OsStr) -> io::Result<Option<(usize, SampleFileKi
         ));
     };
 
-    let number = number.parse::<usize>().map_err(|_| {
+    let number_text = number;
+    let number = number_text.parse::<usize>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid sample number in file name: {name}"),
         )
     })?;
 
-    if number == 0 {
+    if number == 0 || number.to_string() != number_text {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("sample number must start from 1: {name}"),
+            format!("sample number must use its canonical positive form: {name}"),
         ));
     }
 
@@ -1104,6 +1104,24 @@ pub fn replace_refresh_data(
     staging: TempDir,
     allow_missing_marker: bool,
 ) -> io::Result<()> {
+    replace_refresh_data_with_hooks(
+        destination,
+        staging,
+        allow_missing_marker,
+        || {},
+        || {},
+        || {},
+    )
+}
+
+fn replace_refresh_data_with_hooks(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+) -> io::Result<()> {
     validate_contest_directory(destination)?;
 
     let staging_root = staging.path().to_path_buf();
@@ -1137,11 +1155,35 @@ pub fn replace_refresh_data(
         ));
     }
 
+    let owned_problem_indices = if had_destination_tests {
+        let indices = refresh_owned_problem_indices(destination, &staging_root)?;
+        validate_refresh_owned_tests(&destination_tests, &indices)?;
+        indices
+    } else {
+        HashSet::new()
+    };
+
+    before_tests_backup();
+
     if had_destination_tests {
-        fs::rename(&destination_tests, &backup_tests)?;
+        safe_file::rename_noclobber(&destination_tests, &backup_tests)?;
+        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices) {
+            let rollback_errors = rollback_tests(
+                &destination_tests,
+                &staged_tests,
+                &backup_tests,
+                false,
+                true,
+            );
+            return Err(refresh_update_error(staging, error, rollback_errors));
+        }
     }
 
-    if has_staged_tests && let Err(error) = fs::rename(&staged_tests, &destination_tests) {
+    before_tests_install();
+
+    if has_staged_tests
+        && let Err(error) = safe_file::rename_noclobber(&staged_tests, &destination_tests)
+    {
         let rollback_errors = rollback_tests(
             &destination_tests,
             &staged_tests,
@@ -1153,7 +1195,7 @@ pub fn replace_refresh_data(
     }
 
     if had_destination_metadata
-        && let Err(error) = fs::rename(&destination_metadata, &backup_metadata)
+        && let Err(error) = safe_file::rename_noclobber(&destination_metadata, &backup_metadata)
     {
         let rollback_errors = rollback_tests(
             &destination_tests,
@@ -1180,10 +1222,11 @@ pub fn replace_refresh_data(
         true
     };
 
-    if let Err(error) = fs::rename(&staged_metadata, &destination_metadata) {
+    if let Err(error) = safe_file::rename_noclobber(&staged_metadata, &destination_metadata) {
         let mut rollback_errors = Vec::new();
         if had_destination_metadata
-            && let Err(rollback_error) = fs::rename(&backup_metadata, &destination_metadata)
+            && let Err(rollback_error) =
+                safe_file::rename_noclobber(&backup_metadata, &destination_metadata)
         {
             rollback_errors.push(format!(
                 "failed to restore metadata {}: {rollback_error}",
@@ -1208,11 +1251,113 @@ pub fn replace_refresh_data(
         return Err(refresh_update_error(staging, error, rollback_errors));
     }
 
+    before_recovery_cleanup();
+    if had_destination_tests
+        && let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+    {
+        let kind = error.kind();
+        let recovery_path = staging.keep();
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "refresh installed new data, but the previous tests changed before cleanup: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
+
     Ok(())
+}
+
+fn refresh_owned_problem_indices(
+    destination: &Path,
+    staging_root: &Path,
+) -> io::Result<HashSet<String>> {
+    let staged_contest = load_metadata(staging_root)?;
+    validate_contest_paths(&staged_contest)?;
+
+    let mut indices = staged_contest
+        .problems
+        .iter()
+        .map(|problem| problem.index.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    if let ContestMetadataHealth::Healthy(previous_contest) = inspect_contest_metadata(destination)?
+        && validate_contest_paths(&previous_contest).is_ok()
+        && validate_contest_identity(&previous_contest, &staged_contest.contest_id).is_ok()
+    {
+        indices.extend(
+            previous_contest
+                .problems
+                .iter()
+                .map(|problem| problem.index.to_ascii_lowercase()),
+        );
+    }
+
+    Ok(indices)
+}
+
+fn validate_refresh_owned_tests(
+    tests_directory: &Path,
+    owned_problem_indices: &HashSet<String>,
+) -> io::Result<()> {
+    for problem_entry in fs::read_dir(tests_directory)? {
+        let problem_entry = problem_entry?;
+        let problem_path = problem_entry.path();
+        let Some(problem_index) = problem_entry.file_name().to_str().map(str::to_owned) else {
+            return Err(unowned_refresh_test_error(&problem_path));
+        };
+        if refresh_entry_is_reparse(&problem_path)?
+            || !problem_entry.file_type()?.is_dir()
+            || !owned_problem_indices.contains(&problem_index.to_ascii_lowercase())
+        {
+            return Err(unowned_refresh_test_error(&problem_path));
+        }
+
+        for sample_entry in fs::read_dir(&problem_path)? {
+            let sample_entry = sample_entry?;
+            let sample_path = sample_entry.path();
+            if refresh_entry_is_reparse(&sample_path)?
+                || !sample_entry.file_type()?.is_file()
+                || !matches!(
+                    parse_sample_filename(&sample_entry.file_name()),
+                    Ok(Some(_))
+                )
+            {
+                return Err(unowned_refresh_test_error(&sample_path));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn refresh_entry_is_reparse(path: &Path) -> io::Result<bool> {
+    Ok(metadata_is_reparse(&fs::symlink_metadata(path)?))
+}
+
+#[cfg(not(windows))]
+fn refresh_entry_is_reparse(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn unowned_refresh_test_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "refusing to refresh because tests contains an unowned entry: {}; move it outside tests and retry",
+            path.display()
+        ),
+    )
 }
 
 fn existing_real_directory(path: &Path, kind: &str) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata_is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is a reparse point: {}", path.display()),
+        )),
         Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1225,6 +1370,10 @@ fn existing_real_directory(path: &Path, kind: &str) -> io::Result<bool> {
 
 fn existing_regular_file(path: &Path, kind: &str) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata_is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is a reparse point: {}", path.display()),
+        )),
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1233,6 +1382,19 @@ fn existing_regular_file(path: &Path, kind: &str) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn rollback_tests(
@@ -1244,13 +1406,17 @@ fn rollback_tests(
 ) -> Vec<String> {
     let mut errors = Vec::new();
 
-    if new_tests_were_moved && let Err(error) = fs::rename(destination_tests, staged_tests) {
+    if new_tests_were_moved
+        && let Err(error) = safe_file::rename_noclobber(destination_tests, staged_tests)
+    {
         errors.push(format!(
             "failed to move new tests out of {}: {error}",
             destination_tests.display()
         ));
     }
-    if old_tests_were_moved && let Err(error) = fs::rename(backup_tests, destination_tests) {
+    if old_tests_were_moved
+        && let Err(error) = safe_file::rename_noclobber(backup_tests, destination_tests)
+    {
         errors.push(format!(
             "failed to restore previous tests {}: {error}",
             destination_tests.display()
@@ -2195,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_and_invalid_sample_names() {
+    fn rejects_noncanonical_and_invalid_sample_names() {
         let temp = tempfile::tempdir().unwrap();
         let duplicate = temp.path().join("tests").join("A");
         fs::create_dir_all(&duplicate).unwrap();
@@ -2205,7 +2371,7 @@ mod tests {
 
         let error = load_samples(temp.path(), "A").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("duplicate sample input"));
+        assert!(error.to_string().contains("canonical positive form"));
 
         let invalid = temp.path().join("tests").join("B");
         fs::create_dir_all(&invalid).unwrap();
@@ -2626,5 +2792,465 @@ mod tests {
             "user file"
         );
         assert_eq!(load_metadata(&destination).unwrap(), old_contest);
+    }
+
+    #[test]
+    fn refresh_replacement_preserves_unowned_entries_and_leaves_workspace_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &old_contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+        fs::write(old_tests.join("README.txt"), "user notes\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let new_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(staging.path(), &new_contest).unwrap();
+        save_samples(
+            staging.path(),
+            &new_contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data(&destination, staging, false)
+            .expect_err("refresh must not delete an unowned test entry");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("README.txt"));
+        assert_eq!(
+            fs::read_to_string(old_tests.join("README.txt")).unwrap(),
+            "user notes\n"
+        );
+        assert_eq!(
+            fs::read_to_string(old_tests.join("sample-1.in")).unwrap(),
+            "old input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), old_contest);
+    }
+
+    #[test]
+    fn refresh_replacement_does_not_claim_a_noncanonical_sample_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &old_contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-01.in"), "user input\n").unwrap();
+        fs::write(old_tests.join("sample-01.out"), "user output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &old_contest).unwrap();
+        save_samples(
+            staging.path(),
+            &old_contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data(&destination, staging, false)
+            .expect_err("a noncanonical sample name must not be treated as refresh-owned");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("sample-01.in"));
+        assert_eq!(
+            fs::read_to_string(old_tests.join("sample-01.in")).unwrap(),
+            "user input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), old_contest);
+    }
+
+    #[test]
+    fn refresh_replacement_does_not_follow_or_claim_a_sample_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        let external_input = temp.path().join("external-input.txt");
+        fs::write(&external_input, "external user input\n").unwrap();
+        let linked_input = old_tests.join("sample-1.in");
+        if !create_file_symlink(&external_input, &linked_input) {
+            return;
+        }
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data(&destination, staging, false)
+            .expect_err("a sample symlink must not be treated as refresh-owned");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(&external_input).unwrap(),
+            "external user input\n"
+        );
+        assert!(
+            fs::symlink_metadata(&linked_input)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), contest);
+    }
+
+    #[test]
+    fn wrong_contest_prior_metadata_cannot_broaden_refresh_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let unrelated_contest = Contest {
+            contest_id: "other-contest".to_string(),
+            problems: vec![problem("LOCAL")],
+        };
+        save_metadata(&destination, &unrelated_contest).unwrap();
+        let local_tests = destination.join("tests").join("LOCAL");
+        fs::create_dir_all(&local_tests).unwrap();
+        fs::write(local_tests.join("sample-1.in"), "user input\n").unwrap();
+        fs::write(local_tests.join("sample-1.out"), "user output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let new_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(staging.path(), &new_contest).unwrap();
+        save_samples(
+            staging.path(),
+            &new_contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data(&destination, staging, false)
+            .expect_err("wrong-contest metadata must not claim the LOCAL test namespace");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("LOCAL"));
+        assert_eq!(
+            fs::read_to_string(local_tests.join("sample-1.in")).unwrap(),
+            "user input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), unrelated_contest);
+    }
+
+    #[test]
+    fn duplicate_prior_metadata_cannot_broaden_refresh_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir_all(destination.join(".atc")).unwrap();
+        fs::write(
+            destination.join(".atc").join("contest.toml"),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"LOCAL\"\n",
+                "title = \"Local\"\n",
+                "task_id = \"local\"\n",
+                "url = \"https://example.invalid/local\"\n",
+                "[[problems]]\n",
+                "index = \"local\"\n",
+                "title = \"Duplicate\"\n",
+                "task_id = \"duplicate\"\n",
+                "url = \"https://example.invalid/duplicate\"\n",
+            ),
+        )
+        .unwrap();
+        let local_tests = destination.join("tests").join("LOCAL");
+        fs::create_dir_all(&local_tests).unwrap();
+        fs::write(local_tests.join("sample-1.in"), "user input\n").unwrap();
+        fs::write(local_tests.join("sample-1.out"), "user output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let new_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(staging.path(), &new_contest).unwrap();
+
+        let error = replace_refresh_data(&destination, staging, false)
+            .expect_err("duplicate prior indices must invalidate all prior ownership claims");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("LOCAL"));
+        assert_eq!(
+            fs::read_to_string(local_tests.join("sample-1.in")).unwrap(),
+            "user input\n"
+        );
+    }
+
+    #[test]
+    fn refresh_post_move_reinspection_restores_a_late_unowned_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            || fs::write(old_tests.join("notes.txt"), "late user data\n").unwrap(),
+            || {},
+            || {},
+        )
+        .expect_err("post-move validation must detect the late unowned entry");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(old_tests.join("notes.txt")).unwrap(),
+            "late user data\n"
+        );
+        assert_eq!(
+            fs::read_to_string(old_tests.join("sample-1.in")).unwrap(),
+            "old input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), contest);
+        assert!(fs::read_dir(&destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".atc-refresh-")
+        }));
+    }
+
+    #[test]
+    fn refresh_install_and_rollback_race_preserves_competitor_and_recovery_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let competing_tests = destination.join("tests");
+        let error = replace_refresh_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {
+                fs::create_dir(&competing_tests).unwrap();
+                fs::write(competing_tests.join("competitor.txt"), "keep me\n").unwrap();
+            },
+            || {},
+        )
+        .expect_err("a competing tests destination must block install and rollback");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("rollback also failed"));
+        assert!(error.to_string().contains("recovery data kept at"));
+        assert_eq!(
+            fs::read_to_string(competing_tests.join("competitor.txt")).unwrap(),
+            "keep me\n"
+        );
+        let recovery = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-refresh-")
+            })
+            .expect("failed rollback must retain the refresh staging directory");
+        assert_eq!(
+            fs::read_to_string(
+                recovery
+                    .join("previous-tests")
+                    .join("A")
+                    .join("sample-1.in")
+            )
+            .unwrap(),
+            "old input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("tests").join("A").join("sample-1.in")).unwrap(),
+            "new input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), contest);
+    }
+
+    #[test]
+    fn refresh_final_reinspection_keeps_a_late_changed_previous_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &old_contest).unwrap();
+        let old_tests = destination.join("tests").join("A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let new_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("B")],
+        };
+        save_metadata(staging.path(), &new_contest).unwrap();
+        save_samples(
+            staging.path(),
+            &new_contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {},
+            || {
+                fs::write(
+                    staging_path
+                        .join("previous-tests")
+                        .join("A")
+                        .join("notes.txt"),
+                    "late user data\n",
+                )
+                .unwrap();
+            },
+        )
+        .expect_err("a changed previous generation must be retained instead of cleaned");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("recovery data kept at"));
+        assert_eq!(
+            fs::read_to_string(
+                staging_path
+                    .join("previous-tests")
+                    .join("A")
+                    .join("notes.txt")
+            )
+            .unwrap(),
+            "late user data\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                staging_path
+                    .join("previous-tests")
+                    .join("A")
+                    .join("sample-1.in")
+            )
+            .unwrap(),
+            "old input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("tests").join("B").join("sample-1.in")).unwrap(),
+            "new input\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), new_contest);
     }
 }

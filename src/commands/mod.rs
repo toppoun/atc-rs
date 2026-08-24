@@ -38,6 +38,8 @@ use crate::ui::{Event, Reporter};
 #[cfg(test)]
 use create::create_at;
 #[cfg(test)]
+use new::new_at_with_install_hook;
+#[cfg(test)]
 use new::{new_at, new_at_in_workspace, prepare_new};
 #[cfg(test)]
 use refresh::{refresh_at, resolve_refresh_contest_id};

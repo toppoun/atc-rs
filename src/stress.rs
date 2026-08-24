@@ -17,6 +17,7 @@ use crate::error::AppError;
 use crate::language::Language;
 use crate::model::Sample;
 use crate::runner::{self, ExecutionOutcome};
+use crate::safe_file;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 
@@ -125,8 +126,12 @@ pub enum StressError {
     CandidateCompileTimedOut { elapsed: Duration },
     GeneratorRuntimeError { seed: u64, stderr: String },
     GeneratorTimedOut { seed: u64, elapsed: Duration },
+    GeneratorOutputLimit { seed: u64 },
+    GeneratorInvalidUtf8 { seed: u64 },
     ReferenceRuntimeError { seed: u64, stderr: String },
     ReferenceTimedOut { seed: u64, elapsed: Duration },
+    ReferenceOutputLimit { seed: u64 },
+    ReferenceInvalidUtf8 { seed: u64 },
     SeedOverflow { base_seed: u64, case_number: u64 },
 }
 
@@ -156,6 +161,15 @@ impl fmt::Display for StressError {
                     "generator timed out for seed {seed} after {elapsed:.2?}"
                 )
             }
+            Self::GeneratorInvalidUtf8 { seed } => {
+                write!(formatter, "generator emitted invalid UTF-8 for seed {seed}")
+            }
+            Self::GeneratorOutputLimit { seed } => {
+                write!(
+                    formatter,
+                    "generator output exceeded the capture limit for seed {seed}"
+                )
+            }
             Self::ReferenceRuntimeError { seed, stderr } => {
                 write!(formatter, "reference program failed for seed {seed}")?;
                 if !stderr.is_empty() {
@@ -169,6 +183,16 @@ impl fmt::Display for StressError {
                     "reference program timed out for seed {seed} after {elapsed:.2?}"
                 )
             }
+            Self::ReferenceInvalidUtf8 { seed } => {
+                write!(
+                    formatter,
+                    "reference program emitted invalid UTF-8 for seed {seed}"
+                )
+            }
+            Self::ReferenceOutputLimit { seed } => write!(
+                formatter,
+                "reference program output exceeded the capture limit for seed {seed}"
+            ),
             Self::SeedOverflow {
                 base_seed,
                 case_number,
@@ -492,7 +516,7 @@ impl PreparedCandidate {
                     runner::BuildOptions::default()
                 };
 
-                let result = match runner::compile_cpp_with_cancel(
+                let result = match runner::compile_cpp_with_cancel_in(
                     &request.candidate_source,
                     &executable,
                     &request.cpp_compiler,
@@ -500,6 +524,7 @@ impl PreparedCandidate {
                     request.compile_timeout,
                     &build_options,
                     is_cancelled,
+                    &request.destination,
                 ) {
                     Ok(result) => result,
                     Err(error) if io_error_is_clean_cancellation(&error) => {
@@ -539,19 +564,21 @@ impl PreparedCandidate {
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ProcessStep<runner::ExecutionResult>, AppError> {
         let result = match self {
-            Self::Python { source } => runner::execute_python_with_cancel(
+            Self::Python { source } => runner::execute_python_with_cancel_in(
                 source,
                 input,
                 &request.python,
                 request.candidate_timeout,
                 is_cancelled,
+                &request.destination,
             ),
-            Self::Cpp { executable, .. } => runner::execute_with_cancel(
+            Self::Cpp { executable, .. } => runner::execute_with_cancel_in(
                 executable,
                 &[],
                 input,
                 request.candidate_timeout,
                 is_cancelled,
+                &request.destination,
             ),
         };
 
@@ -582,20 +609,27 @@ fn run_generator(
         OsString::from(seed.to_string()),
     ];
 
-    let result = match process_step(runner::execute_with_cancel(
+    let result = match process_step(runner::execute_with_cancel_in(
         Path::new(&request.python),
         &args,
         "",
         request.generator_timeout,
         is_cancelled,
+        &request.destination,
     ))? {
         ProcessStep::Completed(result) => result,
         ProcessStep::Cancelled => return Ok(ProcessStep::Cancelled),
     };
 
     match result.outcome {
-        ExecutionOutcome::Exited(status) if status.success() => {
+        ExecutionOutcome::Exited(status) if status.success() && result.stdout_truncated => {
+            Err(StressError::GeneratorOutputLimit { seed }.into())
+        }
+        ExecutionOutcome::Exited(status) if status.success() && result.stdout_is_utf8 => {
             Ok(ProcessStep::Completed(result.stdout))
+        }
+        ExecutionOutcome::Exited(status) if status.success() => {
+            Err(StressError::GeneratorInvalidUtf8 { seed }.into())
         }
         ExecutionOutcome::Exited(_) => Err(StressError::GeneratorRuntimeError {
             seed,
@@ -616,20 +650,27 @@ fn run_reference(
     seed: u64,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ProcessStep<String>, AppError> {
-    let result = match process_step(runner::execute_python_with_cancel(
+    let result = match process_step(runner::execute_python_with_cancel_in(
         &request.reference_source,
         input,
         &request.python,
         request.reference_timeout,
         is_cancelled,
+        &request.destination,
     ))? {
         ProcessStep::Completed(result) => result,
         ProcessStep::Cancelled => return Ok(ProcessStep::Cancelled),
     };
 
     match result.outcome {
-        ExecutionOutcome::Exited(status) if status.success() => {
+        ExecutionOutcome::Exited(status) if status.success() && result.stdout_truncated => {
+            Err(StressError::ReferenceOutputLimit { seed }.into())
+        }
+        ExecutionOutcome::Exited(status) if status.success() && result.stdout_is_utf8 => {
             Ok(ProcessStep::Completed(result.stdout))
+        }
+        ExecutionOutcome::Exited(status) if status.success() => {
+            Err(StressError::ReferenceInvalidUtf8 { seed }.into())
         }
         ExecutionOutcome::Exited(_) => Err(StressError::ReferenceRuntimeError {
             seed,
@@ -649,6 +690,9 @@ fn candidate_failure_kind(result: &runner::ExecutionResult) -> Option<CandidateF
         ExecutionOutcome::TimedOut => Some(CandidateFailureKind::TimedOut),
         ExecutionOutcome::Exited(status) if !status.success() => {
             Some(CandidateFailureKind::RuntimeError)
+        }
+        ExecutionOutcome::Exited(_) if result.stdout_truncated || !result.stdout_is_utf8 => {
+            Some(CandidateFailureKind::WrongAnswer)
         }
         ExecutionOutcome::Exited(_) => None,
     }
@@ -687,6 +731,16 @@ fn persist_failure(
     request: &StressRequest,
     failure: &StressFailure,
     is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<PersistenceOutcome> {
+    persist_failure_with_hooks(request, failure, is_cancelled, || {}, || {})
+}
+
+fn persist_failure_with_hooks(
+    request: &StressRequest,
+    failure: &StressFailure,
+    is_cancelled: &dyn Fn() -> bool,
+    before_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
 ) -> io::Result<PersistenceOutcome> {
     workspace::validate_problem_index(&request.problem_index)?;
     workspace::validate_workspace_marker(&request.destination)?;
@@ -774,7 +828,7 @@ fn persist_failure(
     }
 
     if target_exists {
-        fs::rename(&target, &previous_generation)?;
+        safe_file::rename_noclobber(&target, &previous_generation)?;
         if let Err(error) = validate_failure_generation(&previous_generation, request) {
             return Err(rollback_previous_generation(
                 staging,
@@ -785,7 +839,9 @@ fn persist_failure(
         }
     }
 
-    if let Err(error) = fs::rename(&new_generation, &target) {
+    before_install();
+
+    if let Err(error) = safe_file::rename_noclobber(&new_generation, &target) {
         if target_exists {
             return Err(rollback_previous_generation(
                 staging,
@@ -796,6 +852,21 @@ fn persist_failure(
         }
 
         return Err(error);
+    }
+
+    before_recovery_cleanup();
+    if target_exists && let Err(error) = validate_failure_generation(&previous_generation, request)
+    {
+        let kind = error.kind();
+        let recovery_path = staging.keep();
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "installed new stress failure {}, but the previous generation changed before cleanup: {error}; recovery data kept at {}",
+                target.display(),
+                recovery_path.display()
+            ),
+        ));
     }
 
     Ok(PersistenceOutcome::Saved(target))
@@ -815,7 +886,10 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
             )
         })?;
 
-        if !FAILURE_GENERATION_FILES.contains(&name) || !entry.file_type()?.is_file() {
+        if stress_entry_is_reparse(&entry.path())?
+            || !FAILURE_GENERATION_FILES.contains(&name)
+            || !entry.file_type()?.is_file()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -929,7 +1003,7 @@ fn rollback_previous_generation(
     previous_generation: &Path,
     original: io::Error,
 ) -> io::Error {
-    if let Err(rollback_error) = fs::rename(previous_generation, target) {
+    if let Err(rollback_error) = safe_file::rename_noclobber(previous_generation, target) {
         let kind = original.kind();
         let recovery_path = staging.keep();
         return io::Error::new(
@@ -1140,6 +1214,10 @@ fn open_stress_lock(
 
 fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if stress_metadata_is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is a reparse point: {}", path.display()),
+        )),
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1152,6 +1230,10 @@ fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
 
 fn existing_real_directory(path: &Path, kind: &str) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if stress_metadata_is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is a reparse point: {}", path.display()),
+        )),
         Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1164,6 +1246,10 @@ fn existing_real_directory(path: &Path, kind: &str) -> io::Result<bool> {
 
 fn existing_regular_file(path: &Path, kind: &str) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if stress_metadata_is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} is a reparse point: {}", path.display()),
+        )),
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1172,6 +1258,29 @@ fn existing_regular_file(path: &Path, kind: &str) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn stress_entry_is_reparse(path: &Path) -> io::Result<bool> {
+    Ok(stress_metadata_is_reparse(&fs::symlink_metadata(path)?))
+}
+
+#[cfg(not(windows))]
+fn stress_entry_is_reparse(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn stress_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn stress_metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn write_new_file(path: &Path, content: &str) -> io::Result<()> {
@@ -1428,6 +1537,198 @@ mod tests {
             "keep me\n"
         );
         assert!(!target.join("failed.in").exists());
+    }
+
+    #[test]
+    fn persistence_destination_race_preserves_the_competing_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let target = temp.path().join(".atc").join("stress").join("A");
+
+        let error = persist_failure_with_hooks(
+            &request,
+            &failure,
+            &|| false,
+            || {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("competitor.txt"), "keep me\n").unwrap();
+            },
+            || {},
+        )
+        .expect_err("a target created immediately before install must win the race");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(target.join("competitor.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(
+            fs::read_dir(temp.path().join(".atc").join("stress"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stress-staging-"))
+        );
+    }
+
+    #[test]
+    fn persistence_rollback_race_preserves_competitor_and_both_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let previous = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old input\n".to_string(),
+            expected: "old expected\n".to_string(),
+            actual: "old actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let target = persisted_path(persist_failure(&request, &previous, &|| false));
+        let replacement = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 2,
+            base_seed: 10,
+            seed: 11,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        let error = persist_failure_with_hooks(
+            &request,
+            &replacement,
+            &|| false,
+            || {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("competitor.txt"), "keep me\n").unwrap();
+            },
+            || {},
+        )
+        .expect_err("a competing target must block both install and rollback");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("rollback also failed"));
+        assert!(error.to_string().contains("recovery data kept at"));
+        assert_eq!(
+            fs::read_to_string(target.join("competitor.txt")).unwrap(),
+            "keep me\n"
+        );
+        let stress_root = temp.path().join(".atc").join("stress");
+        let recovery = fs::read_dir(&stress_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-staging-")
+            })
+            .expect("failed rollback must retain stress staging");
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous").join("failed.in")).unwrap(),
+            "old input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("new").join("failed.in")).unwrap(),
+            "new input\n"
+        );
+    }
+
+    #[test]
+    fn persistence_final_reinspection_keeps_a_late_changed_previous_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let previous = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old input\n".to_string(),
+            expected: "old expected\n".to_string(),
+            actual: "old actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let target = persisted_path(persist_failure(&request, &previous, &|| false));
+        let replacement = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 2,
+            base_seed: 10,
+            seed: 11,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let stress_root = temp.path().join(".atc").join("stress");
+
+        let error = persist_failure_with_hooks(
+            &request,
+            &replacement,
+            &|| false,
+            || {},
+            || {
+                let recovery = fs::read_dir(&stress_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-")
+                    })
+                    .unwrap();
+                fs::write(recovery.join("previous").join("important.txt"), "keep me\n").unwrap();
+            },
+        )
+        .expect_err("a changed previous generation must be retained instead of cleaned");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("recovery data kept at"));
+        assert_eq!(
+            fs::read_to_string(target.join("failed.in")).unwrap(),
+            "new input\n"
+        );
+        let recovery = fs::read_dir(&stress_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-staging-")
+            })
+            .expect("late mutation must retain stress staging");
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous").join("failed.in")).unwrap(),
+            "old input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous").join("important.txt")).unwrap(),
+            "keep me\n"
+        );
     }
 
     #[test]

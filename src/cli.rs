@@ -1,5 +1,6 @@
 use crate::language::Language;
 use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::io::IsTerminal;
 use std::num::NonZeroU64;
 
 const LOGO: &str = r#"
@@ -28,7 +29,8 @@ impl Cli {
         let mut command_tree = command.clone();
         command_tree.build();
 
-        command.override_help(render_help(&command_tree))
+        let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        command.override_help(render_help(&command_tree, color))
     }
 
     pub fn parse() -> Self {
@@ -291,12 +293,13 @@ fn render_help_command(command_tree: &ClapCommand) -> String {
     format!("Help\n  {:<10}{about}\n", help.get_name())
 }
 
-fn render_help(command_tree: &ClapCommand) -> String {
+fn render_help(command_tree: &ClapCommand, color: bool) -> String {
     let command_name = command_tree.get_name();
+    let (gray, reset) = if color { (GRAY, RESET) } else { ("", "") };
 
     format!(
         "{LOGO}
-{GRAY}Fast AtCoder workflow from your terminal.{RESET}
+{gray}Fast AtCoder workflow from your terminal.{reset}
 
 Usage:
   {command_name} [options] <command>
@@ -338,7 +341,10 @@ mod tests {
     fn custom_help_matches_visible_top_level_commands_and_option_scope() {
         let mut command_tree = <Cli as CommandFactory>::command();
         command_tree.build();
-        let help = render_help(&command_tree);
+        let help = render_help(&command_tree, false);
+
+        assert!(!help.contains('\x1b'));
+        assert!(render_help(&command_tree, true).contains(GRAY));
 
         for subcommand in command_tree
             .get_subcommands()

@@ -22,6 +22,9 @@ const REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 // 429を受けたとき、Retry-Afterが無い場合の待機時間
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
 
+// A malformed or overly defensive server value must not suspend the CLI indefinitely.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
 // 最初のリクエストとは別に何回retryするか
 const MAX_429_RETRIES: usize = 3;
 
@@ -367,7 +370,7 @@ fn retry_wait(headers: &reqwest::header::HeaderMap) -> Duration {
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_WAIT))
         .unwrap_or(DEFAULT_RETRY_WAIT)
 }
 
@@ -768,6 +771,12 @@ mod tests {
             reqwest::header::HeaderValue::from_static("invalid"),
         );
         assert_eq!(retry_wait(&headers), DEFAULT_RETRY_WAIT);
+
+        headers.insert(
+            RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("18446744073709551615"),
+        );
+        assert_eq!(retry_wait(&headers), MAX_RETRY_WAIT);
     }
 
     #[test]

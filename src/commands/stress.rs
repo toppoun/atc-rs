@@ -240,6 +240,7 @@ pub(super) fn build_request(
     count: Option<NonZeroU64>,
 ) -> Result<StressRequest, AppError> {
     validate_debug_language(language, debug)?;
+    validate_finite_seed_range(base_seed, count)?;
 
     let candidate_source = destination.join(format!("{}.{}", problem.index, language.extension()));
     let generator_source = destination.join(format!("{}_gen.py", problem.index));
@@ -274,6 +275,22 @@ pub(super) fn build_request(
         count,
         debug,
     })
+}
+
+fn validate_finite_seed_range(base_seed: u64, count: Option<NonZeroU64>) -> Result<(), AppError> {
+    let Some(last_case_number) = count.map(NonZeroU64::get) else {
+        return Ok(());
+    };
+    let last_offset = last_case_number - 1;
+    if base_seed.checked_add(last_offset).is_some() {
+        return Ok(());
+    }
+
+    Err(stress::StressError::SeedOverflow {
+        base_seed,
+        case_number: last_case_number,
+    }
+    .into())
 }
 
 fn require_file(path: &Path, kind: &str) -> io::Result<()> {
@@ -416,6 +433,22 @@ mod tests {
     #[test]
     fn default_count_is_finite_and_nonzero() {
         assert_eq!(DEFAULT_STRESS_COUNT.get(), 100);
+    }
+
+    #[test]
+    fn finite_seed_range_is_validated_before_execution() {
+        assert!(validate_finite_seed_range(u64::MAX, NonZeroU64::new(1)).is_ok());
+        assert!(validate_finite_seed_range(u64::MAX - 1, NonZeroU64::new(2)).is_ok());
+        assert!(validate_finite_seed_range(u64::MAX, None).is_ok());
+
+        let error = validate_finite_seed_range(u64::MAX, NonZeroU64::new(2)).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Stress(stress::StressError::SeedOverflow {
+                base_seed: u64::MAX,
+                case_number: 2,
+            })
+        ));
     }
 
     #[test]

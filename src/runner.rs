@@ -9,6 +9,7 @@ use wait_timeout::ChildExt;
 use crate::attempt::{clean_cancellation_io_error, io_error_is_clean_cancellation};
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionCheckpoint {
@@ -28,6 +29,8 @@ pub enum ExecutionOutcome {
 pub struct ExecutionResult {
     pub outcome: ExecutionOutcome,
     pub stdout: String,
+    pub stdout_is_utf8: bool,
+    pub stdout_truncated: bool,
     pub stderr: String,
     pub elapsed: Duration,
 }
@@ -37,43 +40,54 @@ pub struct BuildOptions {
     pub debug_include_dir: Option<PathBuf>,
 }
 
-pub fn execute_python(
+pub fn execute_python_in(
     source: &Path,
     input: &str,
     python: &str,
     timeout: Duration,
+    working_directory: &Path,
 ) -> Result<ExecutionResult, io::Error> {
     let args = vec![source.as_os_str().to_owned()];
 
-    execute(Path::new(python), &args, input, timeout)
+    execute_in(Path::new(python), &args, input, timeout, working_directory)
 }
 
-pub fn execute_python_with_cancel(
+pub fn execute_python_with_cancel_in(
     source: &Path,
     input: &str,
     python: &str,
     timeout: Duration,
     is_cancelled: &dyn Fn() -> bool,
+    working_directory: &Path,
 ) -> Result<ExecutionResult, io::Error> {
     let args = vec![source.as_os_str().to_owned()];
 
-    execute_with_cancel(Path::new(python), &args, input, timeout, is_cancelled)
+    execute_with_cancel_in(
+        Path::new(python),
+        &args,
+        input,
+        timeout,
+        is_cancelled,
+        working_directory,
+    )
 }
 
-pub fn compile_cpp(
+pub fn compile_cpp_in(
     source: &Path,
     output: &Path,
     compiler: &str,
     cpp_flags: &[String],
     timeout: Duration,
     options: &BuildOptions,
+    working_directory: &Path,
 ) -> Result<ExecutionResult, io::Error> {
     let args = cpp_arguments(source, output, cpp_flags, options);
 
-    execute(Path::new(compiler), &args, "", timeout)
+    execute_in(Path::new(compiler), &args, "", timeout, working_directory)
 }
 
-pub fn compile_cpp_with_cancel(
+#[allow(clippy::too_many_arguments)]
+pub fn compile_cpp_with_cancel_in(
     source: &Path,
     output: &Path,
     compiler: &str,
@@ -81,10 +95,18 @@ pub fn compile_cpp_with_cancel(
     timeout: Duration,
     options: &BuildOptions,
     is_cancelled: &dyn Fn() -> bool,
+    working_directory: &Path,
 ) -> Result<ExecutionResult, io::Error> {
     let args = cpp_arguments(source, output, cpp_flags, options);
 
-    execute_with_cancel(Path::new(compiler), &args, "", timeout, is_cancelled)
+    execute_with_cancel_in(
+        Path::new(compiler),
+        &args,
+        "",
+        timeout,
+        is_cancelled,
+        working_directory,
+    )
 }
 
 fn cpp_arguments(
@@ -109,6 +131,7 @@ fn cpp_arguments(
     args
 }
 
+#[cfg(test)]
 pub fn execute(
     program: &Path,
     args: &[OsString],
@@ -118,6 +141,7 @@ pub fn execute(
     execute_with_cancel(program, args, input, timeout, &|| false)
 }
 
+#[cfg(test)]
 pub fn execute_with_cancel(
     program: &Path,
     args: &[OsString],
@@ -128,6 +152,36 @@ pub fn execute_with_cancel(
     execute_with_cancel_observer(program, args, input, timeout, is_cancelled, &|_| {})
 }
 
+pub fn execute_in(
+    program: &Path,
+    args: &[OsString],
+    input: &str,
+    timeout: Duration,
+    working_directory: &Path,
+) -> Result<ExecutionResult, io::Error> {
+    execute_with_cancel_in(program, args, input, timeout, &|| false, working_directory)
+}
+
+pub fn execute_with_cancel_in(
+    program: &Path,
+    args: &[OsString],
+    input: &str,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+    working_directory: &Path,
+) -> Result<ExecutionResult, io::Error> {
+    execute_with_cancel_observer_in(
+        program,
+        args,
+        input,
+        timeout,
+        is_cancelled,
+        &|_| {},
+        Some(working_directory),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn execute_with_cancel_observer(
     program: &Path,
     args: &[OsString],
@@ -136,11 +190,27 @@ pub(crate) fn execute_with_cancel_observer(
     is_cancelled: &dyn Fn() -> bool,
     observer: &dyn Fn(ExecutionCheckpoint),
 ) -> Result<ExecutionResult, io::Error> {
+    execute_with_cancel_observer_in(program, args, input, timeout, is_cancelled, observer, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_cancel_observer_in(
+    program: &Path,
+    args: &[OsString],
+    input: &str,
+    timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+    observer: &dyn Fn(ExecutionCheckpoint),
+    working_directory: Option<&Path>,
+) -> Result<ExecutionResult, io::Error> {
     if is_cancelled() {
         return Err(clean_cancellation_io_error());
     }
 
     let mut command = Command::new(program);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -200,13 +270,19 @@ pub(crate) fn execute_with_cancel_observer(
 
     stdin_result?;
 
-    let stdout_bytes = stdout_result?;
-    let stderr_bytes = stderr_result?;
+    let stdout_capture = stdout_result?;
+    let stderr_capture = stderr_result?;
+
+    let stdout_is_utf8 = std::str::from_utf8(&stdout_capture.bytes).is_ok();
+    let stdout = display_captured_output(&stdout_capture, "stdout");
+    let stderr = display_captured_output(&stderr_capture, "stderr");
 
     Ok(ExecutionResult {
         outcome,
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        stdout,
+        stdout_is_utf8,
+        stdout_truncated: stdout_capture.truncated,
+        stderr,
         elapsed,
     })
 }
@@ -265,10 +341,43 @@ fn cancellation_result(cleanup: io::Result<()>) -> io::Result<ExecutionOutcome> 
     }
 }
 
-fn read_all(mut pipe: impl Read) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    pipe.read_to_end(&mut output)?;
-    Ok(output)
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_all(pipe: impl Read) -> io::Result<CapturedOutput> {
+    read_bounded(pipe, MAX_CAPTURE_BYTES)
+}
+
+fn read_bounded(mut pipe: impl Read, limit: usize) -> io::Result<CapturedOutput> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+
+    loop {
+        let read = pipe.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+
+    Ok(CapturedOutput { bytes, truncated })
+}
+
+fn display_captured_output(output: &CapturedOutput, stream: &str) -> String {
+    let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
+    if output.truncated {
+        text.push_str(&format!(
+            "\n[atc: {stream} truncated after {MAX_CAPTURE_BYTES} bytes]\n"
+        ));
+    }
+    text
 }
 
 fn write_input(mut stdin: impl Write, input: &[u8]) -> io::Result<()> {
@@ -680,6 +789,54 @@ mod tests {
         assert!(result.stdout.contains("input-bytes=524288"));
         assert!(result.stdout.len() >= 512 * 1024);
         assert!(result.stderr.len() >= 512 * 1024);
+        assert!(!result.stdout_truncated);
+    }
+
+    #[test]
+    fn capture_limit_retains_a_prefix_and_drains_the_rest() {
+        let captured = read_bounded(std::io::Cursor::new(b"0123456789"), 4).unwrap();
+
+        assert_eq!(captured.bytes, b"0123");
+        assert!(captured.truncated);
+    }
+
+    #[test]
+    fn explicit_working_directory_is_used_by_the_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = execute_in(
+            &std::env::current_exe().unwrap(),
+            &helper_args("working_directory_helper"),
+            "",
+            Duration::from_secs(5),
+            temp.path(),
+        )
+        .unwrap();
+
+        assert!(matches!(result.outcome, ExecutionOutcome::Exited(status) if status.success()));
+        let reported = result
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("working-directory="))
+            .expect("helper should report its working directory");
+        assert_eq!(
+            std::fs::canonicalize(reported).unwrap(),
+            std::fs::canonicalize(temp.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_stdout_is_marked_even_when_the_process_succeeds() {
+        let result = execute(
+            &std::env::current_exe().unwrap(),
+            &helper_args("invalid_utf8_stdout_helper"),
+            "",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(matches!(result.outcome, ExecutionOutcome::Exited(status) if status.success()));
+        assert!(!result.stdout_is_utf8);
+        assert!(result.stdout.contains('\u{fffd}'));
     }
 
     #[test]
@@ -772,6 +929,22 @@ mod tests {
         let mut input = Vec::new();
         io::stdin().read_to_end(&mut input).unwrap();
         println!("input-bytes={}", input.len());
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by runner tests"]
+    fn invalid_utf8_stdout_helper() {
+        io::stdout().write_all(&[0xff]).unwrap();
+        io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    #[ignore = "launched as a child process by runner tests"]
+    fn working_directory_helper() {
+        println!(
+            "working-directory={}",
+            std::env::current_dir().unwrap().display()
+        );
     }
 
     fn write_continuously(mut stdout: bool, mut stderr: bool) {

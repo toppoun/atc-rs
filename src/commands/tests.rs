@@ -94,6 +94,8 @@ fn execution(outcome: ExecutionOutcome, stdout: &str, stderr: &str) -> runner::E
     runner::ExecutionResult {
         outcome,
         stdout: stdout.to_string(),
+        stdout_is_utf8: true,
+        stdout_truncated: false,
         stderr: stderr.to_string(),
         elapsed: Duration::from_millis(10),
     }
@@ -1035,6 +1037,71 @@ fn new_at_creates_a_missing_mapped_parent_directory() {
 }
 
 #[test]
+fn new_at_reports_a_racing_directory_without_replacing_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = RecordingReporter::default();
+
+    let error = new_at_with_install_hook(
+        &destination,
+        "abc466",
+        Language::Cpp,
+        builtin_template(Language::Cpp),
+        &client,
+        &mut reporter,
+        || {
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("competitor.txt"), "keep me\n").unwrap();
+        },
+    )
+    .expect_err("a destination created during staging must be reported as a race");
+
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("competitor.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("workspace-created:"))
+    );
+    assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".atc-new-")
+    }));
+}
+
+#[test]
+fn invalid_utf8_candidate_output_cannot_be_accepted_as_replacement_text() {
+    let sample = Sample {
+        input: String::new(),
+        output: "\u{fffd}\n".to_string(),
+    };
+    let mut result = execution(ExecutionOutcome::Exited(exit_status(0)), "\u{fffd}\n", "");
+    result.stdout_is_utf8 = false;
+    let mut reporter = RecordingReporter::default();
+
+    let verdict = report_case_result(1, &sample, &result, false, &mut reporter);
+
+    assert!(matches!(verdict, test::CaseVerdict::WrongAnswer));
+    assert!(
+        reporter
+            .events
+            .iter()
+            .any(|event| event == "case-wrong-answer:1")
+    );
+}
+
+#[test]
 fn workspace_new_flow_creates_a_nested_mapped_parent_hierarchy() {
     let mut reporter = NullReporter;
     let temp = tempfile::tempdir().unwrap();
@@ -1073,6 +1140,27 @@ fn workspace_new_flow_creates_a_nested_mapped_parent_hierarchy() {
     assert_eq!(
         workspace::load_metadata(&destination).unwrap().contest_id,
         "abc466"
+    );
+}
+
+#[test]
+fn truncated_candidate_output_cannot_be_accepted_as_displayed_prefix() {
+    let sample = Sample {
+        input: String::new(),
+        output: "prefix\n".to_string(),
+    };
+    let mut result = execution(ExecutionOutcome::Exited(exit_status(0)), "prefix\n", "");
+    result.stdout_truncated = true;
+    let mut reporter = RecordingReporter::default();
+
+    let verdict = report_case_result(1, &sample, &result, false, &mut reporter);
+
+    assert!(matches!(verdict, test::CaseVerdict::WrongAnswer));
+    assert!(
+        reporter
+            .events
+            .iter()
+            .any(|event| event == "case-wrong-answer:1")
     );
 }
 
@@ -1289,7 +1377,10 @@ fn refresh_rebuilds_metadata_and_tests_without_touching_sources() {
         .expect("local source should be written");
     let stale_tests = destination.join("tests").join("C");
     std::fs::create_dir_all(&stale_tests).expect("stale tests should be created");
-    std::fs::write(stale_tests.join("old.in"), "stale").expect("stale test should be written");
+    std::fs::write(stale_tests.join("sample-99.in"), "stale")
+        .expect("stale input should be written");
+    std::fs::write(stale_tests.join("sample-99.out"), "stale")
+        .expect("stale output should be written");
 
     let client = atcoder::AtCoderClient::fixture(fixture_root());
     let mut reporter = RecordingReporter::default();
@@ -1341,7 +1432,8 @@ fn refresh_sample_failure_is_recoverable_and_removes_old_problem_tests() {
     create_workspace(&destination, "mini");
     let old_b_tests = destination.join("tests").join("B");
     std::fs::create_dir_all(&old_b_tests).expect("old tests should be created");
-    std::fs::write(old_b_tests.join("old.in"), "old").expect("old test should be written");
+    std::fs::write(old_b_tests.join("sample-1.in"), "old").expect("old input should be written");
+    std::fs::write(old_b_tests.join("sample-1.out"), "old").expect("old output should be written");
 
     let fixtures = temp.path().join("fixtures");
     std::fs::create_dir_all(fixtures.join("contests")).expect("contest fixtures should be created");
@@ -1426,9 +1518,12 @@ fn forced_refresh_reconstructs_a_markerless_workspace_without_touching_sources()
     let destination = temp.path().join("abc350");
     std::fs::create_dir(&destination).expect("old contest directory should be created");
     std::fs::write(destination.join("A.cpp"), "user source").expect("source should be written");
-    let stale_tests = destination.join("tests").join("OLD");
+    let stale_tests = destination.join("tests").join("A");
     std::fs::create_dir_all(&stale_tests).expect("stale tests should be created");
-    std::fs::write(stale_tests.join("old.in"), "stale").expect("stale sample should be written");
+    std::fs::write(stale_tests.join("sample-99.in"), "stale")
+        .expect("stale input should be written");
+    std::fs::write(stale_tests.join("sample-99.out"), "stale")
+        .expect("stale output should be written");
 
     let fixtures = temp.path().join("fixtures");
     create_single_problem_fixture(&fixtures, "abc350");

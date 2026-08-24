@@ -25,6 +25,10 @@ fn judge_case(sample: &Sample, result: &runner::ExecutionResult) -> CaseVerdict 
 
         ExecutionOutcome::Exited(status) if !status.success() => CaseVerdict::RuntimeError,
 
+        ExecutionOutcome::Exited(_) if result.stdout_truncated || !result.stdout_is_utf8 => {
+            CaseVerdict::WrongAnswer
+        }
+
         ExecutionOutcome::Exited(_) => match comparator::compare(&sample.output, &result.stdout) {
             ComparisonResult::Accepted => CaseVerdict::Accepted,
             ComparisonResult::WrongAnswer => CaseVerdict::WrongAnswer,
@@ -356,19 +360,21 @@ fn test_problem_with_debug_header_and_cancel(
                 debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {
-                        runner::execute_python_with_cancel(
+                        runner::execute_python_with_cancel_in(
                             &source,
                             &sample.input,
                             &runner_config.python,
                             timeout,
                             is_cancelled,
+                            destination,
                         )
                     } else {
-                        runner::execute_python(
+                        runner::execute_python_in(
                             &source,
                             &sample.input,
                             &runner_config.python,
                             timeout,
+                            destination,
                         )
                     }
                 },
@@ -393,7 +399,7 @@ fn test_problem_with_debug_header_and_cancel(
             };
 
             let compile_result = if let Some(is_cancelled) = is_cancelled {
-                runner::compile_cpp_with_cancel(
+                runner::compile_cpp_with_cancel_in(
                     &source,
                     &output,
                     &runner_config.cpp_compiler,
@@ -401,15 +407,17 @@ fn test_problem_with_debug_header_and_cancel(
                     compile_timeout,
                     &build_options,
                     is_cancelled,
+                    destination,
                 )?
             } else {
-                runner::compile_cpp(
+                runner::compile_cpp_in(
                     &source,
                     &output,
                     &runner_config.cpp_compiler,
                     &runner_config.cpp_flags,
                     compile_timeout,
                     &build_options,
+                    destination,
                 )?
             };
 
@@ -424,15 +432,16 @@ fn test_problem_with_debug_header_and_cancel(
                 debug,
                 |sample| {
                     if let Some(is_cancelled) = is_cancelled {
-                        runner::execute_with_cancel(
+                        runner::execute_with_cancel_in(
                             &output,
                             &[],
                             &sample.input,
                             timeout,
                             is_cancelled,
+                            destination,
                         )
                     } else {
-                        runner::execute(&output, &[], &sample.input, timeout)
+                        runner::execute_in(&output, &[], &sample.input, timeout, destination)
                     }
                 },
                 reporter,
