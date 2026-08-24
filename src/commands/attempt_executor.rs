@@ -92,9 +92,9 @@ impl AttemptExecutor {
                                 count,
                             )?;
                             match crate::stress::run(&stress_request, reporter, is_cancelled)? {
-                                crate::stress::StressOutcome::Cancelled { .. } => Err(
-                                    crate::attempt::clean_cancellation_io_error().into(),
-                                ),
+                                crate::stress::StressOutcome::Cancelled { .. } => {
+                                    Err(crate::attempt::clean_cancellation_io_error().into())
+                                }
                                 crate::stress::StressOutcome::Completed { .. }
                                 | crate::stress::StressOutcome::Failed { .. } => Ok(()),
                             }

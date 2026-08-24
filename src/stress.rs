@@ -32,9 +32,9 @@ const FAILURE_GENERATION_FILES: [&str; 5] = [
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn automatic_seed() -> io::Result<u64> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
-        io::Error::other(format!("system clock is before UNIX epoch: {error}"))
-    })?;
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("system clock is before UNIX epoch: {error}")))?;
 
     u64::try_from(elapsed.as_nanos()).map_err(|_| {
         io::Error::new(
@@ -146,7 +146,10 @@ impl fmt::Display for StressError {
                 Ok(())
             }
             Self::CandidateCompileTimedOut { elapsed } => {
-                write!(formatter, "candidate compilation timed out after {elapsed:.2?}")
+                write!(
+                    formatter,
+                    "candidate compilation timed out after {elapsed:.2?}"
+                )
             }
             Self::GeneratorRuntimeError { seed, stderr } => {
                 write!(formatter, "generator failed for seed {seed}")?;
@@ -1801,10 +1804,7 @@ mod tests {
         fs::write(target.join("failed.in"), "1 2\n").unwrap();
         fs::write(target.join("expected.out"), "3\n").unwrap();
 
-        assert_eq!(
-            load_saved_case(temp.path(), "abc123", "A").unwrap(),
-            None
-        );
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
     }
 
     #[test]
@@ -1821,14 +1821,7 @@ mod tests {
     fn old_v1_wrong_answer_is_promoted_but_old_re_without_expected_is_not() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join(".atc").join("stress").join("A");
-        write_v1_generation(
-            &target,
-            "abc123",
-            "A",
-            "wrong-answer",
-            "1 2\n",
-            Some("3\n"),
-        );
+        write_v1_generation(&target, "abc123", "A", "wrong-answer", "1 2\n", Some("3\n"));
 
         assert_eq!(
             load_saved_case(temp.path(), "abc123", "A").unwrap(),
@@ -1839,18 +1832,8 @@ mod tests {
         );
 
         fs::remove_dir_all(&target).unwrap();
-        write_v1_generation(
-            &target,
-            "abc123",
-            "A",
-            "runtime-error",
-            "4\n",
-            None,
-        );
-        assert_eq!(
-            load_saved_case(temp.path(), "abc123", "A").unwrap(),
-            None
-        );
+        write_v1_generation(&target, "abc123", "A", "runtime-error", "4\n", None);
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
     }
 
     #[test]
@@ -1866,20 +1849,14 @@ mod tests {
             Some("2\n"),
         );
 
-        assert_eq!(
-            load_saved_case(temp.path(), "abc123", "A").unwrap(),
-            None
-        );
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
 
         fs::write(
             target.join("meta.toml"),
             "version = 1\ncontest = \"abc123\"\nproblem = \"B\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 10\nseed = 10\n",
         )
         .unwrap();
-        assert_eq!(
-            load_saved_case(temp.path(), "abc123", "A").unwrap(),
-            None
-        );
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
     }
 
     #[test]

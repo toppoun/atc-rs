@@ -623,17 +623,14 @@ fn resume_suspended_process(process_id: u32) -> io::Result<()> {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if raw_snapshot == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    let snapshot = unsafe {
-        std::os::windows::io::OwnedHandle::from_raw_handle(raw_snapshot.cast())
-    };
+    let snapshot =
+        unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_snapshot.cast()) };
 
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
@@ -649,9 +646,8 @@ fn resume_suspended_process(process_id: u32) -> io::Result<()> {
             if raw_thread.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let thread = unsafe {
-                std::os::windows::io::OwnedHandle::from_raw_handle(raw_thread.cast())
-            };
+            let thread =
+                unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_thread.cast()) };
 
             if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
                 return Err(io::Error::last_os_error());
