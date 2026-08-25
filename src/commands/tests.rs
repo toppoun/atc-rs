@@ -127,6 +127,7 @@ struct RecordingReporter {
 impl Reporter for RecordingReporter {
     fn report(&mut self, event: Event<'_>) {
         let event = match event {
+            Event::DoctorReport { .. } => "doctor-report".to_owned(),
             Event::ContestFetching { contest_id } => format!("contest-fetching:{contest_id}"),
             Event::ContestFetched {
                 contest_id,

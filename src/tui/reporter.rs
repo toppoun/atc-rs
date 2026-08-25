@@ -194,7 +194,8 @@ impl Reporter for ChannelReporter {
                 self.send_stress(StressEvent::Cancelled { cases, elapsed });
             }
 
-            Event::ContestFetching { .. }
+            Event::DoctorReport { .. }
+            | Event::ContestFetching { .. }
             | Event::ContestFetched { .. }
             | Event::ProblemFetching { .. }
             | Event::ProblemFetched { .. }

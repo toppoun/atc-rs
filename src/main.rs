@@ -11,6 +11,7 @@ mod commands;
 mod comparator;
 mod config;
 mod debug;
+mod doctor;
 mod error;
 mod language;
 mod model;
@@ -29,7 +30,7 @@ use ui::TerminalReporter;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), AppError> {
+fn run() -> Result<ExitCode, AppError> {
     let cli = cli::Cli::parse();
 
     let mut reporter = TerminalReporter::default();
@@ -117,7 +118,13 @@ fn run() -> Result<(), AppError> {
         cli::Command::Account(cli::AccountCommand::Login) => {
             commands::login()?;
         }
+
+        cli::Command::Diagnostics(cli::DiagnosticsCommand::Doctor) => {
+            if !commands::doctor(&mut reporter)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

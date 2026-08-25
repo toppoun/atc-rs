@@ -87,6 +87,12 @@ struct WorkspaceConfig {
     paths: Vec<WorkspacePathRule>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceConfigInspection {
+    pub(crate) path: PathBuf,
+    pub(crate) mapping_count: usize,
+}
+
 struct WorkspacePathRule {
     pattern: Regex,
     path: WorkspaceRelativePath,
@@ -238,6 +244,19 @@ fn load_workspace_config(root: &Path) -> io::Result<Option<WorkspaceConfig>> {
     }
 
     load_workspace_config_file(&path).map(Some)
+}
+
+pub(crate) fn inspect_workspace_config(
+    root: &Path,
+) -> io::Result<Option<WorkspaceConfigInspection>> {
+    let path = root.join(WORKSPACE_CONFIG_FILE);
+
+    load_workspace_config(root).map(|config| {
+        config.map(|config| WorkspaceConfigInspection {
+            path,
+            mapping_count: config.paths.len(),
+        })
+    })
 }
 
 fn load_existing_workspace_config(

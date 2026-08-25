@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::language::Language;
 use crate::user_config_fs::{self, OptionalUtf8File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const CPP_TEMPLATE: &str = include_str!("../assets/templates/default.cpp");
 
@@ -30,18 +30,47 @@ pub(crate) fn resolve_source_template(language: Language) -> Result<String, AppE
     resolve_source_template_in(&templates_dir, language)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SourceTemplateOrigin {
+    BuiltIn,
+    UserOverride(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedSourceTemplate {
+    pub(crate) contents: String,
+    pub(crate) origin: SourceTemplateOrigin,
+}
+
 pub(crate) fn resolve_source_template_in(
     templates_dir: &Path,
     language: Language,
 ) -> Result<String, AppError> {
+    resolve_source_template_with_origin_in(templates_dir, language)
+        .map(|resolved| resolved.contents)
+}
+
+pub(crate) fn resolve_source_template_with_origin_in(
+    templates_dir: &Path,
+    language: Language,
+) -> Result<ResolvedSourceTemplate, AppError> {
     if !user_config_fs::optional_directory_exists(templates_dir, "source template directory")? {
-        return Ok(builtin_template(language).to_owned());
+        return Ok(ResolvedSourceTemplate {
+            contents: builtin_template(language).to_owned(),
+            origin: SourceTemplateOrigin::BuiltIn,
+        });
     }
 
     let template_path = templates_dir.join(source_template_filename(language));
     match user_config_fs::read_optional_utf8_file(&template_path, "source template")? {
-        OptionalUtf8File::Missing => Ok(builtin_template(language).to_owned()),
-        OptionalUtf8File::Present(contents) => Ok(contents),
+        OptionalUtf8File::Missing => Ok(ResolvedSourceTemplate {
+            contents: builtin_template(language).to_owned(),
+            origin: SourceTemplateOrigin::BuiltIn,
+        }),
+        OptionalUtf8File::Present(contents) => Ok(ResolvedSourceTemplate {
+            contents,
+            origin: SourceTemplateOrigin::UserOverride(template_path),
+        }),
     }
 }
 

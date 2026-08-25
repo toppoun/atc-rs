@@ -59,6 +59,9 @@ pub enum Command {
 
     #[command(flatten)]
     Account(AccountCommand),
+
+    #[command(flatten)]
+    Diagnostics(DiagnosticsCommand),
 }
 
 // ============================================================
@@ -249,6 +252,16 @@ pub enum AccountCommand {
     Login,
 }
 
+// ============================================================
+// Diagnostics
+// ============================================================
+
+#[derive(Subcommand, Debug)]
+pub enum DiagnosticsCommand {
+    /// Diagnose the local atc environment
+    Doctor,
+}
+
 fn render_category<T: Subcommand>(title: &str, command_tree: &ClapCommand) -> String {
     let category = T::augment_subcommands(ClapCommand::new("category"));
 
@@ -318,6 +331,8 @@ Usage:
 
 {}
 
+{}
+
 Options
   -h, --help       Show help
   -V, --version    Show version
@@ -328,6 +343,7 @@ Options
         render_category::<RunTestCommand>("Run & Test", command_tree).trim_end(),
         render_category::<FileCommand>("Files", command_tree).trim_end(),
         render_category::<AccountCommand>("Account", command_tree).trim_end(),
+        render_category::<DiagnosticsCommand>("Diagnostics", command_tree).trim_end(),
         render_help_command(command_tree).trim_end(),
     )
 }
@@ -369,6 +385,7 @@ mod tests {
         assert!(help.contains("init      Initialize an atc workspace"));
         assert!(help.contains("config    Manage global configuration"));
         assert!(help.contains("template  Manage source templates"));
+        assert!(help.contains("doctor    Diagnose the local atc environment"));
 
         let mut stress = command_tree
             .find_subcommand("stress")
@@ -391,6 +408,23 @@ mod tests {
         assert!(init_help.contains("-c, --contest <CONTEST>"));
         for run_option in ["--language", "--debug", "--count", "--forever", "--seed"] {
             assert!(!init_help.contains(run_option));
+        }
+    }
+
+    #[test]
+    fn parses_doctor_without_additional_arguments_or_flags() {
+        let cli = Cli::try_parse_from(["atc", "doctor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Diagnostics(DiagnosticsCommand::Doctor)
+        ));
+
+        for args in [
+            &["atc", "doctor", "extra"][..],
+            &["atc", "doctor", "--fix"][..],
+            &["atc", "doctor", "--json"][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 

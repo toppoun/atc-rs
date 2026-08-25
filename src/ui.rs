@@ -1,10 +1,13 @@
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::model::Sample;
 
 pub enum Event<'a> {
+    DoctorReport {
+        report: &'a crate::doctor::DoctorReport,
+    },
     ContestFetching {
         contest_id: &'a str,
     },
@@ -244,6 +247,11 @@ pub struct TerminalReporter {
 impl Reporter for TerminalReporter {
     fn report(&mut self, event: Event<'_>) {
         match event {
+            Event::DoctorReport { report } => {
+                let color =
+                    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                print!("{}", render_doctor_report(report, color));
+            }
             Event::ContestFetching { contest_id } => {
                 eprintln!("Fetching contest {contest_id}...");
             }
@@ -531,6 +539,69 @@ impl Reporter for TerminalReporter {
     }
 }
 
+pub(crate) fn render_doctor_report(report: &crate::doctor::DoctorReport, color: bool) -> String {
+    use std::fmt::Write as _;
+
+    const RESET: &str = "\x1b[0m";
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const RED: &str = "\x1b[31m";
+    const CYAN: &str = "\x1b[36m";
+    const GRAY: &str = "\x1b[90m";
+
+    let mut output = String::new();
+    for section in &report.sections {
+        writeln!(output, "{}", section.title).expect("writing to String cannot fail");
+        for diagnostic in &section.diagnostics {
+            let color_code = if color {
+                match diagnostic.level {
+                    crate::doctor::DiagnosticLevel::Ok => GREEN,
+                    crate::doctor::DiagnosticLevel::Warn => YELLOW,
+                    crate::doctor::DiagnosticLevel::Error => RED,
+                    crate::doctor::DiagnosticLevel::Info => CYAN,
+                    crate::doctor::DiagnosticLevel::Skip => GRAY,
+                }
+            } else {
+                ""
+            };
+            let reset = if color { RESET } else { "" };
+            writeln!(
+                output,
+                "  [{color_code}{}{reset}] {}",
+                diagnostic.level.label(),
+                diagnostic.message
+            )
+            .expect("writing to String cannot fail");
+            for detail in &diagnostic.details {
+                writeln!(output, "       {detail}").expect("writing to String cannot fail");
+            }
+        }
+        writeln!(output).expect("writing to String cannot fail");
+    }
+
+    let errors = report.error_count();
+    let warnings = report.warning_count();
+    let summary = match (errors, warnings) {
+        (0, 0) => "OK".to_owned(),
+        (0, warnings) => format!(
+            "OK ({warnings} warning{})",
+            if warnings == 1 { "" } else { "s" }
+        ),
+        (errors, 0) => format!(
+            "FAILED ({errors} error{})",
+            if errors == 1 { "" } else { "s" }
+        ),
+        (errors, warnings) => format!(
+            "FAILED ({errors} error{}, {warnings} warning{})",
+            if errors == 1 { "" } else { "s" },
+            if warnings == 1 { "" } else { "s" }
+        ),
+    };
+    writeln!(output, "Result: {summary}").expect("writing to String cannot fail");
+
+    output
+}
+
 fn case_label(number: usize, sample_cases: usize) -> String {
     if number <= sample_cases {
         format!("sample-{number}")
@@ -659,8 +730,68 @@ impl Reporter for NullReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doctor::{Diagnostic, DiagnosticLevel, DiagnosticSection, DoctorReport};
 
     const ELAPSED: Duration = Duration::from_micros(7_200);
+
+    fn doctor_report(levels: &[DiagnosticLevel]) -> DoctorReport {
+        DoctorReport {
+            sections: vec![DiagnosticSection {
+                title: "Test",
+                diagnostics: levels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, level)| Diagnostic {
+                        level: *level,
+                        message: format!("diagnostic {index}"),
+                        details: vec![format!("detail {index}")],
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn doctor_rendering_is_plain_when_color_is_disabled() {
+        let report = doctor_report(&[
+            DiagnosticLevel::Ok,
+            DiagnosticLevel::Warn,
+            DiagnosticLevel::Error,
+            DiagnosticLevel::Info,
+            DiagnosticLevel::Skip,
+        ]);
+
+        let plain = render_doctor_report(&report, false);
+        let colored = render_doctor_report(&report, true);
+
+        assert!(!plain.contains('\x1b'));
+        for label in ["[OK]", "[WARN]", "[ERROR]", "[INFO]", "[SKIP]"] {
+            assert!(plain.contains(label));
+        }
+        assert!(plain.contains("Result: FAILED (1 error, 1 warning)"));
+        assert!(colored.contains('\x1b'));
+    }
+
+    #[test]
+    fn doctor_summary_ignores_info_and_skip_for_exit_result() {
+        let clean = doctor_report(&[
+            DiagnosticLevel::Ok,
+            DiagnosticLevel::Info,
+            DiagnosticLevel::Skip,
+        ]);
+        let warnings = doctor_report(&[DiagnosticLevel::Warn, DiagnosticLevel::Warn]);
+
+        assert!(clean.is_success());
+        assert_eq!(
+            render_doctor_report(&clean, false).lines().last(),
+            Some("Result: OK")
+        );
+        assert!(warnings.is_success());
+        assert_eq!(
+            render_doctor_report(&warnings, false).lines().last(),
+            Some("Result: OK (2 warnings)")
+        );
+    }
 
     fn start(reporter: &mut TerminalReporter, problem_index: &str, total_cases: usize) {
         reporter.report(Event::TestRunStarted {
