@@ -71,6 +71,9 @@ fn translate_key(event: event::KeyEvent) -> Option<KeyEvent> {
     Some(KeyEvent {
         code: match event.code {
             event::KeyCode::Char(character) => KeyCode::Char(character),
+            event::KeyCode::Enter => KeyCode::Enter,
+            event::KeyCode::Escape => KeyCode::Escape,
+            event::KeyCode::Backspace => KeyCode::Backspace,
             event::KeyCode::Left => KeyCode::Left,
             event::KeyCode::Right => KeyCode::Right,
             event::KeyCode::Up => KeyCode::Up,
@@ -259,8 +262,11 @@ mod tests {
     }
 
     #[test]
-    fn translates_arrow_keys() {
+    fn translates_navigation_and_modal_input_keys() {
         for (source, expected) in [
+            (TerminaKeyCode::Enter, KeyCode::Enter),
+            (TerminaKeyCode::Escape, KeyCode::Escape),
+            (TerminaKeyCode::Backspace, KeyCode::Backspace),
             (TerminaKeyCode::Left, KeyCode::Left),
             (TerminaKeyCode::Right, KeyCode::Right),
             (TerminaKeyCode::Up, KeyCode::Up),
@@ -445,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             translate(key(
-                TerminaKeyCode::Enter,
+                TerminaKeyCode::Tab,
                 TerminaKeyEventKind::Press,
                 TerminaModifiers::NONE,
             )),

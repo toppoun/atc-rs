@@ -5,9 +5,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use super::SwitchContestModal;
 use super::app::{
     CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
 };
@@ -49,11 +50,23 @@ pub(super) fn render(
     render_with_mouse_mode(frame, app, detail_layout, MouseMode::Cells)
 }
 
+#[cfg(test)]
 pub(super) fn render_with_mouse_mode(
     frame: &mut Frame,
     app: &WatchApp,
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
+) -> RenderInfo {
+    render_frontend_with_mouse_mode(frame, app, detail_layout, mouse_mode, false, None)
+}
+
+pub(super) fn render_frontend_with_mouse_mode(
+    frame: &mut Frame,
+    app: &WatchApp,
+    detail_layout: &mut DetailLayout,
+    mouse_mode: MouseMode,
+    contest_switch_available: bool,
+    switch_modal: Option<&SwitchContestModal>,
 ) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
@@ -207,16 +220,25 @@ pub(super) fn render_with_mouse_mode(
         }
     }
 
-    let footer_text = if current_problem
+    let footer_base = if current_problem
         .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
     {
-        "s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit"
+        "s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
     } else {
-        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   q quit"
+        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
+    };
+    let footer_text = if contest_switch_available {
+        format!("{footer_base}   c contest   q quit")
+    } else {
+        format!("{footer_base}   q quit")
     };
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
 
     frame.render_widget(footer, rows[2]);
+
+    if let Some(modal) = switch_modal {
+        render_switch_contest_modal(frame, modal);
+    }
 
     RenderInfo {
         max_detail_scroll: detail_viewport.max_scroll,
@@ -225,6 +247,45 @@ pub(super) fn render_with_mouse_mode(
         detail_scrollbar,
         detail_section_headers,
     }
+}
+
+fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
+    let frame_area = frame.area();
+    let width = frame_area.width.min(72);
+    let height = frame_area.height.min(11);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    let destination = modal
+        .destination
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let error = modal.error.as_deref().unwrap_or("");
+    let text = Text::from(vec![
+        Line::raw("Contest:"),
+        Line::from(vec![Span::raw("> "), Span::raw(modal.contest_id.clone())]),
+        Line::raw(""),
+        Line::raw("Destination:"),
+        Line::raw(format!("  {destination}")),
+        Line::styled(error.to_string(), Style::default().fg(Color::Red)),
+        Line::raw(""),
+        Line::raw("[Enter] Switch   [Esc] Cancel"),
+    ]);
+    let modal = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Switch Contest ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(modal, area);
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -633,6 +694,40 @@ mod tests {
         text
     }
 
+    fn rendered_frontend_text(
+        app: &WatchApp,
+        switch_available: bool,
+        modal: Option<&SwitchContestModal>,
+    ) -> String {
+        let width = 100;
+        let height = 20;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    switch_available,
+                    modal,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn render_with_layout(
         terminal: &mut Terminal<TestBackend>,
         app: &WatchApp,
@@ -899,6 +994,25 @@ mod tests {
 
         assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
         assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+    }
+
+    #[test]
+    fn workspace_footer_and_switch_modal_render_destination_and_error() {
+        let app = app();
+        assert!(!rendered_frontend_text(&app, false, None).contains("c contest"));
+        assert!(rendered_frontend_text(&app, true, None).contains("c contest"));
+
+        let modal = SwitchContestModal {
+            contest_id: "abc467".to_string(),
+            destination: Some(PathBuf::from("D:/atcoder/ABC/abc467")),
+            error: Some("contest metadata is invalid".to_string()),
+        };
+        let rendered = rendered_frontend_text(&app, true, Some(&modal));
+        assert!(rendered.contains("Switch Contest"));
+        assert!(rendered.contains("> abc467"));
+        assert!(rendered.contains("D:/atcoder/ABC/abc467"));
+        assert!(rendered.contains("contest metadata is invalid"));
+        assert!(rendered.contains("[Enter] Switch"));
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {

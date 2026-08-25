@@ -131,6 +131,16 @@ impl RunWorker {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn start_with_test_attempt(
+        message_tx: Sender<Message>,
+        spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>
+        + Send
+        + 'static,
+    ) -> io::Result<Self> {
+        Self::start_with(message_tx, spawn_attempt)
+    }
+
     pub fn sender(&self) -> Sender<RunRequest> {
         self.request_tx.clone()
     }

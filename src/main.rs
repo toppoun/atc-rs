@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+mod app_context;
 mod atcoder;
 // S2でphysical attemptのcancel/outcome境界だけを実装する。
 // production workerへの接続は後続段階で行う。

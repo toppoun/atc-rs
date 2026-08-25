@@ -1,4 +1,5 @@
 use super::resolve_language;
+use crate::app_context::AppContext;
 use crate::atcoder;
 use crate::config::Config;
 use crate::error::AppError;
@@ -8,8 +9,39 @@ use crate::workspace::{self, ContestMetadataHealth};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
+pub(super) enum ContestTargetHealth {
+    MissingDirectory,
+    RepairRequired,
+    UnsupportedVersion(u32),
+    Healthy(crate::model::Contest),
+}
+
+pub(super) fn inspect_contest_target(
+    destination: &Path,
+    contest_id: &str,
+) -> io::Result<ContestTargetHealth> {
+    if !workspace::contest_directory_exists(destination)? {
+        return Ok(ContestTargetHealth::MissingDirectory);
+    }
+
+    match workspace::inspect_contest_metadata(destination)? {
+        ContestMetadataHealth::Healthy(contest) => {
+            workspace::validate_contest_identity(&contest, contest_id)?;
+            workspace::validate_contest_paths(&contest)?;
+            Ok(ContestTargetHealth::Healthy(contest))
+        }
+        ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
+            Ok(ContestTargetHealth::RepairRequired)
+        }
+        ContestMetadataHealth::UnsupportedVersion(version) => {
+            Ok(ContestTargetHealth::UnsupportedVersion(version))
+        }
+    }
+}
+
 pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
+    let app_context = AppContext::from_launch_root(&cwd)?;
 
     let destination = workspace::resolve_contest_path(&cwd, contest_id)?;
 
@@ -20,7 +52,9 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
         |destination| confirm_repair(destination).map_err(AppError::from),
         |destination, contest_id, reporter| create_contest(&cwd, destination, contest_id, reporter),
         repair_contest,
-        |destination, contest_id, _| super::watch_tui::watch_tui_at(destination, Some(contest_id)),
+        |destination, contest_id, _| {
+            super::watch_tui::watch_tui_at(destination, Some(contest_id), app_context.clone())
+        },
     )
 }
 
@@ -39,33 +73,25 @@ where
     R: FnMut(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
     W: FnMut(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
 {
-    if !workspace::contest_directory_exists(destination)? {
-        create(destination, contest_id, reporter)?;
-    } else {
-        match workspace::inspect_contest_metadata(destination)? {
-            ContestMetadataHealth::Healthy(contest) => {
-                workspace::validate_contest_identity(&contest, contest_id)?;
-                workspace::validate_contest_paths(&contest)?;
+    match inspect_contest_target(destination, contest_id)? {
+        ContestTargetHealth::MissingDirectory => create(destination, contest_id, reporter)?,
+        ContestTargetHealth::Healthy(_) => {}
+        ContestTargetHealth::RepairRequired => {
+            if !confirm(destination)? {
+                return Ok(());
             }
 
-            ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
-                if !confirm(destination)? {
-                    return Ok(());
-                }
-
-                repair(destination, contest_id, reporter)?;
-            }
-
-            ContestMetadataHealth::UnsupportedVersion(version) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "unsupported contest metadata version: {version}; \
-                         refusing to repair automatically"
-                    ),
-                )
-                .into());
-            }
+            repair(destination, contest_id, reporter)?;
+        }
+        ContestTargetHealth::UnsupportedVersion(version) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported contest metadata version: {version}; \
+                     refusing to repair automatically"
+                ),
+            )
+            .into());
         }
     }
 

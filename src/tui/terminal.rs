@@ -1973,6 +1973,9 @@ pub(super) struct KeyEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyCode {
     Char(char),
+    Enter,
+    Escape,
+    Backspace,
     Left,
     Right,
     Up,

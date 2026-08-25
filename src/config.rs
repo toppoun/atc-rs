@@ -123,7 +123,7 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunnerConfig {
     pub python: String,

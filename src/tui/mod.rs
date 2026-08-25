@@ -15,11 +15,17 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 
+use crate::app_context::AppContext;
 use crate::model::Contest;
 use crate::ui::{Event, Reporter};
 use app::WatchApp;
 use detail_layout::{DetailAnalysisCommand, DetailAnalysisResult};
+pub(crate) use detail_layout::{
+    DetailAnalysisCommand as SessionDetailAnalysisCommand,
+    DetailAnalysisResult as SessionDetailAnalysisResult,
+};
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
 use message::{Message, RunRequest};
 use mouse::{
@@ -36,6 +42,179 @@ const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrontendPreferences {
+    debug: bool,
+    samples_pane: bool,
+}
+
+impl FrontendPreferences {
+    fn apply(self, app: &mut WatchApp) {
+        if self.debug != app.debug_enabled() {
+            app.toggle_debug();
+        }
+        if self.samples_pane != app.samples_pane_enabled() {
+            app.toggle_samples_pane();
+        }
+    }
+
+    fn capture(&mut self, app: &WatchApp) {
+        self.debug = app.debug_enabled();
+        self.samples_pane = app.samples_pane_enabled();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionExit {
+    Quit,
+    SwitchContest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContestSwitchResolution {
+    pub(crate) destination: Option<std::path::PathBuf>,
+    pub(crate) error: Option<String>,
+}
+
+impl ContestSwitchResolution {
+    pub(crate) fn accepted(destination: std::path::PathBuf) -> Self {
+        Self {
+            destination: Some(destination),
+            error: None,
+        }
+    }
+
+    pub(crate) fn rejected(destination: Option<std::path::PathBuf>, error: String) -> Self {
+        Self {
+            destination,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SwitchContestModal {
+    pub(super) contest_id: String,
+    pub(super) destination: Option<std::path::PathBuf>,
+    pub(super) error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContestSwitchKeyResult {
+    NotHandled,
+    Handled,
+    SwitchRequested,
+}
+
+struct ContestSwitchController<'a> {
+    available: bool,
+    current_destination: &'a Path,
+    modal: Option<SwitchContestModal>,
+    resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+    switch_requested: bool,
+}
+
+impl<'a> ContestSwitchController<'a> {
+    fn new(
+        context: &AppContext,
+        current_destination: &'a Path,
+        resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+    ) -> Self {
+        Self {
+            available: context.workspace_root().is_some(),
+            current_destination,
+            modal: None,
+            resolve,
+            switch_requested: false,
+        }
+    }
+
+    fn modal(&self) -> Option<&SwitchContestModal> {
+        self.modal.as_ref()
+    }
+
+    fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    fn refresh_resolution(&mut self) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let resolution = (self.resolve)(&modal.contest_id);
+        modal.destination = resolution.destination;
+        modal.error = resolution.error;
+    }
+
+    fn remove_last_grapheme(&mut self) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        if let Some((start, _)) = modal.contest_id.grapheme_indices(true).next_back() {
+            modal.contest_id.truncate(start);
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ContestSwitchKeyResult {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return if self.modal_active() {
+                ContestSwitchKeyResult::Handled
+            } else {
+                ContestSwitchKeyResult::NotHandled
+            };
+        }
+
+        if self.modal_active() {
+            match key.code {
+                KeyCode::Escape if key.kind == KeyEventKind::Press => {
+                    self.modal = None;
+                }
+                KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                    self.refresh_resolution();
+                    let accepted_destination = self
+                        .modal
+                        .as_ref()
+                        .filter(|modal| modal.error.is_none())
+                        .and_then(|modal| modal.destination.as_deref());
+                    if accepted_destination == Some(self.current_destination) {
+                        self.modal = None;
+                    } else if accepted_destination.is_some() {
+                        self.switch_requested = true;
+                        return ContestSwitchKeyResult::SwitchRequested;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.remove_last_grapheme();
+                    self.refresh_resolution();
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
+                {
+                    if let Some(modal) = self.modal.as_mut() {
+                        modal.contest_id.push(character);
+                    }
+                    self.refresh_resolution();
+                }
+                _ => {}
+            }
+            return ContestSwitchKeyResult::Handled;
+        }
+
+        if self.available
+            && key.code == KeyCode::Char('c')
+            && key.kind == KeyEventKind::Press
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.super_key
+        {
+            self.modal = Some(SwitchContestModal::default());
+            ContestSwitchKeyResult::Handled
+        } else {
+            ContestSwitchKeyResult::NotHandled
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StressSetupContext<'a> {
     destination: &'a Path,
@@ -47,6 +226,55 @@ impl<'a> StressSetupContext<'a> {
         Self {
             destination,
             contest,
+        }
+    }
+}
+
+pub(crate) struct SessionChannels<'a> {
+    message_rx: &'a Receiver<Message>,
+    run_tx: &'a Sender<RunRequest>,
+    detail_analysis_tx: &'a Sender<DetailAnalysisCommand>,
+    detail_analysis_rx: &'a Receiver<DetailAnalysisResult>,
+}
+
+impl<'a> SessionChannels<'a> {
+    pub(crate) fn new(
+        message_rx: &'a Receiver<Message>,
+        run_tx: &'a Sender<RunRequest>,
+        detail_analysis_tx: &'a Sender<DetailAnalysisCommand>,
+        detail_analysis_rx: &'a Receiver<DetailAnalysisResult>,
+    ) -> Self {
+        Self {
+            message_rx,
+            run_tx,
+            detail_analysis_tx,
+            detail_analysis_rx,
+        }
+    }
+}
+
+pub(crate) struct SessionRuntime<'a> {
+    current_destination: &'a Path,
+    stress_setup: StressSetupContext<'a>,
+    sample_counts: Vec<usize>,
+    stress_cases: Vec<Option<crate::model::Sample>>,
+    channels: SessionChannels<'a>,
+}
+
+impl<'a> SessionRuntime<'a> {
+    pub(crate) fn new(
+        current_destination: &'a Path,
+        contest: &'a Contest,
+        sample_counts: Vec<usize>,
+        stress_cases: Vec<Option<crate::model::Sample>>,
+        channels: SessionChannels<'a>,
+    ) -> Self {
+        Self {
+            current_destination,
+            stress_setup: StressSetupContext::new(current_destination, contest),
+            sample_counts,
+            stress_cases,
+            channels,
         }
     }
 }
@@ -64,6 +292,11 @@ impl<'a> TerminalInputContext<'a> {
             stress_setup,
         }
     }
+}
+
+struct FrontendInputContext<'run, 'controller, 'resolver> {
+    terminal: TerminalInputContext<'run>,
+    contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
 }
 
 struct StressInitializationReporter;
@@ -363,16 +596,32 @@ fn send_detail_analysis_command(
 
 pub(crate) fn run(
     terminal: &mut TerminaSession,
-    stress_setup: StressSetupContext<'_>,
-    sample_counts: Vec<usize>,
-    stress_cases: Vec<Option<crate::model::Sample>>,
-    message_rx: Receiver<Message>,
-    run_tx: Sender<RunRequest>,
-    detail_analysis_tx: Sender<DetailAnalysisCommand>,
-    detail_analysis_rx: Receiver<DetailAnalysisResult>,
-) -> io::Result<()> {
+    app_context: &AppContext,
+    preferences: &mut FrontendPreferences,
+    runtime: SessionRuntime<'_>,
+    mut resolve_contest_switch: impl FnMut(&str) -> ContestSwitchResolution,
+) -> io::Result<SessionExit> {
+    let SessionRuntime {
+        current_destination,
+        stress_setup,
+        sample_counts,
+        stress_cases,
+        channels:
+            SessionChannels {
+                message_rx,
+                run_tx,
+                detail_analysis_tx,
+                detail_analysis_rx,
+            },
+    } = runtime;
     let mut app =
         WatchApp::new_with_stress_cases(stress_setup.contest, sample_counts, stress_cases)?;
+    preferences.apply(&mut app);
+    let mut contest_switch = ContestSwitchController::new(
+        app_context,
+        current_destination,
+        &mut resolve_contest_switch,
+    );
 
     let mut dirty = true;
 
@@ -386,7 +635,7 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_quit_event(&terminal_events) {
+        if contains_global_quit_event(&terminal_events, &contest_switch) {
             app.quit();
             break;
         }
@@ -398,14 +647,14 @@ pub(crate) fn run(
             dirty = true;
         }
 
-        if handle_messages(&mut app, &message_rx, &run_tx)? {
+        if handle_messages(&mut app, message_rx, run_tx)? {
             dirty = true;
         }
 
         if handle_detail_analysis_results(
             &mut detail_layout,
             app.detail_revision(),
-            &detail_analysis_rx,
+            detail_analysis_rx,
         )? {
             dirty = true;
         }
@@ -418,7 +667,7 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_quit_event(&terminal_events) {
+        if contains_global_quit_event(&terminal_events, &contest_switch) {
             app.quit();
             break;
         }
@@ -435,11 +684,13 @@ pub(crate) fn run(
             let render_mouse_mode = terminal.mouse_mode();
 
             terminal.draw(|frame| {
-                next_render_info = view::render_with_mouse_mode(
+                next_render_info = view::render_frontend_with_mouse_mode(
                     frame,
                     &app,
                     &mut detail_layout,
                     render_mouse_mode,
+                    contest_switch.available,
+                    contest_switch.modal(),
                 );
             })?;
 
@@ -453,7 +704,7 @@ pub(crate) fn run(
             }
 
             if let Some(command) = detail_layout.take_analysis_command() {
-                send_detail_analysis_command(&detail_analysis_tx, command)?;
+                send_detail_analysis_command(detail_analysis_tx, command)?;
             }
 
             dirty = false;
@@ -474,7 +725,7 @@ pub(crate) fn run(
         }
 
         // qは同じbatch内のresize/mouseより先に扱い、再描画を挟まず終了する。
-        if contains_quit_event(&terminal_events) {
+        if contains_global_quit_event(&terminal_events, &contest_switch) {
             app.quit();
             continue;
         }
@@ -487,9 +738,15 @@ pub(crate) fn run(
             &render_info,
             &mut terminal_events,
             terminal.mouse_mode(),
-            TerminalInputContext::new(&run_tx, Some(stress_setup)),
+            FrontendInputContext {
+                terminal: TerminalInputContext::new(run_tx, Some(stress_setup)),
+                contest_switch: Some(&mut contest_switch),
+            },
         )? {
             dirty = true;
+        }
+        if contest_switch.switch_requested {
+            break;
         }
         if resize_event_count(&terminal_events) < resize_count_before {
             discard_stale_pixel_events(&mut terminal_events);
@@ -497,7 +754,12 @@ pub(crate) fn run(
         }
     }
 
-    Ok(())
+    preferences.capture(&app);
+    if contest_switch.switch_requested {
+        Ok(SessionExit::SwitchContest)
+    } else {
+        Ok(SessionExit::Quit)
+    }
 }
 
 fn read_terminal_events(
@@ -571,8 +833,48 @@ fn read_terminal_events_with(
     Ok(events)
 }
 
+#[cfg(test)]
 fn contains_quit_event(events: &VecDeque<TerminalEvent>) -> bool {
     events.iter().any(is_quit_event)
+}
+
+fn contains_global_quit_event(
+    events: &VecDeque<TerminalEvent>,
+    contest_switch: &ContestSwitchController<'_>,
+) -> bool {
+    let mut modal_active = contest_switch.modal_active();
+
+    for event in events {
+        let TerminalEvent::Key(key) = event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if modal_active {
+            if key.code == KeyCode::Escape {
+                modal_active = false;
+            }
+            continue;
+        }
+
+        if contest_switch.available
+            && key.code == KeyCode::Char('c')
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.super_key
+        {
+            modal_active = true;
+            continue;
+        }
+
+        if is_quit_event(event) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn is_quit_event(terminal_event: &TerminalEvent) -> bool {
@@ -613,7 +915,10 @@ fn handle_terminal_events(
         render_info,
         events,
         MouseMode::Cells,
-        TerminalInputContext::new(run_tx, None),
+        FrontendInputContext {
+            terminal: TerminalInputContext::new(run_tx, None),
+            contest_switch: None,
+        },
     )
 }
 
@@ -624,7 +929,7 @@ fn handle_terminal_events_with_mouse_mode(
     render_info: &view::RenderInfo,
     events: &mut VecDeque<TerminalEvent>,
     mouse_mode: MouseMode,
-    input: TerminalInputContext<'_>,
+    mut input: FrontendInputContext<'_, '_, '_>,
 ) -> io::Result<bool> {
     let mut changed = false;
     let mut scrollbar_geometry_changed_by_drag = false;
@@ -674,8 +979,15 @@ fn handle_terminal_events_with_mouse_mode(
             terminal_event,
             render_info,
             mouse_mode,
-            input,
+            &mut input,
         )?;
+        if input
+            .contest_switch
+            .as_ref()
+            .is_some_and(|contest_switch| contest_switch.switch_requested)
+        {
+            break;
+        }
         if app.detail_revision() != detail_revision_before
             || app.samples_pane_enabled() != samples_pane_before
         {
@@ -707,12 +1019,35 @@ fn handle_terminal_event_with_mouse_mode(
     terminal_event: TerminalEvent,
     render_info: &view::RenderInfo,
     mouse_mode: MouseMode,
-    input: TerminalInputContext<'_>,
+    input: &mut FrontendInputContext<'_, '_, '_>,
 ) -> io::Result<bool> {
-    match terminal_event {
-        TerminalEvent::Key(key) => {
-            handle_key_event_with_stress_context(app, key, input.run_tx, input.stress_setup)
+    if let TerminalEvent::Key(key) = terminal_event
+        && let Some(contest_switch) = input.contest_switch.as_deref_mut()
+    {
+        match contest_switch.handle_key(key) {
+            ContestSwitchKeyResult::NotHandled => {}
+            ContestSwitchKeyResult::Handled | ContestSwitchKeyResult::SwitchRequested => {
+                return Ok(true);
+            }
         }
+    }
+
+    if input
+        .contest_switch
+        .as_ref()
+        .is_some_and(|contest_switch| contest_switch.modal_active())
+        && matches!(terminal_event, TerminalEvent::Pointer(_))
+    {
+        return Ok(false);
+    }
+
+    match terminal_event {
+        TerminalEvent::Key(key) => handle_key_event_with_stress_context(
+            app,
+            key,
+            input.terminal.run_tx,
+            input.terminal.stress_setup,
+        ),
 
         TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event_with_mouse_mode(
             app,
@@ -1211,6 +1546,205 @@ mod tests {
             events,
             run_tx,
         )
+    }
+
+    fn workspace_context(root: &Path) -> AppContext {
+        AppContext::Workspace {
+            root: root.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn contest_switch_modal_opens_and_cancels_only_in_workspace_context() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "incomplete".to_string());
+        let mut controller =
+            ContestSwitchController::new(&workspace_context(root.path()), &current, &mut resolve);
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(controller.modal_active());
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(!controller.modal_active());
+
+        let standalone = AppContext::Standalone {
+            launch_root: root.path().to_path_buf(),
+        };
+        let mut standalone = ContestSwitchController::new(&standalone, &current, &mut resolve);
+        assert_eq!(
+            standalone.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press)),
+            ContestSwitchKeyResult::NotHandled
+        );
+        assert!(!standalone.modal_active());
+    }
+
+    #[test]
+    fn modal_accepts_chars_q_backspace_and_unicode_grapheme_backspace() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "incomplete".to_string());
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+
+        for character in ['a', 'b', 'c', 'q', '7', '0', 'e', '\u{301}'] {
+            assert_eq!(
+                controller.handle_key(key(KeyCode::Char(character), KeyEventKind::Press)),
+                ContestSwitchKeyResult::Handled
+            );
+        }
+        assert_eq!(controller.modal().unwrap().contest_id, "abcq70e\u{301}");
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Backspace, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert_eq!(controller.modal().unwrap().contest_id, "abcq70");
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn modal_enter_switches_only_for_an_accepted_different_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let next = root.path().join("abc467");
+        let mut resolve = |contest_id: &str| {
+            if contest_id == "abc467" {
+                ContestSwitchResolution::accepted(next.clone())
+            } else {
+                ContestSwitchResolution::rejected(None, "invalid contest".to_string())
+            }
+        };
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        for character in "bad".chars() {
+            controller.handle_key(key(KeyCode::Char(character), KeyEventKind::Press));
+        }
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(controller.modal_active());
+        assert!(!controller.switch_requested);
+
+        controller.modal.as_mut().unwrap().contest_id = "abc467".to_string();
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::SwitchRequested
+        );
+        assert!(controller.switch_requested);
+    }
+
+    #[test]
+    fn same_destination_is_a_noop_and_closes_the_modal() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve = |_: &str| ContestSwitchResolution::accepted(current.clone());
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        controller.modal.as_mut().unwrap().contest_id = "abc123".to_string();
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(!controller.modal_active());
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn modal_suppresses_global_shortcuts_and_queued_q_is_not_global_quit() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        let mut app = app();
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+
+        for code in [KeyCode::Char('q'), KeyCode::Char('d'), KeyCode::Char('j')] {
+            assert_ne!(
+                controller.handle_key(key(code, KeyEventKind::Press)),
+                ContestSwitchKeyResult::NotHandled
+            );
+        }
+        assert!(!app.should_quit());
+        assert!(!app.debug_enabled());
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(controller.modal().unwrap().contest_id, "qdj");
+
+        let queued = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Char('c'), KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        let mut fresh_resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+        let fresh = ContestSwitchController::new(&context, &current, &mut fresh_resolve);
+        assert!(!contains_global_quit_event(&queued, &fresh));
+
+        // The modal consumes these keys before the existing application handler can mutate app.
+        assert!(!handle_key(
+            &mut app,
+            KeyCode::Char('x'),
+            KeyEventKind::Press
+        ));
+    }
+
+    #[test]
+    fn frontend_preferences_survive_fresh_contest_state() {
+        let mut first = app_with_problems(&[3]);
+        first.toggle_debug();
+        first.toggle_samples_pane();
+        first.next_case();
+        let mut preferences = FrontendPreferences::default();
+        preferences.capture(&first);
+
+        let mut next = app_with_problems(&[1]);
+        preferences.apply(&mut next);
+
+        assert!(next.debug_enabled());
+        assert!(next.samples_pane_enabled());
+        assert_eq!(next.selected_case(), 0);
+        assert_eq!(next.contest_id(), "abc123");
+    }
+
+    #[test]
+    fn old_session_messages_cannot_modify_a_new_session_app() {
+        let mut old_app = app_with_problems(&[1]);
+        let mut new_app = app_with_problems(&[1]);
+        let (old_tx, old_rx) = mpsc::channel();
+        let (_new_tx, new_rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+        old_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("old-session-A.py"),
+                language: Language::Python,
+            })
+            .unwrap();
+
+        assert!(!handle_messages(&mut new_app, &new_rx, &run_tx).unwrap());
+        assert!(new_app.current_problem().unwrap().source.is_none());
+        assert!(handle_messages(&mut old_app, &old_rx, &run_tx).unwrap());
+        assert_eq!(
+            old_app
+                .current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .path,
+            PathBuf::from("old-session-A.py")
+        );
     }
 
     #[test]
@@ -2963,7 +3497,10 @@ mod tests {
                 &info,
                 &mut events,
                 MouseMode::Disabled,
-                TerminalInputContext::new(&run_tx, None),
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, None),
+                    contest_switch: None,
+                },
             )
             .unwrap()
         );
