@@ -251,7 +251,7 @@ pub(super) fn watch_tui_at(
 
     let mut preferences = crate::tui::FrontendPreferences::default();
     let prepared_switch = Arc::new(Mutex::new(None));
-    let create_task = contest_create_task(&app_context, Arc::clone(&prepared_switch));
+    let switch_task = contest_switch_task(&app_context, Arc::clone(&prepared_switch));
     let result = loop {
         match prepared_switch.lock() {
             Ok(mut pending) => *pending = None,
@@ -291,6 +291,12 @@ pub(super) fn watch_tui_at(
                         }
                         crate::tui::ContestSwitchResolution::missing(destination)
                     }
+                    Ok(SwitchTargetPreparation::RepairRequired { destination }) => {
+                        if let Ok(mut pending) = resolver_prepared.lock() {
+                            *pending = None;
+                        }
+                        crate::tui::ContestSwitchResolution::repair_required(destination)
+                    }
                     Err(SwitchPreparationError { destination, error }) => {
                         if let Ok(mut pending) = resolver_prepared.lock() {
                             *pending = None;
@@ -302,7 +308,7 @@ pub(super) fn watch_tui_at(
                     }
                 }
             },
-            Arc::clone(&create_task),
+            Arc::clone(&switch_task),
         );
 
         match frontend_result {
@@ -383,6 +389,7 @@ struct PreparedWatchInput {
 enum SwitchTargetPreparation {
     Existing(PreparedWatchInput),
     Missing { destination: PathBuf },
+    RepairRequired { destination: PathBuf },
 }
 
 #[derive(Debug)]
@@ -415,6 +422,15 @@ impl PreparedWatchInput {
         contest_id: &str,
         expected_destination: Option<&Path>,
     ) -> Result<SwitchTargetPreparation, SwitchPreparationError> {
+        Self::resolve_for_switch_expected_with_hook(root, contest_id, expected_destination, || {})
+    }
+
+    fn resolve_for_switch_expected_with_hook(
+        root: &Path,
+        contest_id: &str,
+        expected_destination: Option<&Path>,
+        after_healthy_inspection: impl FnOnce(),
+    ) -> Result<SwitchTargetPreparation, SwitchPreparationError> {
         let destination = workspace::resolve_contest_path(root, contest_id).map_err(|error| {
             SwitchPreparationError {
                 destination: None,
@@ -444,21 +460,13 @@ impl PreparedWatchInput {
                 error,
             }
         })?;
-        let contest = match target {
-            ContestTargetHealth::Healthy(contest) => contest,
+        match target {
+            ContestTargetHealth::Healthy => after_healthy_inspection(),
             ContestTargetHealth::MissingDirectory => {
                 return Ok(SwitchTargetPreparation::Missing { destination });
             }
             ContestTargetHealth::RepairRequired => {
-                return Err(SwitchPreparationError {
-                    destination: Some(destination),
-                    error: io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "contest {contest_id:?} metadata is missing or invalid; repair is not supported by TUI switch yet"
-                        ),
-                    ),
-                });
+                return Ok(SwitchTargetPreparation::RepairRequired { destination });
             }
             ContestTargetHealth::UnsupportedVersion(version) => {
                 return Err(SwitchPreparationError {
@@ -469,12 +477,14 @@ impl PreparedWatchInput {
                     ),
                 });
             }
-        };
+        }
 
-        let (sample_counts, stress_cases) =
-            load_watch_data(&destination, &contest).map_err(|error| SwitchPreparationError {
-                destination: Some(destination.clone()),
-                error,
+        let (contest, sample_counts, stress_cases) =
+            load_watch_input(&destination, Some(contest_id)).map_err(|error| {
+                SwitchPreparationError {
+                    destination: Some(destination.clone()),
+                    error,
+                }
             })?;
 
         Ok(SwitchTargetPreparation::Existing(Self {
@@ -486,10 +496,10 @@ impl PreparedWatchInput {
     }
 }
 
-fn contest_create_task(
+fn contest_switch_task(
     app_context: &AppContext,
     prepared_switch: Arc<Mutex<Option<PreparedWatchInput>>>,
-) -> crate::tui::ContestCreateTask {
+) -> crate::tui::ContestSwitchTask {
     let workspace_root = app_context.workspace_root().map(Path::to_path_buf);
     Arc::new(move |request, reporter| {
         let root = workspace_root.as_deref().ok_or_else(|| {
@@ -498,7 +508,14 @@ fn contest_create_task(
                 "contest switching is unavailable outside a workspace",
             )
         })?;
-        let prepared = create_and_prepare_contest_switch(root, &request, reporter)?;
+        let prepared = match request.mutation {
+            crate::tui::ContestSwitchMutation::Create => {
+                create_and_prepare_contest_switch(root, &request, reporter)?
+            }
+            crate::tui::ContestSwitchMutation::Repair => {
+                repair_and_prepare_contest_switch(root, &request, reporter)?
+            }
+        };
         *prepared_switch
             .lock()
             .map_err(|_| io::Error::other("prepared contest switch state is poisoned"))? =
@@ -509,7 +526,7 @@ fn contest_create_task(
 
 fn create_and_prepare_contest_switch(
     root: &Path,
-    request: &crate::tui::ContestCreateRequest,
+    request: &crate::tui::ContestSwitchRequest,
     reporter: &mut dyn Reporter,
 ) -> Result<PreparedWatchInput, AppError> {
     create_and_prepare_contest_switch_with(
@@ -524,10 +541,18 @@ fn create_and_prepare_contest_switch(
 
 fn create_and_prepare_contest_switch_with(
     root: &Path,
-    request: &crate::tui::ContestCreateRequest,
+    request: &crate::tui::ContestSwitchRequest,
     reporter: &mut dyn Reporter,
     create: impl FnOnce(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
 ) -> Result<PreparedWatchInput, AppError> {
+    if request.mutation != crate::tui::ContestSwitchMutation::Create {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "contest switch request is not a create operation",
+        )
+        .into());
+    }
+
     let target = PreparedWatchInput::resolve_for_switch_expected(
         root,
         &request.contest_id,
@@ -539,6 +564,16 @@ fn create_and_prepare_contest_switch_with(
         SwitchTargetPreparation::Existing(_) => {}
         SwitchTargetPreparation::Missing { ref destination } => {
             create(destination, &request.contest_id, reporter)?;
+        }
+        SwitchTargetPreparation::RepairRequired { destination } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contest creation was requested but metadata requires repair: {}",
+                    destination.display()
+                ),
+            )
+            .into());
         }
     }
 
@@ -554,6 +589,103 @@ fn create_and_prepare_contest_switch_with(
             io::ErrorKind::NotFound,
             format!(
                 "contest creation completed but the destination is still missing: {}",
+                destination.display()
+            ),
+        )
+        .into()),
+        SwitchTargetPreparation::RepairRequired { destination } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contest creation completed but contest data requires repair: {}",
+                destination.display()
+            ),
+        )
+        .into()),
+    }
+}
+
+fn repair_and_prepare_contest_switch(
+    root: &Path,
+    request: &crate::tui::ContestSwitchRequest,
+    reporter: &mut dyn Reporter,
+) -> Result<PreparedWatchInput, AppError> {
+    repair_and_prepare_contest_switch_with(root, request, reporter, super::contest::repair_contest)
+}
+
+fn repair_and_prepare_contest_switch_with(
+    root: &Path,
+    request: &crate::tui::ContestSwitchRequest,
+    reporter: &mut dyn Reporter,
+    repair: impl FnOnce(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
+) -> Result<PreparedWatchInput, AppError> {
+    repair_and_prepare_contest_switch_with_final_hook(root, request, reporter, repair, || {})
+}
+
+fn repair_and_prepare_contest_switch_with_final_hook(
+    root: &Path,
+    request: &crate::tui::ContestSwitchRequest,
+    reporter: &mut dyn Reporter,
+    repair: impl FnOnce(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
+    after_final_healthy_inspection: impl FnOnce(),
+) -> Result<PreparedWatchInput, AppError> {
+    if request.mutation != crate::tui::ContestSwitchMutation::Repair {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "contest switch request is not a repair operation",
+        )
+        .into());
+    }
+
+    match PreparedWatchInput::resolve_for_switch_expected(
+        root,
+        &request.contest_id,
+        Some(&request.destination),
+    )
+    .map_err(|error| error.error)?
+    {
+        SwitchTargetPreparation::RepairRequired { ref destination } => {
+            repair(destination, &request.contest_id, reporter)?;
+        }
+        SwitchTargetPreparation::Existing(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "contest no longer requires repair",
+            )
+            .into());
+        }
+        SwitchTargetPreparation::Missing { destination } => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "contest repair was requested but the destination is missing: {}",
+                    destination.display()
+                ),
+            )
+            .into());
+        }
+    }
+
+    match PreparedWatchInput::resolve_for_switch_expected_with_hook(
+        root,
+        &request.contest_id,
+        Some(&request.destination),
+        after_final_healthy_inspection,
+    )
+    .map_err(|error| error.error)?
+    {
+        SwitchTargetPreparation::Existing(prepared) => Ok(prepared),
+        SwitchTargetPreparation::Missing { destination } => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "contest repair completed but the destination is missing: {}",
+                destination.display()
+            ),
+        )
+        .into()),
+        SwitchTargetPreparation::RepairRequired { destination } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contest repair completed but contest data still requires repair: {}",
                 destination.display()
             ),
         )
@@ -683,7 +815,7 @@ impl ContestSession {
         app_context: &AppContext,
         preferences: &mut crate::tui::FrontendPreferences,
         resolve_contest_switch: impl FnMut(&str) -> crate::tui::ContestSwitchResolution,
-        contest_create_task: crate::tui::ContestCreateTask,
+        contest_switch_task: crate::tui::ContestSwitchTask,
     ) -> io::Result<crate::tui::SessionExit> {
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
@@ -701,7 +833,7 @@ impl ContestSession {
             preferences,
             runtime,
             resolve_contest_switch,
-            contest_create_task,
+            contest_switch_task,
         )
     }
 
@@ -757,7 +889,7 @@ type LoadedWatchInput = (Contest, Vec<usize>, Vec<Option<crate::model::Sample>>)
 fn load_watch_input(
     destination: &Path,
     expected_contest_id: Option<&str>,
-) -> Result<LoadedWatchInput, AppError> {
+) -> io::Result<LoadedWatchInput> {
     workspace::validate_workspace_marker(destination)?;
 
     let contest = workspace::load_metadata(destination)?;
@@ -779,7 +911,17 @@ fn load_watch_data(
         .problems
         .iter()
         .map(|problem| {
-            workspace::load_samples(destination, &problem.index).map(|samples| samples.len())
+            let sample_count = workspace::load_samples(destination, &problem.index)?.len();
+            if sample_count != problem.sample_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "problem {} has {sample_count} local samples, but contest metadata requires {}",
+                        problem.index, problem.sample_count
+                    ),
+                ));
+            }
+            Ok(sample_count)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stress_cases = contest
@@ -812,18 +954,40 @@ mod tests {
             destination,
             &Contest {
                 contest_id: contest_id.to_string(),
-                problems: vec![problem("A")],
+                problems: vec![problem_for(contest_id, "A")],
             },
         )
         .unwrap();
     }
 
     fn problem(index: &str) -> Problem {
+        problem_for("contest", index)
+    }
+
+    fn problem_for(contest_id: &str, index: &str) -> Problem {
+        let task_id = format!("{contest_id}_{}", index.to_ascii_lowercase());
         Problem {
             index: index.to_string(),
             title: format!("Problem {index}"),
-            task_id: format!("contest_{}", index.to_ascii_lowercase()),
-            url: format!("https://example.invalid/{index}"),
+            url: format!("https://atcoder.jp/contests/{contest_id}/tasks/{task_id}"),
+            task_id,
+            sample_count: 0,
+        }
+    }
+
+    fn write_empty_workspace(root: &Path) {
+        std::fs::write(
+            root.join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+    }
+
+    fn repair_request(contest_id: &str, destination: PathBuf) -> crate::tui::ContestSwitchRequest {
+        crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Repair,
+            contest_id: contest_id.to_string(),
+            destination,
         }
     }
 
@@ -832,7 +996,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let contest = Contest {
             contest_id: "contest".to_string(),
-            problems: vec![problem("A"), problem("B"), problem("C")],
+            problems: [("A", 2), ("B", 0), ("C", 1)]
+                .into_iter()
+                .map(|(index, sample_count)| Problem {
+                    sample_count,
+                    ..problem(index)
+                })
+                .collect(),
         };
         workspace::save_metadata(temp.path(), &contest).unwrap();
         workspace::save_samples(
@@ -901,17 +1071,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let contest = Contest {
             contest_id: "arc001".to_string(),
-            problems: Vec::new(),
+            problems: vec![problem_for("arc001", "A")],
         };
         workspace::save_metadata(temp.path(), &contest).unwrap();
 
         let error = load_watch_input(temp.path(), Some("abc466"))
             .expect_err("resolved destination metadata must match the requested contest");
 
-        assert!(matches!(
-            error,
-            AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
-        ));
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -971,7 +1138,8 @@ mod tests {
             "version = 1\npaths = [{ pattern = \"^abc\", path = \"one\" }]\n",
         )
         .unwrap();
-        let request = crate::tui::ContestCreateRequest {
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
             contest_id: "abc470".to_string(),
             destination: root.path().join("one/abc470"),
         };
@@ -1004,7 +1172,8 @@ mod tests {
         )
         .unwrap();
         let destination = root.path().join("abc470");
-        let request = crate::tui::ContestCreateRequest {
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
             contest_id: "abc470".to_string(),
             destination: destination.clone(),
         };
@@ -1015,7 +1184,8 @@ mod tests {
             &request,
             &mut reporter,
             |destination, contest_id, _| {
-                let problem = problem("A");
+                let mut problem = problem_for(contest_id, "A");
+                problem.sample_count = 1;
                 workspace::save_metadata(
                     destination,
                     &Contest {
@@ -1043,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn create_switch_preserves_recoverable_sample_fetch_semantics() {
+    fn create_switch_sample_fetch_failure_installs_nothing() {
         #[derive(Default)]
         struct FetchReporter {
             failed_problems: Vec<String>,
@@ -1068,7 +1238,8 @@ mod tests {
             "version = 1\npaths = []\n",
         )
         .unwrap();
-        let request = crate::tui::ContestCreateRequest {
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
             contest_id: "mini".to_string(),
             destination: root.path().join("mini"),
         };
@@ -1096,7 +1267,7 @@ mod tests {
         let client = crate::atcoder::AtCoderClient::fixture(&fixtures);
         let mut reporter = FetchReporter::default();
 
-        let prepared = create_and_prepare_contest_switch_with(
+        let error = create_and_prepare_contest_switch_with(
             root.path(),
             &request,
             &mut reporter,
@@ -1112,12 +1283,12 @@ mod tests {
                 )
             },
         )
-        .unwrap();
+        .expect_err("strict create must fail when any problem page is unavailable");
 
-        assert_eq!(prepared.contest.problems.len(), 2);
-        assert!(reporter.workspace_created);
+        assert!(matches!(error, AppError::AtCoder(_)));
+        assert!(!request.destination.exists());
+        assert!(!reporter.workspace_created);
         assert_eq!(reporter.failed_problems, ["B"]);
-        assert_eq!(prepared.sample_counts, [1, 0]);
     }
 
     #[test]
@@ -1131,7 +1302,8 @@ mod tests {
         let active = root.path().join("abc123");
         save_healthy_contest(&active, "abc123");
         let active_before = std::fs::read(active.join(".atc/contest.toml")).unwrap();
-        let request = crate::tui::ContestCreateRequest {
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
             contest_id: "abc470".to_string(),
             destination: root.path().join("abc470"),
         };
@@ -1162,7 +1334,8 @@ mod tests {
         .unwrap();
         let active = root.path().join("abc123");
         save_healthy_contest(&active, "abc123");
-        let request = crate::tui::ContestCreateRequest {
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
             contest_id: "abc470".to_string(),
             destination: root.path().join("abc470"),
         };
@@ -1180,7 +1353,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("repair is not supported"));
+        assert!(error.to_string().contains("contest data requires repair"));
         assert_eq!(
             workspace::load_metadata(&active).unwrap().contest_id,
             "abc123"
@@ -1218,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_metadata_is_rejected_without_repairing_or_touching_active_contest() {
+    fn invalid_metadata_is_repair_required_without_mutation_or_touching_active_contest() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".atc-workspace.toml"),
@@ -1227,16 +1400,26 @@ mod tests {
         .unwrap();
         let active = root.path().join("abc123");
         save_healthy_contest(&active, "abc123");
+        let missing_metadata = root.path().join("abc466");
+        std::fs::create_dir(&missing_metadata).unwrap();
         let invalid = root.path().join("abc467");
         std::fs::create_dir_all(invalid.join(".atc")).unwrap();
         std::fs::write(invalid.join(".atc/contest.toml"), "invalid metadata").unwrap();
         let invalid_before = std::fs::read(invalid.join(".atc/contest.toml")).unwrap();
 
-        let error = switch_error(root.path(), "abc467");
+        assert!(matches!(
+            PreparedWatchInput::resolve_for_switch(root.path(), "abc466").unwrap(),
+            SwitchTargetPreparation::RepairRequired { destination }
+                if destination == missing_metadata
+        ));
 
-        assert_eq!(error.destination, Some(invalid.clone()));
-        assert_eq!(error.error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.error.to_string().contains("repair is not supported"));
+        let target = PreparedWatchInput::resolve_for_switch(root.path(), "abc467").unwrap();
+
+        assert!(matches!(
+            target,
+            SwitchTargetPreparation::RepairRequired { destination }
+                if destination == invalid
+        ));
         assert_eq!(
             std::fs::read(invalid.join(".atc/contest.toml")).unwrap(),
             invalid_before
@@ -1244,6 +1427,219 @@ mod tests {
         assert_eq!(
             workspace::load_metadata(&active).unwrap().contest_id,
             "abc123"
+        );
+    }
+
+    #[test]
+    fn repair_switch_revalidates_mapping_before_calling_repair_core() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".atc-workspace.toml");
+        std::fs::write(
+            &config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"one\" }]\n",
+        )
+        .unwrap();
+        let destination = root.path().join("one/abc470");
+        std::fs::create_dir_all(&destination).unwrap();
+        let request = repair_request("abc470", destination.clone());
+        std::fs::write(
+            &config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"two\" }]\n",
+        )
+        .unwrap();
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |_, _, _| panic!("stale preview must not start repair"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("workspace config changed"));
+        assert!(destination.is_dir());
+        assert!(!root.path().join("two").exists());
+    }
+
+    #[test]
+    fn repair_switch_loads_metadata_samples_and_saved_stress_before_success() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&destination).unwrap();
+        let request = repair_request("abc470", destination.clone());
+        let mut reporter = crate::ui::NullReporter;
+
+        let prepared = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |destination, contest_id, _| {
+                let mut problem = problem_for(contest_id, "A");
+                problem.sample_count = 1;
+                workspace::save_metadata(
+                    destination,
+                    &Contest {
+                        contest_id: contest_id.to_string(),
+                        problems: vec![problem.clone()],
+                    },
+                )?;
+                workspace::save_samples(
+                    destination,
+                    &problem,
+                    &[Sample {
+                        input: "1\n".to_string(),
+                        output: "2\n".to_string(),
+                    }],
+                )?;
+                let stress = destination.join(".atc/stress/A");
+                std::fs::create_dir_all(&stress)?;
+                std::fs::write(stress.join("failed.in"), "3\n")?;
+                std::fs::write(stress.join("actual.out"), "5\n")?;
+                std::fs::write(stress.join("expected.out"), "4\n")?;
+                std::fs::write(
+                    stress.join("meta.toml"),
+                    "version = 1\ncontest = \"abc470\"\nproblem = \"A\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 9\nseed = 9\n",
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.destination, destination);
+        assert_eq!(prepared.contest.contest_id, "abc470");
+        assert_eq!(prepared.sample_counts, [1]);
+        assert_eq!(
+            prepared.stress_cases,
+            [Some(Sample {
+                input: "3\n".to_string(),
+                output: "4\n".to_string(),
+            })]
+        );
+    }
+
+    #[test]
+    fn repair_completion_requires_fresh_healthy_metadata_and_loadable_session_data() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let mut reporter = crate::ui::NullReporter;
+
+        let still_invalid = root.path().join("abc470");
+        std::fs::create_dir(&still_invalid).unwrap();
+        let error = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &repair_request("abc470", still_invalid.clone()),
+            &mut reporter,
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("still requires repair"));
+        assert!(still_invalid.is_dir());
+
+        let metadata_race = root.path().join("abc473");
+        std::fs::create_dir(&metadata_race).unwrap();
+        let metadata_path = metadata_race.join(".atc/contest.toml");
+        let error = repair_and_prepare_contest_switch_with_final_hook(
+            root.path(),
+            &repair_request("abc473", metadata_race.clone()),
+            &mut reporter,
+            |destination, contest_id, _| {
+                workspace::save_metadata(
+                    destination,
+                    &Contest {
+                        contest_id: contest_id.to_string(),
+                        problems: vec![problem_for(contest_id, "A")],
+                    },
+                )?;
+                Ok(())
+            },
+            || std::fs::write(&metadata_path, "invalid after inspection").unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(
+            std::fs::read_to_string(metadata_path).unwrap(),
+            "invalid after inspection"
+        );
+
+        let invalid_samples = root.path().join("abc471");
+        std::fs::create_dir(&invalid_samples).unwrap();
+        let error = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &repair_request("abc471", invalid_samples.clone()),
+            &mut reporter,
+            |destination, contest_id, _| {
+                workspace::save_metadata(
+                    destination,
+                    &Contest {
+                        contest_id: contest_id.to_string(),
+                        problems: vec![problem_for(contest_id, "A")],
+                    },
+                )?;
+                std::fs::create_dir_all(destination.join("tests/A"))?;
+                std::fs::write(destination.join("tests/A/sample-1.in"), "1\n")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("still requires repair"));
+        assert!(invalid_samples.join("tests/A/sample-1.in").exists());
+
+        let invalid_stress = root.path().join("abc472");
+        std::fs::create_dir(&invalid_stress).unwrap();
+        let error = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &repair_request("abc472", invalid_stress.clone()),
+            &mut reporter,
+            |destination, contest_id, _| {
+                workspace::save_metadata(
+                    destination,
+                    &Contest {
+                        contest_id: contest_id.to_string(),
+                        problems: vec![problem_for(contest_id, "A")],
+                    },
+                )?;
+                std::fs::write(destination.join(".atc/stress"), "not a directory")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(invalid_stress.join(".atc/stress").is_file());
+    }
+
+    #[test]
+    fn repair_failure_preserves_the_active_session_destination_and_partial_target() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let active = root.path().join("abc123");
+        save_healthy_contest(&active, "abc123");
+        let active_before = std::fs::read(active.join(".atc/contest.toml")).unwrap();
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&destination).unwrap();
+        let partial = destination.join("repair-partial.txt");
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = repair_and_prepare_contest_switch_with(
+            root.path(),
+            &repair_request("abc470", destination.clone()),
+            &mut reporter,
+            |destination, _, _| {
+                std::fs::write(destination.join("repair-partial.txt"), "kept")?;
+                Err(io::Error::other("repair failed after mutation").into())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("repair failed after mutation"));
+        assert_eq!(std::fs::read_to_string(partial).unwrap(), "kept");
+        assert_eq!(
+            std::fs::read(active.join(".atc/contest.toml")).unwrap(),
+            active_before
         );
     }
 

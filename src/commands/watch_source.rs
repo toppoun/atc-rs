@@ -44,6 +44,7 @@ mod tests {
             title: format!("Problem {index}"),
             task_id: format!("contest_{}", index.to_ascii_lowercase()),
             url: format!("https://example.invalid/{index}"),
+            sample_count: 0,
         }
     }
 

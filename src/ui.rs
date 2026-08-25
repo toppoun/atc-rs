@@ -34,6 +34,9 @@ pub enum Event<'a> {
     WorkspaceRefreshed {
         destination: &'a Path,
     },
+    WorkspaceRepaired {
+        destination: &'a Path,
+    },
     WorkspaceInitialized {
         path: &'a Path,
     },
@@ -276,7 +279,7 @@ impl Reporter for TerminalReporter {
             }
 
             Event::ProblemFetchFailed { index, error } => {
-                eprintln!("  warning: {index}: {error}");
+                eprintln!("  failed to fetch {index}: {error}");
             }
 
             Event::WorkspaceCreated { destination } => {
@@ -285,6 +288,9 @@ impl Reporter for TerminalReporter {
 
             Event::WorkspaceRefreshed { destination } => {
                 eprintln!("Refreshed {}", destination.display());
+            }
+            Event::WorkspaceRepaired { destination } => {
+                eprintln!("Repaired {}", destination.display());
             }
             Event::WorkspaceInitialized { path } => {
                 eprintln!("Initialized atc workspace: {}", path.display());

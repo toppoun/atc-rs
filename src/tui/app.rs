@@ -1482,6 +1482,7 @@ mod tests {
                     title: format!("Problem {index}"),
                     task_id: format!("abc123_{index}"),
                     url: format!("https://example.invalid/{index}"),
+                    sample_count: 0,
                 })
                 .collect(),
         }

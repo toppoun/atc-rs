@@ -202,6 +202,7 @@ impl Reporter for ChannelReporter {
             | Event::ProblemFetchFailed { .. }
             | Event::WorkspaceCreated { .. }
             | Event::WorkspaceRefreshed { .. }
+            | Event::WorkspaceRepaired { .. }
             | Event::WorkspaceInitialized { .. }
             | Event::WorkspaceAlreadyInitialized { .. }
             | Event::SourceCreated { .. }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contest {
     pub contest_id: String,
     pub problems: Vec<Problem>,
@@ -13,6 +13,7 @@ pub struct Problem {
     pub title: String,
     pub task_id: String,
     pub url: String,
+    pub sample_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -704,6 +704,7 @@ mod tests {
                 title: "Problem A".to_string(),
                 task_id: "abc123_a".to_string(),
                 url: "https://example.invalid/a".to_string(),
+                sample_count: 0,
             }],
         }
     }

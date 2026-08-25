@@ -163,9 +163,7 @@ fn new_at_with_parent_preparation_and_hook(
 
     workspace::create_source_files(staging.path(), &contest.problems, language, template)?;
     for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
-        if let Some(samples) = samples {
-            workspace::save_samples(staging.path(), problem, &samples)?;
-        }
+        workspace::save_samples(staging.path(), problem, &samples)?;
     }
     workspace::save_metadata(staging.path(), &contest)?;
 

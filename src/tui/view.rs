@@ -278,6 +278,9 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
             if modal.target == Some(super::ContestSwitchTarget::Missing) {
                 lines.push(Line::raw(""));
                 lines.push(Line::raw("Contest does not exist."));
+            } else if modal.target == Some(super::ContestSwitchTarget::RepairRequired) {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("Contest data requires repair."));
             }
             if let Some(error) = modal.error.as_deref() {
                 lines.push(Line::styled(
@@ -286,28 +289,41 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
                 ));
             }
             lines.push(Line::raw(""));
-            let action = if modal.target == Some(super::ContestSwitchTarget::Missing) {
-                "[Enter] Create & Switch   [Esc] Cancel"
-            } else {
-                "[Enter] Switch   [Esc] Cancel"
+            let action = match modal.target {
+                Some(super::ContestSwitchTarget::Missing) => {
+                    "[Enter] Create & Switch   [Esc] Cancel"
+                }
+                Some(super::ContestSwitchTarget::RepairRequired) => {
+                    "[Enter] Repair & Switch   [Esc] Cancel"
+                }
+                Some(super::ContestSwitchTarget::Existing) => "[Enter] Switch   [Esc] Cancel",
+                None => "[Esc] Cancel",
             };
             lines.push(Line::raw(action));
         }
-        SwitchContestModalState::Creating => {
+        SwitchContestModalState::Creating | SwitchContestModalState::Repairing => {
+            let (verb, noun) = if modal.state == SwitchContestModalState::Repairing {
+                ("Repairing", "Repair")
+            } else {
+                ("Creating", "Creation")
+            };
             lines.push(Line::raw(""));
-            lines.push(Line::raw(format!("Creating {}", modal.contest_id)));
+            lines.push(Line::raw(format!("{verb} {}", modal.contest_id)));
             for progress in modal.progress.iter().rev().take(5).rev() {
                 lines.push(Line::raw(progress.display_line()));
             }
             lines.push(Line::raw(""));
-            lines.push(Line::raw("Creation is running and cannot be cancelled."));
+            lines.push(Line::raw(format!(
+                "{noun} is running and cannot be cancelled."
+            )));
         }
         SwitchContestModalState::Failed => {
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Create & Switch failed:",
-                Style::default().fg(Color::Red),
-            ));
+            let failure = match modal.mutation {
+                Some(super::ContestSwitchMutation::Repair) => "Repair & Switch failed:",
+                _ => "Create & Switch failed:",
+            };
+            lines.push(Line::styled(failure, Style::default().fg(Color::Red)));
             if let Some(error) = modal.error.as_deref() {
                 lines.push(Line::styled(
                     error.to_string(),
@@ -694,6 +710,7 @@ mod tests {
                     title: "Problem A".to_string(),
                     task_id: "abc123_a".to_string(),
                     url: "https://example.invalid/a".to_string(),
+                    sample_count: 1,
                 }],
             },
             vec![1],
@@ -1056,7 +1073,8 @@ mod tests {
         assert!(rendered.contains("> abc467"));
         assert!(rendered.contains("D:/atcoder/ABC/abc467"));
         assert!(rendered.contains("contest metadata is invalid"));
-        assert!(rendered.contains("[Enter] Switch"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        assert!(!rendered.contains("[Enter]"));
     }
 
     #[test]
@@ -1075,7 +1093,7 @@ mod tests {
 
         let creating = SwitchContestModal {
             state: SwitchContestModalState::Creating,
-            progress: vec![super::super::ContestCreateProgress::ProblemFetching {
+            progress: vec![super::super::ContestSwitchProgress::ProblemFetching {
                 index: "A".to_string(),
                 current: 1,
                 total: 2,
@@ -1086,6 +1104,38 @@ mod tests {
         assert!(rendered.contains("Creating abc470"));
         assert!(rendered.contains("[1/2] Fetching A..."));
         assert!(rendered.contains("cannot be cancelled"));
+
+        let repair = SwitchContestModal {
+            contest_id: "abc470".to_string(),
+            destination: Some(PathBuf::from("D:/atcoder/ABC/abc470")),
+            target: Some(super::super::ContestSwitchTarget::RepairRequired),
+            ..SwitchContestModal::default()
+        };
+        let rendered = rendered_frontend_text(&app, true, Some(&repair));
+        assert!(rendered.contains("Contest data requires repair."));
+        assert!(rendered.contains("[Enter] Repair & Switch"));
+
+        let repairing = SwitchContestModal {
+            state: SwitchContestModalState::Repairing,
+            mutation: Some(super::super::ContestSwitchMutation::Repair),
+            progress: vec![super::super::ContestSwitchProgress::WorkspaceRepaired {
+                destination: PathBuf::from("D:/atcoder/ABC/abc470"),
+            }],
+            ..repair
+        };
+        let rendered = rendered_frontend_text(&app, true, Some(&repairing));
+        assert!(rendered.contains("Repairing abc470"));
+        assert!(rendered.contains("Contest repaired"));
+        assert!(rendered.contains("Repair is running and cannot be cancelled."));
+
+        let failed = SwitchContestModal {
+            state: SwitchContestModalState::Failed,
+            error: Some("network unavailable".to_string()),
+            ..repairing
+        };
+        let rendered = rendered_frontend_text(&app, true, Some(&failed));
+        assert!(rendered.contains("Repair & Switch failed:"));
+        assert!(rendered.contains("[Enter] Retry"));
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {
@@ -1564,6 +1614,7 @@ mod tests {
                     title: "Problem A".to_string(),
                     task_id: "abc123_a".to_string(),
                     url: "https://example.invalid/a".to_string(),
+                    sample_count: 2,
                 }],
             },
             vec![2],

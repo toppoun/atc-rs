@@ -110,9 +110,7 @@ pub(super) fn refresh_at(
         .tempdir_in(destination)?;
 
     for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
-        if let Some(samples) = samples {
-            workspace::save_samples(staging.path(), problem, &samples)?;
-        }
+        workspace::save_samples(staging.path(), problem, &samples)?;
     }
     workspace::save_metadata(staging.path(), &contest)?;
 

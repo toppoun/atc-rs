@@ -66,7 +66,7 @@ use std::time::Duration;
 
 struct FetchedContestData {
     contest: Contest,
-    samples_by_problem: Vec<Option<Vec<Sample>>>,
+    samples_by_problem: Vec<Vec<Sample>>,
 }
 
 fn fetch_contest_data(
@@ -76,29 +76,41 @@ fn fetch_contest_data(
 ) -> Result<FetchedContestData, AppError> {
     reporter.report(Event::ContestFetching { contest_id });
 
-    let contest = atcoder.fetch_contest(contest_id)?;
+    let outline = atcoder.fetch_contest(contest_id)?;
 
     reporter.report(Event::ContestFetched {
-        contest_id: &contest.contest_id,
-        problems: contest.problems.len(),
+        contest_id: &outline.contest_id,
+        problems: outline.problems.len(),
     });
 
-    let total = contest.problems.len();
-    let mut samples_by_problem = Vec::with_capacity(total);
+    for problem in &outline.problems {
+        crate::workspace::validate_problem_index(&problem.index)?;
+    }
 
-    for (i, problem) in contest.problems.iter().enumerate() {
+    let total = outline.problems.len();
+    let mut samples_by_problem = Vec::with_capacity(total);
+    let mut problems = Vec::with_capacity(total);
+
+    for (i, problem) in outline.problems.into_iter().enumerate() {
         reporter.report(Event::ProblemFetching {
             index: &problem.index,
             current: i + 1,
             total,
         });
-        match atcoder.fetch_samples(problem) {
+        match atcoder.fetch_samples(&problem) {
             Ok(samples) => {
                 reporter.report(Event::ProblemFetched {
                     index: &problem.index,
                     samples: samples.len(),
                 });
-                samples_by_problem.push(Some(samples));
+                problems.push(crate::model::Problem {
+                    index: problem.index,
+                    title: problem.title,
+                    task_id: problem.task_id,
+                    url: problem.url,
+                    sample_count: samples.len(),
+                });
+                samples_by_problem.push(samples);
             }
 
             Err(err) => {
@@ -108,14 +120,73 @@ fn fetch_contest_data(
                     index: &problem.index,
                     error: &message,
                 });
-                samples_by_problem.push(None);
+                return Err(err.into());
             }
         }
     }
+    let contest = Contest {
+        contest_id: outline.contest_id,
+        problems,
+    };
     Ok(FetchedContestData {
         contest,
         samples_by_problem,
     })
+}
+
+fn fetch_samples_for_manifest(
+    contest: &Contest,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+) -> Result<Vec<Vec<Sample>>, AppError> {
+    let total = contest.problems.len();
+    let mut samples_by_problem = Vec::with_capacity(total);
+
+    for (i, problem) in contest.problems.iter().enumerate() {
+        if problem.sample_count == 0 {
+            samples_by_problem.push(Vec::new());
+            continue;
+        }
+
+        reporter.report(Event::ProblemFetching {
+            index: &problem.index,
+            current: i + 1,
+            total,
+        });
+        let outline = atcoder::ProblemOutline::from(problem);
+        let samples = match atcoder.fetch_samples(&outline) {
+            Ok(samples) => samples,
+            Err(error) => {
+                let message = error.to_string();
+                reporter.report(Event::ProblemFetchFailed {
+                    index: &problem.index,
+                    error: &message,
+                });
+                return Err(error.into());
+            }
+        };
+        reporter.report(Event::ProblemFetched {
+            index: &problem.index,
+            samples: samples.len(),
+        });
+
+        if samples.len() != problem.sample_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "remote sample count for problem {} is {}, but the local manifest requires {}; run `atc refresh` to synchronize remote changes",
+                    problem.index,
+                    samples.len(),
+                    problem.sample_count
+                ),
+            )
+            .into());
+        }
+
+        samples_by_problem.push(samples);
+    }
+
+    Ok(samples_by_problem)
 }
 
 fn resolve_language(cli_language: Option<Language>, config: &Config) -> Language {

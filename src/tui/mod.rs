@@ -97,6 +97,14 @@ impl ContestSwitchResolution {
         }
     }
 
+    pub(crate) fn repair_required(destination: std::path::PathBuf) -> Self {
+        Self {
+            destination: Some(destination),
+            error: None,
+            target: Some(ContestSwitchTarget::RepairRequired),
+        }
+    }
+
     pub(crate) fn rejected(destination: Option<std::path::PathBuf>, error: String) -> Self {
         Self {
             destination,
@@ -110,6 +118,7 @@ impl ContestSwitchResolution {
 enum ContestSwitchTarget {
     Existing,
     Missing,
+    RepairRequired,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +126,24 @@ pub(super) enum SwitchContestModalState {
     #[default]
     Input,
     Creating,
+    Repairing,
     Failed,
 }
 
+impl SwitchContestModalState {
+    fn is_running(self) -> bool {
+        matches!(self, Self::Creating | Self::Repairing)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContestSwitchMutation {
+    Create,
+    Repair,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ContestCreateProgress {
+pub(crate) enum ContestSwitchProgress {
     ContestFetching {
         contest_id: String,
     },
@@ -145,9 +167,15 @@ pub(crate) enum ContestCreateProgress {
     WorkspaceCreated {
         destination: PathBuf,
     },
+    WorkspaceRefreshed {
+        destination: PathBuf,
+    },
+    WorkspaceRepaired {
+        destination: PathBuf,
+    },
 }
 
-impl ContestCreateProgress {
+impl ContestSwitchProgress {
     pub(super) fn display_line(&self) -> String {
         match self {
             Self::ContestFetching { .. } => "Fetching contest...".to_string(),
@@ -164,44 +192,47 @@ impl ContestCreateProgress {
                 format!("Fetched {index} ({samples} samples)")
             }
             Self::ProblemFetchFailed { index, error } => {
-                format!("Warning: {index}: {error}")
+                format!("Failed to fetch {index}: {error}")
             }
             Self::WorkspaceCreated { destination } => {
                 format!("Created {}", destination.display())
             }
+            Self::WorkspaceRefreshed { .. } => "Contest refreshed".to_string(),
+            Self::WorkspaceRepaired { .. } => "Contest repaired".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContestCreateRequest {
+pub(crate) struct ContestSwitchRequest {
+    pub(crate) mutation: ContestSwitchMutation,
     pub(crate) contest_id: String,
     pub(crate) destination: PathBuf,
 }
 
-pub(crate) type ContestCreateTask = Arc<
-    dyn Fn(ContestCreateRequest, &mut dyn Reporter) -> Result<(), AppError> + Send + Sync + 'static,
+pub(crate) type ContestSwitchTask = Arc<
+    dyn Fn(ContestSwitchRequest, &mut dyn Reporter) -> Result<(), AppError> + Send + Sync + 'static,
 >;
 
-enum ContestCreateOperationMessage {
-    Progress(ContestCreateProgress),
+enum ContestSwitchOperationMessage {
+    Progress(ContestSwitchProgress),
     Finished(Result<(), String>),
 }
 
-struct ContestCreateReporter {
-    tx: Sender<ContestCreateOperationMessage>,
+struct ContestSwitchReporter {
+    tx: Sender<ContestSwitchOperationMessage>,
 }
 
-impl Reporter for ContestCreateReporter {
+impl Reporter for ContestSwitchReporter {
     fn report(&mut self, event: Event<'_>) {
         let progress = match event {
-            Event::ContestFetching { contest_id } => ContestCreateProgress::ContestFetching {
+            Event::ContestFetching { contest_id } => ContestSwitchProgress::ContestFetching {
                 contest_id: contest_id.to_owned(),
             },
             Event::ContestFetched {
                 contest_id,
                 problems,
-            } => ContestCreateProgress::ContestFetched {
+            } => ContestSwitchProgress::ContestFetched {
                 contest_id: contest_id.to_owned(),
                 problems,
             },
@@ -209,22 +240,30 @@ impl Reporter for ContestCreateReporter {
                 index,
                 current,
                 total,
-            } => ContestCreateProgress::ProblemFetching {
+            } => ContestSwitchProgress::ProblemFetching {
                 index: index.to_owned(),
                 current,
                 total,
             },
-            Event::ProblemFetched { index, samples } => ContestCreateProgress::ProblemFetched {
+            Event::ProblemFetched { index, samples } => ContestSwitchProgress::ProblemFetched {
                 index: index.to_owned(),
                 samples,
             },
             Event::ProblemFetchFailed { index, error } => {
-                ContestCreateProgress::ProblemFetchFailed {
+                ContestSwitchProgress::ProblemFetchFailed {
                     index: index.to_owned(),
                     error: error.to_owned(),
                 }
             }
-            Event::WorkspaceCreated { destination } => ContestCreateProgress::WorkspaceCreated {
+            Event::WorkspaceCreated { destination } => ContestSwitchProgress::WorkspaceCreated {
+                destination: destination.to_path_buf(),
+            },
+            Event::WorkspaceRefreshed { destination } => {
+                ContestSwitchProgress::WorkspaceRefreshed {
+                    destination: destination.to_path_buf(),
+                }
+            }
+            Event::WorkspaceRepaired { destination } => ContestSwitchProgress::WorkspaceRepaired {
                 destination: destination.to_path_buf(),
             },
             _ => return,
@@ -232,54 +271,58 @@ impl Reporter for ContestCreateReporter {
 
         let _ = self
             .tx
-            .send(ContestCreateOperationMessage::Progress(progress));
+            .send(ContestSwitchOperationMessage::Progress(progress));
     }
 }
 
-struct ActiveContestCreateOperation {
-    rx: Receiver<ContestCreateOperationMessage>,
+struct ActiveContestSwitchOperation {
+    rx: Receiver<ContestSwitchOperationMessage>,
     handle: JoinHandle<()>,
 }
 
-struct ContestCreateOperation {
-    task: ContestCreateTask,
-    active: Option<ActiveContestCreateOperation>,
+struct ContestSwitchOperation {
+    task: ContestSwitchTask,
+    active: Option<ActiveContestSwitchOperation>,
 }
 
-impl ContestCreateOperation {
-    fn new(task: ContestCreateTask) -> Self {
+impl ContestSwitchOperation {
+    fn new(task: ContestSwitchTask) -> Self {
         Self { task, active: None }
     }
 
-    fn start(&mut self, request: ContestCreateRequest) -> io::Result<()> {
+    fn start(&mut self, request: ContestSwitchRequest) -> io::Result<()> {
         if self.active.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "a contest creation operation is already running",
+                "a contest switch operation is already running",
             ));
         }
 
         let (tx, rx) = mpsc::channel();
         let task = Arc::clone(&self.task);
+        let thread_name = match request.mutation {
+            ContestSwitchMutation::Create => "atc-tui-contest-create",
+            ContestSwitchMutation::Repair => "atc-tui-contest-repair",
+        };
         let handle = thread::Builder::new()
-            .name("atc-tui-contest-create".to_string())
+            .name(thread_name.to_string())
             .spawn(move || {
-                let mut reporter = ContestCreateReporter { tx: tx.clone() };
+                let mut reporter = ContestSwitchReporter { tx: tx.clone() };
                 let result = task(request, &mut reporter).map_err(|error| error.to_string());
                 drop(reporter);
-                let _ = tx.send(ContestCreateOperationMessage::Finished(result));
+                let _ = tx.send(ContestSwitchOperationMessage::Finished(result));
             })?;
 
-        self.active = Some(ActiveContestCreateOperation { rx, handle });
+        self.active = Some(ActiveContestSwitchOperation { rx, handle });
         Ok(())
     }
 
-    fn try_recv(&mut self) -> Option<ContestCreateOperationMessage> {
+    fn try_recv(&mut self) -> Option<ContestSwitchOperationMessage> {
         let result = self.active.as_ref()?.rx.try_recv();
         match result {
-            Ok(ContestCreateOperationMessage::Finished(result)) => {
+            Ok(ContestSwitchOperationMessage::Finished(result)) => {
                 let join_result = self.join_active();
-                Some(ContestCreateOperationMessage::Finished(match join_result {
+                Some(ContestSwitchOperationMessage::Finished(match join_result {
                     Ok(()) => result,
                     Err(error) => Err(error.to_string()),
                 }))
@@ -290,10 +333,10 @@ impl ContestCreateOperation {
                 let result = self.join_active().and_then(|()| {
                     Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "contest creation worker disconnected before reporting completion",
+                        "contest switch worker disconnected before reporting completion",
                     ))
                 });
-                Some(ContestCreateOperationMessage::Finished(
+                Some(ContestSwitchOperationMessage::Finished(
                     result.map_err(|error| error.to_string()),
                 ))
             }
@@ -307,11 +350,11 @@ impl ContestCreateOperation {
         active
             .handle
             .join()
-            .map_err(|_| io::Error::other("contest creation worker panicked"))
+            .map_err(|_| io::Error::other("contest switch worker panicked"))
     }
 }
 
-impl Drop for ContestCreateOperation {
+impl Drop for ContestSwitchOperation {
     fn drop(&mut self) {
         let _ = self.join_active();
     }
@@ -324,7 +367,8 @@ pub(super) struct SwitchContestModal {
     pub(super) error: Option<String>,
     target: Option<ContestSwitchTarget>,
     pub(super) state: SwitchContestModalState,
-    pub(super) progress: Vec<ContestCreateProgress>,
+    pub(super) progress: Vec<ContestSwitchProgress>,
+    pub(super) mutation: Option<ContestSwitchMutation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +383,8 @@ struct ContestSwitchController<'a> {
     current_destination: &'a Path,
     modal: Option<SwitchContestModal>,
     resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
-    create_operation: ContestCreateOperation,
+    same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
+    operation: ContestSwitchOperation,
     switch_requested: bool,
 }
 
@@ -348,14 +393,31 @@ impl<'a> ContestSwitchController<'a> {
         context: &AppContext,
         current_destination: &'a Path,
         resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
-        create_task: ContestCreateTask,
+        switch_task: ContestSwitchTask,
+    ) -> Self {
+        Self::new_with_identity_check(
+            context,
+            current_destination,
+            resolve,
+            switch_task,
+            existing_destinations_have_same_identity,
+        )
+    }
+
+    fn new_with_identity_check(
+        context: &AppContext,
+        current_destination: &'a Path,
+        resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+        switch_task: ContestSwitchTask,
+        same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
     ) -> Self {
         Self {
             available: context.workspace_root().is_some(),
             current_destination,
             modal: None,
             resolve,
-            create_operation: ContestCreateOperation::new(create_task),
+            same_existing_destination,
+            operation: ContestSwitchOperation::new(switch_task),
             switch_requested: false,
         }
     }
@@ -371,7 +433,33 @@ impl<'a> ContestSwitchController<'a> {
     fn escape_dismisses_modal(&self) -> bool {
         self.modal
             .as_ref()
-            .is_some_and(|modal| modal.state != SwitchContestModalState::Creating)
+            .is_some_and(|modal| !modal.state.is_running())
+    }
+
+    fn normalize_resolution(
+        &self,
+        mut resolution: ContestSwitchResolution,
+    ) -> ContestSwitchResolution {
+        if resolution.target == Some(ContestSwitchTarget::RepairRequired)
+            && let Some(destination) = resolution.destination.as_deref()
+        {
+            match (self.same_existing_destination)(destination, self.current_destination) {
+                Ok(true) => {
+                    resolution.target = None;
+                    resolution.error = Some(
+                        "Cannot repair the active contest from Switch Contest yet.".to_string(),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    resolution.target = None;
+                    resolution.error = Some(format!(
+                        "Cannot determine whether the repair target is the active contest: {error}"
+                    ));
+                }
+            }
+        }
+        resolution
     }
 
     fn refresh_resolution(&mut self) {
@@ -379,7 +467,9 @@ impl<'a> ContestSwitchController<'a> {
             return;
         };
         let resolution = (self.resolve)(&contest_id);
+        let resolution = self.normalize_resolution(resolution);
         let modal = self.modal.as_mut().expect("modal must still exist");
+        modal.mutation = None;
         Self::apply_resolution(modal, resolution);
     }
 
@@ -400,6 +490,7 @@ impl<'a> ContestSwitchController<'a> {
         let retrying = modal.state == SwitchContestModalState::Failed;
 
         let resolution = (self.resolve)(&contest_id);
+        let resolution = self.normalize_resolution(resolution);
         let unchanged = displayed_destination == resolution.destination
             && displayed_target == resolution.target
             && (retrying || displayed_error == resolution.error);
@@ -407,6 +498,7 @@ impl<'a> ContestSwitchController<'a> {
         let modal = self.modal.as_mut().expect("modal must still exist");
         modal.state = SwitchContestModalState::Input;
         modal.progress.clear();
+        modal.mutation = None;
         Self::apply_resolution(modal, resolution);
         unchanged
     }
@@ -428,6 +520,7 @@ impl<'a> ContestSwitchController<'a> {
             modal.state = SwitchContestModalState::Input;
             modal.error = None;
             modal.progress.clear();
+            modal.mutation = None;
         }
     }
 
@@ -444,7 +537,7 @@ impl<'a> ContestSwitchController<'a> {
             if self
                 .modal
                 .as_ref()
-                .is_some_and(|modal| modal.state == SwitchContestModalState::Creating)
+                .is_some_and(|modal| modal.state.is_running())
             {
                 return ContestSwitchKeyResult::Handled;
             }
@@ -484,23 +577,51 @@ impl<'a> ContestSwitchController<'a> {
                             }
                             Some(ContestSwitchTarget::Missing) => {
                                 let modal = self.modal.as_ref().expect("modal must exist");
-                                let request = ContestCreateRequest {
+                                let request = ContestSwitchRequest {
+                                    mutation: ContestSwitchMutation::Create,
                                     contest_id: modal.contest_id.clone(),
                                     destination: modal
                                         .destination
                                         .clone()
                                         .expect("missing target must have a destination"),
                                 };
-                                match self.create_operation.start(request) {
+                                match self.operation.start(request) {
                                     Ok(()) => {
                                         let modal = self.modal.as_mut().expect("modal must exist");
                                         modal.state = SwitchContestModalState::Creating;
                                         modal.error = None;
+                                        modal.mutation = Some(ContestSwitchMutation::Create);
                                     }
                                     Err(error) => {
                                         let modal = self.modal.as_mut().expect("modal must exist");
                                         modal.state = SwitchContestModalState::Failed;
                                         modal.error = Some(error.to_string());
+                                        modal.mutation = Some(ContestSwitchMutation::Create);
+                                    }
+                                }
+                            }
+                            Some(ContestSwitchTarget::RepairRequired) => {
+                                let modal = self.modal.as_ref().expect("modal must exist");
+                                let request = ContestSwitchRequest {
+                                    mutation: ContestSwitchMutation::Repair,
+                                    contest_id: modal.contest_id.clone(),
+                                    destination: modal
+                                        .destination
+                                        .clone()
+                                        .expect("repair target must have a destination"),
+                                };
+                                match self.operation.start(request) {
+                                    Ok(()) => {
+                                        let modal = self.modal.as_mut().expect("modal must exist");
+                                        modal.state = SwitchContestModalState::Repairing;
+                                        modal.error = None;
+                                        modal.mutation = Some(ContestSwitchMutation::Repair);
+                                    }
+                                    Err(error) => {
+                                        let modal = self.modal.as_mut().expect("modal must exist");
+                                        modal.state = SwitchContestModalState::Failed;
+                                        modal.error = Some(error.to_string());
+                                        modal.mutation = Some(ContestSwitchMutation::Repair);
                                     }
                                 }
                             }
@@ -544,21 +665,21 @@ impl<'a> ContestSwitchController<'a> {
     fn handle_operation_messages(&mut self) -> bool {
         let mut changed = false;
         for _ in 0..MAX_MESSAGES_PER_TICK {
-            match self.create_operation.try_recv() {
-                Some(ContestCreateOperationMessage::Progress(progress)) => {
+            match self.operation.try_recv() {
+                Some(ContestSwitchOperationMessage::Progress(progress)) => {
                     if let Some(modal) = self.modal.as_mut()
-                        && modal.state == SwitchContestModalState::Creating
+                        && modal.state.is_running()
                     {
                         modal.progress.push(progress);
                         changed = true;
                     }
                 }
-                Some(ContestCreateOperationMessage::Finished(Ok(()))) => {
+                Some(ContestSwitchOperationMessage::Finished(Ok(()))) => {
                     self.switch_requested = true;
                     changed = true;
                     break;
                 }
-                Some(ContestCreateOperationMessage::Finished(Err(error))) => {
+                Some(ContestSwitchOperationMessage::Finished(Err(error))) => {
                     if let Some(modal) = self.modal.as_mut() {
                         modal.state = SwitchContestModalState::Failed;
                         modal.error = Some(error);
@@ -571,6 +692,34 @@ impl<'a> ContestSwitchController<'a> {
         }
         changed
     }
+}
+
+fn existing_destinations_have_same_identity(left: &Path, right: &Path) -> io::Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+
+    let left = std::fs::canonicalize(left).map_err(|error| {
+        let kind = error.kind();
+        io::Error::new(
+            kind,
+            format!(
+                "failed to resolve repair target {}: {error}",
+                left.display()
+            ),
+        )
+    })?;
+    let right = std::fs::canonicalize(right).map_err(|error| {
+        let kind = error.kind();
+        io::Error::new(
+            kind,
+            format!(
+                "failed to resolve active contest {}: {error}",
+                right.display()
+            ),
+        )
+    })?;
+    Ok(left == right)
 }
 
 #[derive(Clone, Copy)]
@@ -958,7 +1107,7 @@ pub(crate) fn run(
     preferences: &mut FrontendPreferences,
     runtime: SessionRuntime<'_>,
     mut resolve_contest_switch: impl FnMut(&str) -> ContestSwitchResolution,
-    contest_create_task: ContestCreateTask,
+    contest_switch_task: ContestSwitchTask,
 ) -> io::Result<SessionExit> {
     let SessionRuntime {
         current_destination,
@@ -980,7 +1129,7 @@ pub(crate) fn run(
         app_context,
         current_destination,
         &mut resolve_contest_switch,
-        contest_create_task,
+        contest_switch_task,
     );
 
     let mut dirty = true;
@@ -1807,11 +1956,12 @@ mod tests {
             problems: sample_counts
                 .iter()
                 .enumerate()
-                .map(|(index, _)| Problem {
+                .map(|(index, sample_count)| Problem {
                     index: char::from(b'A' + index as u8).to_string(),
                     title: format!("Problem {index}"),
                     task_id: format!("abc123_{index}"),
                     url: format!("https://example.invalid/{index}"),
+                    sample_count: *sample_count,
                 })
                 .collect(),
         }
@@ -1921,23 +2071,23 @@ mod tests {
         }
     }
 
-    fn successful_create_task() -> ContestCreateTask {
+    fn successful_create_task() -> ContestSwitchTask {
         Arc::new(|_, _| Ok(()))
     }
 
-    fn failing_create_task() -> ContestCreateTask {
+    fn failing_create_task() -> ContestSwitchTask {
         Arc::new(|_, _| Err(io::Error::other("contest fetch failed").into()))
     }
 
     fn wait_for_create_operation(controller: &mut ContestSwitchController<'_>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while controller.create_operation.active.is_some() && std::time::Instant::now() < deadline {
+        while controller.operation.active.is_some() && std::time::Instant::now() < deadline {
             controller.handle_operation_messages();
             thread::yield_now();
         }
         controller.handle_operation_messages();
         assert!(
-            controller.create_operation.active.is_none(),
+            controller.operation.active.is_none(),
             "contest creation operation did not finish"
         );
     }
@@ -2079,6 +2229,391 @@ mod tests {
     }
 
     #[test]
+    fn repair_required_preview_is_non_mutating_and_confirmation_starts_one_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("ABC/abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("injected repair failure").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.destination, Some(destination.clone()));
+        assert_eq!(modal.target, Some(ContestSwitchTarget::RepairRequired));
+        assert!(controller.operation.active.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        assert!(!controller.modal_active());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.mutation, ContestSwitchMutation::Repair);
+        assert_eq!(request.contest_id, "abc470");
+        assert_eq!(request.destination, destination);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Repairing
+        );
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        wait_for_create_operation(&mut controller);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Failed
+        );
+        assert_eq!(
+            controller.modal().unwrap().mutation,
+            Some(ContestSwitchMutation::Repair)
+        );
+    }
+
+    #[test]
+    fn repair_confirmation_races_refresh_without_acting_until_reconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let first = root.path().join("one/abc470");
+        let second = root.path().join("two/abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let phase = Cell::new(0);
+        let mut resolve = |_: &str| match phase.get() {
+            0 => ContestSwitchResolution::repair_required(first.clone()),
+            _ => ContestSwitchResolution::repair_required(second.clone()),
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("stop after capture").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        phase.set(1);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert_eq!(
+            controller.modal().unwrap().destination,
+            Some(second.clone())
+        );
+        assert_eq!(
+            controller.modal().unwrap().target,
+            Some(ContestSwitchTarget::RepairRequired)
+        );
+        assert!(controller.operation.active.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.mutation, ContestSwitchMutation::Repair);
+        assert_eq!(request.destination, second);
+        wait_for_create_operation(&mut controller);
+
+        for changed_target in [ContestSwitchTarget::Existing, ContestSwitchTarget::Missing] {
+            let destination = root.path().join(format!("changed-{changed_target:?}"));
+            std::fs::create_dir(&destination).unwrap();
+            let phase = Cell::new(false);
+            let mut resolve = |_: &str| {
+                if !phase.get() {
+                    ContestSwitchResolution::repair_required(destination.clone())
+                } else if changed_target == ContestSwitchTarget::Existing {
+                    ContestSwitchResolution::accepted(destination.clone())
+                } else {
+                    ContestSwitchResolution::missing(destination.clone())
+                }
+            };
+            let (request_tx, request_rx) = mpsc::channel();
+            let task: ContestSwitchTask = Arc::new(move |request, _| {
+                request_tx.send(request).unwrap();
+                Err(io::Error::other("captured").into())
+            });
+            let mut controller =
+                ContestSwitchController::new(&context, &current, &mut resolve, task);
+            controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+            set_displayed_contest_id(&mut controller, "abc470");
+            phase.set(true);
+
+            assert_eq!(
+                controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+                ContestSwitchKeyResult::Handled
+            );
+            assert_eq!(controller.modal().unwrap().target, Some(changed_target));
+            assert!(!controller.switch_requested);
+            assert!(controller.operation.active.is_none());
+            assert!(matches!(
+                request_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+
+            let result = controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+            if changed_target == ContestSwitchTarget::Existing {
+                assert_eq!(result, ContestSwitchKeyResult::SwitchRequested);
+                assert!(controller.switch_requested);
+            } else {
+                assert_eq!(result, ContestSwitchKeyResult::Handled);
+                let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(request.mutation, ContestSwitchMutation::Create);
+                wait_for_create_operation(&mut controller);
+            }
+        }
+    }
+
+    #[test]
+    fn repair_target_becoming_an_error_starts_no_action() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let phase = Cell::new(false);
+        let mut resolve = |_: &str| {
+            if phase.get() {
+                ContestSwitchResolution::rejected(
+                    Some(destination.clone()),
+                    "workspace mapping is ambiguous".to_string(),
+                )
+            } else {
+                ContestSwitchResolution::repair_required(destination.clone())
+            }
+        };
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        phase.set(true);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert_eq!(controller.modal().unwrap().target, None);
+        assert_eq!(
+            controller.modal().unwrap().error.as_deref(),
+            Some("workspace mapping is ambiguous")
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn active_destination_repair_is_deliberately_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(current.clone());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc123");
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.destination, Some(current.clone()));
+        assert_eq!(modal.target, None);
+        assert_eq!(
+            modal.error.as_deref(),
+            Some("Cannot repair the active contest from Switch Contest yet.")
+        );
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        assert!(controller.modal_active());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(controller.operation.active.is_none());
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn active_destination_identity_error_blocks_repair_and_surfaces_the_failure() {
+        fn identity_error(_: &Path, _: &Path) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "identity unavailable",
+            ))
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let active_marker = current.join("active-session.txt");
+        std::fs::write(&active_marker, "unchanged\n").unwrap();
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new_with_identity_check(
+            &context,
+            &current,
+            &mut resolve,
+            task,
+            identity_error,
+        );
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.destination, Some(destination.clone()));
+        assert_eq!(modal.target, None);
+        assert!(
+            modal
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Cannot determine whether the repair target is the active contest")
+        );
+        assert!(
+            modal
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("identity unavailable")
+        );
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(controller.operation.active.is_none());
+        assert!(!controller.switch_requested);
+        assert_eq!(
+            std::fs::read_to_string(active_marker).unwrap(),
+            "unchanged\n"
+        );
+    }
+
+    #[test]
+    fn distinct_existing_destination_remains_repairable() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        assert!(!existing_destinations_have_same_identity(&current, &destination).unwrap());
+
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let task: ContestSwitchTask = Arc::new(|_, _| Ok(()));
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.destination, Some(destination.clone()));
+        assert_eq!(modal.target, Some(ContestSwitchTarget::RepairRequired));
+        assert!(modal.error.is_none());
+        assert!(controller.operation.active.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn differently_cased_active_destination_alias_is_rejected_for_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("ABC").join("abc123");
+        std::fs::create_dir_all(&current).unwrap();
+        let alias = root.path().join("abc").join("abc123");
+        assert_ne!(current, alias);
+        assert_eq!(
+            std::fs::canonicalize(&current).unwrap(),
+            std::fs::canonicalize(&alias).unwrap()
+        );
+
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(alias.clone());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc123");
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.destination, Some(alias.clone()));
+        assert_eq!(modal.target, None);
+        assert_eq!(
+            modal.error.as_deref(),
+            Some("Cannot repair the active contest from Switch Contest yet.")
+        );
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(controller.operation.active.is_none());
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn standalone_context_cannot_enter_repair_and_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = AppContext::Standalone {
+            launch_root: root.path().to_path_buf(),
+        };
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press)),
+            ContestSwitchKeyResult::NotHandled
+        );
+        assert!(!controller.modal_active());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn missing_destination_requires_confirmation_and_escape_before_it_creates_nothing() {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("abc123");
@@ -2086,7 +2621,7 @@ mod tests {
         let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_starts = Arc::clone(&starts);
-        let task: ContestCreateTask = Arc::new(move |_, _| {
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
             task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
@@ -2124,7 +2659,7 @@ mod tests {
             )
         };
         let (request_tx, request_rx) = mpsc::channel();
-        let task: ContestCreateTask = Arc::new(move |request, _| {
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
             request_tx.send(request).unwrap();
             Err(io::Error::other("injected create failure").into())
         });
@@ -2152,7 +2687,7 @@ mod tests {
         assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
         assert_eq!(modal.destination, Some(second_destination.clone()));
         assert!(modal.error.is_none());
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
         assert!(matches!(
             request_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -2177,7 +2712,7 @@ mod tests {
             _ => ContestSwitchResolution::missing(destination.clone()),
         };
         let (request_tx, request_rx) = mpsc::channel();
-        let task: ContestCreateTask = Arc::new(move |request, _| {
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
             request_tx.send(request).unwrap();
             Err(io::Error::other("injected create failure").into())
         });
@@ -2196,7 +2731,7 @@ mod tests {
             ContestSwitchKeyResult::Handled
         );
         assert!(!controller.switch_requested);
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
         assert!(matches!(
             request_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -2224,7 +2759,7 @@ mod tests {
         };
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_starts = Arc::clone(&starts);
-        let task: ContestCreateTask = Arc::new(move |_, _| {
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
             task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
@@ -2268,7 +2803,7 @@ mod tests {
         };
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_starts = Arc::clone(&starts);
-        let task: ContestCreateTask = Arc::new(move |_, _| {
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
             task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
@@ -2292,7 +2827,7 @@ mod tests {
             Some("contest metadata became invalid")
         );
         assert!(!controller.switch_requested);
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!destination.exists());
     }
@@ -2372,7 +2907,7 @@ mod tests {
         let destination = root.path().join("anc");
         let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
         let (request_tx, request_rx) = mpsc::channel();
-        let task: ContestCreateTask = Arc::new(move |request, _| {
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
             request_tx.send(request).unwrap();
             Err(io::Error::other("contest fetch failed").into())
         });
@@ -2414,7 +2949,7 @@ mod tests {
             _ => ContestSwitchResolution::missing(second_destination.clone()),
         };
         let (request_tx, request_rx) = mpsc::channel();
-        let task: ContestCreateTask = Arc::new(move |request, _| {
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
             request_tx.send(request).unwrap();
             Err(io::Error::other("contest fetch failed").into())
         });
@@ -2444,7 +2979,7 @@ mod tests {
         assert_eq!(modal.destination, Some(second_destination.clone()));
         assert!(modal.error.is_none());
         assert!(modal.progress.is_empty());
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
         assert!(matches!(
             request_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -2490,7 +3025,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let task_release = Arc::clone(&release_rx);
-        let task: ContestCreateTask = Arc::new(move |request, reporter| {
+        let task: ContestSwitchTask = Arc::new(move |request, reporter| {
             started_tx.send(thread::current().id()).unwrap();
             reporter.report(Event::ContestFetching {
                 contest_id: &request.contest_id,
@@ -2526,7 +3061,7 @@ mod tests {
             controller.modal().unwrap().state,
             SwitchContestModalState::Creating
         );
-        assert!(controller.create_operation.active.is_some());
+        assert!(controller.operation.active.is_some());
 
         controller.handle_key(key(KeyCode::Char('x'), KeyEventKind::Press));
         assert_eq!(controller.modal().unwrap().contest_id, "abc470");
@@ -2537,7 +3072,8 @@ mod tests {
             SwitchContestModalState::Creating
         );
 
-        let duplicate = controller.create_operation.start(ContestCreateRequest {
+        let duplicate = controller.operation.start(ContestSwitchRequest {
+            mutation: ContestSwitchMutation::Create,
             contest_id: "abc471".to_string(),
             destination: root.path().join("abc471"),
         });
@@ -2573,7 +3109,7 @@ mod tests {
 
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while controller.create_operation.active.is_some() && std::time::Instant::now() < deadline {
+        while controller.operation.active.is_some() && std::time::Instant::now() < deadline {
             controller.handle_operation_messages();
             thread::yield_now();
         }
@@ -2590,18 +3126,275 @@ mod tests {
         );
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestCreateProgress::ContestFetching { contest_id } if contest_id == "abc470"
+            ContestSwitchProgress::ContestFetching { contest_id } if contest_id == "abc470"
         )));
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestCreateProgress::ProblemFetchFailed { index, error }
+            ContestSwitchProgress::ProblemFetchFailed { index, error }
                 if index == "A" && error == "sample endpoint unavailable"
         )));
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
         assert!(!controller.switch_requested);
 
         controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
         assert!(!controller.modal_active());
+    }
+
+    #[test]
+    fn confirmed_repair_runs_off_thread_reports_progress_and_keeps_old_events_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let task_release = Arc::clone(&release_rx);
+        let task: ContestSwitchTask = Arc::new(move |request, reporter| {
+            started_tx.send(thread::current().id()).unwrap();
+            reporter.report(Event::ContestFetching {
+                contest_id: &request.contest_id,
+            });
+            reporter.report(Event::ProblemFetching {
+                index: "A",
+                current: 1,
+                total: 1,
+            });
+            reporter.report(Event::WorkspaceRepaired {
+                destination: &request.destination,
+            });
+            task_release.lock().unwrap().recv().unwrap();
+            Err(io::Error::other("repair failed").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+
+        let worker_thread = started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(worker_thread, thread::current().id());
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Repairing
+        );
+        assert!(controller.operation.active.is_some());
+
+        controller.handle_key(key(KeyCode::Char('x'), KeyEventKind::Press));
+        controller.handle_key(key(KeyCode::Backspace, KeyEventKind::Press));
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        assert_eq!(controller.modal().unwrap().contest_id, "abc470");
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Repairing
+        );
+        assert!(controller.modal_active());
+
+        let duplicate = controller.operation.start(ContestSwitchRequest {
+            mutation: ContestSwitchMutation::Create,
+            contest_id: "abc471".to_string(),
+            destination: root.path().join("abc471"),
+        });
+        assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+
+        let mut old_app = app();
+        let (old_tx, old_rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+        old_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("old-session-still-live.cpp"),
+                language: Language::Cpp,
+            })
+            .unwrap();
+        assert!(handle_messages(&mut old_app, &old_rx, &run_tx).unwrap());
+        assert_eq!(
+            old_app
+                .current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .path,
+            PathBuf::from("old-session-still-live.cpp")
+        );
+
+        release_tx.send(()).unwrap();
+        wait_for_create_operation(&mut controller);
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Failed);
+        assert_eq!(modal.mutation, Some(ContestSwitchMutation::Repair));
+        assert!(modal.error.as_deref().unwrap().contains("repair failed"));
+        assert!(modal.progress.iter().any(|progress| matches!(
+            progress,
+            ContestSwitchProgress::ContestFetching { contest_id } if contest_id == "abc470"
+        )));
+        assert!(modal.progress.iter().any(|progress| matches!(
+            progress,
+            ContestSwitchProgress::WorkspaceRepaired { destination }
+                if destination == &root.path().join("abc470")
+        )));
+        assert!(controller.operation.active.is_none());
+        assert!(!controller.switch_requested);
+
+        old_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("old-session-after-repair-failure.cpp"),
+                language: Language::Cpp,
+            })
+            .unwrap();
+        assert!(handle_messages(&mut old_app, &old_rx, &run_tx).unwrap());
+        assert_eq!(
+            old_app
+                .current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .path,
+            PathBuf::from("old-session-after-repair-failure.cpp")
+        );
+    }
+
+    #[test]
+    fn failed_repair_retries_only_an_unchanged_repair_target() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestSwitchTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("repair failed").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let first = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_for_create_operation(&mut controller);
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let retry = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(retry.mutation, ContestSwitchMutation::Repair);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Repairing
+        );
+        wait_for_create_operation(&mut controller);
+    }
+
+    #[test]
+    fn failed_repair_refreshes_changed_health_or_destination_without_acting() {
+        for change in ["mapping", "healthy", "missing"] {
+            let root = tempfile::tempdir().unwrap();
+            let current = root.path().join("abc123");
+            let first = root.path().join("one/abc470");
+            let second = root.path().join("two/abc470");
+            std::fs::create_dir(&current).unwrap();
+            std::fs::create_dir_all(&first).unwrap();
+            std::fs::create_dir_all(&second).unwrap();
+            let phase = Cell::new(false);
+            let mut resolve = |_: &str| {
+                if !phase.get() {
+                    ContestSwitchResolution::repair_required(first.clone())
+                } else {
+                    match change {
+                        "mapping" => ContestSwitchResolution::repair_required(second.clone()),
+                        "healthy" => ContestSwitchResolution::accepted(first.clone()),
+                        "missing" => ContestSwitchResolution::missing(first.clone()),
+                        _ => unreachable!(),
+                    }
+                }
+            };
+            let (request_tx, request_rx) = mpsc::channel();
+            let task: ContestSwitchTask = Arc::new(move |request, _| {
+                request_tx.send(request).unwrap();
+                Err(io::Error::other("repair failed").into())
+            });
+            let context = workspace_context(root.path());
+            let mut controller =
+                ContestSwitchController::new(&context, &current, &mut resolve, task);
+            controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+            set_displayed_contest_id(&mut controller, "abc470");
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            wait_for_create_operation(&mut controller);
+
+            phase.set(true);
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+            let modal = controller.modal().unwrap();
+            assert_eq!(modal.state, SwitchContestModalState::Input, "{change}");
+            assert!(modal.error.is_none(), "{change}");
+            assert!(modal.progress.is_empty(), "{change}");
+            assert!(!controller.switch_requested, "{change}");
+            assert!(controller.operation.active.is_none(), "{change}");
+            assert!(matches!(
+                request_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            match change {
+                "mapping" => {
+                    assert_eq!(modal.destination, Some(second.clone()));
+                    assert_eq!(modal.target, Some(ContestSwitchTarget::RepairRequired));
+                }
+                "healthy" => {
+                    assert_eq!(modal.destination, Some(first.clone()));
+                    assert_eq!(modal.target, Some(ContestSwitchTarget::Existing));
+                }
+                "missing" => {
+                    assert_eq!(modal.destination, Some(first.clone()));
+                    assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn editing_after_failed_repair_clears_stale_failure_and_re_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(root.path().join("anc")).unwrap();
+        std::fs::create_dir(root.path().join("ancx")).unwrap();
+        let mut resolve = |contest_id: &str| {
+            ContestSwitchResolution::repair_required(root.path().join(contest_id))
+        };
+        let context = workspace_context(root.path());
+        let mut controller =
+            ContestSwitchController::new(&context, &current, &mut resolve, failing_create_task());
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        wait_for_create_operation(&mut controller);
+
+        controller.handle_key(key(KeyCode::Char('x'), KeyEventKind::Press));
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.contest_id, "ancx");
+        assert_eq!(modal.destination, Some(root.path().join("ancx")));
+        assert_eq!(modal.target, Some(ContestSwitchTarget::RepairRequired));
+        assert_eq!(modal.error, None);
+        assert!(modal.progress.is_empty());
+        assert_eq!(modal.mutation, None);
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        wait_for_create_operation(&mut controller);
+        controller.handle_key(key(KeyCode::Backspace, KeyEventKind::Press));
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.contest_id, "anc");
+        assert_eq!(modal.destination, Some(root.path().join("anc")));
+        assert_eq!(modal.error, None);
+        assert!(modal.progress.is_empty());
     }
 
     #[test]
@@ -2610,7 +3403,7 @@ mod tests {
         let current = root.path().join("abc123");
         let destination = root.path().join("abc470");
         let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
-        let task: ContestCreateTask = Arc::new(|request, reporter| {
+        let task: ContestSwitchTask = Arc::new(|request, reporter| {
             reporter.report(Event::ContestFetching {
                 contest_id: &request.contest_id,
             });
@@ -2629,13 +3422,44 @@ mod tests {
         }
 
         assert!(controller.switch_requested);
-        assert!(controller.create_operation.active.is_none());
+        assert!(controller.operation.active.is_none());
     }
 
     #[test]
-    fn contest_create_reporter_copies_relevant_borrowed_events() {
+    fn successful_repair_is_joined_before_requesting_the_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut resolve = |_: &str| ContestSwitchResolution::repair_required(destination.clone());
+        let task: ContestSwitchTask = Arc::new(|request, reporter| {
+            assert_eq!(request.mutation, ContestSwitchMutation::Repair);
+            reporter.report(Event::WorkspaceRepaired {
+                destination: &request.destination,
+            });
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !controller.switch_requested && std::time::Instant::now() < deadline {
+            controller.handle_operation_messages();
+            thread::yield_now();
+        }
+
+        assert!(controller.switch_requested);
+        assert!(controller.operation.active.is_none());
+    }
+
+    #[test]
+    fn contest_switch_reporter_copies_relevant_borrowed_events() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ContestCreateReporter { tx };
+        let mut reporter = ContestSwitchReporter { tx };
         let contest_id = String::from("abc470");
         let problem = String::from("A");
         let warning = String::from("samples unavailable");
@@ -2664,41 +3488,53 @@ mod tests {
         reporter.report(Event::WorkspaceCreated {
             destination: &destination,
         });
+        reporter.report(Event::WorkspaceRefreshed {
+            destination: &destination,
+        });
+        reporter.report(Event::WorkspaceRepaired {
+            destination: &destination,
+        });
         drop(contest_id);
         drop(problem);
         drop(warning);
         drop(destination);
 
         let progress = std::iter::from_fn(|| match rx.try_recv() {
-            Ok(ContestCreateOperationMessage::Progress(progress)) => Some(progress),
-            Ok(ContestCreateOperationMessage::Finished(_)) | Err(_) => None,
+            Ok(ContestSwitchOperationMessage::Progress(progress)) => Some(progress),
+            Ok(ContestSwitchOperationMessage::Finished(_)) | Err(_) => None,
         })
         .collect::<Vec<_>>();
 
         assert_eq!(
             progress,
             [
-                ContestCreateProgress::ContestFetching {
+                ContestSwitchProgress::ContestFetching {
                     contest_id: "abc470".to_string(),
                 },
-                ContestCreateProgress::ContestFetched {
+                ContestSwitchProgress::ContestFetched {
                     contest_id: "abc470".to_string(),
                     problems: 1,
                 },
-                ContestCreateProgress::ProblemFetching {
+                ContestSwitchProgress::ProblemFetching {
                     index: "A".to_string(),
                     current: 1,
                     total: 1,
                 },
-                ContestCreateProgress::ProblemFetched {
+                ContestSwitchProgress::ProblemFetched {
                     index: "A".to_string(),
                     samples: 3,
                 },
-                ContestCreateProgress::ProblemFetchFailed {
+                ContestSwitchProgress::ProblemFetchFailed {
                     index: "A".to_string(),
                     error: "samples unavailable".to_string(),
                 },
-                ContestCreateProgress::WorkspaceCreated {
+                ContestSwitchProgress::WorkspaceCreated {
+                    destination: PathBuf::from("workspace/abc470"),
+                },
+                ContestSwitchProgress::WorkspaceRefreshed {
+                    destination: PathBuf::from("workspace/abc470"),
+                },
+                ContestSwitchProgress::WorkspaceRepaired {
                     destination: PathBuf::from("workspace/abc470"),
                 },
             ]
@@ -2711,14 +3547,15 @@ mod tests {
         let (release_worker_tx, release_worker_rx) = mpsc::channel();
         let release_worker_rx = Arc::new(std::sync::Mutex::new(release_worker_rx));
         let task_release = Arc::clone(&release_worker_rx);
-        let task: ContestCreateTask = Arc::new(move |_, _| {
+        let task: ContestSwitchTask = Arc::new(move |_, _| {
             worker_started_tx.send(()).unwrap();
             task_release.lock().unwrap().recv().unwrap();
             Ok(())
         });
-        let mut operation = ContestCreateOperation::new(task);
+        let mut operation = ContestSwitchOperation::new(task);
         operation
-            .start(ContestCreateRequest {
+            .start(ContestSwitchRequest {
+                mutation: ContestSwitchMutation::Repair,
                 contest_id: "abc470".to_string(),
                 destination: PathBuf::from("abc470"),
             })

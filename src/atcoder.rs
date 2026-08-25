@@ -1,5 +1,5 @@
 use crate::auth;
-use crate::model::{Contest, Problem, Sample};
+use crate::model::Sample;
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -169,6 +169,31 @@ pub struct AtCoderClient {
     source: Source,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ContestOutline {
+    pub(crate) contest_id: String,
+    pub(crate) problems: Vec<ProblemOutline>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProblemOutline {
+    pub(crate) index: String,
+    pub(crate) title: String,
+    pub(crate) task_id: String,
+    pub(crate) url: String,
+}
+
+impl From<&crate::model::Problem> for ProblemOutline {
+    fn from(problem: &crate::model::Problem) -> Self {
+        Self {
+            index: problem.index.clone(),
+            title: problem.title.clone(),
+            task_id: problem.task_id.clone(),
+            url: problem.url.clone(),
+        }
+    }
+}
+
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
         let cookie = auth::load_cookie().map_err(AtCoderError::Auth)?;
@@ -192,7 +217,7 @@ impl AtCoderClient {
     // Contest
     // ============================================================
 
-    pub fn fetch_contest(&self, contest_id: &str) -> Result<Contest, AtCoderError> {
+    pub(crate) fn fetch_contest(&self, contest_id: &str) -> Result<ContestOutline, AtCoderError> {
         validate_identifier("contest ID", contest_id)?;
 
         let html = match &self.source {
@@ -216,7 +241,10 @@ impl AtCoderClient {
     // Samples
     // ============================================================
 
-    pub fn fetch_samples(&self, problem: &Problem) -> Result<Vec<Sample>, AtCoderError> {
+    pub(crate) fn fetch_samples(
+        &self,
+        problem: &ProblemOutline,
+    ) -> Result<Vec<Sample>, AtCoderError> {
         let html = match &self.source {
             Source::Http(http) => {
                 validate_problem_url(&problem.url)?;
@@ -378,7 +406,7 @@ fn retry_wait(headers: &reqwest::header::HeaderMap) -> Duration {
 // Contest Parser
 // ============================================================
 
-fn parse_contest(contest_id: &str, html: &str) -> Result<Contest, AtCoderError> {
+fn parse_contest(contest_id: &str, html: &str) -> Result<ContestOutline, AtCoderError> {
     let document = Html::parse_document(html);
 
     let row_selector = Selector::parse("table tbody tr")
@@ -445,7 +473,7 @@ fn parse_contest(contest_id: &str, html: &str) -> Result<Contest, AtCoderError> 
 
         let url = format!("{BASE_URL}{href}");
 
-        problems.push(Problem {
+        problems.push(ProblemOutline {
             index,
             title,
             task_id: task_id.to_string(),
@@ -457,7 +485,7 @@ fn parse_contest(contest_id: &str, html: &str) -> Result<Contest, AtCoderError> 
         return Err(AtCoderError::Parse("no problems found".to_string()));
     }
 
-    Ok(Contest {
+    Ok(ContestOutline {
         contest_id: contest_id.to_string(),
         problems,
     })
@@ -550,10 +578,16 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
         }
     }
 
-    // インタラクティブなど。
-    // 通常sampleが無いのはエラーではない。
     if inputs.is_empty() && outputs.is_empty() {
-        return Ok(Vec::new());
+        if statement_confidently_has_no_normal_samples(&statement, &section_selector, &h3_selector)
+        {
+            return Ok(Vec::new());
+        }
+
+        return Err(AtCoderError::Parse(
+            "no normal samples found and the selected statement does not identify a known zero-sample problem"
+                .to_string(),
+        ));
     }
 
     // 入力例と出力例の個数が違うなら
@@ -587,6 +621,55 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
     }
 
     Ok(samples)
+}
+
+fn statement_confidently_has_no_normal_samples(
+    statement: &scraper::ElementRef<'_>,
+    section_selector: &Selector,
+    h3_selector: &Selector,
+) -> bool {
+    for section in statement.select(section_selector) {
+        let Some(h3) = section.select(h3_selector).next() else {
+            continue;
+        };
+        let heading = h3.text().collect::<String>();
+        let heading = heading.trim();
+        if !matches!(heading, "問題文" | "Problem Statement") {
+            continue;
+        }
+
+        let text = section
+            .text()
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let Some(body) = text.strip_prefix(heading).map(str::trim_start) else {
+            continue;
+        };
+
+        if heading == "Problem Statement" {
+            let body = body.to_ascii_lowercase();
+            let Some(rest) = body.strip_prefix("this is an interactive problem") else {
+                continue;
+            };
+            return rest.is_empty()
+                || rest.starts_with(|character: char| {
+                    character.is_whitespace() || matches!(character, '(' | '.' | ',')
+                });
+        }
+
+        let compact = body
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let Some(rest) = compact.strip_prefix("この問題はインタラクティブな問題")
+        else {
+            continue;
+        };
+        return rest.starts_with("です") || (rest.starts_with('（') && rest.contains("）です"));
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -642,7 +725,7 @@ mod tests {
     #[test]
     fn parses_samples_from_problem_fixture() {
         let client = AtCoderClient::fixture(fixture_root());
-        let problem = Problem {
+        let problem = ProblemOutline {
             index: "A".to_string(),
             title: "Compromise".to_string(),
             task_id: "abc466_a".to_string(),
@@ -664,17 +747,83 @@ mod tests {
     }
 
     #[test]
-    fn interactive_statement_without_samples_returns_empty_samples() {
+    fn recognized_interactive_statement_without_samples_returns_empty_samples() {
         let html = r#"
             <div id="task-statement">
                 <span class="lang-ja">
-                    <div class="part"><section><h3>問題文</h3><p>対話型です。</p></section></div>
+                    <div class="part"><section><h3>問題文</h3><p>この問題はインタラクティブな問題です。</p></section></div>
                 </span>
             </div>
         "#;
 
         let samples = parse_samples(html).expect("interactive statement should parse");
 
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn statement_without_samples_or_positive_zero_evidence_is_a_parse_error() {
+        let html = r#"
+            <div id="task-statement">
+                <span class="lang-en">
+                    <div class="part"><section><h3>Problem Statement</h3><p>Solve it.</p></section></div>
+                </span>
+            </div>
+        "#;
+
+        let error = parse_samples(html).expect_err("unrecognized absence must not become zero");
+
+        assert!(error.to_string().contains("no normal samples found"));
+    }
+
+    #[test]
+    fn negated_or_unrelated_interactive_wording_is_not_zero_sample_evidence() {
+        for (language, heading, body) in [
+            (
+                "lang-en",
+                "Problem Statement",
+                "This is not an interactive problem.",
+            ),
+            (
+                "lang-en",
+                "Problem Statement",
+                "Unlike an interactive problem, this task uses ordinary input.",
+            ),
+            (
+                "lang-ja",
+                "問題文",
+                "この問題はインタラクティブな問題ではありません。",
+            ),
+            (
+                "lang-ja",
+                "問題文",
+                "インタラクティブな問題とは異なり、通常の入力を用います。",
+            ),
+        ] {
+            let html = format!(
+                r#"<div id="task-statement"><span class="{language}">
+                    <div class="part"><section><h3>{heading}</h3><p>{body}</p></section></div>
+                </span></div>"#
+            );
+
+            let error = parse_samples(&html)
+                .expect_err("negated or unrelated wording must not establish zero samples");
+            assert!(
+                error.to_string().contains("no normal samples found"),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn abc466_interactive_fixture_confidently_has_zero_samples() {
+        let client = AtCoderClient::fixture(fixture_root());
+        let contest = client.fetch_contest("abc466").unwrap();
+        let problem = &contest.problems[2];
+
+        let samples = client.fetch_samples(problem).unwrap();
+
+        assert_eq!(problem.index, "C");
         assert!(samples.is_empty());
     }
 
@@ -715,7 +864,7 @@ mod tests {
     #[test]
     fn fixture_mode_ignores_problem_url_and_never_uses_http() {
         let client = AtCoderClient::fixture(fixture_root());
-        let problem = Problem {
+        let problem = ProblemOutline {
             index: "A".to_string(),
             title: "Compromise".to_string(),
             task_id: "abc466_a".to_string(),

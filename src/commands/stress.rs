@@ -362,7 +362,11 @@ mod tests {
             index: index.to_string(),
             title: format!("Problem {index}"),
             task_id: format!("abc466_{}", index.to_ascii_lowercase()),
-            url: format!("https://example.invalid/{index}"),
+            url: format!(
+                "https://atcoder.jp/contests/abc466/tasks/abc466_{}",
+                index.to_ascii_lowercase()
+            ),
+            sample_count: 0,
         }
     }
 
@@ -372,7 +376,19 @@ mod tests {
             destination,
             &Contest {
                 contest_id: contest_id.to_string(),
-                problems: indices.iter().map(|index| problem(index)).collect(),
+                problems: indices
+                    .iter()
+                    .map(|index| Problem {
+                        index: (*index).to_string(),
+                        title: format!("Problem {index}"),
+                        task_id: format!("{contest_id}_{}", index.to_ascii_lowercase()),
+                        url: format!(
+                            "https://atcoder.jp/contests/{contest_id}/tasks/{contest_id}_{}",
+                            index.to_ascii_lowercase()
+                        ),
+                        sample_count: 0,
+                    })
+                    .collect(),
             },
         )
         .unwrap();

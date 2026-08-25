@@ -74,7 +74,8 @@ fn test_problem_model() -> crate::model::Problem {
         index: "A".to_string(),
         title: "Problem A".to_string(),
         task_id: "abc466_a".to_string(),
-        url: "https://example.invalid/a".to_string(),
+        url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+        sample_count: 0,
     }
 }
 
@@ -102,13 +103,15 @@ fn execution(outcome: ExecutionOutcome, stdout: &str, stderr: &str) -> runner::E
 }
 
 fn old_contest(contest_id: &str) -> Contest {
+    let task_id = format!("{contest_id}_old");
     Contest {
         contest_id: contest_id.to_string(),
         problems: vec![crate::model::Problem {
             index: "OLD".to_string(),
             title: "Old problem".to_string(),
-            task_id: "old_problem".to_string(),
-            url: "https://atcoder.jp/contests/old/tasks/old_problem".to_string(),
+            url: format!("https://atcoder.jp/contests/{contest_id}/tasks/{task_id}"),
+            task_id,
+            sample_count: 0,
         }],
     }
 }
@@ -143,6 +146,9 @@ impl Reporter for RecordingReporter {
             }
             Event::WorkspaceRefreshed { destination } => {
                 format!("refreshed:{}", destination.display())
+            }
+            Event::WorkspaceRepaired { destination } => {
+                format!("repaired:{}", destination.display())
             }
             Event::WorkspaceInitialized { path } => {
                 format!("workspace-initialized:{}", path.display())
@@ -284,7 +290,8 @@ fn problem_lookup_is_ascii_case_insensitive_and_rejects_ambiguity() {
             index: "A".to_string(),
             title: "Problem A".to_string(),
             task_id: "abc466_a".to_string(),
-            url: "https://example.invalid/a".to_string(),
+            url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+            sample_count: 0,
         }],
     };
 
@@ -297,8 +304,9 @@ fn problem_lookup_is_ascii_case_insensitive_and_rejects_ambiguity() {
             crate::model::Problem {
                 index: "a".to_string(),
                 title: "Duplicate".to_string(),
-                task_id: "duplicate".to_string(),
-                url: "https://example.invalid/duplicate".to_string(),
+                task_id: "abc466_duplicate".to_string(),
+                url: "https://atcoder.jp/contests/abc466/tasks/abc466_duplicate".to_string(),
+                sample_count: 0,
             },
         ],
     };
@@ -1410,6 +1418,22 @@ fn refresh_rebuilds_metadata_and_tests_without_touching_sources() {
         workspace::load_metadata(&destination).expect("refreshed metadata should be readable");
     assert_eq!(contest.contest_id, "abc466");
     assert_eq!(contest.problems.len(), 7);
+    assert_eq!(
+        contest
+            .problems
+            .iter()
+            .map(|problem| (problem.index.as_str(), problem.sample_count))
+            .collect::<Vec<_>>(),
+        [
+            ("A", 3),
+            ("B", 2),
+            ("C", 0),
+            ("D", 2),
+            ("E", 3),
+            ("F", 1),
+            ("G", 3)
+        ]
+    );
     assert!(
         reporter
             .events
@@ -1427,7 +1451,7 @@ fn refresh_rebuilds_metadata_and_tests_without_touching_sources() {
 }
 
 #[test]
-fn refresh_sample_failure_is_recoverable_and_removes_old_problem_tests() {
+fn refresh_sample_failure_is_fatal_and_preserves_old_metadata_and_tests() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("mini");
     create_workspace(&destination, "mini");
@@ -1435,6 +1459,7 @@ fn refresh_sample_failure_is_recoverable_and_removes_old_problem_tests() {
     std::fs::create_dir_all(&old_b_tests).expect("old tests should be created");
     std::fs::write(old_b_tests.join("sample-1.in"), "old").expect("old input should be written");
     std::fs::write(old_b_tests.join("sample-1.out"), "old").expect("old output should be written");
+    let old_metadata = std::fs::read(destination.join(".atc/contest.toml")).unwrap();
 
     let fixtures = temp.path().join("fixtures");
     std::fs::create_dir_all(fixtures.join("contests")).expect("contest fixtures should be created");
@@ -1458,16 +1483,122 @@ fn refresh_sample_failure_is_recoverable_and_removes_old_problem_tests() {
 
     let client = atcoder::AtCoderClient::fixture(&fixtures);
     let mut reporter = RecordingReporter::default();
-    refresh_at(&destination, "mini", false, &client, &mut reporter)
-        .expect("partial sample failure should be recoverable");
+    let error = refresh_at(&destination, "mini", false, &client, &mut reporter)
+        .expect_err("a partial remote snapshot must fail");
 
-    assert!(destination.join("tests").join("A").is_dir());
-    assert!(!destination.join("tests").join("B").exists());
+    assert!(matches!(error, AppError::AtCoder(_)));
+    assert_eq!(
+        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
+        old_metadata
+    );
+    assert!(!destination.join("tests").join("A").exists());
+    assert_eq!(
+        std::fs::read_to_string(old_b_tests.join("sample-1.in")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(old_b_tests.join("sample-1.out")).unwrap(),
+        "old"
+    );
     assert!(
         reporter
             .events
             .iter()
             .any(|event| event == "problem-failed:B")
+    );
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("refreshed:"))
+    );
+}
+
+#[test]
+fn create_problem_fetch_failure_installs_no_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixtures = temp.path().join("fixtures");
+    std::fs::create_dir_all(fixtures.join("contests")).unwrap();
+    std::fs::create_dir_all(fixtures.join("problems")).unwrap();
+    std::fs::write(
+        fixtures.join("contests/mini.html"),
+        r#"<table><tbody>
+            <tr><td><a href="/contests/mini/tasks/mini_a">A</a></td><td><a href="/contests/mini/tasks/mini_a">A</a></td></tr>
+            <tr><td><a href="/contests/mini/tasks/mini_b">B</a></td><td><a href="/contests/mini/tasks/mini_b">B</a></td></tr>
+        </tbody></table>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixtures.join("problems/mini_a.html"),
+        r#"<div id="task-statement"><span class="lang-en">
+            <div class="part"><section><h3>Sample Input 1</h3><pre>1
+</pre></section></div>
+            <div class="part"><section><h3>Sample Output 1</h3><pre>2
+</pre></section></div>
+        </span></div>"#,
+    )
+    .unwrap();
+    let destination = temp.path().join("mini");
+    let client = atcoder::AtCoderClient::fixture(&fixtures);
+    let mut reporter = RecordingReporter::default();
+
+    let error = new_at(
+        &destination,
+        "mini",
+        Language::Cpp,
+        builtin_template(Language::Cpp),
+        &client,
+        &mut reporter,
+    )
+    .expect_err("incomplete authoritative fetch must prevent creation");
+
+    assert!(matches!(error, AppError::AtCoder(_)));
+    assert!(!destination.exists());
+    assert!(
+        reporter
+            .events
+            .iter()
+            .any(|event| event == "problem-failed:B")
+    );
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("created:"))
+    );
+}
+
+#[test]
+fn strict_fetch_builds_authoritative_abc466_sample_counts() {
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = NullReporter;
+
+    let fetched = fetch_contest_data("abc466", &client, &mut reporter).unwrap();
+
+    assert_eq!(
+        fetched
+            .contest
+            .problems
+            .iter()
+            .map(|problem| (problem.index.as_str(), problem.sample_count))
+            .collect::<Vec<_>>(),
+        [
+            ("A", 3),
+            ("B", 2),
+            ("C", 0),
+            ("D", 2),
+            ("E", 3),
+            ("F", 1),
+            ("G", 3)
+        ]
+    );
+    assert_eq!(
+        fetched
+            .samples_by_problem
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        [3, 2, 0, 2, 3, 1, 3]
     );
 }
 

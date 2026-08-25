@@ -720,6 +720,7 @@ mod tests {
                     title: "A".to_owned(),
                     task_id: "abc466_a".to_owned(),
                     url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_owned(),
+                    sample_count: 0,
                 }],
             },
         )

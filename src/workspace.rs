@@ -69,6 +69,12 @@ pub enum ContestMetadataHealth {
     UnsupportedVersion(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestsHealth {
+    Healthy,
+    Broken,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceConfigFile {
@@ -673,10 +679,17 @@ pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadat
         }
     };
 
-    Ok(ContestMetadataHealth::Healthy(Contest {
+    let contest = Contest {
         contest_id: metadata.contest_id,
         problems: metadata.problems,
-    }))
+    };
+    validate_contest_path_components(&contest)?;
+    if inspect_contest_manifest_semantics(&contest)? == ContestManifestSemantics::RepairableInvalid
+    {
+        return Ok(ContestMetadataHealth::Invalid);
+    }
+
+    Ok(ContestMetadataHealth::Healthy(contest))
 }
 
 pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -> io::Result<()> {
@@ -852,6 +865,23 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
     Ok(samples)
 }
 
+pub fn inspect_tests_health(destination: &Path, contest: &Contest) -> io::Result<TestsHealth> {
+    validate_contest_paths(contest)?;
+
+    for problem in &contest.problems {
+        match load_samples(destination, &problem.index) {
+            Ok(samples) if samples.len() == problem.sample_count => {}
+            Ok(_) => return Ok(TestsHealth::Broken),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Ok(TestsHealth::Broken);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(TestsHealth::Healthy)
+}
+
 pub fn create_source_file(
     destination: &Path,
     name: &str,
@@ -1021,7 +1051,74 @@ fn is_safe_platform_path_component(value: &str) -> bool {
     }
 }
 
-pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContestManifestSemantics {
+    Valid,
+    RepairableInvalid,
+}
+
+fn inspect_contest_manifest_semantics(contest: &Contest) -> io::Result<ContestManifestSemantics> {
+    let mut repairable_invalid = contest.problems.is_empty();
+
+    for problem in &contest.problems {
+        let task_id_is_safe = !problem.task_id.is_empty()
+            && problem
+                .task_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        if !task_id_is_safe {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "contest metadata contains an unsafe task ID: {:?}",
+                    problem.task_id
+                ),
+            ));
+        }
+
+        let parsed = reqwest::Url::parse(&problem.url).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "contest metadata contains an unsafe problem URL: {:?}",
+                    problem.url
+                ),
+            )
+        })?;
+        let url_is_safe = parsed.scheme() == "https"
+            && parsed.host_str() == Some("atcoder.jp")
+            && parsed.port().is_none()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path().starts_with("/contests/")
+            && parsed.path().contains("/tasks/");
+        if !url_is_safe {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "contest metadata contains an unsafe problem URL: {:?}",
+                    problem.url
+                ),
+            ));
+        }
+
+        let expected_url = format!(
+            "https://atcoder.jp/contests/{}/tasks/{}",
+            contest.contest_id, problem.task_id
+        );
+        if problem.url != expected_url {
+            repairable_invalid = true;
+        }
+    }
+
+    Ok(if repairable_invalid {
+        ContestManifestSemantics::RepairableInvalid
+    } else {
+        ContestManifestSemantics::Valid
+    })
+}
+
+fn validate_contest_path_components(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
     let mut problem_indices = HashSet::new();
     for problem in &contest.problems {
@@ -1035,6 +1132,17 @@ pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
+    validate_contest_path_components(contest)?;
+    if inspect_contest_manifest_semantics(contest)? == ContestManifestSemantics::RepairableInvalid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "contest metadata is not an authoritative non-empty AtCoder task manifest",
+        ));
     }
     Ok(())
 }
@@ -1118,19 +1226,284 @@ pub fn validate_refresh_destination(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContestDataReplacement {
+    MetadataOnly,
+    TestsOnly,
+    MetadataAndTests,
+}
+
+pub(crate) fn preflight_tests_replacement(destination: &Path, contest: &Contest) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+    validate_contest_paths(contest)?;
+
+    let tests = destination.join("tests");
+    if !existing_real_directory(&tests, "existing tests path")? {
+        return Ok(());
+    }
+
+    let indices = contest
+        .problems
+        .iter()
+        .map(|problem| problem.index.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    validate_refresh_owned_tests(&tests, &indices)
+}
+
+pub(crate) fn replace_contest_data(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    replacement: ContestDataReplacement,
+) -> io::Result<()> {
+    replace_contest_data_with_hooks(
+        destination,
+        staging,
+        allow_missing_marker,
+        replacement,
+        || {},
+        || {},
+        || {},
+    )
+}
+
 pub fn replace_refresh_data(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
 ) -> io::Result<()> {
-    replace_refresh_data_with_hooks(
+    replace_contest_data(
         destination,
         staging,
         allow_missing_marker,
-        || {},
-        || {},
-        || {},
+        ContestDataReplacement::MetadataAndTests,
     )
+}
+
+fn replace_contest_data_with_hooks(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    replacement: ContestDataReplacement,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+) -> io::Result<()> {
+    match replacement {
+        ContestDataReplacement::MetadataOnly => {
+            replace_metadata_only(destination, staging, allow_missing_marker)
+        }
+        ContestDataReplacement::TestsOnly => replace_tests_only_with_hooks(
+            destination,
+            staging,
+            allow_missing_marker,
+            before_tests_backup,
+            before_tests_install,
+            before_recovery_cleanup,
+        ),
+        ContestDataReplacement::MetadataAndTests => replace_refresh_data_with_hooks(
+            destination,
+            staging,
+            allow_missing_marker,
+            before_tests_backup,
+            before_tests_install,
+            before_recovery_cleanup,
+        ),
+    }
+}
+
+fn replace_metadata_only(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+
+    let staging_root = staging.path();
+    let destination_marker = destination.join(".atc");
+    let destination_metadata = destination_marker.join("contest.toml");
+    let staged_metadata = staging_root.join(".atc/contest.toml");
+    let backup_metadata = staging_root.join("previous-contest.toml");
+
+    let had_destination_marker = existing_real_directory(&destination_marker, "workspace marker")?;
+    if !had_destination_marker && !allow_missing_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace marker not found: {}",
+                destination_marker.display()
+            ),
+        ));
+    }
+    if !existing_regular_file(&staged_metadata, "staged metadata path")? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("staged metadata not found: {}", staged_metadata.display()),
+        ));
+    }
+
+    let had_destination_metadata = had_destination_marker
+        && existing_regular_file(&destination_metadata, "existing metadata path")?;
+    if had_destination_metadata {
+        safe_file::rename_noclobber(&destination_metadata, &backup_metadata)?;
+    }
+
+    let created_destination_marker = if had_destination_marker {
+        false
+    } else if let Err(error) = fs::create_dir(&destination_marker) {
+        return Err(error);
+    } else {
+        true
+    };
+
+    if let Err(error) = safe_file::rename_noclobber(&staged_metadata, &destination_metadata) {
+        let mut rollback_errors = Vec::new();
+        if had_destination_metadata
+            && let Err(rollback_error) =
+                safe_file::rename_noclobber(&backup_metadata, &destination_metadata)
+        {
+            rollback_errors.push(format!(
+                "failed to restore metadata {}: {rollback_error}",
+                destination_metadata.display()
+            ));
+        }
+        if created_destination_marker
+            && let Err(rollback_error) = fs::remove_dir(&destination_marker)
+        {
+            rollback_errors.push(format!(
+                "failed to remove new workspace marker {}: {rollback_error}",
+                destination_marker.display()
+            ));
+        }
+        return Err(refresh_update_error(staging, error, rollback_errors));
+    }
+
+    Ok(())
+}
+
+fn replace_tests_only_with_hooks(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+
+    let staging_root = staging.path().to_path_buf();
+    let destination_marker = destination.join(".atc");
+    if !existing_real_directory(&destination_marker, "workspace marker")? && !allow_missing_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace marker not found: {}",
+                destination_marker.display()
+            ),
+        ));
+    }
+
+    let destination_tests = destination.join("tests");
+    let staged_tests = staging_root.join("tests");
+    let backup_tests = staging_root.join("previous-tests");
+    let staged_contest = load_metadata(&staging_root)?;
+    validate_live_tests_manifest(destination, &staged_contest)?;
+    let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")?;
+    let has_staged_tests = existing_real_directory(&staged_tests, "staged tests path")?;
+    let owned_problem_indices = if had_destination_tests {
+        let indices = refresh_owned_problem_indices(destination, &staging_root)?;
+        validate_refresh_owned_tests(&destination_tests, &indices)?;
+        indices
+    } else {
+        HashSet::new()
+    };
+
+    before_tests_backup();
+    if had_destination_tests {
+        safe_file::rename_noclobber(&destination_tests, &backup_tests)?;
+        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices) {
+            let rollback_errors = rollback_tests(
+                &destination_tests,
+                &staged_tests,
+                &backup_tests,
+                false,
+                true,
+            );
+            return Err(refresh_update_error(staging, error, rollback_errors));
+        }
+    }
+
+    before_tests_install();
+    if let Err(error) = validate_live_tests_manifest(destination, &staged_contest) {
+        let rollback_errors = rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            false,
+            had_destination_tests,
+        );
+        return Err(refresh_update_error(staging, error, rollback_errors));
+    }
+    if has_staged_tests
+        && let Err(error) = safe_file::rename_noclobber(&staged_tests, &destination_tests)
+    {
+        let rollback_errors = rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            false,
+            had_destination_tests,
+        );
+        return Err(refresh_update_error(staging, error, rollback_errors));
+    }
+
+    before_recovery_cleanup();
+    if let Err(error) = validate_live_tests_manifest(destination, &staged_contest) {
+        let rollback_errors = rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            has_staged_tests,
+            had_destination_tests,
+        );
+        if has_staged_tests && rollback_errors.is_empty() {
+            let kind = error.kind();
+            let recovery_path = staging.keep();
+            return Err(io::Error::new(
+                kind,
+                format!(
+                    "tests replacement failed after installing new data: {error}; moved-out tests recovery data kept at {}",
+                    recovery_path.display()
+                ),
+            ));
+        }
+        return Err(refresh_update_error(staging, error, rollback_errors));
+    }
+    if had_destination_tests
+        && let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+    {
+        let kind = error.kind();
+        let recovery_path = staging.keep();
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "tests replacement installed new data, but the previous tests changed before cleanup: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_live_tests_manifest(destination: &Path, staged_contest: &Contest) -> io::Result<()> {
+    match inspect_contest_metadata(destination)? {
+        ContestMetadataHealth::Healthy(current) if current == *staged_contest => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "live contest metadata changed during tests replacement; retry repair",
+        )),
+    }
 }
 
 fn replace_refresh_data_with_hooks(
@@ -1365,7 +1738,7 @@ fn unowned_refresh_test_error(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "refusing to refresh because tests contains an unowned entry: {}; move it outside tests and retry",
+            "refusing to replace tests because it contains an unowned entry: {}; move it outside tests and retry",
             path.display()
         ),
     )
@@ -1459,7 +1832,7 @@ fn refresh_update_error(
     io::Error::new(
         kind,
         format!(
-            "refresh update failed: {original}; rollback also failed: {}; recovery data kept at {}",
+            "contest data update failed: {original}; rollback also failed: {}; recovery data kept at {}",
             rollback_errors.join("; "),
             recovery_path.display()
         ),
@@ -1511,7 +1884,22 @@ mod tests {
                 "https://atcoder.jp/contests/abc466/tasks/abc466_{}",
                 index.to_ascii_lowercase()
             ),
+            sample_count: 0,
         }
+    }
+
+    fn problem_with_sample_count(index: &str, sample_count: usize) -> Problem {
+        Problem {
+            sample_count,
+            ..problem(index)
+        }
+    }
+
+    fn write_sample_pair(destination: &Path, index: &str, number: usize, contents: &str) {
+        let directory = destination.join("tests").join(index);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("sample-{number}.in")), contents).unwrap();
+        fs::write(directory.join(format!("sample-{number}.out")), contents).unwrap();
     }
 
     fn create_directory_symlink(target: &Path, link: &Path) -> bool {
@@ -1997,6 +2385,7 @@ mod tests {
         for invalid in [
             "version = ???",
             "contest_id = \"abc466\"\nproblems = []\n",
+            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
             concat!(
                 "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
                 "source = \"A.py\"\ntests = \"tests/A\"\n"
@@ -2020,12 +2409,135 @@ mod tests {
 
         write_metadata_text(
             temp.path(),
-            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Problem A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 0\n",
+            ),
         );
         assert!(matches!(
             inspect_contest_metadata(temp.path()).unwrap(),
             ContestMetadataHealth::Healthy(Contest { contest_id, problems })
-                if contest_id == "abc466" && problems.is_empty()
+                if contest_id == "abc466" && problems.len() == 1
+        ));
+    }
+
+    #[test]
+    fn metadata_health_classifies_safe_task_url_mismatch_as_invalid_but_unsafe_url_as_hard_error() {
+        let temp = tempfile::tempdir().unwrap();
+        write_metadata_text(
+            temp.path(),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Problem A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_b\"\n",
+                "sample_count = 3\n",
+                "[[problems]]\n",
+                "index = \"B\"\n",
+                "title = \"Problem B\"\n",
+                "task_id = \"abc466_b\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_b\"\n",
+                "sample_count = 2\n",
+            ),
+        );
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::Invalid
+        ));
+
+        write_metadata_text(
+            temp.path(),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Problem A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://example.invalid/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 3\n",
+            ),
+        );
+        let Err(error) = inspect_contest_metadata(temp.path()) else {
+            panic!("unsafe problem URL unexpectedly passed metadata inspection");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn metadata_hard_errors_dominate_safe_identity_mismatches_in_any_problem_order() {
+        let temp = tempfile::tempdir().unwrap();
+
+        for metadata in [
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Safe mismatch\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_e\"\n",
+                "sample_count = 3\n",
+                "[[problems]]\n",
+                "index = \"B\"\n",
+                "title = \"Off origin\"\n",
+                "task_id = \"abc466_b\"\n",
+                "url = \"https://example.invalid/contests/abc466/tasks/abc466_b\"\n",
+                "sample_count = 2\n",
+            ),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Unsafe task ID\"\n",
+                "task_id = \"../abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 3\n",
+                "[[problems]]\n",
+                "index = \"B\"\n",
+                "title = \"Safe mismatch\"\n",
+                "task_id = \"abc466_b\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_e\"\n",
+                "sample_count = 2\n",
+            ),
+        ] {
+            write_metadata_text(temp.path(), metadata);
+            let Err(error) = inspect_contest_metadata(temp.path()) else {
+                panic!("a hard safety error must dominate repairable URL mismatches");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn old_problem_schema_without_sample_count_is_invalid_not_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        write_metadata_text(
+            temp.path(),
+            concat!(
+                "version = 1\n",
+                "contest_id = \"abc466\"\n",
+                "[[problems]]\n",
+                "index = \"A\"\n",
+                "title = \"Problem A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            ),
+        );
+
+        assert!(matches!(
+            inspect_contest_metadata(temp.path()).unwrap(),
+            ContestMetadataHealth::Invalid
         ));
     }
 
@@ -2074,7 +2586,7 @@ mod tests {
             external.path(),
             &Contest {
                 contest_id: "abc466".to_string(),
-                problems: Vec::new(),
+                problems: vec![problem("A")],
             },
         )
         .unwrap();
@@ -2234,12 +2746,14 @@ mod tests {
                     title: "Compromise".to_string(),
                     task_id: "abc466_a".to_string(),
                     url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+                    sample_count: 3,
                 },
                 Problem {
                     index: "B".to_string(),
                     title: "Representative Balls".to_string(),
                     task_id: "abc466_b".to_string(),
                     url: "https://atcoder.jp/contests/abc466/tasks/abc466_b".to_string(),
+                    sample_count: 2,
                 },
             ],
         };
@@ -2336,6 +2850,120 @@ mod tests {
 
         fs::create_dir_all(temp.path().join("tests").join("A")).unwrap();
         assert!(load_samples(temp.path(), "A").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tests_health_accepts_abc466_counts_without_interactive_problem_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: [
+                ("A", 3),
+                ("B", 2),
+                ("C", 0),
+                ("D", 2),
+                ("E", 3),
+                ("F", 1),
+                ("G", 3),
+            ]
+            .into_iter()
+            .map(|(index, count)| problem_with_sample_count(index, count))
+            .collect(),
+        };
+        for problem in &contest.problems {
+            if problem.sample_count == 0 {
+                continue;
+            }
+            for number in 1..=problem.sample_count {
+                write_sample_pair(temp.path(), &problem.index, number, "edited UTF-8\n");
+            }
+        }
+
+        assert_eq!(
+            inspect_tests_health(temp.path(), &contest).unwrap(),
+            TestsHealth::Healthy
+        );
+
+        fs::create_dir(temp.path().join("tests/C")).unwrap();
+        assert_eq!(
+            inspect_tests_health(temp.path(), &contest).unwrap(),
+            TestsHealth::Healthy
+        );
+
+        write_sample_pair(temp.path(), "C", 1, "unexpected\n");
+        assert_eq!(
+            inspect_tests_health(temp.path(), &contest).unwrap(),
+            TestsHealth::Broken
+        );
+    }
+
+    #[test]
+    fn tests_health_requires_the_exact_positive_canonical_structure() {
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 3)],
+        };
+
+        let missing = tempfile::tempdir().unwrap();
+        assert_eq!(
+            inspect_tests_health(missing.path(), &contest).unwrap(),
+            TestsHealth::Broken
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        fs::create_dir_all(empty.path().join("tests/A")).unwrap();
+        assert_eq!(
+            inspect_tests_health(empty.path(), &contest).unwrap(),
+            TestsHealth::Broken
+        );
+
+        for scenario in ["two", "missing-pair", "gap", "extra"] {
+            let temp = tempfile::tempdir().unwrap();
+            match scenario {
+                "two" => {
+                    write_sample_pair(temp.path(), "A", 1, "one\n");
+                    write_sample_pair(temp.path(), "A", 2, "two\n");
+                }
+                "missing-pair" => {
+                    for number in 1..=3 {
+                        write_sample_pair(temp.path(), "A", number, "sample\n");
+                    }
+                    fs::remove_file(temp.path().join("tests/A/sample-2.out")).unwrap();
+                }
+                "gap" => {
+                    write_sample_pair(temp.path(), "A", 1, "one\n");
+                    write_sample_pair(temp.path(), "A", 3, "three\n");
+                }
+                "extra" => {
+                    for number in 1..=4 {
+                        write_sample_pair(temp.path(), "A", number, "sample\n");
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                inspect_tests_health(temp.path(), &contest).unwrap(),
+                TestsHealth::Broken,
+                "{scenario}"
+            );
+        }
+
+        let healthy = tempfile::tempdir().unwrap();
+        for number in 1..=3 {
+            write_sample_pair(healthy.path(), "A", number, "locally edited UTF-8\n");
+        }
+        fs::write(healthy.path().join("tests/memo.txt"), "unrelated").unwrap();
+        fs::write(healthy.path().join("tests/A/memo.txt"), "unrelated").unwrap();
+        assert_eq!(
+            inspect_tests_health(healthy.path(), &contest).unwrap(),
+            TestsHealth::Healthy
+        );
+
+        fs::write(healthy.path().join("tests/A/sample-2.in"), [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            inspect_tests_health(healthy.path(), &contest).unwrap(),
+            TestsHealth::Broken
+        );
     }
 
     #[test]
@@ -2781,6 +3409,407 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_replacement_never_inspects_or_changes_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("OLD", 0)],
+        };
+        save_metadata(&destination, &old_contest).unwrap();
+        fs::write(destination.join("tests"), "unmanaged and not a directory").unwrap();
+        let tests_before = fs::read(destination.join("tests")).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let new_contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 0)],
+        };
+        save_metadata(staging.path(), &new_contest).unwrap();
+
+        replace_contest_data(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::MetadataOnly,
+        )
+        .unwrap();
+
+        assert_eq!(load_metadata(&destination).unwrap(), new_contest);
+        assert_eq!(fs::read(destination.join("tests")).unwrap(), tests_before);
+    }
+
+    #[test]
+    fn tests_only_replacement_keeps_live_metadata_bytes_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let metadata_before = fs::read(destination.join(".atc/contest.toml")).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        replace_contest_data(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join(".atc/contest.toml")).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
+    }
+
+    #[test]
+    fn tests_only_rolls_back_when_metadata_changes_after_old_tests_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        let mut changed_contest = contest.clone();
+        changed_contest.problems[0].title = "Changed Problem A".to_string();
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || {},
+            || save_metadata(&destination, &changed_contest).unwrap(),
+            || {},
+        )
+        .expect_err("metadata changing after backup must abort and restore old tests");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn tests_only_rolls_back_when_metadata_changes_after_new_tests_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        let mut changed_contest = contest.clone();
+        changed_contest.problems[0].title = "Changed Problem A".to_string();
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || {},
+            || {},
+            || save_metadata(&destination, &changed_contest).unwrap(),
+        )
+        .expect_err("metadata changing after install must roll new tests back");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn tests_only_late_metadata_rollback_retains_a_modified_installed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        let mut changed_contest = contest.clone();
+        changed_contest.problems[0].title = "Changed Problem A".to_string();
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || {},
+            || {},
+            || {
+                fs::write(destination.join("tests/A/memo.txt"), "late user data\n").unwrap();
+                save_metadata(&destination, &changed_contest).unwrap();
+            },
+        )
+        .expect_err("late metadata change must retain the modified installed generation");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+        assert!(!destination.join("tests/A/memo.txt").exists());
+
+        let recovery = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-repair-")
+            })
+            .expect("the moved-out installed generation must be retained");
+        assert!(error.to_string().contains(&recovery.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(recovery.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("tests/A/memo.txt")).unwrap(),
+            "late user data\n"
+        );
+    }
+
+    #[test]
+    fn tests_only_post_move_reinspection_rolls_back_late_unowned_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let metadata_before = fs::read(destination.join(".atc/contest.toml")).unwrap();
+        let old_tests = destination.join("tests/A");
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || fs::write(old_tests.join("memo.txt"), "late user data").unwrap(),
+            || {},
+            || {},
+        )
+        .expect_err("late unmanaged content must be detected after moving tests");
+
+        assert!(error.to_string().contains("memo.txt"));
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/memo.txt")).unwrap(),
+            "late user data"
+        );
+        assert_eq!(
+            fs::read(destination.join(".atc/contest.toml")).unwrap(),
+            metadata_before
+        );
+    }
+
+    #[test]
+    fn tests_only_install_race_retains_recovery_without_touching_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let metadata_before = fs::read(destination.join(".atc/contest.toml")).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let competing_tests = destination.join("tests");
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || {},
+            || {
+                fs::create_dir(&competing_tests).unwrap();
+                fs::write(competing_tests.join("competitor.txt"), "keep me").unwrap();
+            },
+            || {},
+        )
+        .expect_err("a competing tests generation must block install and rollback");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("rollback also failed"));
+        assert_eq!(
+            fs::read_to_string(competing_tests.join("competitor.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            fs::read(destination.join(".atc/contest.toml")).unwrap(),
+            metadata_before
+        );
+        let recovery = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-repair-")
+            })
+            .expect("failed rollback must retain both tests generations");
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous-tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
+    }
+
+    #[test]
+    fn tests_replacement_preflight_separates_health_from_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 3)],
+        };
+        write_sample_pair(temp.path(), "A", 1, "one\n");
+        write_sample_pair(temp.path(), "A", 2, "two\n");
+        fs::write(temp.path().join("tests/A/memo.txt"), "keep me").unwrap();
+
+        assert_eq!(
+            inspect_tests_health(temp.path(), &contest).unwrap(),
+            TestsHealth::Broken
+        );
+        let error = preflight_tests_replacement(temp.path(), &contest)
+            .expect_err("unmanaged content must block whole-tests replacement");
+        assert!(error.to_string().contains("memo.txt"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("tests/A/memo.txt")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
     fn refresh_replacement_rejects_tests_file_without_changing_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
@@ -2965,7 +3994,14 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         let unrelated_contest = Contest {
             contest_id: "other-contest".to_string(),
-            problems: vec![problem("LOCAL")],
+            problems: vec![Problem {
+                index: "LOCAL".to_string(),
+                title: "Local problem".to_string(),
+                task_id: "other-contest_local".to_string(),
+                url: "https://atcoder.jp/contests/other-contest/tasks/other-contest_local"
+                    .to_string(),
+                sample_count: 0,
+            }],
         };
         save_metadata(&destination, &unrelated_contest).unwrap();
         let local_tests = destination.join("tests").join("LOCAL");
