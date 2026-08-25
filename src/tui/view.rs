@@ -8,7 +8,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use super::SwitchContestModal;
 use super::app::{
     CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
 };
@@ -19,6 +18,7 @@ use super::detail_scrollbar::{
     render_detail_scrollbar,
 };
 use super::mouse::MouseMode;
+use super::{SwitchContestModal, SwitchContestModalState};
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
@@ -251,8 +251,8 @@ pub(super) fn render_frontend_with_mouse_mode(
 
 fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
     let frame_area = frame.area();
-    let width = frame_area.width.min(72);
-    let height = frame_area.height.min(11);
+    let width = frame_area.width.min(76);
+    let height = frame_area.height.min(16);
     let area = Rect::new(
         frame_area.x + frame_area.width.saturating_sub(width) / 2,
         frame_area.y + frame_area.height.saturating_sub(height) / 2,
@@ -265,17 +265,60 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
         .as_deref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let error = modal.error.as_deref().unwrap_or("");
-    let text = Text::from(vec![
+    let mut lines = vec![
         Line::raw("Contest:"),
         Line::from(vec![Span::raw("> "), Span::raw(modal.contest_id.clone())]),
         Line::raw(""),
         Line::raw("Destination:"),
         Line::raw(format!("  {destination}")),
-        Line::styled(error.to_string(), Style::default().fg(Color::Red)),
-        Line::raw(""),
-        Line::raw("[Enter] Switch   [Esc] Cancel"),
-    ]);
+    ];
+
+    match modal.state {
+        SwitchContestModalState::Input => {
+            if modal.target == Some(super::ContestSwitchTarget::Missing) {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("Contest does not exist."));
+            }
+            if let Some(error) = modal.error.as_deref() {
+                lines.push(Line::styled(
+                    error.to_string(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(""));
+            let action = if modal.target == Some(super::ContestSwitchTarget::Missing) {
+                "[Enter] Create & Switch   [Esc] Cancel"
+            } else {
+                "[Enter] Switch   [Esc] Cancel"
+            };
+            lines.push(Line::raw(action));
+        }
+        SwitchContestModalState::Creating => {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!("Creating {}", modal.contest_id)));
+            for progress in modal.progress.iter().rev().take(5).rev() {
+                lines.push(Line::raw(progress.display_line()));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("Creation is running and cannot be cancelled."));
+        }
+        SwitchContestModalState::Failed => {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Create & Switch failed:",
+                Style::default().fg(Color::Red),
+            ));
+            if let Some(error) = modal.error.as_deref() {
+                lines.push(Line::styled(
+                    error.to_string(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("[Enter] Retry   [Esc] Dismiss"));
+        }
+    }
+    let text = Text::from(lines);
     let modal = Paragraph::new(text)
         .block(
             Block::default()
@@ -1006,6 +1049,7 @@ mod tests {
             contest_id: "abc467".to_string(),
             destination: Some(PathBuf::from("D:/atcoder/ABC/abc467")),
             error: Some("contest metadata is invalid".to_string()),
+            ..SwitchContestModal::default()
         };
         let rendered = rendered_frontend_text(&app, true, Some(&modal));
         assert!(rendered.contains("Switch Contest"));
@@ -1013,6 +1057,35 @@ mod tests {
         assert!(rendered.contains("D:/atcoder/ABC/abc467"));
         assert!(rendered.contains("contest metadata is invalid"));
         assert!(rendered.contains("[Enter] Switch"));
+    }
+
+    #[test]
+    fn missing_and_running_switch_modals_explain_confirmation_and_cancellation() {
+        let app = app();
+        let missing = SwitchContestModal {
+            contest_id: "abc470".to_string(),
+            destination: Some(PathBuf::from("D:/atcoder/ABC/abc470")),
+            target: Some(super::super::ContestSwitchTarget::Missing),
+            ..SwitchContestModal::default()
+        };
+
+        let rendered = rendered_frontend_text(&app, true, Some(&missing));
+        assert!(rendered.contains("Contest does not exist."));
+        assert!(rendered.contains("[Enter] Create & Switch"));
+
+        let creating = SwitchContestModal {
+            state: SwitchContestModalState::Creating,
+            progress: vec![super::super::ContestCreateProgress::ProblemFetching {
+                index: "A".to_string(),
+                current: 1,
+                total: 2,
+            }],
+            ..missing
+        };
+        let rendered = rendered_frontend_text(&app, true, Some(&creating));
+        assert!(rendered.contains("Creating abc470"));
+        assert!(rendered.contains("[1/2] Fetching A..."));
+        assert!(rendered.contains("cannot be cancelled"));
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {

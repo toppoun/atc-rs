@@ -98,7 +98,7 @@ where
     watch(destination, contest_id, reporter)
 }
 
-fn create_contest(
+pub(super) fn create_contest(
     root: &Path,
     destination: &Path,
     contest_id: &str,

@@ -6,9 +6,9 @@ use crate::workspace;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use super::contest::{ContestTargetHealth, inspect_contest_target};
 use super::watch_worker::RunWorker;
 use crate::tui::detail_analysis::DetailAnalysisWorker;
 use crate::tui::message::Message;
+use crate::ui::Reporter;
 use crate::watcher;
 
 use super::watch_source::{build_watched_sources, resolve_watched_source};
@@ -249,11 +250,21 @@ pub(super) fn watch_tui_at(
     };
 
     let mut preferences = crate::tui::FrontendPreferences::default();
+    let prepared_switch = Arc::new(Mutex::new(None));
+    let create_task = contest_create_task(&app_context, Arc::clone(&prepared_switch));
     let result = loop {
+        match prepared_switch.lock() {
+            Ok(mut pending) => *pending = None,
+            Err(_) => {
+                break Err(io::Error::other(
+                    "prepared contest switch state is poisoned",
+                ));
+            }
+        }
         let active_session = session
             .as_mut()
             .expect("an active contest session must exist while the frontend is running");
-        let mut prepared_switch = None;
+        let resolver_prepared = Arc::clone(&prepared_switch);
         let frontend_result = active_session.run_frontend(
             &mut terminal,
             &app_context,
@@ -266,14 +277,24 @@ pub(super) fn watch_tui_at(
                     );
                 };
 
-                match PreparedWatchInput::for_switch(root, contest_id) {
-                    Ok(prepared) => {
+                match PreparedWatchInput::resolve_for_switch(root, contest_id) {
+                    Ok(SwitchTargetPreparation::Existing(prepared)) => {
                         let destination = prepared.destination.clone();
-                        prepared_switch = Some(prepared);
+                        if let Ok(mut pending) = resolver_prepared.lock() {
+                            *pending = Some(prepared);
+                        }
                         crate::tui::ContestSwitchResolution::accepted(destination)
                     }
+                    Ok(SwitchTargetPreparation::Missing { destination }) => {
+                        if let Ok(mut pending) = resolver_prepared.lock() {
+                            *pending = None;
+                        }
+                        crate::tui::ContestSwitchResolution::missing(destination)
+                    }
                     Err(SwitchPreparationError { destination, error }) => {
-                        prepared_switch = None;
+                        if let Ok(mut pending) = resolver_prepared.lock() {
+                            *pending = None;
+                        }
                         crate::tui::ContestSwitchResolution::rejected(
                             destination,
                             error.to_string(),
@@ -281,14 +302,28 @@ pub(super) fn watch_tui_at(
                     }
                 }
             },
+            Arc::clone(&create_task),
         );
 
         match frontend_result {
             Err(error) => break Err(error),
             Ok(crate::tui::SessionExit::Quit) => break Ok(()),
             Ok(crate::tui::SessionExit::SwitchContest) => {
-                let prepared = prepared_switch
-                    .expect("a switch exit must retain its validated prepared contest");
+                let prepared = match prepared_switch.lock() {
+                    Ok(mut pending) => match pending.take() {
+                        Some(prepared) => prepared,
+                        None => {
+                            break Err(io::Error::other(
+                                "a switch exit did not retain its validated prepared contest",
+                            ));
+                        }
+                    },
+                    Err(_) => {
+                        break Err(io::Error::other(
+                            "prepared contest switch state is poisoned",
+                        ));
+                    }
+                };
                 let old_session = session
                     .take()
                     .expect("the old contest session must still exist before switching");
@@ -337,11 +372,17 @@ pub(super) fn watch_tui_at(
     .map_err(AppError::from)
 }
 
+#[derive(Debug)]
 struct PreparedWatchInput {
     destination: PathBuf,
     contest: Contest,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
+}
+
+enum SwitchTargetPreparation {
+    Existing(PreparedWatchInput),
+    Missing { destination: PathBuf },
 }
 
 #[derive(Debug)]
@@ -362,13 +403,40 @@ impl PreparedWatchInput {
         })
     }
 
-    fn for_switch(root: &Path, contest_id: &str) -> Result<Self, SwitchPreparationError> {
+    fn resolve_for_switch(
+        root: &Path,
+        contest_id: &str,
+    ) -> Result<SwitchTargetPreparation, SwitchPreparationError> {
+        Self::resolve_for_switch_expected(root, contest_id, None)
+    }
+
+    fn resolve_for_switch_expected(
+        root: &Path,
+        contest_id: &str,
+        expected_destination: Option<&Path>,
+    ) -> Result<SwitchTargetPreparation, SwitchPreparationError> {
         let destination = workspace::resolve_contest_path(root, contest_id).map_err(|error| {
             SwitchPreparationError {
                 destination: None,
                 error,
             }
         })?;
+
+        if let Some(expected_destination) = expected_destination
+            && destination != expected_destination
+        {
+            return Err(SwitchPreparationError {
+                destination: Some(destination.clone()),
+                error: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "workspace config changed while preparing contest {contest_id:?}: expected {}, now resolves to {}",
+                        expected_destination.display(),
+                        destination.display()
+                    ),
+                ),
+            });
+        }
 
         let target = inspect_contest_target(&destination, contest_id).map_err(|error| {
             SwitchPreparationError {
@@ -379,15 +447,7 @@ impl PreparedWatchInput {
         let contest = match target {
             ContestTargetHealth::Healthy(contest) => contest,
             ContestTargetHealth::MissingDirectory => {
-                return Err(SwitchPreparationError {
-                    destination: Some(destination),
-                    error: io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "contest {contest_id:?} does not exist; creating or fetching it is not supported by TUI switch yet"
-                        ),
-                    ),
-                });
+                return Ok(SwitchTargetPreparation::Missing { destination });
             }
             ContestTargetHealth::RepairRequired => {
                 return Err(SwitchPreparationError {
@@ -417,12 +477,87 @@ impl PreparedWatchInput {
                 error,
             })?;
 
-        Ok(Self {
+        Ok(SwitchTargetPreparation::Existing(Self {
             destination,
             contest,
             sample_counts,
             stress_cases,
-        })
+        }))
+    }
+}
+
+fn contest_create_task(
+    app_context: &AppContext,
+    prepared_switch: Arc<Mutex<Option<PreparedWatchInput>>>,
+) -> crate::tui::ContestCreateTask {
+    let workspace_root = app_context.workspace_root().map(Path::to_path_buf);
+    Arc::new(move |request, reporter| {
+        let root = workspace_root.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "contest switching is unavailable outside a workspace",
+            )
+        })?;
+        let prepared = create_and_prepare_contest_switch(root, &request, reporter)?;
+        *prepared_switch
+            .lock()
+            .map_err(|_| io::Error::other("prepared contest switch state is poisoned"))? =
+            Some(prepared);
+        Ok(())
+    })
+}
+
+fn create_and_prepare_contest_switch(
+    root: &Path,
+    request: &crate::tui::ContestCreateRequest,
+    reporter: &mut dyn Reporter,
+) -> Result<PreparedWatchInput, AppError> {
+    create_and_prepare_contest_switch_with(
+        root,
+        request,
+        reporter,
+        |destination, contest_id, reporter| {
+            super::contest::create_contest(root, destination, contest_id, reporter)
+        },
+    )
+}
+
+fn create_and_prepare_contest_switch_with(
+    root: &Path,
+    request: &crate::tui::ContestCreateRequest,
+    reporter: &mut dyn Reporter,
+    create: impl FnOnce(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
+) -> Result<PreparedWatchInput, AppError> {
+    let target = PreparedWatchInput::resolve_for_switch_expected(
+        root,
+        &request.contest_id,
+        Some(&request.destination),
+    )
+    .map_err(|error| error.error)?;
+
+    match target {
+        SwitchTargetPreparation::Existing(_) => {}
+        SwitchTargetPreparation::Missing { ref destination } => {
+            create(destination, &request.contest_id, reporter)?;
+        }
+    }
+
+    match PreparedWatchInput::resolve_for_switch_expected(
+        root,
+        &request.contest_id,
+        Some(&request.destination),
+    )
+    .map_err(|error| error.error)?
+    {
+        SwitchTargetPreparation::Existing(prepared) => Ok(prepared),
+        SwitchTargetPreparation::Missing { destination } => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "contest creation completed but the destination is still missing: {}",
+                destination.display()
+            ),
+        )
+        .into()),
     }
 }
 
@@ -548,6 +683,7 @@ impl ContestSession {
         app_context: &AppContext,
         preferences: &mut crate::tui::FrontendPreferences,
         resolve_contest_switch: impl FnMut(&str) -> crate::tui::ContestSwitchResolution,
+        contest_create_task: crate::tui::ContestCreateTask,
     ) -> io::Result<crate::tui::SessionExit> {
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
@@ -565,6 +701,7 @@ impl ContestSession {
             preferences,
             runtime,
             resolve_contest_switch,
+            contest_create_task,
         )
     }
 
@@ -664,7 +801,7 @@ mod tests {
     use crate::tui::message::{RunKind, RunRequest, TestEvent};
 
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
-        match PreparedWatchInput::for_switch(root, contest_id) {
+        match PreparedWatchInput::resolve_for_switch(root, contest_id) {
             Ok(_) => panic!("contest switch unexpectedly succeeded"),
             Err(error) => error,
         }
@@ -788,7 +925,11 @@ mod tests {
         let destination = root.path().join("AtCoder/ABC/abc467");
         save_healthy_contest(&destination, "abc467");
 
-        let prepared = PreparedWatchInput::for_switch(root.path(), "abc467").unwrap();
+        let SwitchTargetPreparation::Existing(prepared) =
+            PreparedWatchInput::resolve_for_switch(root.path(), "abc467").unwrap()
+        else {
+            panic!("healthy contest must resolve as existing");
+        };
 
         assert_eq!(prepared.destination, destination);
         assert_eq!(prepared.contest.contest_id, "abc467");
@@ -796,7 +937,259 @@ mod tests {
     }
 
     #[test]
-    fn invalid_and_nonexistent_switch_targets_are_rejected_without_mutation() {
+    fn missing_contests_preview_mapped_and_fallback_destinations_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = [{ pattern = \"^abc[0-9]+$\", path = \"AtCoder/ABC\" }]\n",
+        )
+        .unwrap();
+
+        let mapped = PreparedWatchInput::resolve_for_switch(root.path(), "abc470").unwrap();
+        let fallback = PreparedWatchInput::resolve_for_switch(root.path(), "typical90").unwrap();
+
+        assert!(matches!(
+            mapped,
+            SwitchTargetPreparation::Missing { destination }
+                if destination == root.path().join("AtCoder/ABC/abc470")
+        ));
+        assert!(matches!(
+            fallback,
+            SwitchTargetPreparation::Missing { destination }
+                if destination == root.path().join("typical90")
+        ));
+        assert!(!root.path().join("AtCoder").exists());
+        assert!(!root.path().join("typical90").exists());
+    }
+
+    #[test]
+    fn create_switch_revalidates_mapping_before_calling_creation_core() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".atc-workspace.toml");
+        std::fs::write(
+            &config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"one\" }]\n",
+        )
+        .unwrap();
+        let request = crate::tui::ContestCreateRequest {
+            contest_id: "abc470".to_string(),
+            destination: root.path().join("one/abc470"),
+        };
+        std::fs::write(
+            &config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"two\" }]\n",
+        )
+        .unwrap();
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = create_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |_, _, _| panic!("stale preview must not start creation"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("workspace config changed"));
+        assert!(!root.path().join("one").exists());
+        assert!(!root.path().join("two").exists());
+    }
+
+    #[test]
+    fn create_switch_loads_complete_session_input_before_success() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+        let destination = root.path().join("abc470");
+        let request = crate::tui::ContestCreateRequest {
+            contest_id: "abc470".to_string(),
+            destination: destination.clone(),
+        };
+        let mut reporter = crate::ui::NullReporter;
+
+        let prepared = create_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |destination, contest_id, _| {
+                let problem = problem("A");
+                workspace::save_metadata(
+                    destination,
+                    &Contest {
+                        contest_id: contest_id.to_string(),
+                        problems: vec![problem.clone()],
+                    },
+                )?;
+                workspace::save_samples(
+                    destination,
+                    &problem,
+                    &[Sample {
+                        input: "1\n".to_string(),
+                        output: "2\n".to_string(),
+                    }],
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.destination, destination);
+        assert_eq!(prepared.contest.contest_id, "abc470");
+        assert_eq!(prepared.sample_counts, [1]);
+        assert_eq!(prepared.stress_cases, [None]);
+    }
+
+    #[test]
+    fn create_switch_preserves_recoverable_sample_fetch_semantics() {
+        #[derive(Default)]
+        struct FetchReporter {
+            failed_problems: Vec<String>,
+            workspace_created: bool,
+        }
+
+        impl Reporter for FetchReporter {
+            fn report(&mut self, event: crate::ui::Event<'_>) {
+                match event {
+                    crate::ui::Event::ProblemFetchFailed { index, .. } => {
+                        self.failed_problems.push(index.to_string());
+                    }
+                    crate::ui::Event::WorkspaceCreated { .. } => self.workspace_created = true,
+                    _ => {}
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+        let request = crate::tui::ContestCreateRequest {
+            contest_id: "mini".to_string(),
+            destination: root.path().join("mini"),
+        };
+        let fixtures = root.path().join("fixtures");
+        std::fs::create_dir_all(fixtures.join("contests")).unwrap();
+        std::fs::create_dir_all(fixtures.join("problems")).unwrap();
+        std::fs::write(
+            fixtures.join("contests/mini.html"),
+            r#"<table><tbody>
+                <tr><td><a href="/contests/mini/tasks/mini_a">A</a></td><td><a href="/contests/mini/tasks/mini_a">A</a></td></tr>
+                <tr><td><a href="/contests/mini/tasks/mini_b">B</a></td><td><a href="/contests/mini/tasks/mini_b">B</a></td></tr>
+            </tbody></table>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixtures.join("problems/mini_a.html"),
+            r#"<div id="task-statement"><span class="lang-en">
+                <div class="part"><section><h3>Sample Input 1</h3><pre>1
+</pre></section></div>
+                <div class="part"><section><h3>Sample Output 1</h3><pre>2
+</pre></section></div>
+            </span></div>"#,
+        )
+        .unwrap();
+        let client = crate::atcoder::AtCoderClient::fixture(&fixtures);
+        let mut reporter = FetchReporter::default();
+
+        let prepared = create_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |destination, contest_id, reporter| {
+                super::super::new::new_at_in_workspace(
+                    root.path(),
+                    destination,
+                    contest_id,
+                    Language::Cpp,
+                    crate::template::builtin_template(Language::Cpp),
+                    &client,
+                    reporter,
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.contest.problems.len(), 2);
+        assert!(reporter.workspace_created);
+        assert_eq!(reporter.failed_problems, ["B"]);
+        assert_eq!(prepared.sample_counts, [1, 0]);
+    }
+
+    #[test]
+    fn create_or_post_create_failure_never_touches_the_active_contest() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+        let active = root.path().join("abc123");
+        save_healthy_contest(&active, "abc123");
+        let active_before = std::fs::read(active.join(".atc/contest.toml")).unwrap();
+        let request = crate::tui::ContestCreateRequest {
+            contest_id: "abc470".to_string(),
+            destination: root.path().join("abc470"),
+        };
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = create_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |_, _, _| Err(io::Error::other("network unavailable").into()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("network unavailable"));
+        assert_eq!(
+            std::fs::read(active.join(".atc/contest.toml")).unwrap(),
+            active_before
+        );
+    }
+
+    #[test]
+    fn post_create_validation_failure_preserves_old_and_partial_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+        let active = root.path().join("abc123");
+        save_healthy_contest(&active, "abc123");
+        let request = crate::tui::ContestCreateRequest {
+            contest_id: "abc470".to_string(),
+            destination: root.path().join("abc470"),
+        };
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = create_and_prepare_contest_switch_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            |destination, _, _| {
+                std::fs::create_dir_all(destination.join(".atc"))?;
+                std::fs::write(destination.join(".atc/contest.toml"), "invalid")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("repair is not supported"));
+        assert_eq!(
+            workspace::load_metadata(&active).unwrap().contest_id,
+            "abc123"
+        );
+        assert!(request.destination.join(".atc/contest.toml").exists());
+    }
+
+    #[test]
+    fn invalid_targets_are_rejected_and_missing_targets_are_previewed_without_mutation() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".atc-workspace.toml"),
@@ -811,15 +1204,12 @@ mod tests {
         assert!(invalid.destination.is_none());
         assert_eq!(invalid.error.kind(), io::ErrorKind::InvalidInput);
 
-        let missing = switch_error(root.path(), "abc467");
-        assert_eq!(missing.destination, Some(root.path().join("abc467")));
-        assert_eq!(missing.error.kind(), io::ErrorKind::NotFound);
-        assert!(
-            missing
-                .error
-                .to_string()
-                .contains("not supported by TUI switch yet")
-        );
+        let missing = PreparedWatchInput::resolve_for_switch(root.path(), "abc467").unwrap();
+        assert!(matches!(
+            missing,
+            SwitchTargetPreparation::Missing { destination }
+                if destination == root.path().join("abc467")
+        ));
         assert!(!root.path().join("abc467").exists());
         assert_eq!(
             std::fs::read(active.join(".atc/contest.toml")).unwrap(),

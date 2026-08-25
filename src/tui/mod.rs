@@ -9,15 +9,18 @@ pub mod reporter;
 mod termina_adapter;
 mod terminal;
 pub mod view;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_context::AppContext;
+use crate::error::AppError;
 use crate::model::Contest;
 use crate::ui::{Event, Reporter};
 use app::WatchApp;
@@ -74,6 +77,7 @@ pub(crate) enum SessionExit {
 pub(crate) struct ContestSwitchResolution {
     pub(crate) destination: Option<std::path::PathBuf>,
     pub(crate) error: Option<String>,
+    target: Option<ContestSwitchTarget>,
 }
 
 impl ContestSwitchResolution {
@@ -81,6 +85,15 @@ impl ContestSwitchResolution {
         Self {
             destination: Some(destination),
             error: None,
+            target: Some(ContestSwitchTarget::Existing),
+        }
+    }
+
+    pub(crate) fn missing(destination: std::path::PathBuf) -> Self {
+        Self {
+            destination: Some(destination),
+            error: None,
+            target: Some(ContestSwitchTarget::Missing),
         }
     }
 
@@ -88,7 +101,219 @@ impl ContestSwitchResolution {
         Self {
             destination,
             error: Some(error),
+            target: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContestSwitchTarget {
+    Existing,
+    Missing,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SwitchContestModalState {
+    #[default]
+    Input,
+    Creating,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContestCreateProgress {
+    ContestFetching {
+        contest_id: String,
+    },
+    ContestFetched {
+        contest_id: String,
+        problems: usize,
+    },
+    ProblemFetching {
+        index: String,
+        current: usize,
+        total: usize,
+    },
+    ProblemFetched {
+        index: String,
+        samples: usize,
+    },
+    ProblemFetchFailed {
+        index: String,
+        error: String,
+    },
+    WorkspaceCreated {
+        destination: PathBuf,
+    },
+}
+
+impl ContestCreateProgress {
+    pub(super) fn display_line(&self) -> String {
+        match self {
+            Self::ContestFetching { .. } => "Fetching contest...".to_string(),
+            Self::ContestFetched {
+                contest_id,
+                problems,
+            } => format!("Found {problems} problems in {contest_id}"),
+            Self::ProblemFetching {
+                index,
+                current,
+                total,
+            } => format!("[{current}/{total}] Fetching {index}..."),
+            Self::ProblemFetched { index, samples } => {
+                format!("Fetched {index} ({samples} samples)")
+            }
+            Self::ProblemFetchFailed { index, error } => {
+                format!("Warning: {index}: {error}")
+            }
+            Self::WorkspaceCreated { destination } => {
+                format!("Created {}", destination.display())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContestCreateRequest {
+    pub(crate) contest_id: String,
+    pub(crate) destination: PathBuf,
+}
+
+pub(crate) type ContestCreateTask = Arc<
+    dyn Fn(ContestCreateRequest, &mut dyn Reporter) -> Result<(), AppError> + Send + Sync + 'static,
+>;
+
+enum ContestCreateOperationMessage {
+    Progress(ContestCreateProgress),
+    Finished(Result<(), String>),
+}
+
+struct ContestCreateReporter {
+    tx: Sender<ContestCreateOperationMessage>,
+}
+
+impl Reporter for ContestCreateReporter {
+    fn report(&mut self, event: Event<'_>) {
+        let progress = match event {
+            Event::ContestFetching { contest_id } => ContestCreateProgress::ContestFetching {
+                contest_id: contest_id.to_owned(),
+            },
+            Event::ContestFetched {
+                contest_id,
+                problems,
+            } => ContestCreateProgress::ContestFetched {
+                contest_id: contest_id.to_owned(),
+                problems,
+            },
+            Event::ProblemFetching {
+                index,
+                current,
+                total,
+            } => ContestCreateProgress::ProblemFetching {
+                index: index.to_owned(),
+                current,
+                total,
+            },
+            Event::ProblemFetched { index, samples } => ContestCreateProgress::ProblemFetched {
+                index: index.to_owned(),
+                samples,
+            },
+            Event::ProblemFetchFailed { index, error } => {
+                ContestCreateProgress::ProblemFetchFailed {
+                    index: index.to_owned(),
+                    error: error.to_owned(),
+                }
+            }
+            Event::WorkspaceCreated { destination } => ContestCreateProgress::WorkspaceCreated {
+                destination: destination.to_path_buf(),
+            },
+            _ => return,
+        };
+
+        let _ = self
+            .tx
+            .send(ContestCreateOperationMessage::Progress(progress));
+    }
+}
+
+struct ActiveContestCreateOperation {
+    rx: Receiver<ContestCreateOperationMessage>,
+    handle: JoinHandle<()>,
+}
+
+struct ContestCreateOperation {
+    task: ContestCreateTask,
+    active: Option<ActiveContestCreateOperation>,
+}
+
+impl ContestCreateOperation {
+    fn new(task: ContestCreateTask) -> Self {
+        Self { task, active: None }
+    }
+
+    fn start(&mut self, request: ContestCreateRequest) -> io::Result<()> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a contest creation operation is already running",
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let task = Arc::clone(&self.task);
+        let handle = thread::Builder::new()
+            .name("atc-tui-contest-create".to_string())
+            .spawn(move || {
+                let mut reporter = ContestCreateReporter { tx: tx.clone() };
+                let result = task(request, &mut reporter).map_err(|error| error.to_string());
+                drop(reporter);
+                let _ = tx.send(ContestCreateOperationMessage::Finished(result));
+            })?;
+
+        self.active = Some(ActiveContestCreateOperation { rx, handle });
+        Ok(())
+    }
+
+    fn try_recv(&mut self) -> Option<ContestCreateOperationMessage> {
+        let result = self.active.as_ref()?.rx.try_recv();
+        match result {
+            Ok(ContestCreateOperationMessage::Finished(result)) => {
+                let join_result = self.join_active();
+                Some(ContestCreateOperationMessage::Finished(match join_result {
+                    Ok(()) => result,
+                    Err(error) => Err(error.to_string()),
+                }))
+            }
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                let result = self.join_active().and_then(|()| {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "contest creation worker disconnected before reporting completion",
+                    ))
+                });
+                Some(ContestCreateOperationMessage::Finished(
+                    result.map_err(|error| error.to_string()),
+                ))
+            }
+        }
+    }
+
+    fn join_active(&mut self) -> io::Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        active
+            .handle
+            .join()
+            .map_err(|_| io::Error::other("contest creation worker panicked"))
+    }
+}
+
+impl Drop for ContestCreateOperation {
+    fn drop(&mut self) {
+        let _ = self.join_active();
     }
 }
 
@@ -97,6 +322,9 @@ pub(super) struct SwitchContestModal {
     pub(super) contest_id: String,
     pub(super) destination: Option<std::path::PathBuf>,
     pub(super) error: Option<String>,
+    target: Option<ContestSwitchTarget>,
+    pub(super) state: SwitchContestModalState,
+    pub(super) progress: Vec<ContestCreateProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +339,7 @@ struct ContestSwitchController<'a> {
     current_destination: &'a Path,
     modal: Option<SwitchContestModal>,
     resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+    create_operation: ContestCreateOperation,
     switch_requested: bool,
 }
 
@@ -119,12 +348,14 @@ impl<'a> ContestSwitchController<'a> {
         context: &AppContext,
         current_destination: &'a Path,
         resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+        create_task: ContestCreateTask,
     ) -> Self {
         Self {
             available: context.workspace_root().is_some(),
             current_destination,
             modal: None,
             resolve,
+            create_operation: ContestCreateOperation::new(create_task),
             switch_requested: false,
         }
     }
@@ -137,13 +368,47 @@ impl<'a> ContestSwitchController<'a> {
         self.modal.is_some()
     }
 
+    fn escape_dismisses_modal(&self) -> bool {
+        self.modal
+            .as_ref()
+            .is_some_and(|modal| modal.state != SwitchContestModalState::Creating)
+    }
+
     fn refresh_resolution(&mut self) {
-        let Some(modal) = self.modal.as_mut() else {
+        let Some(contest_id) = self.modal.as_ref().map(|modal| modal.contest_id.clone()) else {
             return;
         };
-        let resolution = (self.resolve)(&modal.contest_id);
+        let resolution = (self.resolve)(&contest_id);
+        let modal = self.modal.as_mut().expect("modal must still exist");
+        Self::apply_resolution(modal, resolution);
+    }
+
+    fn apply_resolution(modal: &mut SwitchContestModal, resolution: ContestSwitchResolution) {
         modal.destination = resolution.destination;
         modal.error = resolution.error;
+        modal.target = resolution.target;
+    }
+
+    fn refresh_resolution_for_confirmation(&mut self) -> bool {
+        let Some(modal) = self.modal.as_ref() else {
+            return false;
+        };
+        let contest_id = modal.contest_id.clone();
+        let displayed_destination = modal.destination.clone();
+        let displayed_error = modal.error.clone();
+        let displayed_target = modal.target;
+        let retrying = modal.state == SwitchContestModalState::Failed;
+
+        let resolution = (self.resolve)(&contest_id);
+        let unchanged = displayed_destination == resolution.destination
+            && displayed_target == resolution.target
+            && (retrying || displayed_error == resolution.error);
+
+        let modal = self.modal.as_mut().expect("modal must still exist");
+        modal.state = SwitchContestModalState::Input;
+        modal.progress.clear();
+        Self::apply_resolution(modal, resolution);
+        unchanged
     }
 
     fn remove_last_grapheme(&mut self) {
@@ -152,6 +417,17 @@ impl<'a> ContestSwitchController<'a> {
         };
         if let Some((start, _)) = modal.contest_id.grapheme_indices(true).next_back() {
             modal.contest_id.truncate(start);
+        }
+    }
+
+    fn resume_editing(&mut self) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        if modal.state == SwitchContestModalState::Failed {
+            modal.state = SwitchContestModalState::Input;
+            modal.error = None;
+            modal.progress.clear();
         }
     }
 
@@ -165,31 +441,82 @@ impl<'a> ContestSwitchController<'a> {
         }
 
         if self.modal_active() {
+            if self
+                .modal
+                .as_ref()
+                .is_some_and(|modal| modal.state == SwitchContestModalState::Creating)
+            {
+                return ContestSwitchKeyResult::Handled;
+            }
+            if self
+                .modal
+                .as_ref()
+                .is_some_and(|modal| modal.state == SwitchContestModalState::Failed)
+                && !matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Escape | KeyCode::Backspace | KeyCode::Char(_)
+                )
+            {
+                return ContestSwitchKeyResult::Handled;
+            }
+
             match key.code {
                 KeyCode::Escape if key.kind == KeyEventKind::Press => {
                     self.modal = None;
                 }
                 KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                    self.refresh_resolution();
-                    let accepted_destination = self
-                        .modal
-                        .as_ref()
-                        .filter(|modal| modal.error.is_none())
-                        .and_then(|modal| modal.destination.as_deref());
+                    if !self.refresh_resolution_for_confirmation() {
+                        return ContestSwitchKeyResult::Handled;
+                    }
+                    let accepted_destination = self.modal.as_ref().and_then(|modal| {
+                        modal
+                            .target
+                            .filter(|_| modal.error.is_none())
+                            .and(modal.destination.as_deref())
+                    });
                     if accepted_destination == Some(self.current_destination) {
                         self.modal = None;
                     } else if accepted_destination.is_some() {
-                        self.switch_requested = true;
-                        return ContestSwitchKeyResult::SwitchRequested;
+                        match self.modal.as_ref().and_then(|modal| modal.target) {
+                            Some(ContestSwitchTarget::Existing) => {
+                                self.switch_requested = true;
+                                return ContestSwitchKeyResult::SwitchRequested;
+                            }
+                            Some(ContestSwitchTarget::Missing) => {
+                                let modal = self.modal.as_ref().expect("modal must exist");
+                                let request = ContestCreateRequest {
+                                    contest_id: modal.contest_id.clone(),
+                                    destination: modal
+                                        .destination
+                                        .clone()
+                                        .expect("missing target must have a destination"),
+                                };
+                                match self.create_operation.start(request) {
+                                    Ok(()) => {
+                                        let modal = self.modal.as_mut().expect("modal must exist");
+                                        modal.state = SwitchContestModalState::Creating;
+                                        modal.error = None;
+                                    }
+                                    Err(error) => {
+                                        let modal = self.modal.as_mut().expect("modal must exist");
+                                        modal.state = SwitchContestModalState::Failed;
+                                        modal.error = Some(error.to_string());
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
                     }
                 }
                 KeyCode::Backspace => {
+                    self.resume_editing();
                     self.remove_last_grapheme();
                     self.refresh_resolution();
                 }
                 KeyCode::Char(character)
                     if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
                 {
+                    self.resume_editing();
                     if let Some(modal) = self.modal.as_mut() {
                         modal.contest_id.push(character);
                     }
@@ -212,6 +539,37 @@ impl<'a> ContestSwitchController<'a> {
         } else {
             ContestSwitchKeyResult::NotHandled
         }
+    }
+
+    fn handle_operation_messages(&mut self) -> bool {
+        let mut changed = false;
+        for _ in 0..MAX_MESSAGES_PER_TICK {
+            match self.create_operation.try_recv() {
+                Some(ContestCreateOperationMessage::Progress(progress)) => {
+                    if let Some(modal) = self.modal.as_mut()
+                        && modal.state == SwitchContestModalState::Creating
+                    {
+                        modal.progress.push(progress);
+                        changed = true;
+                    }
+                }
+                Some(ContestCreateOperationMessage::Finished(Ok(()))) => {
+                    self.switch_requested = true;
+                    changed = true;
+                    break;
+                }
+                Some(ContestCreateOperationMessage::Finished(Err(error))) => {
+                    if let Some(modal) = self.modal.as_mut() {
+                        modal.state = SwitchContestModalState::Failed;
+                        modal.error = Some(error);
+                    }
+                    changed = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        changed
     }
 }
 
@@ -600,6 +958,7 @@ pub(crate) fn run(
     preferences: &mut FrontendPreferences,
     runtime: SessionRuntime<'_>,
     mut resolve_contest_switch: impl FnMut(&str) -> ContestSwitchResolution,
+    contest_create_task: ContestCreateTask,
 ) -> io::Result<SessionExit> {
     let SessionRuntime {
         current_destination,
@@ -621,6 +980,7 @@ pub(crate) fn run(
         app_context,
         current_destination,
         &mut resolve_contest_switch,
+        contest_create_task,
     );
 
     let mut dirty = true;
@@ -649,6 +1009,13 @@ pub(crate) fn run(
 
         if handle_messages(&mut app, message_rx, run_tx)? {
             dirty = true;
+        }
+
+        if contest_switch.handle_operation_messages() {
+            dirty = true;
+        }
+        if contest_switch.switch_requested {
+            break;
         }
 
         if handle_detail_analysis_results(
@@ -853,7 +1220,7 @@ fn contains_global_quit_event(
         }
 
         if modal_active {
-            if key.code == KeyCode::Escape {
+            if key.code == KeyCode::Escape && contest_switch.escape_dismisses_modal() {
                 modal_active = false;
             }
             continue;
@@ -1554,14 +1921,44 @@ mod tests {
         }
     }
 
+    fn successful_create_task() -> ContestCreateTask {
+        Arc::new(|_, _| Ok(()))
+    }
+
+    fn failing_create_task() -> ContestCreateTask {
+        Arc::new(|_, _| Err(io::Error::other("contest fetch failed").into()))
+    }
+
+    fn wait_for_create_operation(controller: &mut ContestSwitchController<'_>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while controller.create_operation.active.is_some() && std::time::Instant::now() < deadline {
+            controller.handle_operation_messages();
+            thread::yield_now();
+        }
+        controller.handle_operation_messages();
+        assert!(
+            controller.create_operation.active.is_none(),
+            "contest creation operation did not finish"
+        );
+    }
+
+    fn set_displayed_contest_id(controller: &mut ContestSwitchController<'_>, contest_id: &str) {
+        controller.modal.as_mut().unwrap().contest_id = contest_id.to_string();
+        controller.refresh_resolution();
+    }
+
     #[test]
     fn contest_switch_modal_opens_and_cancels_only_in_workspace_context() {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("abc123");
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "incomplete".to_string());
-        let mut controller =
-            ContestSwitchController::new(&workspace_context(root.path()), &current, &mut resolve);
+        let mut controller = ContestSwitchController::new(
+            &workspace_context(root.path()),
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
 
         assert_eq!(
             controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press)),
@@ -1577,7 +1974,12 @@ mod tests {
         let standalone = AppContext::Standalone {
             launch_root: root.path().to_path_buf(),
         };
-        let mut standalone = ContestSwitchController::new(&standalone, &current, &mut resolve);
+        let mut standalone = ContestSwitchController::new(
+            &standalone,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
         assert_eq!(
             standalone.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press)),
             ContestSwitchKeyResult::NotHandled
@@ -1592,7 +1994,12 @@ mod tests {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "incomplete".to_string());
         let context = workspace_context(root.path());
-        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
         controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
 
         for character in ['a', 'b', 'c', 'q', '7', '0', 'e', '\u{301}'] {
@@ -1623,7 +2030,12 @@ mod tests {
             }
         };
         let context = workspace_context(root.path());
-        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
         controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
         for character in "bad".chars() {
             controller.handle_key(key(KeyCode::Char(character), KeyEventKind::Press));
@@ -1635,7 +2047,7 @@ mod tests {
         assert!(controller.modal_active());
         assert!(!controller.switch_requested);
 
-        controller.modal.as_mut().unwrap().contest_id = "abc467".to_string();
+        set_displayed_contest_id(&mut controller, "abc467");
         assert_eq!(
             controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
             ContestSwitchKeyResult::SwitchRequested
@@ -1649,9 +2061,14 @@ mod tests {
         let current = root.path().join("abc123");
         let mut resolve = |_: &str| ContestSwitchResolution::accepted(current.clone());
         let context = workspace_context(root.path());
-        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
         controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
-        controller.modal.as_mut().unwrap().contest_id = "abc123".to_string();
+        set_displayed_contest_id(&mut controller, "abc123");
 
         assert_eq!(
             controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
@@ -1662,12 +2079,689 @@ mod tests {
     }
 
     #[test]
+    fn missing_destination_requires_confirmation_and_escape_before_it_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("ABC/abc470");
+        let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestCreateTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        assert_eq!(
+            controller.modal().unwrap().destination,
+            Some(destination.clone())
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        assert!(!controller.modal_active());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn changed_missing_destination_refreshes_without_starting_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let first_destination = root.path().join("one/abc470");
+        let second_destination = root.path().join("two/abc470");
+        let workspace_config = root.path().join(".atc-workspace.toml");
+        fs::write(
+            &workspace_config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"one\" }]\n",
+        )
+        .unwrap();
+        let mut resolve = |contest_id: &str| {
+            ContestSwitchResolution::missing(
+                crate::workspace::resolve_contest_path(root.path(), contest_id).unwrap(),
+            )
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestCreateTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("injected create failure").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        assert_eq!(
+            controller.modal().unwrap().destination,
+            Some(first_destination.clone())
+        );
+
+        fs::write(
+            &workspace_config,
+            "version = 1\npaths = [{ pattern = \"^abc\", path = \"two\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
+        assert_eq!(modal.destination, Some(second_destination.clone()));
+        assert!(modal.error.is_none());
+        assert!(controller.create_operation.active.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!root.path().join("one").exists());
+        assert!(!root.path().join("two").exists());
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.destination, second_destination);
+        wait_for_create_operation(&mut controller);
+    }
+
+    #[test]
+    fn existing_target_becoming_missing_requires_create_reconfirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let phase = Cell::new(0);
+        let mut resolve = |_: &str| match phase.get() {
+            0 => ContestSwitchResolution::accepted(destination.clone()),
+            _ => ContestSwitchResolution::missing(destination.clone()),
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestCreateTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("injected create failure").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        assert_eq!(
+            controller.modal().unwrap().target,
+            Some(ContestSwitchTarget::Existing)
+        );
+
+        phase.set(1);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(!controller.switch_requested);
+        assert!(controller.create_operation.active.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            controller.modal().unwrap().target,
+            Some(ContestSwitchTarget::Missing)
+        );
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.destination, destination);
+        wait_for_create_operation(&mut controller);
+    }
+
+    #[test]
+    fn missing_target_becoming_existing_requires_switch_reconfirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let phase = Cell::new(0);
+        let mut resolve = |_: &str| match phase.get() {
+            0 => ContestSwitchResolution::missing(destination.clone()),
+            _ => ContestSwitchResolution::accepted(destination.clone()),
+        };
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestCreateTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        phase.set(1);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        assert!(!controller.switch_requested);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.modal().unwrap().target,
+            Some(ContestSwitchTarget::Existing)
+        );
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::SwitchRequested
+        );
+        assert!(controller.switch_requested);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn error_introduced_before_enter_refreshes_without_starting_an_action() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let phase = Cell::new(0);
+        let mut resolve = |_: &str| match phase.get() {
+            0 => ContestSwitchResolution::missing(destination.clone()),
+            _ => ContestSwitchResolution::rejected(
+                Some(destination.clone()),
+                "contest metadata became invalid".to_string(),
+            ),
+        };
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let task: ContestCreateTask = Arc::new(move |_, _| {
+            task_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        phase.set(1);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.target, None);
+        assert_eq!(modal.destination, Some(destination.clone()));
+        assert_eq!(
+            modal.error.as_deref(),
+            Some("contest metadata became invalid")
+        );
+        assert!(!controller.switch_requested);
+        assert!(controller.create_operation.active.is_none());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn failed_creation_character_input_resumes_editing_and_refreshes_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve =
+            |contest_id: &str| ContestSwitchResolution::missing(root.path().join(contest_id));
+        let context = workspace_context(root.path());
+        let mut controller =
+            ContestSwitchController::new(&context, &current, &mut resolve, failing_create_task());
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        wait_for_create_operation(&mut controller);
+
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("contest fetch failed")
+        );
+        controller.handle_key(key(KeyCode::Char('x'), KeyEventKind::Press));
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.contest_id, "ancx");
+        assert_eq!(modal.destination, Some(root.path().join("ancx")));
+        assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
+        assert_eq!(modal.error, None);
+        assert!(modal.progress.is_empty());
+    }
+
+    #[test]
+    fn failed_creation_backspace_removes_last_grapheme_and_refreshes_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve =
+            |contest_id: &str| ContestSwitchResolution::missing(root.path().join(contest_id));
+        let context = workspace_context(root.path());
+        let mut controller =
+            ContestSwitchController::new(&context, &current, &mut resolve, failing_create_task());
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc\u{301}");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        wait_for_create_operation(&mut controller);
+
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("contest fetch failed")
+        );
+        controller.handle_key(key(KeyCode::Backspace, KeyEventKind::Press));
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.contest_id, "an");
+        assert_eq!(modal.destination, Some(root.path().join("an")));
+        assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
+        assert_eq!(modal.error, None);
+        assert!(modal.progress.is_empty());
+    }
+
+    #[test]
+    fn failed_creation_enter_retries_the_same_resolved_target() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("anc");
+        let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestCreateTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("contest fetch failed").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc");
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let first_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_for_create_operation(&mut controller);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Failed
+        );
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let retry_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(retry_request, first_request);
+        assert_eq!(retry_request.contest_id, "anc");
+        assert_eq!(retry_request.destination, destination);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Creating
+        );
+        wait_for_create_operation(&mut controller);
+    }
+
+    #[test]
+    fn failed_creation_mapping_change_refreshes_without_retrying() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let first_destination = root.path().join("one/anc");
+        let second_destination = root.path().join("two/anc");
+        let phase = Cell::new(0);
+        let mut resolve = |_: &str| match phase.get() {
+            0 => ContestSwitchResolution::missing(first_destination.clone()),
+            _ => ContestSwitchResolution::missing(second_destination.clone()),
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+        let task: ContestCreateTask = Arc::new(move |request, _| {
+            request_tx.send(request).unwrap();
+            Err(io::Error::other("contest fetch failed").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc");
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let first_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first_request.destination, first_destination);
+        wait_for_create_operation(&mut controller);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Failed
+        );
+
+        phase.set(1);
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Input);
+        assert_eq!(modal.target, Some(ContestSwitchTarget::Missing));
+        assert_eq!(modal.destination, Some(second_destination.clone()));
+        assert!(modal.error.is_none());
+        assert!(modal.progress.is_empty());
+        assert!(controller.create_operation.active.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        let retry_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(retry_request.destination, second_destination);
+        wait_for_create_operation(&mut controller);
+    }
+
+    #[test]
+    fn failed_creation_escape_dismisses_the_modal() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("anc");
+        let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
+        let context = workspace_context(root.path());
+        let mut controller =
+            ContestSwitchController::new(&context, &current, &mut resolve, failing_create_task());
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "anc");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+        wait_for_create_operation(&mut controller);
+
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Failed
+        );
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+
+        assert!(!controller.modal_active());
+        assert!(!controller.switch_requested);
+    }
+
+    #[test]
+    fn confirmed_creation_runs_off_thread_reports_progress_and_keeps_old_events_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let task_release = Arc::clone(&release_rx);
+        let task: ContestCreateTask = Arc::new(move |request, reporter| {
+            started_tx.send(thread::current().id()).unwrap();
+            reporter.report(Event::ContestFetching {
+                contest_id: &request.contest_id,
+            });
+            reporter.report(Event::ContestFetched {
+                contest_id: &request.contest_id,
+                problems: 1,
+            });
+            reporter.report(Event::ProblemFetching {
+                index: "A",
+                current: 1,
+                total: 1,
+            });
+            reporter.report(Event::ProblemFetchFailed {
+                index: "A",
+                error: "sample endpoint unavailable",
+            });
+            task_release.lock().unwrap().recv().unwrap();
+            Err(io::Error::other("contest fetch failed").into())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ContestSwitchKeyResult::Handled
+        );
+        let worker_thread = started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(worker_thread, thread::current().id());
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Creating
+        );
+        assert!(controller.create_operation.active.is_some());
+
+        controller.handle_key(key(KeyCode::Char('x'), KeyEventKind::Press));
+        assert_eq!(controller.modal().unwrap().contest_id, "abc470");
+        controller.handle_key(key(KeyCode::Backspace, KeyEventKind::Press));
+        assert_eq!(controller.modal().unwrap().contest_id, "abc470");
+        assert_eq!(
+            controller.modal().unwrap().state,
+            SwitchContestModalState::Creating
+        );
+
+        let duplicate = controller.create_operation.start(ContestCreateRequest {
+            contest_id: "abc471".to_string(),
+            destination: root.path().join("abc471"),
+        });
+        assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        assert!(
+            controller.modal_active(),
+            "Escape must not cancel a running create"
+        );
+
+        let mut old_app = app();
+        let (old_tx, old_rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+        old_tx
+            .send(Message::SourceChanged {
+                problem: 0,
+                path: PathBuf::from("old-session-A.cpp"),
+                language: Language::Cpp,
+            })
+            .unwrap();
+        assert!(handle_messages(&mut old_app, &old_rx, &run_tx).unwrap());
+        assert_eq!(
+            old_app
+                .current_problem()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .path,
+            PathBuf::from("old-session-A.cpp")
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while controller.create_operation.active.is_some() && std::time::Instant::now() < deadline {
+            controller.handle_operation_messages();
+            thread::yield_now();
+        }
+        controller.handle_operation_messages();
+
+        let modal = controller.modal().unwrap();
+        assert_eq!(modal.state, SwitchContestModalState::Failed);
+        assert!(
+            modal
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("contest fetch failed")
+        );
+        assert!(modal.progress.iter().any(|progress| matches!(
+            progress,
+            ContestCreateProgress::ContestFetching { contest_id } if contest_id == "abc470"
+        )));
+        assert!(modal.progress.iter().any(|progress| matches!(
+            progress,
+            ContestCreateProgress::ProblemFetchFailed { index, error }
+                if index == "A" && error == "sample endpoint unavailable"
+        )));
+        assert!(controller.create_operation.active.is_none());
+        assert!(!controller.switch_requested);
+
+        controller.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        assert!(!controller.modal_active());
+    }
+
+    #[test]
+    fn successful_creation_is_joined_before_requesting_the_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let destination = root.path().join("abc470");
+        let mut resolve = |_: &str| ContestSwitchResolution::missing(destination.clone());
+        let task: ContestCreateTask = Arc::new(|request, reporter| {
+            reporter.report(Event::ContestFetching {
+                contest_id: &request.contest_id,
+            });
+            Ok(())
+        });
+        let context = workspace_context(root.path());
+        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve, task);
+        controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        set_displayed_contest_id(&mut controller, "abc470");
+        controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !controller.switch_requested && std::time::Instant::now() < deadline {
+            controller.handle_operation_messages();
+            thread::yield_now();
+        }
+
+        assert!(controller.switch_requested);
+        assert!(controller.create_operation.active.is_none());
+    }
+
+    #[test]
+    fn contest_create_reporter_copies_relevant_borrowed_events() {
+        let (tx, rx) = mpsc::channel();
+        let mut reporter = ContestCreateReporter { tx };
+        let contest_id = String::from("abc470");
+        let problem = String::from("A");
+        let warning = String::from("samples unavailable");
+        let destination = PathBuf::from("workspace/abc470");
+
+        reporter.report(Event::ContestFetching {
+            contest_id: &contest_id,
+        });
+        reporter.report(Event::ContestFetched {
+            contest_id: &contest_id,
+            problems: 1,
+        });
+        reporter.report(Event::ProblemFetching {
+            index: &problem,
+            current: 1,
+            total: 1,
+        });
+        reporter.report(Event::ProblemFetched {
+            index: &problem,
+            samples: 3,
+        });
+        reporter.report(Event::ProblemFetchFailed {
+            index: &problem,
+            error: &warning,
+        });
+        reporter.report(Event::WorkspaceCreated {
+            destination: &destination,
+        });
+        drop(contest_id);
+        drop(problem);
+        drop(warning);
+        drop(destination);
+
+        let progress = std::iter::from_fn(|| match rx.try_recv() {
+            Ok(ContestCreateOperationMessage::Progress(progress)) => Some(progress),
+            Ok(ContestCreateOperationMessage::Finished(_)) | Err(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            progress,
+            [
+                ContestCreateProgress::ContestFetching {
+                    contest_id: "abc470".to_string(),
+                },
+                ContestCreateProgress::ContestFetched {
+                    contest_id: "abc470".to_string(),
+                    problems: 1,
+                },
+                ContestCreateProgress::ProblemFetching {
+                    index: "A".to_string(),
+                    current: 1,
+                    total: 1,
+                },
+                ContestCreateProgress::ProblemFetched {
+                    index: "A".to_string(),
+                    samples: 3,
+                },
+                ContestCreateProgress::ProblemFetchFailed {
+                    index: "A".to_string(),
+                    error: "samples unavailable".to_string(),
+                },
+                ContestCreateProgress::WorkspaceCreated {
+                    destination: PathBuf::from("workspace/abc470"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_frontend_operation_joins_its_worker() {
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let release_worker_rx = Arc::new(std::sync::Mutex::new(release_worker_rx));
+        let task_release = Arc::clone(&release_worker_rx);
+        let task: ContestCreateTask = Arc::new(move |_, _| {
+            worker_started_tx.send(()).unwrap();
+            task_release.lock().unwrap().recv().unwrap();
+            Ok(())
+        });
+        let mut operation = ContestCreateOperation::new(task);
+        operation
+            .start(ContestCreateRequest {
+                contest_id: "abc470".to_string(),
+                destination: PathBuf::from("abc470"),
+            })
+            .unwrap();
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (drop_started_tx, drop_started_rx) = mpsc::channel();
+        let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
+        let drop_thread = thread::spawn(move || {
+            drop_started_tx.send(()).unwrap();
+            drop(operation);
+            drop_finished_tx.send(()).unwrap();
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        assert!(matches!(
+            drop_finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_worker_tx.send(()).unwrap();
+        drop_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop_thread.join().unwrap();
+    }
+
+    #[test]
     fn modal_suppresses_global_shortcuts_and_queued_q_is_not_global_quit() {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("abc123");
         let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
         let context = workspace_context(root.path());
-        let mut controller = ContestSwitchController::new(&context, &current, &mut resolve);
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
         let mut app = app();
         controller.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
 
@@ -1688,7 +2782,12 @@ mod tests {
         ]);
         let mut fresh_resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
-        let fresh = ContestSwitchController::new(&context, &current, &mut fresh_resolve);
+        let fresh = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut fresh_resolve,
+            successful_create_task(),
+        );
         assert!(!contains_global_quit_event(&queued, &fresh));
 
         // The modal consumes these keys before the existing application handler can mutate app.
