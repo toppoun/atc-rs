@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use ratatui::{
     Frame,
@@ -7,6 +7,8 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::app::{
     CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
@@ -15,15 +17,181 @@ use super::detail::{DetailDocument, DetailSectionKind};
 use super::detail_layout::DetailLayout;
 use super::detail_scrollbar::{
     DetailScrollbarGeometry, DetailScrollbarInteraction, DetailScrollbarPixelGeometry,
-    render_detail_scrollbar,
+    VerticalScrollbarGeometry, render_detail_scrollbar,
 };
 use super::mouse::MouseMode;
-use super::{SwitchContestModal, SwitchContestModalState};
+use super::{
+    CommandPalette, FrontendActionAvailability, SwitchContestModal, SwitchContestModalState,
+};
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SAMPLES_LAYOUT_WIDTH: u16 = SAMPLES_PANE_WIDTH + MIN_DETAIL_WIDTH;
+const COMMAND_PALETTE_WIDTH: u16 = 76;
+const COMMAND_PALETTE_BORDER_ROWS: u16 = 2;
+const COMMAND_PALETTE_COMMAND_ROW_OFFSET: u16 = 2;
+const COMMAND_PALETTE_ROWS_AFTER_COMMANDS: u16 = 3;
+const COMMAND_PALETTE_FIXED_HEIGHT: u16 = COMMAND_PALETTE_BORDER_ROWS
+    + COMMAND_PALETTE_COMMAND_ROW_OFFSET
+    + COMMAND_PALETTE_ROWS_AFTER_COMMANDS;
+const COMMAND_PALETTE_MAX_VISIBLE_COMMANDS: usize = 10;
+const COMMAND_PALETTE_LABEL_WIDTH: usize = 18;
+const COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH: u16 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandPaletteLayout {
+    area: Rect,
+    inner_area: Rect,
+    query_area: Rect,
+    command_area: Rect,
+    list_area: Rect,
+    scrollbar_gutter: Option<Rect>,
+    status_area: Rect,
+    help_area: Rect,
+    command_capacity: usize,
+    viewport: Range<usize>,
+    show_scrollbar: bool,
+    list_width: usize,
+}
+
+fn command_palette_viewport(total: usize, selected: usize, capacity: usize) -> Range<usize> {
+    if total == 0 || capacity == 0 {
+        return 0..0;
+    }
+
+    let capacity = capacity.min(total);
+    let selected = selected.min(total - 1);
+    let start = selected.saturating_add(1).saturating_sub(capacity);
+    start..start.saturating_add(capacity).min(total)
+}
+
+fn command_palette_layout(frame_area: Rect, total: usize, selected: usize) -> CommandPaletteLayout {
+    let desired_command_rows = total.clamp(1, COMMAND_PALETTE_MAX_VISIBLE_COMMANDS);
+    let desired_height = COMMAND_PALETTE_FIXED_HEIGHT
+        .saturating_add(u16::try_from(desired_command_rows).unwrap_or(u16::MAX));
+    let width = frame_area.width.min(COMMAND_PALETTE_WIDTH);
+    let height = frame_area.height.min(desired_height);
+    let area = Rect::new(
+        frame_area
+            .x
+            .saturating_add(frame_area.width.saturating_sub(width) / 2),
+        frame_area
+            .y
+            .saturating_add(frame_area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    let inner_area = Block::default().borders(Borders::ALL).inner(area);
+    let command_capacity =
+        usize::from(height.saturating_sub(COMMAND_PALETTE_FIXED_HEIGHT)).min(desired_command_rows);
+    let viewport = command_palette_viewport(total, selected, command_capacity);
+    let command_area = clipped_rect(
+        inner_area,
+        COMMAND_PALETTE_COMMAND_ROW_OFFSET,
+        u16::try_from(command_capacity).unwrap_or(u16::MAX),
+    );
+    let show_scrollbar = total > command_capacity
+        && command_capacity > 0
+        && inner_area.width > COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH;
+    let scrollbar_gutter = show_scrollbar.then(|| {
+        Rect::new(
+            command_area.x.saturating_add(
+                command_area
+                    .width
+                    .saturating_sub(COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH),
+            ),
+            command_area.y,
+            COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH.min(command_area.width),
+            command_area.height,
+        )
+    });
+    let list_width = command_area
+        .width
+        .saturating_sub(scrollbar_gutter.map_or(0, |gutter| gutter.width));
+    let list_area = Rect::new(
+        command_area.x,
+        command_area.y,
+        list_width,
+        command_area.height,
+    );
+    let status_row = COMMAND_PALETTE_COMMAND_ROW_OFFSET
+        .saturating_add(u16::try_from(command_capacity).unwrap_or(u16::MAX));
+
+    CommandPaletteLayout {
+        area,
+        inner_area,
+        query_area: clipped_rect(inner_area, 0, 1),
+        command_area,
+        list_area,
+        scrollbar_gutter,
+        status_area: clipped_rect(inner_area, status_row, 1),
+        help_area: clipped_rect(inner_area, status_row.saturating_add(2), 1),
+        command_capacity,
+        viewport,
+        show_scrollbar,
+        list_width: usize::from(list_width),
+    }
+}
+
+fn clipped_rect(area: Rect, row_offset: u16, height: u16) -> Rect {
+    let row_offset = row_offset.min(area.height);
+    Rect::new(
+        area.x,
+        area.y.saturating_add(row_offset),
+        area.width,
+        height.min(area.height.saturating_sub(row_offset)),
+    )
+}
+
+fn fit_command_palette_row(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let text_width = UnicodeWidthStr::width(text);
+    if text_width <= width {
+        let mut fitted = text.to_string();
+        fitted.push_str(&" ".repeat(width - text_width));
+        return fitted;
+    }
+
+    if width == 1 {
+        return text
+            .graphemes(true)
+            .find(|grapheme| UnicodeWidthStr::width(*grapheme) == 1)
+            .unwrap_or(" ")
+            .to_string();
+    }
+
+    let content_width = width - 1;
+    let mut fitted = String::new();
+    let mut fitted_width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if fitted_width.saturating_add(grapheme_width) > content_width {
+            break;
+        }
+        fitted.push_str(grapheme);
+        fitted_width = fitted_width.saturating_add(grapheme_width);
+    }
+    fitted.push('…');
+    fitted.push_str(&" ".repeat(width.saturating_sub(fitted_width.saturating_add(1))));
+    fitted
+}
+
+fn command_palette_row(marker: &str, label: &str, shortcut: &str, width: usize) -> String {
+    let aligned = format!("{marker} {label:<COMMAND_PALETTE_LABEL_WIDTH$} {shortcut}");
+    let compact = format!("{marker} {label} {shortcut}");
+    let base = if UnicodeWidthStr::width(aligned.as_str()) <= width {
+        aligned
+    } else if UnicodeWidthStr::width(compact.as_str()) <= width {
+        compact
+    } else {
+        format!("{marker} {label}")
+    };
+    fit_command_palette_row(&base, width)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DetailSectionHeaderTarget {
@@ -57,7 +225,7 @@ pub(super) fn render_with_mouse_mode(
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
 ) -> RenderInfo {
-    render_frontend_with_mouse_mode(frame, app, detail_layout, mouse_mode, false, None)
+    render_frontend_with_mouse_mode(frame, app, detail_layout, mouse_mode, false, None, None)
 }
 
 pub(super) fn render_frontend_with_mouse_mode(
@@ -67,6 +235,7 @@ pub(super) fn render_frontend_with_mouse_mode(
     mouse_mode: MouseMode,
     contest_switch_available: bool,
     switch_modal: Option<&SwitchContestModal>,
+    command_palette: Option<&CommandPalette>,
 ) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
@@ -228,9 +397,9 @@ pub(super) fn render_frontend_with_mouse_mode(
         "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
     };
     let footer_text = if contest_switch_available {
-        format!("{footer_base}   c contest   q quit")
+        format!(": commands   c contest   q quit   {footer_base}")
     } else {
-        format!("{footer_base}   q quit")
+        format!(": commands   q quit   {footer_base}")
     };
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
 
@@ -238,6 +407,8 @@ pub(super) fn render_frontend_with_mouse_mode(
 
     if let Some(modal) = switch_modal {
         render_switch_contest_modal(frame, modal);
+    } else if let Some(command_palette) = command_palette {
+        render_command_palette(frame, app, command_palette, contest_switch_available);
     }
 
     RenderInfo {
@@ -247,6 +418,104 @@ pub(super) fn render_frontend_with_mouse_mode(
         detail_scrollbar,
         detail_section_headers,
     }
+}
+
+fn render_command_palette(
+    frame: &mut Frame,
+    app: &WatchApp,
+    palette: &CommandPalette,
+    contest_switch_available: bool,
+) {
+    let actions = palette.filtered_actions();
+    let layout = command_palette_layout(frame.area(), actions.len(), palette.selected_index());
+    let block = Block::default()
+        .title(" Command Palette ")
+        .borders(Borders::ALL);
+
+    frame.render_widget(Clear, layout.area);
+    frame.render_widget(block, layout.area);
+    frame.render_widget(Clear, layout.inner_area);
+    frame.render_widget(
+        Paragraph::new(fit_command_palette_row(
+            &format!("> {}", palette.query),
+            usize::from(layout.query_area.width),
+        )),
+        layout.query_area,
+    );
+
+    if actions.is_empty() {
+        if layout.list_area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    fit_command_palette_row("  No matching commands", layout.list_width),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                layout.list_area,
+            );
+        }
+    } else {
+        let scrollbar = layout.show_scrollbar.then(|| {
+            VerticalScrollbarGeometry::new(
+                u16::try_from(layout.command_capacity).unwrap_or(u16::MAX),
+                actions.len().saturating_sub(layout.command_capacity),
+                layout.viewport.start,
+                layout.command_capacity,
+            )
+            .expect("overflowing command viewport must have scrollbar geometry")
+        });
+
+        let mut lines = Vec::with_capacity(layout.viewport.len());
+        for index in layout.viewport.clone() {
+            let action = actions[index];
+            let availability = action.availability(app, contest_switch_available);
+            let marker = if palette.is_selected(index) { ">" } else { " " };
+            let row =
+                command_palette_row(marker, action.label(), action.shortcut(), layout.list_width);
+
+            let mut style = match availability {
+                FrontendActionAvailability::Available => Style::default(),
+                FrontendActionAvailability::Unavailable(_) => Style::default().fg(Color::DarkGray),
+            };
+            if palette.is_selected(index) {
+                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            }
+            lines.push(Line::styled(row, style));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), layout.list_area);
+
+        if let (Some(scrollbar), Some(gutter)) = (scrollbar, layout.scrollbar_gutter) {
+            let scrollbar_lines = (0..gutter.height)
+                .map(|row| Line::raw(scrollbar.symbol_at(row)))
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(Text::from(scrollbar_lines)),
+                Rect::new(gutter.x, gutter.y, 1, gutter.height),
+            );
+        }
+    }
+    let status = match palette
+        .selected_action()
+        .map(|action| action.availability(app, contest_switch_available))
+    {
+        Some(FrontendActionAvailability::Unavailable(reason)) => {
+            format!("  Unavailable: {reason}")
+        }
+        Some(FrontendActionAvailability::Available) | None => String::new(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            fit_command_palette_row(&status, usize::from(layout.status_area.width)),
+            Style::default().fg(Color::DarkGray),
+        )),
+        layout.status_area,
+    );
+    frame.render_widget(
+        Paragraph::new(fit_command_palette_row(
+            "[↑↓] Select   [Enter] Run   [Esc] Cancel",
+            usize::from(layout.help_area.width),
+        )),
+        layout.help_area,
+    );
 }
 
 fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
@@ -759,8 +1028,43 @@ mod tests {
         switch_available: bool,
         modal: Option<&SwitchContestModal>,
     ) -> String {
-        let width = 100;
-        let height = 20;
+        rendered_frontend_text_with_palette(app, switch_available, modal, None, 100, 20)
+    }
+
+    fn rendered_frontend_text_with_palette(
+        app: &WatchApp,
+        switch_available: bool,
+        modal: Option<&SwitchContestModal>,
+        palette: Option<&CommandPalette>,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let buffer = rendered_frontend_buffer_with_palette(
+            app,
+            switch_available,
+            modal,
+            palette,
+            width,
+            height,
+        );
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn rendered_frontend_buffer_with_palette(
+        app: &WatchApp,
+        switch_available: bool,
+        modal: Option<&SwitchContestModal>,
+        palette: Option<&CommandPalette>,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut detail_layout = DetailLayout::default();
@@ -773,19 +1077,22 @@ mod tests {
                     MouseMode::Cells,
                     switch_available,
                     modal,
+                    palette,
                 );
             })
             .unwrap();
+        terminal.backend().buffer().clone()
+    }
 
-        let buffer = terminal.backend().buffer();
-        let mut text = String::new();
-        for row in 0..height {
-            for column in 0..width {
-                text.push_str(buffer.cell((column, row)).unwrap().symbol());
-            }
-            text.push('\n');
-        }
-        text
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, x: u16, y: u16, width: usize) -> String {
+        (0..width)
+            .map(|offset| {
+                buffer
+                    .cell((x.saturating_add(offset as u16), y))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect()
     }
 
     fn render_with_layout(
@@ -1044,6 +1351,7 @@ mod tests {
     #[test]
     fn footer_advertises_initialize_only_while_setup_is_required() {
         let mut app = app();
+        assert!(rendered_buffer_text(&app, 120, 20).contains(": commands"));
         assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
 
         assert!(app.set_stress_setup_required(0, true, true));
@@ -1054,6 +1362,537 @@ mod tests {
 
         assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
         assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+    }
+
+    #[test]
+    fn command_palette_renders_query_selection_shortcuts_and_dedicated_unavailable_status() {
+        let app = app();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "sw".to_string();
+
+        let rendered =
+            rendered_frontend_text_with_palette(&app, false, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("Command Palette"));
+        assert!(rendered.contains("> sw"));
+        assert!(rendered.contains("> Switch Contest"));
+        assert!(rendered.contains(" c"));
+        assert!(!rendered.contains("unavailable —"));
+        assert!(rendered.contains("Unavailable: not in a workspace"));
+        assert!(rendered.contains("[↑↓] Select"));
+
+        let buffer =
+            rendered_frontend_buffer_with_palette(&app, false, None, Some(&palette), 100, 20);
+        assert!(buffer.content().iter().any(|cell| {
+            cell.symbol() == "S"
+                && cell.fg == Color::DarkGray
+                && cell.modifier.contains(Modifier::REVERSED)
+        }));
+
+        palette.query = "str".to_string();
+        let rendered =
+            rendered_frontend_text_with_palette(&app, true, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("Start Stress"));
+        assert!(rendered.contains("Initialize Stress"));
+        assert!(!rendered.contains("unavailable —"));
+        assert!(rendered.contains("Unavailable: no source file"));
+
+        palette.selected = 1;
+        let rendered =
+            rendered_frontend_text_with_palette(&app, true, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("Unavailable: stress initialization not required"));
+    }
+
+    #[test]
+    fn command_palette_renders_zero_results_and_is_safe_in_small_frames() {
+        let app = app();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "nope".to_string();
+
+        let rendered =
+            rendered_frontend_text_with_palette(&app, false, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("> nope"));
+        assert!(rendered.contains("No matching commands"));
+
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (3, 2), (5, 3), (5, 12), (80, 3)] {
+            rendered_frontend_buffer_with_palette(&app, false, None, Some(&palette), width, height);
+        }
+    }
+
+    #[test]
+    fn command_palette_status_row_is_reserved_and_tracks_only_selected_availability() {
+        let app = app();
+        let frame = Rect::new(0, 0, 76, 20);
+        let mut palette = CommandPalette::default();
+        palette.open();
+
+        let unavailable_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let unavailable_buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let status_y = unavailable_layout.status_area.y;
+        let status_x = unavailable_layout.status_area.x;
+        let status_width = usize::from(unavailable_layout.status_area.width);
+        let unavailable_status =
+            buffer_row_text(&unavailable_buffer, status_x, status_y, status_width);
+        assert!(unavailable_status.contains("Unavailable: no source file"));
+        assert!((0..status_width).all(|offset| {
+            unavailable_buffer
+                .cell((status_x.saturating_add(offset as u16), status_y))
+                .unwrap()
+                .fg
+                == Color::DarkGray
+        }));
+
+        assert!(palette.select_next());
+        let available_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let available_buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let available_status = buffer_row_text(&available_buffer, status_x, status_y, status_width);
+        assert!(available_status.trim().is_empty());
+        assert_eq!(available_layout.area, unavailable_layout.area);
+        assert_eq!(
+            available_layout.command_capacity,
+            unavailable_layout.command_capacity
+        );
+    }
+
+    #[test]
+    fn command_palette_status_row_truncates_safely_in_narrow_frames() {
+        let app = app();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "ini".to_string();
+        let frame = Rect::new(0, 0, 24, 20);
+        let layout = command_palette_layout(frame, 1, 0);
+        let buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let status_y = layout.status_area.y;
+        let status_width = usize::from(layout.status_area.width);
+        let status = buffer_row_text(&buffer, layout.status_area.x, status_y, status_width);
+        assert_eq!(UnicodeWidthStr::width(status.as_str()), status_width);
+        assert!(status.contains("Unavailable:"));
+        assert!(status.contains('…'));
+        assert!(!status.contains("unavailable —"));
+    }
+
+    #[test]
+    fn command_palette_viewport_follows_selection_without_stored_scroll_state() {
+        assert_eq!(command_palette_viewport(3, 0, 6), 0..3);
+        assert_eq!(command_palette_viewport(10, 0, 6), 0..6);
+        assert_eq!(command_palette_viewport(10, 5, 6), 0..6);
+        assert_eq!(command_palette_viewport(10, 6, 6), 1..7);
+        assert_eq!(command_palette_viewport(10, 7, 6), 2..8);
+        assert_eq!(command_palette_viewport(10, 9, 6), 4..10);
+        assert_eq!(command_palette_viewport(10, 9, 0), 0..0);
+
+        let wrapped_to_last = command_palette_viewport(10, 9, 4);
+        assert!(wrapped_to_last.contains(&9));
+        let after_resize = command_palette_viewport(10, 7, 3);
+        assert_eq!(after_resize, 5..8);
+        assert!(after_resize.contains(&7));
+    }
+
+    #[test]
+    fn command_palette_height_tracks_content_and_caps_large_lists() {
+        assert_eq!(COMMAND_PALETTE_FIXED_HEIGHT, 7);
+        let frame = Rect::new(0, 0, 100, 40);
+        let few = command_palette_layout(frame, 3, 0);
+        assert_eq!(few.area.height, COMMAND_PALETTE_FIXED_HEIGHT + 3);
+        assert_eq!(few.command_capacity, 3);
+        assert!(!few.show_scrollbar);
+
+        let many = command_palette_layout(frame, 30, 0);
+        assert_eq!(
+            many.area.height,
+            COMMAND_PALETTE_FIXED_HEIGHT + COMMAND_PALETTE_MAX_VISIBLE_COMMANDS as u16
+        );
+        assert_eq!(many.command_capacity, COMMAND_PALETTE_MAX_VISIBLE_COMMANDS);
+        assert_eq!(many.viewport, 0..COMMAND_PALETTE_MAX_VISIBLE_COMMANDS);
+        assert!(many.show_scrollbar);
+        assert_eq!(many.command_area.height, 10);
+        assert_eq!(many.list_area.height, many.command_area.height);
+        assert_eq!(many.scrollbar_gutter.unwrap().height, 10);
+        assert_eq!(many.status_area.y, many.command_area.bottom());
+        assert_eq!(many.help_area.y, many.status_area.y.saturating_add(2));
+
+        let small = command_palette_layout(Rect::new(0, 0, 40, 9), 30, 12);
+        assert_eq!(small.area.height, 9);
+        assert_eq!(small.command_capacity, 2);
+        assert!(small.viewport.contains(&12));
+        assert!(small.show_scrollbar);
+
+        let tiny = command_palette_layout(Rect::new(0, 0, 1, 1), 30, 29);
+        assert_eq!(tiny.command_capacity, 0);
+        assert_eq!(tiny.viewport, 0..0);
+        assert!(!tiny.show_scrollbar);
+    }
+
+    #[test]
+    fn command_palette_overflow_clips_rows_and_renders_shared_scrollbar_glyphs() {
+        let app = app();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        let frame = Rect::new(0, 0, 100, 11);
+        let layout = command_palette_layout(
+            frame,
+            palette.filtered_actions().len(),
+            palette.selected_index(),
+        );
+        assert_eq!(layout.command_capacity, 4);
+        assert!(layout.show_scrollbar);
+
+        let buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let command_y = layout.command_area.y;
+        let scrollbar_x = layout.scrollbar_gutter.unwrap().x;
+        assert_eq!(buffer.cell((scrollbar_x, command_y)).unwrap().symbol(), "↑");
+        assert_eq!(
+            buffer
+                .cell((
+                    scrollbar_x,
+                    command_y.saturating_add(layout.command_capacity as u16 - 1),
+                ))
+                .unwrap()
+                .symbol(),
+            "↓"
+        );
+        assert!((0..layout.command_capacity).any(|row| {
+            buffer
+                .cell((scrollbar_x, command_y.saturating_add(row as u16)))
+                .unwrap()
+                .symbol()
+                == "█"
+        }));
+
+        for expected in 1..=4 {
+            assert!(palette.select_next());
+            assert_eq!(palette.selected_index(), expected);
+            let rendered = rendered_frontend_text_with_palette(
+                &app,
+                false,
+                None,
+                Some(&palette),
+                frame.width,
+                frame.height,
+            );
+            assert!(rendered.contains(palette.selected_action().unwrap().label()));
+        }
+        let shifted = command_palette_layout(frame, 6, palette.selected_index());
+        assert_eq!(shifted.viewport, 1..5);
+        let rendered = rendered_frontend_text_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        assert!(rendered.contains("Initialize Stress"));
+        assert!(!rendered.contains("Run Tests"));
+
+        palette.selected = 0;
+        assert!(palette.select_previous());
+        assert_eq!(palette.selected_index(), 5);
+        let wrapped = command_palette_layout(frame, 6, palette.selected_index());
+        assert_eq!(wrapped.viewport, 2..6);
+        let rendered = rendered_frontend_text_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        assert!(rendered.contains("Switch Contest"));
+
+        palette.query = "str".to_string();
+        palette.reset_selection();
+        let filtered = command_palette_layout(frame, 2, palette.selected_index());
+        assert_eq!(filtered.viewport, 0..2);
+        assert!(!filtered.show_scrollbar);
+        let rendered = rendered_frontend_text_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        assert!(rendered.contains("> Start Stress"));
+        assert!(rendered.contains("Initialize Stress"));
+    }
+
+    #[test]
+    fn command_palette_scrollbar_is_contained_and_preserves_every_modal_border() {
+        let app = app();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = " ".repeat(200);
+
+        for (width, height) in [(76, 11), (30, 10), (24, 11)] {
+            let frame = Rect::new(0, 0, width, height);
+            let layout = command_palette_layout(
+                frame,
+                palette.filtered_actions().len(),
+                palette.selected_index(),
+            );
+            assert!(layout.show_scrollbar, "{width}x{height}");
+            let gutter = layout.scrollbar_gutter.unwrap();
+            let buffer = rendered_frontend_buffer_with_palette(
+                &app,
+                false,
+                None,
+                Some(&palette),
+                width,
+                height,
+            );
+
+            let right_border = layout.area.right().saturating_sub(1);
+            let bottom_border = layout.area.bottom().saturating_sub(1);
+            assert_eq!(gutter.right(), right_border);
+            assert_eq!(gutter.y, layout.command_area.y);
+            assert_eq!(gutter.height, layout.command_area.height);
+            assert_eq!(
+                buffer
+                    .cell((layout.area.x, layout.area.y))
+                    .unwrap()
+                    .symbol(),
+                "┌"
+            );
+            assert_eq!(
+                buffer.cell((right_border, layout.area.y)).unwrap().symbol(),
+                "┐"
+            );
+            assert_eq!(
+                buffer
+                    .cell((layout.area.x, bottom_border))
+                    .unwrap()
+                    .symbol(),
+                "└"
+            );
+            assert_eq!(
+                buffer.cell((right_border, bottom_border)).unwrap().symbol(),
+                "┘"
+            );
+            for x in layout.area.x.saturating_add(1)..right_border {
+                assert_eq!(buffer.cell((x, bottom_border)).unwrap().symbol(), "─");
+            }
+            for y in layout.area.y.saturating_add(1)..bottom_border {
+                assert_eq!(buffer.cell((right_border, y)).unwrap().symbol(), "│");
+            }
+
+            let symbol_x = gutter.x;
+            let border_gap_x = gutter.x.saturating_add(1);
+            assert_eq!(
+                buffer.cell((symbol_x, layout.area.y)).unwrap().symbol(),
+                "─"
+            );
+            assert_eq!(
+                buffer.cell((border_gap_x, layout.area.y)).unwrap().symbol(),
+                "─"
+            );
+            assert_eq!(
+                buffer
+                    .cell((symbol_x, layout.command_area.y))
+                    .unwrap()
+                    .symbol(),
+                "↑"
+            );
+            assert_eq!(
+                buffer
+                    .cell((symbol_x, layout.command_area.bottom().saturating_sub(1),))
+                    .unwrap()
+                    .symbol(),
+                "↓"
+            );
+            assert!(
+                (layout.command_area.y..layout.command_area.bottom())
+                    .any(|y| { buffer.cell((symbol_x, y)).unwrap().symbol() == "█" })
+            );
+            for y in layout.command_area.y..layout.command_area.bottom() {
+                let gap = buffer.cell((border_gap_x, y)).unwrap();
+                assert_eq!(gap.symbol(), " ");
+                assert!(!gap.modifier.contains(Modifier::REVERSED));
+            }
+
+            for area in [layout.query_area, layout.status_area, layout.help_area] {
+                if area.height == 0 {
+                    continue;
+                }
+                assert!(
+                    !["↑", "↓", "█"].contains(&buffer.cell((symbol_x, area.y)).unwrap().symbol())
+                );
+            }
+            assert!(layout.command_area.bottom() <= layout.status_area.y);
+            assert!(layout.help_area.bottom() <= bottom_border);
+
+            let rendered = rendered_frontend_text_with_palette(
+                &app,
+                false,
+                None,
+                Some(&palette),
+                width,
+                height,
+            );
+            assert!(rendered.contains("Command Palette"));
+        }
+    }
+
+    #[test]
+    fn command_palette_selected_rows_fill_list_width_but_not_scrollbar_gutter() {
+        let app = app();
+        let selected_width = |query: &str| {
+            let mut palette = CommandPalette::default();
+            palette.open();
+            palette.query = query.to_string();
+            let frame = Rect::new(0, 0, 76, 20);
+            let layout = command_palette_layout(frame, 1, 0);
+            let buffer = rendered_frontend_buffer_with_palette(
+                &app,
+                false,
+                None,
+                Some(&palette),
+                frame.width,
+                frame.height,
+            );
+            let row = layout.list_area.y;
+            let start = layout.list_area.x;
+            let reversed = (0..layout.list_width)
+                .filter(|offset| {
+                    buffer
+                        .cell((start.saturating_add(*offset as u16), row))
+                        .unwrap()
+                        .modifier
+                        .contains(Modifier::REVERSED)
+                })
+                .count();
+            (layout.list_width, reversed, buffer, start, row)
+        };
+
+        let (available_width, available_reversed, _, _, _) = selected_width("deb");
+        let (disabled_width, disabled_reversed, disabled, start, row) = selected_width("tes");
+        assert_eq!(available_width, disabled_width);
+        assert_eq!(available_reversed, available_width);
+        assert_eq!(disabled_reversed, disabled_width);
+        for offset in 0..disabled_width {
+            assert_eq!(
+                disabled
+                    .cell((start.saturating_add(offset as u16), row))
+                    .unwrap()
+                    .fg,
+                Color::DarkGray
+            );
+        }
+
+        let mut palette = CommandPalette::default();
+        palette.open();
+        let frame = Rect::new(0, 0, 76, 10);
+        let layout = command_palette_layout(frame, 6, 0);
+        let buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let scrollbar_x = layout.scrollbar_gutter.unwrap().x;
+        let selected_row = layout.list_area.y;
+        assert!(layout.show_scrollbar);
+        for x in scrollbar_x..layout.scrollbar_gutter.unwrap().right() {
+            assert!(
+                !buffer
+                    .cell((x, selected_row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+
+        assert!(palette.select_next());
+        let available_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let available_buffer = rendered_frontend_buffer_with_palette(
+            &app,
+            false,
+            None,
+            Some(&palette),
+            frame.width,
+            frame.height,
+        );
+        let available_row = available_layout
+            .list_area
+            .y
+            .saturating_add((palette.selected_index() - available_layout.viewport.start) as u16);
+        assert_eq!(
+            (0..available_layout.list_width)
+                .filter(|offset| {
+                    available_buffer
+                        .cell((
+                            available_layout.list_area.x.saturating_add(*offset as u16),
+                            available_row,
+                        ))
+                        .unwrap()
+                        .modifier
+                        .contains(Modifier::REVERSED)
+                })
+                .count(),
+            available_layout.list_width
+        );
+        let available_gutter = available_layout.scrollbar_gutter.unwrap();
+        for x in available_gutter.x..available_gutter.right() {
+            assert!(
+                !available_buffer
+                    .cell((x, available_row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_rows_truncate_unicode_safely_and_prioritize_label() {
+        let medium = command_palette_row(">", "Switch Contest", "c", 30);
+        assert_eq!(UnicodeWidthStr::width(medium.as_str()), 30);
+        assert!(medium.contains("Switch Contest"));
+        assert!(medium.contains(" c"));
+        assert!(!medium.contains("Unavailable"));
+
+        let narrow = command_palette_row(">", "Run Tests", "r", 10);
+        assert_eq!(UnicodeWidthStr::width(narrow.as_str()), 10);
+        assert!(narrow.starts_with("> Run"));
+        assert!(narrow.contains('…'));
+
+        for width in 0..=12 {
+            let fitted =
+                fit_command_palette_row("  Unavailable: stress initialization not required", width);
+            assert_eq!(UnicodeWidthStr::width(fitted.as_str()), width);
+        }
     }
 
     #[test]

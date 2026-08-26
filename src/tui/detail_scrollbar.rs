@@ -15,6 +15,61 @@ const BOTTOM_CAP_SYMBOL: &str = "↓";
 const MARKER_SYMBOL: &str = "•";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VerticalScrollbarGeometry {
+    top_cap_row: Option<u16>,
+    bottom_cap_row: Option<u16>,
+    track_start_row: u16,
+    track_len: u16,
+    thumb_len: u16,
+    thumb_start_row: u16,
+    thumb_travel: u16,
+}
+
+impl VerticalScrollbarGeometry {
+    pub(super) fn new(
+        height: u16,
+        max_scroll: usize,
+        scroll: usize,
+        viewport_height: usize,
+    ) -> Option<Self> {
+        if height == 0 || max_scroll == 0 {
+            return None;
+        }
+
+        let top_cap_row = Some(0);
+        let bottom_cap_row = (height >= 2).then_some(height.saturating_sub(1));
+        let track_start_row = 1;
+        let track_len = height.saturating_sub(2);
+        let (thumb_len, thumb_travel) = thumb_metrics(max_scroll, viewport_height, track_len);
+        let thumb_offset = scroll_to_thumb_offset(scroll, max_scroll, thumb_travel);
+
+        Some(Self {
+            top_cap_row,
+            bottom_cap_row,
+            track_start_row,
+            track_len,
+            thumb_len,
+            thumb_start_row: track_start_row.saturating_add(thumb_offset),
+            thumb_travel,
+        })
+    }
+
+    pub(super) fn symbol_at(self, row: u16) -> &'static str {
+        if self.top_cap_row == Some(row) {
+            TOP_CAP_SYMBOL
+        } else if self.bottom_cap_row == Some(row) {
+            BOTTOM_CAP_SYMBOL
+        } else if row >= self.thumb_start_row
+            && row < self.thumb_start_row.saturating_add(self.thumb_len)
+        {
+            THUMB_SYMBOL
+        } else {
+            TRACK_SYMBOL
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DetailScrollbarHit {
     TopCap,
     BottomCap,
@@ -165,16 +220,16 @@ impl DetailScrollbarGeometry {
             1,
             area.height,
         );
-        let top_cap_row = Some(area.y);
-        let bottom_cap_row =
-            (area.height >= 2).then_some(area.y.saturating_add(area.height.saturating_sub(1)));
-        let track_start_row = area.y.saturating_add(1);
-        let track_len = area.height.saturating_sub(2);
-
-        let (thumb_len, thumb_travel) = thumb_metrics(max_scroll, viewport_height, track_len);
+        let visual =
+            VerticalScrollbarGeometry::new(area.height, max_scroll, scroll, viewport_height)?;
+        let top_cap_row = visual.top_cap_row.map(|row| area.y.saturating_add(row));
+        let bottom_cap_row = visual.bottom_cap_row.map(|row| area.y.saturating_add(row));
+        let track_start_row = area.y.saturating_add(visual.track_start_row);
+        let track_len = visual.track_len;
+        let thumb_len = visual.thumb_len;
+        let thumb_travel = visual.thumb_travel;
         let scroll = scroll.min(max_scroll);
-        let thumb_offset = scroll_to_thumb_offset(scroll, max_scroll, thumb_travel);
-        let thumb_start_row = track_start_row.saturating_add(thumb_offset);
+        let thumb_start_row = area.y.saturating_add(visual.thumb_start_row);
 
         let mut marker_rows = if track_len == 0 {
             Vec::new()
@@ -640,6 +695,26 @@ mod tests {
         assert!(geometry(10, 0, 0).is_none());
         assert!(DetailScrollbarGeometry::new(Rect::new(0, 0, 0, 10), 1, 0, 10, &[]).is_none());
         assert!(DetailScrollbarGeometry::new(Rect::new(0, 0, 10, 0), 1, 0, 0, &[]).is_none());
+    }
+
+    #[test]
+    fn shared_vertical_geometry_keeps_detail_caps_and_thumb_mapping() {
+        let top = VerticalScrollbarGeometry::new(6, 20, 0, 6).unwrap();
+        let bottom = VerticalScrollbarGeometry::new(6, 20, 20, 6).unwrap();
+        assert_eq!(top.symbol_at(0), TOP_CAP_SYMBOL);
+        assert_eq!(top.symbol_at(5), BOTTOM_CAP_SYMBOL);
+        assert_eq!(top.symbol_at(top.thumb_start_row), THUMB_SYMBOL);
+        assert_eq!(
+            bottom.thumb_start_row,
+            bottom.track_start_row + bottom.thumb_travel
+        );
+
+        let detail = geometry(6, 20, 20).unwrap();
+        assert_eq!(
+            detail.thumb_start_row.saturating_sub(detail.gutter.y),
+            bottom.thumb_start_row
+        );
+        assert_eq!(detail.thumb_len, bottom.thumb_len);
     }
 
     #[test]

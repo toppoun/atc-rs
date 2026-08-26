@@ -68,6 +68,258 @@ impl FrontendPreferences {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrontendAction {
+    RunTests,
+    ToggleDebug,
+    ToggleSamples,
+    StartStress,
+    InitializeStress,
+    SwitchContest,
+}
+
+impl FrontendAction {
+    const ALL: [Self; 6] = [
+        Self::RunTests,
+        Self::ToggleDebug,
+        Self::ToggleSamples,
+        Self::StartStress,
+        Self::InitializeStress,
+        Self::SwitchContest,
+    ];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::RunTests => "Run Tests",
+            Self::ToggleDebug => "Toggle Debug",
+            Self::ToggleSamples => "Toggle Samples",
+            Self::StartStress => "Start Stress",
+            Self::InitializeStress => "Initialize Stress",
+            Self::SwitchContest => "Switch Contest",
+        }
+    }
+
+    pub(super) const fn shortcut(self) -> &'static str {
+        match self {
+            Self::RunTests => "r",
+            Self::ToggleDebug => "d",
+            Self::ToggleSamples => "s",
+            Self::StartStress => "S",
+            Self::InitializeStress => "i",
+            Self::SwitchContest => "c",
+        }
+    }
+
+    fn availability(
+        self,
+        app: &WatchApp,
+        contest_switch_available: bool,
+    ) -> FrontendActionAvailability {
+        match self {
+            Self::RunTests | Self::StartStress
+                if app
+                    .current_problem()
+                    .and_then(|problem| problem.source.as_ref())
+                    .is_none() =>
+            {
+                FrontendActionAvailability::Unavailable("no source file")
+            }
+            Self::StartStress
+                if app.current_problem().is_some_and(|problem| {
+                    matches!(
+                        &problem.stress_setup,
+                        app::StressSetupState::Required { .. }
+                    )
+                }) =>
+            {
+                FrontendActionAvailability::Unavailable("stress helpers not initialized")
+            }
+            Self::InitializeStress
+                if !app.current_problem().is_some_and(|problem| {
+                    matches!(
+                        &problem.stress_setup,
+                        app::StressSetupState::Required { .. }
+                    )
+                }) =>
+            {
+                FrontendActionAvailability::Unavailable("stress initialization not required")
+            }
+            Self::SwitchContest if !contest_switch_available => {
+                FrontendActionAvailability::Unavailable("not in a workspace")
+            }
+            Self::RunTests
+            | Self::ToggleDebug
+            | Self::ToggleSamples
+            | Self::StartStress
+            | Self::InitializeStress
+            | Self::SwitchContest => FrontendActionAvailability::Available,
+        }
+    }
+
+    fn from_shortcut(key: KeyEvent) -> Option<Self> {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
+
+        match key.code {
+            KeyCode::Char('r') => Some(Self::RunTests),
+            KeyCode::Char('d') => Some(Self::ToggleDebug),
+            KeyCode::Char('s') => Some(Self::ToggleSamples),
+            KeyCode::Char('S') => Some(Self::StartStress),
+            KeyCode::Char('i') => Some(Self::InitializeStress),
+            KeyCode::Char('c')
+                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
+            {
+                Some(Self::SwitchContest)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrontendActionAvailability {
+    Available,
+    Unavailable(&'static str),
+}
+
+impl FrontendActionAvailability {
+    fn is_available(self) -> bool {
+        self == Self::Available
+    }
+}
+
+fn command_matches(label: &str, query: &str) -> bool {
+    let words = label
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .all(|token| words.iter().any(|word| word.starts_with(&token)))
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct CommandPalette {
+    open: bool,
+    pub(super) query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPaletteKeyResult {
+    NotHandled,
+    Handled(bool),
+    ExecuteRequested(FrontendAction),
+}
+
+impl CommandPalette {
+    fn is_active(&self) -> bool {
+        self.open
+    }
+
+    fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.selected = 0;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.selected = 0;
+    }
+
+    pub(super) fn filtered_actions(&self) -> Vec<FrontendAction> {
+        FrontendAction::ALL
+            .into_iter()
+            .filter(|action| command_matches(action.label(), &self.query))
+            .collect()
+    }
+
+    pub(super) fn selected_action(&self) -> Option<FrontendAction> {
+        self.filtered_actions().get(self.selected).copied()
+    }
+
+    pub(super) fn is_selected(&self, index: usize) -> bool {
+        self.selected == index
+    }
+
+    pub(super) fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    fn reset_selection(&mut self) {
+        self.selected = 0;
+    }
+
+    fn select_previous(&mut self) -> bool {
+        let count = self.filtered_actions().len();
+        if count <= 1 {
+            self.selected = 0;
+            return false;
+        }
+        self.selected = if self.selected == 0 {
+            count - 1
+        } else {
+            self.selected.min(count - 1) - 1
+        };
+        true
+    }
+
+    fn select_next(&mut self) -> bool {
+        let count = self.filtered_actions().len();
+        if count <= 1 {
+            self.selected = 0;
+            return false;
+        }
+        self.selected = (self.selected + 1) % count;
+        true
+    }
+
+    fn remove_last_grapheme(&mut self) -> bool {
+        let Some((start, _)) = self.query.grapheme_indices(true).next_back() else {
+            return false;
+        };
+        self.query.truncate(start);
+        self.reset_selection();
+        true
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> CommandPaletteKeyResult {
+        if !self.is_active() {
+            return CommandPaletteKeyResult::NotHandled;
+        }
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return CommandPaletteKeyResult::Handled(false);
+        }
+
+        match key.code {
+            KeyCode::Escape if key.kind == KeyEventKind::Press => {
+                self.close();
+                CommandPaletteKeyResult::Handled(true)
+            }
+            KeyCode::Enter if key.kind == KeyEventKind::Press => self
+                .selected_action()
+                .map(CommandPaletteKeyResult::ExecuteRequested)
+                .unwrap_or(CommandPaletteKeyResult::Handled(false)),
+            KeyCode::Backspace => CommandPaletteKeyResult::Handled(self.remove_last_grapheme()),
+            KeyCode::Up => CommandPaletteKeyResult::Handled(self.select_previous()),
+            KeyCode::Down => CommandPaletteKeyResult::Handled(self.select_next()),
+            KeyCode::Char(character)
+                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
+            {
+                self.query.push(character);
+                self.reset_selection();
+                CommandPaletteKeyResult::Handled(true)
+            }
+            _ => CommandPaletteKeyResult::Handled(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionExit {
     Quit,
     SwitchContest,
@@ -430,6 +682,14 @@ impl<'a> ContestSwitchController<'a> {
         self.modal.is_some()
     }
 
+    fn open(&mut self) -> bool {
+        if !self.available || self.modal_active() {
+            return false;
+        }
+        self.modal = Some(SwitchContestModal::default());
+        true
+    }
+
     fn escape_dismisses_modal(&self) -> bool {
         self.modal
             .as_ref()
@@ -648,15 +908,12 @@ impl<'a> ContestSwitchController<'a> {
             return ContestSwitchKeyResult::Handled;
         }
 
-        if self.available
-            && key.code == KeyCode::Char('c')
-            && key.kind == KeyEventKind::Press
-            && !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.super_key
-        {
-            self.modal = Some(SwitchContestModal::default());
-            ContestSwitchKeyResult::Handled
+        if FrontendAction::from_shortcut(key) == Some(FrontendAction::SwitchContest) {
+            if self.open() {
+                ContestSwitchKeyResult::Handled
+            } else {
+                ContestSwitchKeyResult::NotHandled
+            }
         } else {
             ContestSwitchKeyResult::NotHandled
         }
@@ -801,9 +1058,10 @@ impl<'a> TerminalInputContext<'a> {
     }
 }
 
-struct FrontendInputContext<'run, 'controller, 'resolver> {
+struct FrontendInputContext<'run, 'controller, 'resolver, 'palette> {
     terminal: TerminalInputContext<'run>,
     contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
+    command_palette: Option<&'palette mut CommandPalette>,
 }
 
 struct StressInitializationReporter;
@@ -1131,6 +1389,7 @@ pub(crate) fn run(
         &mut resolve_contest_switch,
         contest_switch_task,
     );
+    let mut command_palette = CommandPalette::default();
 
     let mut dirty = true;
 
@@ -1144,7 +1403,7 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_global_quit_event(&terminal_events, &contest_switch) {
+        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
             app.quit();
             break;
         }
@@ -1183,7 +1442,7 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_global_quit_event(&terminal_events, &contest_switch) {
+        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
             app.quit();
             break;
         }
@@ -1207,6 +1466,7 @@ pub(crate) fn run(
                     render_mouse_mode,
                     contest_switch.available,
                     contest_switch.modal(),
+                    command_palette.is_active().then_some(&command_palette),
                 );
             })?;
 
@@ -1241,7 +1501,7 @@ pub(crate) fn run(
         }
 
         // qは同じbatch内のresize/mouseより先に扱い、再描画を挟まず終了する。
-        if contains_global_quit_event(&terminal_events, &contest_switch) {
+        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
             app.quit();
             continue;
         }
@@ -1257,6 +1517,7 @@ pub(crate) fn run(
             FrontendInputContext {
                 terminal: TerminalInputContext::new(run_tx, Some(stress_setup)),
                 contest_switch: Some(&mut contest_switch),
+                command_palette: Some(&mut command_palette),
             },
         )? {
             dirty = true;
@@ -1356,32 +1617,56 @@ fn contains_quit_event(events: &VecDeque<TerminalEvent>) -> bool {
 
 fn contains_global_quit_event(
     events: &VecDeque<TerminalEvent>,
+    app: &WatchApp,
     contest_switch: &ContestSwitchController<'_>,
+    command_palette: &CommandPalette,
 ) -> bool {
-    let mut modal_active = contest_switch.modal_active();
+    let mut contest_modal_active = contest_switch.modal_active();
+    let mut command_palette = command_palette.clone();
 
     for event in events {
         let TerminalEvent::Key(key) = event else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
 
-        if modal_active {
-            if key.code == KeyCode::Escape && contest_switch.escape_dismisses_modal() {
-                modal_active = false;
+        if contest_modal_active {
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Escape
+                && contest_switch.escape_dismisses_modal()
+            {
+                contest_modal_active = false;
             }
             continue;
         }
 
-        if contest_switch.available
-            && key.code == KeyCode::Char('c')
-            && !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.super_key
+        if command_palette.is_active() {
+            if let CommandPaletteKeyResult::ExecuteRequested(action) =
+                command_palette.handle_key(*key)
+                && action
+                    .availability(app, contest_switch.available)
+                    .is_available()
+            {
+                command_palette.close();
+                if action == FrontendAction::SwitchContest {
+                    contest_modal_active = true;
+                }
+            }
+            continue;
+        }
+
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if is_command_palette_open_key(*key) {
+            command_palette.open();
+            continue;
+        }
+
+        if FrontendAction::from_shortcut(*key) == Some(FrontendAction::SwitchContest)
+            && contest_switch.available
         {
-            modal_active = true;
+            contest_modal_active = true;
             continue;
         }
 
@@ -1391,6 +1676,14 @@ fn contains_global_quit_event(
     }
 
     false
+}
+
+fn is_command_palette_open_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char(':')
+        && !key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.super_key
 }
 
 fn is_quit_event(terminal_event: &TerminalEvent) -> bool {
@@ -1434,6 +1727,7 @@ fn handle_terminal_events(
         FrontendInputContext {
             terminal: TerminalInputContext::new(run_tx, None),
             contest_switch: None,
+            command_palette: None,
         },
     )
 }
@@ -1445,7 +1739,7 @@ fn handle_terminal_events_with_mouse_mode(
     render_info: &view::RenderInfo,
     events: &mut VecDeque<TerminalEvent>,
     mouse_mode: MouseMode,
-    mut input: FrontendInputContext<'_, '_, '_>,
+    mut input: FrontendInputContext<'_, '_, '_, '_>,
 ) -> io::Result<bool> {
     let mut changed = false;
     let mut scrollbar_geometry_changed_by_drag = false;
@@ -1535,10 +1829,11 @@ fn handle_terminal_event_with_mouse_mode(
     terminal_event: TerminalEvent,
     render_info: &view::RenderInfo,
     mouse_mode: MouseMode,
-    input: &mut FrontendInputContext<'_, '_, '_>,
+    input: &mut FrontendInputContext<'_, '_, '_, '_>,
 ) -> io::Result<bool> {
     if let TerminalEvent::Key(key) = terminal_event
         && let Some(contest_switch) = input.contest_switch.as_deref_mut()
+        && contest_switch.modal_active()
     {
         match contest_switch.handle_key(key) {
             ContestSwitchKeyResult::NotHandled => {}
@@ -1548,22 +1843,76 @@ fn handle_terminal_event_with_mouse_mode(
         }
     }
 
-    if input
+    if let TerminalEvent::Key(key) = terminal_event
+        && input
+            .command_palette
+            .as_ref()
+            .is_some_and(|palette| palette.is_active())
+    {
+        let result = input
+            .command_palette
+            .as_deref_mut()
+            .expect("active palette must exist")
+            .handle_key(key);
+        match result {
+            CommandPaletteKeyResult::NotHandled => {}
+            CommandPaletteKeyResult::Handled(changed) => return Ok(changed),
+            CommandPaletteKeyResult::ExecuteRequested(action) => {
+                let contest_switch_available = input
+                    .contest_switch
+                    .as_ref()
+                    .is_some_and(|controller| controller.available);
+                if !action
+                    .availability(app, contest_switch_available)
+                    .is_available()
+                {
+                    return Ok(false);
+                }
+
+                input
+                    .command_palette
+                    .as_deref_mut()
+                    .expect("active palette must exist")
+                    .close();
+                return execute_frontend_action(
+                    app,
+                    action,
+                    input.terminal,
+                    input.contest_switch.as_deref_mut(),
+                );
+            }
+        }
+    }
+
+    let frontend_interaction_active = input
         .contest_switch
         .as_ref()
         .is_some_and(|contest_switch| contest_switch.modal_active())
-        && matches!(terminal_event, TerminalEvent::Pointer(_))
-    {
+        || input
+            .command_palette
+            .as_ref()
+            .is_some_and(|palette| palette.is_active());
+    if frontend_interaction_active && matches!(terminal_event, TerminalEvent::Pointer(_)) {
         return Ok(false);
     }
 
     match terminal_event {
-        TerminalEvent::Key(key) => handle_key_event_with_stress_context(
-            app,
-            key,
-            input.terminal.run_tx,
-            input.terminal.stress_setup,
-        ),
+        TerminalEvent::Key(key) => {
+            let palette_was_active = input
+                .command_palette
+                .as_ref()
+                .is_some_and(|palette| palette.is_active());
+            let changed = handle_key_event_with_frontend_context(app, key, input)?;
+            if !palette_was_active
+                && input
+                    .command_palette
+                    .as_ref()
+                    .is_some_and(|palette| palette.is_active())
+            {
+                detail_scrollbar_drag.cancel();
+            }
+            Ok(changed)
+        }
 
         TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event_with_mouse_mode(
             app,
@@ -1592,78 +1941,111 @@ fn handle_key_event(
     handle_key_event_with_stress_context(app, key, run_tx, None)
 }
 
+#[cfg(test)]
 fn handle_key_event_with_stress_context(
     app: &mut WatchApp,
     key: KeyEvent,
     run_tx: &Sender<RunRequest>,
     stress_setup: Option<StressSetupContext<'_>>,
 ) -> io::Result<bool> {
+    handle_key_event_with_frontend_context(
+        app,
+        key,
+        &mut FrontendInputContext {
+            terminal: TerminalInputContext::new(run_tx, stress_setup),
+            contest_switch: None,
+            command_palette: None,
+        },
+    )
+}
+
+fn handle_key_event_with_frontend_context(
+    app: &mut WatchApp,
+    key: KeyEvent,
+    input: &mut FrontendInputContext<'_, '_, '_, '_>,
+) -> io::Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
     }
 
+    if key.code == KeyCode::Char('q') && key.kind == KeyEventKind::Press {
+        app.quit();
+        return Ok(true);
+    }
+
+    if is_command_palette_open_key(key) {
+        let Some(command_palette) = input.command_palette.as_deref_mut() else {
+            return Ok(false);
+        };
+        command_palette.open();
+        return Ok(true);
+    }
+
+    if let Some(action) = FrontendAction::from_shortcut(key) {
+        return execute_frontend_action(
+            app,
+            action,
+            input.terminal,
+            input.contest_switch.as_deref_mut(),
+        );
+    }
+
     match key.code {
-        KeyCode::Char('q') if key.kind == KeyEventKind::Press => {
-            app.quit();
-            Ok(true)
+        KeyCode::Char('h') | KeyCode::Left => Ok(app.previous_problem()),
+        KeyCode::Char('l') | KeyCode::Right => Ok(app.next_problem()),
+        KeyCode::Char('j') | KeyCode::Down => Ok(app.next_case()),
+        KeyCode::Char('k') | KeyCode::Up => Ok(app.previous_case()),
+        _ => Ok(false),
+    }
+}
+
+fn execute_frontend_action(
+    app: &mut WatchApp,
+    action: FrontendAction,
+    input: TerminalInputContext<'_>,
+    contest_switch: Option<&mut ContestSwitchController<'_>>,
+) -> io::Result<bool> {
+    match action {
+        FrontendAction::RunTests => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+            queue_problem_run(app, problem, input.run_tx)
         }
-
-        KeyCode::Char('d') if key.kind == KeyEventKind::Press => {
+        FrontendAction::ToggleDebug => {
             app.toggle_debug();
-
             if app.current_source_language() == Some(crate::language::Language::Cpp)
                 && let Some(problem) = app.selected_problem()
             {
-                queue_problem_run(app, problem, run_tx)?;
+                queue_problem_run(app, problem, input.run_tx)?;
             }
-
             Ok(true)
         }
-
-        KeyCode::Char('r') if key.kind == KeyEventKind::Press => {
-            let Some(problem) = app.selected_problem() else {
-                return Ok(false);
-            };
-
-            queue_problem_run(app, problem, run_tx)
-        }
-
-        KeyCode::Char('S') if key.kind == KeyEventKind::Press => {
-            let Some(problem) = app.selected_problem() else {
-                return Ok(false);
-            };
-            let Some(stress_setup) = stress_setup else {
-                return Ok(false);
-            };
-
-            queue_problem_stress(app, problem, run_tx, stress_setup)
-        }
-
-        KeyCode::Char('i') if key.kind == KeyEventKind::Press => {
-            let Some(problem) = app.selected_problem() else {
-                return Ok(false);
-            };
-            let Some(stress_setup) = stress_setup else {
-                return Ok(false);
-            };
-
-            Ok(initialize_problem_stress(app, problem, stress_setup))
-        }
-
-        KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
+        FrontendAction::ToggleSamples => {
             app.toggle_samples_pane();
             Ok(true)
         }
-
-        KeyCode::Char('h') | KeyCode::Left => Ok(app.previous_problem()),
-
-        KeyCode::Char('l') | KeyCode::Right => Ok(app.next_problem()),
-
-        KeyCode::Char('j') | KeyCode::Down => Ok(app.next_case()),
-
-        KeyCode::Char('k') | KeyCode::Up => Ok(app.previous_case()),
-
-        _ => Ok(false),
+        FrontendAction::StartStress => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+            let Some(stress_setup) = input.stress_setup else {
+                return Ok(false);
+            };
+            queue_problem_stress(app, problem, input.run_tx, stress_setup)
+        }
+        FrontendAction::InitializeStress => {
+            let Some(problem) = app.selected_problem() else {
+                return Ok(false);
+            };
+            let Some(stress_setup) = input.stress_setup else {
+                return Ok(false);
+            };
+            Ok(initialize_problem_stress(app, problem, stress_setup))
+        }
+        FrontendAction::SwitchContest => {
+            Ok(contest_switch.is_some_and(|controller| controller.open()))
+        }
     }
 }
 
@@ -2065,6 +2447,32 @@ mod tests {
         )
     }
 
+    fn handle_frontend_terminal_events(
+        app: &mut WatchApp,
+        render_info: &view::RenderInfo,
+        events: &mut VecDeque<TerminalEvent>,
+        run_tx: &Sender<RunRequest>,
+        stress_setup: Option<StressSetupContext<'_>>,
+        contest_switch: Option<&mut ContestSwitchController<'_>>,
+        command_palette: &mut CommandPalette,
+    ) -> io::Result<bool> {
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        super::handle_terminal_events_with_mouse_mode(
+            app,
+            &mut detail_layout,
+            &mut drag,
+            render_info,
+            events,
+            MouseMode::Cells,
+            FrontendInputContext {
+                terminal: TerminalInputContext::new(run_tx, stress_setup),
+                contest_switch,
+                command_palette: Some(command_palette),
+            },
+        )
+    }
+
     fn workspace_context(root: &Path) -> AppContext {
         AppContext::Workspace {
             root: root.to_path_buf(),
@@ -2095,6 +2503,645 @@ mod tests {
     fn set_displayed_contest_id(controller: &mut ContestSwitchController<'_>, contest_id: &str) {
         controller.modal.as_mut().unwrap().contest_id = contest_id.to_string();
         controller.refresh_resolution();
+    }
+
+    fn palette_labels(query: &str) -> Vec<&'static str> {
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = query.to_string();
+        palette
+            .filtered_actions()
+            .into_iter()
+            .map(FrontendAction::label)
+            .collect()
+    }
+
+    #[test]
+    fn command_palette_opens_closes_and_reopens_without_persisting_query() {
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char(':'),
+            KeyEventKind::Press,
+        ))]);
+
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(palette.is_active());
+        assert_eq!(palette.query, "");
+        assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
+
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            CommandPaletteKeyResult::Handled(true)
+        );
+        assert_eq!(palette.query, "q");
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
+            CommandPaletteKeyResult::Handled(true)
+        );
+        assert!(!palette.is_active());
+        assert_eq!(palette.query, "");
+
+        palette.open();
+        assert!(palette.is_active());
+        assert_eq!(palette.query, "");
+        assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
+
+        palette.handle_key(key(KeyCode::Char('a'), KeyEventKind::Press));
+        palette.handle_key(key(KeyCode::Char('\u{301}'), KeyEventKind::Press));
+        assert_eq!(palette.query, "a\u{301}");
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Backspace, KeyEventKind::Repeat)),
+            CommandPaletteKeyResult::Handled(true)
+        );
+        assert_eq!(palette.query, "");
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Char('x'), KeyEventKind::Release)),
+            CommandPaletteKeyResult::Handled(false)
+        );
+        assert_eq!(palette.query, "");
+    }
+
+    #[test]
+    fn command_palette_search_is_case_insensitive_word_prefix_matching() {
+        for (query, expected) in [
+            ("sw", vec!["Switch Contest"]),
+            ("con", vec!["Switch Contest"]),
+            ("sta", vec!["Start Stress"]),
+            ("str", vec!["Start Stress", "Initialize Stress"]),
+            ("ini", vec!["Initialize Stress"]),
+            ("deb", vec!["Toggle Debug"]),
+            ("sam", vec!["Toggle Samples"]),
+            ("tes", vec!["Run Tests"]),
+            ("Sw", vec!["Switch Contest"]),
+            ("sW cOn", vec!["Switch Contest"]),
+            ("to sam", vec!["Toggle Samples"]),
+            ("does-not-match", vec![]),
+        ] {
+            assert_eq!(palette_labels(query), expected, "query {query:?}");
+        }
+
+        assert!(command_matches("Switch Contest", "  sw   con "));
+        assert!(!command_matches("Switch Contest", "switching"));
+    }
+
+    #[test]
+    fn command_palette_selection_wraps_resets_on_filter_and_never_auto_runs() {
+        let mut palette = CommandPalette::default();
+        palette.open();
+        assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
+
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Down, KeyEventKind::Press)),
+            CommandPaletteKeyResult::Handled(true)
+        );
+        assert_eq!(palette.selected_action(), Some(FrontendAction::ToggleDebug));
+        palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
+        assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
+        palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
+        assert_eq!(
+            palette.selected_action(),
+            Some(FrontendAction::SwitchContest)
+        );
+
+        palette.open();
+        for character in "str".chars() {
+            assert_eq!(
+                palette.handle_key(key(KeyCode::Char(character), KeyEventKind::Press)),
+                CommandPaletteKeyResult::Handled(true)
+            );
+        }
+        assert_eq!(
+            palette.filtered_actions(),
+            [
+                FrontendAction::StartStress,
+                FrontendAction::InitializeStress
+            ]
+        );
+        assert_eq!(palette.selected_action(), Some(FrontendAction::StartStress));
+        palette.handle_key(key(KeyCode::Down, KeyEventKind::Press));
+        assert_eq!(
+            palette.selected_action(),
+            Some(FrontendAction::InitializeStress)
+        );
+        palette.handle_key(key(KeyCode::Char(' '), KeyEventKind::Press));
+        palette.handle_key(key(KeyCode::Char('i'), KeyEventKind::Press));
+        assert_eq!(
+            palette.filtered_actions(),
+            [FrontendAction::InitializeStress]
+        );
+        assert_eq!(
+            palette.selected_action(),
+            Some(FrontendAction::InitializeStress)
+        );
+        assert!(palette.is_active(), "one result must not auto-execute");
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            CommandPaletteKeyResult::ExecuteRequested(FrontendAction::InitializeStress)
+        );
+        assert!(
+            palette.is_active(),
+            "the caller closes only after availability"
+        );
+
+        palette.query = "nope".to_string();
+        palette.reset_selection();
+        assert!(palette.filtered_actions().is_empty());
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            CommandPaletteKeyResult::Handled(false)
+        );
+        assert!(palette.is_active());
+    }
+
+    #[test]
+    fn initial_shortcuts_and_palette_selection_resolve_to_the_same_frontend_actions() {
+        for (index, action) in FrontendAction::ALL.into_iter().enumerate() {
+            let shortcut = action.shortcut().chars().next().unwrap();
+            assert_eq!(
+                FrontendAction::from_shortcut(key(KeyCode::Char(shortcut), KeyEventKind::Press)),
+                Some(action)
+            );
+
+            let mut palette = CommandPalette::default();
+            palette.open();
+            for _ in 0..index {
+                palette.handle_key(key(KeyCode::Down, KeyEventKind::Press));
+            }
+            assert_eq!(
+                palette.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+                CommandPaletteKeyResult::ExecuteRequested(action)
+            );
+        }
+    }
+
+    #[test]
+    fn command_availability_uses_only_current_frontend_state() {
+        let mut app = app();
+        assert_eq!(
+            FrontendAction::RunTests.availability(&app, false),
+            FrontendActionAvailability::Unavailable("no source file")
+        );
+        assert_eq!(
+            FrontendAction::StartStress.availability(&app, false),
+            FrontendActionAvailability::Unavailable("no source file")
+        );
+        assert_eq!(
+            FrontendAction::InitializeStress.availability(&app, false),
+            FrontendActionAvailability::Unavailable("stress initialization not required")
+        );
+        assert_eq!(
+            FrontendAction::SwitchContest.availability(&app, false),
+            FrontendActionAvailability::Unavailable("not in a workspace")
+        );
+        assert_eq!(
+            FrontendAction::ToggleDebug.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        assert_eq!(
+            FrontendAction::RunTests.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+        assert!(app.set_stress_setup_required(0, true, false));
+        assert_eq!(
+            FrontendAction::StartStress.availability(&app, false),
+            FrontendActionAvailability::Unavailable("stress helpers not initialized")
+        );
+        assert_eq!(
+            FrontendAction::InitializeStress.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+        assert_eq!(
+            FrontendAction::SwitchContest.availability(&app, true),
+            FrontendActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn palette_enter_executes_available_action_and_keeps_unavailable_action_open() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+        let standalone_context = AppContext::Standalone {
+            launch_root: root.path().to_path_buf(),
+        };
+        let mut standalone = ContestSwitchController::new(
+            &standalone_context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "deb".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut standalone),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(app.debug_enabled());
+        assert!(!palette.is_active());
+
+        palette.open();
+        palette.query = "sw".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            !handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut standalone),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(palette.is_active());
+        assert!(!standalone.modal_active());
+    }
+
+    #[test]
+    fn palette_enter_rechecks_current_availability_before_execution() {
+        let mut app = app_with_problems(&[1, 1]);
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
+        let (run_tx, run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "tes".to_string();
+        assert_eq!(
+            FrontendAction::RunTests.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+
+        assert!(app.select_problem(1));
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            !handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(palette.is_active());
+        assert!(run_rx.try_recv().is_err());
+
+        assert!(app.source_changed(1, PathBuf::from("B.py"), Language::Python));
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(!palette.is_active());
+        assert_eq!(run_rx.try_recv().unwrap().problem, 1);
+    }
+
+    #[test]
+    fn palette_and_contest_switch_enforce_modal_precedence_without_stacking() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let context = workspace_context(root.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        let mut events =
+            VecDeque::from(['q', 'c', ':', 'r', 'd', 's', 'S', 'i'].map(|character| {
+                TerminalEvent::Key(key(KeyCode::Char(character), KeyEventKind::Press))
+            }));
+
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut controller),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert_eq!(palette.query, "qc:rdsSi");
+        assert!(!app.should_quit());
+        assert!(!app.debug_enabled());
+        assert!(!app.samples_pane_enabled());
+        assert!(!controller.modal_active());
+
+        palette.open();
+        palette.query = "sw".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut controller),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(!palette.is_active());
+        assert!(controller.modal_active());
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char(':'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut controller),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert_eq!(controller.modal().unwrap().contest_id, ":");
+        assert!(!palette.is_active());
+    }
+
+    #[test]
+    fn palette_state_simulation_keeps_same_batch_q_and_c_safe() {
+        for character in ['q', 'c'] {
+            let root = tempfile::tempdir().unwrap();
+            let current = root.path().join("abc123");
+            let context = workspace_context(root.path());
+            let mut resolve =
+                |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+            let mut controller = ContestSwitchController::new(
+                &context,
+                &current,
+                &mut resolve,
+                successful_create_task(),
+            );
+            let mut app = app();
+            let (run_tx, _run_rx) = mpsc::channel();
+            let mut palette = CommandPalette::default();
+            let mut events = VecDeque::from([
+                TerminalEvent::Key(key(KeyCode::Char(':'), KeyEventKind::Press)),
+                TerminalEvent::Key(key(KeyCode::Char(character), KeyEventKind::Press)),
+            ]);
+
+            assert!(!contains_global_quit_event(
+                &events,
+                &app,
+                &controller,
+                &palette,
+            ));
+            assert!(
+                handle_frontend_terminal_events(
+                    &mut app,
+                    &view::RenderInfo::default(),
+                    &mut events,
+                    &run_tx,
+                    None,
+                    Some(&mut controller),
+                    &mut palette,
+                )
+                .unwrap()
+            );
+            assert!(palette.is_active());
+            assert_eq!(palette.query, character.to_string());
+            assert!(!app.should_quit());
+            assert!(!controller.modal_active());
+        }
+    }
+
+    #[test]
+    fn escape_then_q_in_one_batch_restores_global_quit_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let context = workspace_context(root.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".to_string());
+        let mut controller = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "deb".to_string();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Escape, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(contains_global_quit_event(
+            &events,
+            &app,
+            &controller,
+            &palette,
+        ));
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut controller),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(!palette.is_active());
+        assert_eq!(palette.query, "");
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn palette_suppresses_detail_scrollbar_and_samples_pointer_actions() {
+        let mut app = foldable_app("actual body\n".repeat(1_000));
+        let info = rendered_fold_info(&app, 100, 40);
+        let header = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Actual)
+            .unwrap();
+        let scrollbar = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                header.area.x.saturating_add(1),
+                header.area.y,
+            )),
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                scrollbar.gutter.x,
+                scrollbar.track_end_row().saturating_sub(1),
+            )),
+        ]);
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+
+        assert!(
+            !handle_frontend_terminal_events(
+                &mut app,
+                &info,
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Actual)
+        );
+        assert_eq!(app.detail_scroll(), 0);
+
+        let samples_info = view::RenderInfo {
+            max_detail_scroll: Some(20),
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
+        };
+        let mut events = VecDeque::from([TerminalEvent::Pointer(pointer(
+            PointerKind::ScrollDown,
+            5,
+            5,
+        ))]);
+        assert!(
+            !handle_frontend_terminal_events(
+                &mut app,
+                &samples_info,
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.selected_case(), 0);
+    }
+
+    #[test]
+    fn palette_open_cancels_pixel_drag_and_suppresses_later_pixel_events() {
+        let mut app = app();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let generation = 17;
+        let mode = pixel_mode(generation);
+        let info = scrollbar_info_with_pixels(&app, 1_000, 0, 1, Some((20, generation)));
+        let geometry = &info.detail_scrollbar.as_ref().unwrap().geometry;
+        let gutter_x = u32::from(geometry.gutter.x) * 10 + 5;
+        let thumb_y = u32::from(geometry.thumb_start_row) * 20 + 10;
+
+        assert!(!dispatch_pixel(
+            &mut app,
+            &mut layout,
+            &mut drag,
+            &info,
+            mode,
+            PointerKind::Down(PointerButton::Left),
+            gutter_x,
+            thumb_y,
+            Some(generation),
+        ));
+        assert!(drag.active.is_some());
+
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Char(':'), KeyEventKind::Press)),
+            TerminalEvent::Pointer(pixel_pointer(
+                PointerKind::Drag(PointerButton::Left),
+                gutter_x,
+                thumb_y + 200,
+                Some(generation),
+            )),
+            TerminalEvent::Pointer(pixel_pointer(
+                PointerKind::ScrollDown,
+                gutter_x,
+                thumb_y,
+                Some(generation),
+            )),
+        ]);
+
+        assert!(
+            super::handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                mode,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, None),
+                    contest_switch: None,
+                    command_palette: Some(&mut palette),
+                },
+            )
+            .unwrap()
+        );
+        assert!(events.is_empty());
+        assert!(palette.is_active());
+        assert!(drag.active.is_none());
+        assert_eq!(app.detail_scroll(), 0);
     }
 
     #[test]
@@ -3625,7 +4672,12 @@ mod tests {
             &mut fresh_resolve,
             successful_create_task(),
         );
-        assert!(!contains_global_quit_event(&queued, &fresh));
+        assert!(!contains_global_quit_event(
+            &queued,
+            &app,
+            &fresh,
+            &CommandPalette::default(),
+        ));
 
         // The modal consumes these keys before the existing application handler can mutate app.
         assert!(!handle_key(
@@ -5436,6 +6488,7 @@ mod tests {
                 FrontendInputContext {
                     terminal: TerminalInputContext::new(&run_tx, None),
                     contest_switch: None,
+                    command_palette: None,
                 },
             )
             .unwrap()
