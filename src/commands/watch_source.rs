@@ -10,20 +10,23 @@ pub(super) struct WatchedSource {
     pub language: Language,
 }
 
-pub(super) fn build_watched_sources(destination: &Path, contest: &Contest) -> Vec<WatchedSource> {
+pub(super) fn build_watched_sources(
+    destination: &Path,
+    contest: &Contest,
+) -> std::io::Result<Vec<WatchedSource>> {
     let mut sources = Vec::new();
 
     for (problem_index, problem) in contest.problems.iter().enumerate() {
         for language in [Language::Cpp, Language::Python] {
             sources.push(WatchedSource {
                 problem: problem_index,
-                path: destination.join(format!("{}.{}", problem.index, language.extension())),
+                path: crate::workspace::source_file_path(destination, &problem.index, language)?,
                 language,
             });
         }
     }
 
-    sources
+    Ok(sources)
 }
 
 pub(super) fn resolve_watched_source<'a>(
@@ -57,7 +60,7 @@ mod tests {
             problems: vec![problem("A"), problem("D")],
         };
 
-        let sources = build_watched_sources(destination, &contest);
+        let sources = build_watched_sources(destination, &contest).unwrap();
 
         assert_eq!(sources.len(), 4);
 

@@ -39,6 +39,16 @@ where
     let language = resolve_language(specified_language, config);
     let template = resolve_template(language)?;
 
+    create_source_at(destination, name, language, &template, reporter).map(|_| ())
+}
+
+pub(crate) fn create_source(
+    destination: &Path,
+    name: &str,
+    language: Language,
+    reporter: &mut dyn Reporter,
+) -> Result<std::path::PathBuf, AppError> {
+    let template = resolve_source_template(language)?;
     create_source_at(destination, name, language, &template, reporter)
 }
 
@@ -48,10 +58,10 @@ fn create_source_at(
     language: Language,
     template: &str,
     reporter: &mut dyn Reporter,
-) -> Result<(), AppError> {
+) -> Result<std::path::PathBuf, AppError> {
     let path = workspace::create_source_file(destination, name, language, template)?;
 
     reporter.report(Event::SourceCreated { path: &path });
 
-    Ok(())
+    Ok(path)
 }

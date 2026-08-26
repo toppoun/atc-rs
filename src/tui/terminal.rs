@@ -26,6 +26,76 @@ const INITIAL_PIXEL_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
 const PIXEL_ENABLE_VERIFY_TIMEOUT: Duration = Duration::from_millis(100);
 const RESIZE_METRIC_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
 
+#[derive(Debug)]
+pub(super) enum SuspendedRunError<E> {
+    Suspend(io::Error),
+    SuspendAndResume {
+        suspend: io::Error,
+        resume: io::Error,
+    },
+    Operation(E),
+    Resume(io::Error),
+    OperationAndResume {
+        operation: E,
+        resume: io::Error,
+    },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SuspendedRunError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suspend(error) => {
+                write!(formatter, "failed to suspend the TUI terminal: {error}")
+            }
+            Self::SuspendAndResume { suspend, resume } => write!(
+                formatter,
+                "failed to restore the TUI terminal: {resume}; suspension also failed: {suspend}"
+            ),
+            Self::Operation(error) => error.fmt(formatter),
+            Self::Resume(error) => write!(formatter, "failed to restore the TUI terminal: {error}"),
+            Self::OperationAndResume { operation, resume } => write!(
+                formatter,
+                "failed to restore the TUI terminal: {resume}; editor also failed: {operation}"
+            ),
+        }
+    }
+}
+
+fn run_suspended_with<S, T, E>(
+    state: &mut S,
+    suspend: impl FnOnce(&mut S) -> io::Result<()>,
+    operation: impl FnOnce(&mut S) -> Result<T, E>,
+    resume: impl FnOnce(&mut S) -> io::Result<()>,
+) -> Result<T, SuspendedRunError<E>> {
+    if let Err(suspend) = suspend(state) {
+        return match resume(state) {
+            Ok(()) => Err(SuspendedRunError::Suspend(suspend)),
+            Err(resume) => Err(SuspendedRunError::SuspendAndResume { suspend, resume }),
+        };
+    }
+
+    let operation = operation(state);
+    let resume = resume(state);
+    match (operation, resume) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(SuspendedRunError::Operation(operation)),
+        (Ok(_), Err(resume)) => Err(SuspendedRunError::Resume(resume)),
+        (Err(operation), Err(resume)) => {
+            Err(SuspendedRunError::OperationAndResume { operation, resume })
+        }
+    }
+}
+
+fn recreate_after_input_flush<R, T, E>(
+    resource: &mut Option<R>,
+    flush_input: impl FnOnce() -> Result<(), E>,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    flush_input()?;
+    drop(resource.take());
+    operation()
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum PixelRefresh {
     #[default]
@@ -1409,9 +1479,13 @@ fn establish_initial_attempt_fallback(
 }
 
 /// Sole owner of rendering, input, and terminal lifecycle for the watch TUI.
-pub(crate) struct TerminaSession {
+struct TerminalResources {
     terminal: SessionRatatuiTerminal,
     reader: EventReader,
+}
+
+pub(crate) struct TerminaSession {
+    resources: Option<TerminalResources>,
     pending_events: VecDeque<TerminalEvent>,
     mouse_mode: MouseMode,
     pixel_origin: Option<PixelCoordinateOrigin>,
@@ -1420,7 +1494,7 @@ pub(crate) struct TerminaSession {
     high_res_retry: HighResRetry,
     mouse_trace_context: MouseTraceContext,
     mouse_trace_diagnostic: Option<MouseTraceDiagnostic>,
-    _panic_hook: ScopedPanicHook,
+    panic_hook: Option<ScopedPanicHook>,
 }
 
 impl TerminaSession {
@@ -1548,8 +1622,7 @@ impl TerminaSession {
         let terminal = RatatuiTerminal::new(backend)?;
 
         Ok(Self {
-            terminal,
-            reader,
+            resources: Some(TerminalResources { terminal, reader }),
             pending_events,
             mouse_mode,
             pixel_origin,
@@ -1558,12 +1631,17 @@ impl TerminaSession {
             high_res_retry,
             mouse_trace_context,
             mouse_trace_diagnostic,
-            _panic_hook: panic_hook,
+            panic_hook: Some(panic_hook),
         })
     }
 
     pub(super) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
-        self.terminal.draw(render).map(|_| ())
+        self.resources
+            .as_mut()
+            .expect("live TUI session must own terminal resources")
+            .terminal
+            .draw(render)
+            .map(|_| ())
     }
 
     pub(super) fn poll(&mut self, wait: Duration) -> io::Result<bool> {
@@ -1574,10 +1652,15 @@ impl TerminaSession {
         let deadline = Instant::now() + wait;
         let mut remaining = wait;
         loop {
-            if !self.reader.poll(Some(remaining), |_| true)? {
+            let reader = &self
+                .resources
+                .as_ref()
+                .expect("live TUI session must own terminal resources")
+                .reader;
+            if !reader.poll(Some(remaining), |_| true)? {
                 return Ok(false);
             }
-            let event = self.reader.read(|_| true)?;
+            let event = reader.read(|_| true)?;
             if let Some(event) = self.application_event(event) {
                 self.pending_events.push_back(event);
                 return Ok(true);
@@ -1595,7 +1678,12 @@ impl TerminaSession {
             return Ok(event);
         }
         loop {
-            let event = self.reader.read(|_| true)?;
+            let event = self
+                .resources
+                .as_ref()
+                .expect("live TUI session must own terminal resources")
+                .reader
+                .read(|_| true)?;
             if let Some(event) = self.application_event(event) {
                 return Ok(event);
             }
@@ -1684,8 +1772,19 @@ impl TerminaSession {
     }
 
     fn buffer_available_application_events(&mut self) -> io::Result<()> {
-        while self.reader.poll(Some(Duration::ZERO), |_| true)? {
-            let event = self.reader.read(|_| true)?;
+        while self
+            .resources
+            .as_ref()
+            .expect("live TUI session must own terminal resources")
+            .reader
+            .poll(Some(Duration::ZERO), |_| true)?
+        {
+            let event = self
+                .resources
+                .as_ref()
+                .expect("live TUI session must own terminal resources")
+                .reader
+                .read(|_| true)?;
             if let Some(event) = self.application_event(event) {
                 self.pending_events.push_back(event);
             }
@@ -1698,18 +1797,24 @@ impl TerminaSession {
         reason: PixelFallbackReason,
         cell_fallback_safe: bool,
     ) -> io::Result<()> {
-        let fallback = if cell_fallback_safe {
-            transition_to_cells(
-                self.terminal.backend_mut().terminal_mut(),
-                &self.reader,
-                &mut self.pending_events,
-            )
-        } else {
-            transition_to_disabled(
-                self.terminal.backend_mut().terminal_mut(),
-                &self.reader,
-                &mut self.pending_events,
-            )
+        let fallback = {
+            let resources = self
+                .resources
+                .as_mut()
+                .expect("live TUI session must own terminal resources");
+            if cell_fallback_safe {
+                transition_to_cells(
+                    resources.terminal.backend_mut().terminal_mut(),
+                    &resources.reader,
+                    &mut self.pending_events,
+                )
+            } else {
+                transition_to_disabled(
+                    resources.terminal.backend_mut().terminal_mut(),
+                    &resources.reader,
+                    &mut self.pending_events,
+                )
+            }
         };
 
         match fallback {
@@ -1762,22 +1867,40 @@ impl TerminaSession {
         debug_assert_eq!(self.mouse_mode, MouseMode::Cells);
         self.pending_events
             .retain(|event| !matches!(event, TerminalEvent::Pointer(_)));
-        let dimensions = self.terminal.backend().terminal().get_dimensions()?;
+        let dimensions = self
+            .resources
+            .as_ref()
+            .expect("live TUI session must own terminal resources")
+            .terminal
+            .backend()
+            .terminal()
+            .get_dimensions()?;
         let origin = self
             .mouse_trace_context
             .pixel_origin
             .ok_or_else(|| io::Error::other("deferred pixel retry lost its trusted origin"))?;
         let (initial_selection, cell_fallback_safe) = {
-            let output = self.terminal.backend_mut().terminal_mut();
-            let resize_seen =
-                normalize_for_deferred_pixel_retry(output, &self.reader, &mut self.pending_events)?;
+            let resources = self
+                .resources
+                .as_mut()
+                .expect("live TUI session must own terminal resources");
+            let output = resources.terminal.backend_mut().terminal_mut();
+            let resize_seen = normalize_for_deferred_pixel_retry(
+                output,
+                &resources.reader,
+                &mut self.pending_events,
+            )?;
             let replies = if resize_seen {
                 CapabilityReplies {
                     resize_seen: true,
                     ..CapabilityReplies::default()
                 }
             } else {
-                query_initial_pixel_capabilities(output, &self.reader, &mut self.pending_events)?
+                query_initial_pixel_capabilities(
+                    output,
+                    &resources.reader,
+                    &mut self.pending_events,
+                )?
             };
             (
                 classify_initial_pixel_candidate(
@@ -1799,19 +1922,23 @@ impl TerminaSession {
         };
 
         let verification = {
-            let output = self.terminal.backend_mut().terminal_mut();
+            let resources = self
+                .resources
+                .as_mut()
+                .expect("live TUI session must own terminal resources");
+            let output = resources.terminal.backend_mut().terminal_mut();
             let resize_seen =
-                begin_transition_to_pixels(output, &self.reader, &mut self.pending_events)?;
+                begin_transition_to_pixels(output, &resources.reader, &mut self.pending_events)?;
             let mut verification = if resize_seen {
                 CapabilityReplies {
                     resize_seen: true,
                     ..CapabilityReplies::default()
                 }
             } else {
-                query_pixel_mode(output, &self.reader, &mut self.pending_events)?
+                query_pixel_mode(output, &resources.reader, &mut self.pending_events)?
             };
             verification.resize_seen |=
-                drain_transition_mouse_input(&self.reader, &mut self.pending_events)?;
+                drain_transition_mouse_input(&resources.reader, &mut self.pending_events)?;
             verification
         };
 
@@ -1824,7 +1951,14 @@ impl TerminaSession {
                 .complete_deferred_retry_fallback(reason, cell_fallback_is_safe(verification));
         }
 
-        finish_transition_to_pixels(self.terminal.backend_mut().terminal_mut())?;
+        finish_transition_to_pixels(
+            self.resources
+                .as_mut()
+                .expect("live TUI session must own terminal resources")
+                .terminal
+                .backend_mut()
+                .terminal_mut(),
+        )?;
         self.mouse_mode = pixel_mouse_mode(candidate, self.pixel_generation);
         self.pixel_origin = Some(candidate.origin);
         self.mouse_trace_diagnostic = Some(MouseTraceDiagnostic::DeferredRetrySucceeded);
@@ -1856,15 +1990,27 @@ impl TerminaSession {
             )
         });
 
-        let dimensions = self.terminal.backend().terminal().get_dimensions()?;
+        let dimensions = self
+            .resources
+            .as_ref()
+            .expect("live TUI session must own terminal resources")
+            .terminal
+            .backend()
+            .terminal()
+            .get_dimensions()?;
         let origin = self.pixel_origin;
         let refreshed = {
-            let output = self.terminal.backend_mut().terminal_mut();
+            let resources = self
+                .resources
+                .as_mut()
+                .expect("live TUI session must own terminal resources");
+            let output = resources.terminal.backend_mut().terminal_mut();
             output.ensure_mode_disabled(
                 LifecycleStep::ButtonEventMouse,
                 DecPrivateModeCode::ButtonEventMouse,
             )?;
-            let resize_seen = drain_transition_mouse_input(&self.reader, &mut self.pending_events)?;
+            let resize_seen =
+                drain_transition_mouse_input(&resources.reader, &mut self.pending_events)?;
             let replies = if resize_seen {
                 CapabilityReplies {
                     resize_seen: true,
@@ -1873,7 +2019,7 @@ impl TerminaSession {
             } else {
                 query_pixel_metrics(
                     output,
-                    &self.reader,
+                    &resources.reader,
                     &mut self.pending_events,
                     RESIZE_METRIC_QUERY_TIMEOUT,
                 )?
@@ -1893,7 +2039,14 @@ impl TerminaSession {
 
         match refreshed {
             Ok((metrics, origin)) => {
-                finish_transition_to_pixels(self.terminal.backend_mut().terminal_mut())?;
+                finish_transition_to_pixels(
+                    self.resources
+                        .as_mut()
+                        .expect("live TUI session must own terminal resources")
+                        .terminal
+                        .backend_mut()
+                        .terminal_mut(),
+                )?;
                 self.mouse_mode = MouseMode::Pixels {
                     metrics,
                     origin,
@@ -1902,9 +2055,13 @@ impl TerminaSession {
                 self.mouse_trace_diagnostic = None;
             }
             Err(reason) => {
+                let resources = self
+                    .resources
+                    .as_mut()
+                    .expect("live TUI session must own terminal resources");
                 let fallback = transition_to_cells(
-                    self.terminal.backend_mut().terminal_mut(),
-                    &self.reader,
+                    resources.terminal.backend_mut().terminal_mut(),
+                    &resources.reader,
                     &mut self.pending_events,
                 );
                 match fallback {
@@ -1939,7 +2096,64 @@ impl TerminaSession {
     }
 
     pub(crate) fn restore(&mut self) -> io::Result<()> {
-        self.terminal.backend_mut().terminal_mut().restore()
+        let Some(resources) = self.resources.as_mut() else {
+            return Ok(());
+        };
+        resources.terminal.backend_mut().terminal_mut().restore()
+    }
+
+    fn restart(&mut self) -> io::Result<()> {
+        // A failed suspension keeps only the uncertain lifecycle steps active so cleanup can be
+        // retried. Finish that cleanup before replacing the handles.
+        self.restore()?;
+
+        // Termina's platform terminal restores its captured cooked/platform modes from `Drop`.
+        // Destroy both the old terminal and its last EventReader before starting the replacement;
+        // otherwise the old drop would run after `start` and undo the replacement's raw mode.
+        let mut replacement =
+            recreate_after_input_flush(&mut self.resources, flush_terminal_input, Self::start)?;
+
+        // `start` temporarily nests a panic hook. Restore this live session's hook before moving
+        // the replacement terminal state into it.
+        drop(replacement.panic_hook.take());
+
+        self.resources = replacement.resources.take();
+        std::mem::swap(&mut self.pending_events, &mut replacement.pending_events);
+        std::mem::swap(&mut self.mouse_mode, &mut replacement.mouse_mode);
+        std::mem::swap(&mut self.pixel_origin, &mut replacement.pixel_origin);
+        std::mem::swap(
+            &mut self.pixel_generation,
+            &mut replacement.pixel_generation,
+        );
+        std::mem::swap(&mut self.pixel_refresh, &mut replacement.pixel_refresh);
+        std::mem::swap(&mut self.high_res_retry, &mut replacement.high_res_retry);
+        std::mem::swap(
+            &mut self.mouse_trace_context,
+            &mut replacement.mouse_trace_context,
+        );
+        std::mem::swap(
+            &mut self.mouse_trace_diagnostic,
+            &mut replacement.mouse_trace_diagnostic,
+        );
+
+        Ok(())
+    }
+
+    pub(super) fn suspend_and_run<T, E>(
+        &mut self,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, SuspendedRunError<E>> {
+        let mut operation = Some(operation);
+        run_suspended_with(
+            self,
+            Self::restore,
+            |_| {
+                operation
+                    .take()
+                    .expect("editor operation runs at most once")()
+            },
+            Self::restart,
+        )
     }
 }
 
@@ -2033,6 +2247,31 @@ pub(super) enum PointerPosition {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct SuspendedHarness {
+        events: Vec<&'static str>,
+        suspend_error: bool,
+        resume_error: bool,
+    }
+
+    fn harness_suspend(harness: &mut SuspendedHarness) -> io::Result<()> {
+        harness.events.push("suspend");
+        if harness.suspend_error {
+            Err(io::Error::other("suspend failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn harness_resume(harness: &mut SuspendedHarness) -> io::Result<()> {
+        harness.events.push("restore");
+        if harness.resume_error {
+            Err(io::Error::other("restore failed"))
+        } else {
+            Ok(())
+        }
+    }
 
     fn complete_replies() -> CapabilityReplies {
         CapabilityReplies {
@@ -2186,6 +2425,142 @@ mod lifecycle_tests {
         )
         .unwrap_err();
         assert!(!deferred_post_enable.schedules_deferred_retry());
+    }
+
+    #[test]
+    fn suspended_operation_orders_suspend_launch_restore_and_restores_after_success() {
+        let mut harness = SuspendedHarness::default();
+        let result = run_suspended_with(
+            &mut harness,
+            harness_suspend,
+            |harness| {
+                harness.events.push("launch");
+                Ok::<_, &'static str>("complete")
+            },
+            harness_resume,
+        );
+
+        assert_eq!(result.unwrap(), "complete");
+        assert_eq!(harness.events, ["suspend", "launch", "restore"]);
+    }
+
+    #[test]
+    fn suspended_operation_restores_after_spawn_or_nonzero_failure() {
+        for operation_error in ["spawn failed", "editor exited 7"] {
+            let mut harness = SuspendedHarness::default();
+            let error = run_suspended_with(
+                &mut harness,
+                harness_suspend,
+                |harness| {
+                    harness.events.push("launch");
+                    Err::<(), _>(operation_error)
+                },
+                harness_resume,
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(error, SuspendedRunError::Operation(error) if error == operation_error)
+            );
+            assert_eq!(harness.events, ["suspend", "launch", "restore"]);
+        }
+    }
+
+    #[test]
+    fn suspended_operation_prioritizes_restore_failure_and_preserves_editor_error() {
+        let mut harness = SuspendedHarness {
+            resume_error: true,
+            ..SuspendedHarness::default()
+        };
+        let error = run_suspended_with(
+            &mut harness,
+            harness_suspend,
+            |harness| {
+                harness.events.push("launch");
+                Err::<(), _>("spawn failed")
+            },
+            harness_resume,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SuspendedRunError::OperationAndResume { .. }
+        ));
+        let display = error.to_string();
+        assert!(display.starts_with("failed to restore the TUI terminal"));
+        assert!(display.contains("spawn failed"));
+        assert_eq!(harness.events, ["suspend", "launch", "restore"]);
+    }
+
+    #[test]
+    fn failed_suspend_skips_editor_but_still_attempts_tui_restoration() {
+        let mut harness = SuspendedHarness {
+            suspend_error: true,
+            ..SuspendedHarness::default()
+        };
+        let error = run_suspended_with(
+            &mut harness,
+            harness_suspend,
+            |harness| {
+                harness.events.push("must-not-launch");
+                Ok::<_, &'static str>(())
+            },
+            harness_resume,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SuspendedRunError::Suspend(_)));
+        assert_eq!(harness.events, ["suspend", "restore"]);
+    }
+
+    #[test]
+    fn terminal_input_is_flushed_and_old_resources_drop_before_recreation_starts() {
+        struct DropMarker(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("drop-old");
+            }
+        }
+
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut resource = Some(DropMarker(std::rc::Rc::clone(&events)));
+        let replacement = recreate_after_input_flush(
+            &mut resource,
+            || {
+                events.borrow_mut().push("flush-input");
+                Ok::<_, std::convert::Infallible>(())
+            },
+            || {
+                events.borrow_mut().push("start-new");
+                Ok::<_, std::convert::Infallible>("replacement")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(replacement, "replacement");
+        assert!(resource.is_none());
+        assert_eq!(*events.borrow(), ["flush-input", "drop-old", "start-new"]);
+    }
+
+    #[test]
+    fn failed_post_editor_input_flush_keeps_old_resources_for_final_cleanup() {
+        let mut resource = Some("old-terminal");
+        let mut started = false;
+        let error = recreate_after_input_flush(
+            &mut resource,
+            || Err::<(), _>("flush failed"),
+            || {
+                started = true;
+                Ok("replacement")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "flush failed");
+        assert!(!started);
+        assert_eq!(resource, Some("old-terminal"));
     }
 
     #[test]

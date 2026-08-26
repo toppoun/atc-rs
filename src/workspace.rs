@@ -888,9 +888,7 @@ pub fn create_source_file(
     language: Language,
     template: &str,
 ) -> io::Result<PathBuf> {
-    validate_path_component(name, "source name")?;
-
-    let path = destination.join(format!("{}.{}", name, language.extension()));
+    let path = source_file_path(destination, name, language)?;
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -900,6 +898,16 @@ pub fn create_source_file(
     file.write_all(template.as_bytes())?;
 
     Ok(path)
+}
+
+pub(crate) fn source_file_path(
+    destination: &Path,
+    name: &str,
+    language: Language,
+) -> io::Result<PathBuf> {
+    validate_path_component(name, "source name")?;
+
+    Ok(destination.join(format!("{}.{}", name, language.extension())))
 }
 
 pub fn create_source_files(

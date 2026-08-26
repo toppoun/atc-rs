@@ -18,7 +18,7 @@ mod watch_worker;
 
 pub(crate) use config::config_init;
 pub(crate) use contest::contest;
-pub(crate) use create::create;
+pub(crate) use create::{create, create_source};
 pub(crate) use doctor::doctor;
 pub(crate) use init::init;
 pub(crate) use login::login;

@@ -81,7 +81,7 @@ fn process_changed_paths_with(
         &mut dyn Reporter,
     ) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
-    let watched_sources = build_watched_sources(destination, contest);
+    let watched_sources = build_watched_sources(destination, contest)?;
 
     for path in paths {
         if !path.is_file() {
@@ -291,7 +291,7 @@ mod tests {
             problems: vec![problem("A"), problem("D")],
         };
 
-        let sources = build_watched_sources(destination, &contest);
+        let sources = build_watched_sources(destination, &contest).unwrap();
 
         let cpp = resolve_watched_source(&sources, &destination.join("A.cpp")).unwrap();
 

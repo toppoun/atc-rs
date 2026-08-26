@@ -131,7 +131,7 @@ fn start_watcher(
     contest: &Contest,
     tx: mpsc::Sender<Message>,
 ) -> io::Result<WatcherThread> {
-    let watched_sources = build_watched_sources(destination, contest);
+    let watched_sources = build_watched_sources(destination, contest)?;
 
     let file_watcher = watcher::FileWatcher::new(destination)?;
 
@@ -229,8 +229,8 @@ pub(super) fn watch_tui_at(
 
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
-    let runner_config = Config::load()?.runner;
-    let mut session = Some(ContestSession::start(initial_input, &runner_config)?);
+    let config = Config::load()?;
+    let mut session = Some(ContestSession::start(initial_input, &config.runner)?);
 
     let mut terminal = match crate::tui::TerminaSession::start() {
         Ok(terminal) => terminal,
@@ -268,6 +268,7 @@ pub(super) fn watch_tui_at(
         let frontend_result = active_session.run_frontend(
             &mut terminal,
             &app_context,
+            &config,
             &mut preferences,
             |contest_id| {
                 let Some(root) = app_context.workspace_root() else {
@@ -337,7 +338,7 @@ pub(super) fn watch_tui_at(
                     break Err(error);
                 }
 
-                match ContestSession::start(prepared, &runner_config) {
+                match ContestSession::start(prepared, &config.runner) {
                     Ok(new_session) => session = Some(new_session),
                     Err(error) => break Err(error),
                 }
@@ -813,6 +814,7 @@ impl ContestSession {
         &mut self,
         terminal: &mut crate::tui::TerminaSession,
         app_context: &AppContext,
+        config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
         resolve_contest_switch: impl FnMut(&str) -> crate::tui::ContestSwitchResolution,
         contest_switch_task: crate::tui::ContestSwitchTask,
@@ -822,6 +824,7 @@ impl ContestSession {
         let channels = self.channels();
         let runtime = crate::tui::SessionRuntime::new(
             &self.input.destination,
+            config,
             &self.input.contest,
             sample_counts,
             stress_cases,
@@ -1814,7 +1817,7 @@ mod tests {
             contest_id: "contest".to_string(),
             problems: vec![problem("B"), problem("A")],
         };
-        let watched_sources = build_watched_sources(temp.path(), &contest);
+        let watched_sources = build_watched_sources(temp.path(), &contest).unwrap();
         let b_cpp = temp.path().join("B.cpp");
         let a_py = temp.path().join("A.py");
         let helper = temp.path().join("A_brute.py");
@@ -1852,7 +1855,7 @@ mod tests {
             contest_id: "contest".to_string(),
             problems: vec![problem("A")],
         };
-        let watched_sources = build_watched_sources(temp.path(), &contest);
+        let watched_sources = build_watched_sources(temp.path(), &contest).unwrap();
         let source = temp.path().join("A.py");
         assert!(!source.exists());
         std::fs::write(&source, "source").unwrap();

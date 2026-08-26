@@ -21,7 +21,8 @@ use super::detail_scrollbar::{
 };
 use super::mouse::MouseMode;
 use super::{
-    CommandPalette, FrontendActionAvailability, SwitchContestModal, SwitchContestModalState,
+    CommandPalette, FrontendActionAvailability, OpenSourceModal, SwitchContestModal,
+    SwitchContestModalState,
 };
 use crate::language::Language;
 
@@ -214,6 +215,13 @@ pub struct RenderInfo {
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct FrontendOverlays<'a> {
+    pub(super) switch_modal: Option<&'a SwitchContestModal>,
+    pub(super) source_modal: Option<&'a OpenSourceModal>,
+    pub(super) command_palette: Option<&'a CommandPalette>,
+}
+
 #[cfg(test)]
 pub(super) fn render(
     frame: &mut Frame,
@@ -230,7 +238,14 @@ pub(super) fn render_with_mouse_mode(
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
 ) -> RenderInfo {
-    render_frontend_with_mouse_mode(frame, app, detail_layout, mouse_mode, false, None, None)
+    render_frontend_with_mouse_mode(
+        frame,
+        app,
+        detail_layout,
+        mouse_mode,
+        false,
+        FrontendOverlays::default(),
+    )
 }
 
 pub(super) fn render_frontend_with_mouse_mode(
@@ -239,8 +254,7 @@ pub(super) fn render_frontend_with_mouse_mode(
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
     contest_switch_available: bool,
-    switch_modal: Option<&SwitchContestModal>,
-    command_palette: Option<&CommandPalette>,
+    overlays: FrontendOverlays<'_>,
 ) -> RenderInfo {
     let area = frame.area();
     let current_problem = app.current_problem();
@@ -410,9 +424,11 @@ pub(super) fn render_frontend_with_mouse_mode(
 
     frame.render_widget(footer, rows[2]);
 
-    if let Some(modal) = switch_modal {
+    if let Some(modal) = overlays.switch_modal {
         render_switch_contest_modal(frame, modal);
-    } else if let Some(command_palette) = command_palette {
+    } else if let Some(modal) = overlays.source_modal {
+        render_open_source_modal(frame, app, modal);
+    } else if let Some(command_palette) = overlays.command_palette {
         render_command_palette(frame, app, command_palette, contest_switch_available);
     }
 
@@ -423,6 +439,102 @@ pub(super) fn render_frontend_with_mouse_mode(
         detail_scrollbar,
         detail_section_headers,
     }
+}
+
+fn render_open_source_modal(frame: &mut Frame, app: &WatchApp, modal: &OpenSourceModal) {
+    let frame_area = frame.area();
+    let width = frame_area.width.min(76);
+    let height = frame_area.height.min(16);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let line_width = usize::from(inner.width);
+    let current = modal.current_language(app);
+    let mut lines = vec![
+        Line::raw(fit_command_palette_row(
+            &format!("Problem: {}", modal.problem_index),
+            line_width,
+        )),
+        Line::raw(""),
+    ];
+
+    for language in Language::ALL {
+        let marker = if modal.selected_language() == language {
+            ">"
+        } else {
+            " "
+        };
+        let mut states = Vec::new();
+        if current == Some(language) {
+            states.push("current");
+        }
+        if modal.path_for(language).is_ok_and(|path| !path.is_file()) {
+            states.push("not created");
+        }
+        let state = if states.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", states.join(", "))
+        };
+        let row = fit_command_palette_row(
+            &format!("{marker} {:<8}{state}", language_label(language)),
+            line_width,
+        );
+        let style = if modal.selected_language() == language {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(row, style));
+    }
+
+    let selected = modal.selected_path();
+    let selected_exists = selected.as_ref().is_ok_and(|path| path.is_file());
+    let destination = selected
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    lines.extend([
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Destination:", line_width)),
+        Line::raw(fit_command_palette_row(
+            &format!("  {destination}"),
+            line_width,
+        )),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row(
+            if selected_exists {
+                "[Enter] Open"
+            } else {
+                "[i] Create & Open"
+            },
+            line_width,
+        )),
+        Line::raw(fit_command_palette_row(
+            "[↑/↓ or j/k] Select   [Esc] Close",
+            line_width,
+        )),
+    ]);
+    if let Some(error) = modal.error.as_deref() {
+        for line in error.lines() {
+            lines.push(Line::styled(
+                fit_command_palette_row(line, line_width),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .title(" Open Source ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_command_palette(
@@ -973,6 +1085,7 @@ mod tests {
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
     use ratatui::{Terminal, backend::TestBackend};
+    use std::fs;
     use std::path::PathBuf;
 
     fn app() -> WatchApp {
@@ -1062,6 +1175,41 @@ mod tests {
         text
     }
 
+    fn rendered_open_source_text(
+        app: &WatchApp,
+        modal: &OpenSourceModal,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        source_modal: Some(modal),
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn rendered_frontend_buffer_with_palette(
         app: &WatchApp,
         switch_available: bool,
@@ -1081,8 +1229,11 @@ mod tests {
                     &mut detail_layout,
                     MouseMode::Cells,
                     switch_available,
-                    modal,
-                    palette,
+                    FrontendOverlays {
+                        switch_modal: modal,
+                        source_modal: None,
+                        command_palette: palette,
+                    },
                 );
             })
             .unwrap();
@@ -1647,7 +1798,7 @@ mod tests {
             frame.width,
             frame.height,
         );
-        assert!(rendered.contains("Initialize Stress"));
+        assert!(rendered.contains("Stop Stress"));
         assert!(!rendered.contains("Run Tests"));
 
         palette.selected = 0;
@@ -1960,6 +2111,60 @@ mod tests {
         assert!(rendered.contains("contest metadata is invalid"));
         assert!(rendered.contains("[Esc] Cancel"));
         assert!(!rendered.contains("[Enter]"));
+    }
+
+    #[test]
+    fn open_source_modal_renders_fixed_languages_current_missing_destination_and_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let cpp = temp.path().join("A.cpp");
+        fs::write(&cpp, "source").unwrap();
+        let mut app = app();
+        app.source_changed(0, cpp.clone(), Language::Cpp);
+        let mut controller = super::super::OpenSourceController::new(temp.path(), Language::Python);
+        assert!(controller.open(&app));
+
+        let rendered = rendered_open_source_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains("Open Source"));
+        assert!(rendered.contains("Problem: A"));
+        let cpp_position = rendered.find("C++").unwrap();
+        let python_position = rendered.find("Python").unwrap();
+        assert!(cpp_position < python_position);
+        assert!(rendered.contains("C++       current"));
+        assert!(rendered.contains("Python    not created"));
+        assert!(rendered.contains(&cpp.display().to_string()));
+        assert!(rendered.contains("[Enter] Open"));
+
+        controller.modal.as_mut().unwrap().selected_language = Language::Python;
+        let rendered = rendered_open_source_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains(&temp.path().join("A.py").display().to_string()));
+        assert!(rendered.contains("[i] Create & Open"));
+        assert!(rendered.contains("C++       current"));
+    }
+
+    #[test]
+    fn open_source_modal_truncates_unicode_destination_and_survives_narrow_tiny_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let unicode = root
+            .path()
+            .join("非常に長いコンテスト保存先")
+            .join("さらに長いディレクトリ名");
+        fs::create_dir_all(&unicode).unwrap();
+        let app = app();
+        let mut controller = super::super::OpenSourceController::new(&unicode, Language::Python);
+        assert!(controller.open(&app));
+        controller.modal.as_mut().unwrap().error =
+            Some("No editor configured.\nSet VISUAL or EDITOR, or configure [editor].".to_string());
+        let actual_path = unicode.join("A.py");
+
+        let narrow = rendered_open_source_text(&app, controller.modal().unwrap(), 32, 16);
+        assert!(narrow.contains("Open Source"));
+        assert!(narrow.contains("Problem: A"));
+        assert!(narrow.contains('…'));
+        assert!(!narrow.contains(&actual_path.display().to_string()));
+
+        for (width, height) in [(20, 8), (8, 4), (1, 1), (0, 0)] {
+            let _ = rendered_open_source_text(&app, controller.modal().unwrap(), width, height);
+        }
     }
 
     #[test]

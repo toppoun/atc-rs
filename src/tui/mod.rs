@@ -20,7 +20,10 @@ use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_context::AppContext;
+use crate::config::Config;
+use crate::editor::{self, EditorLaunchMode, ResolvedEditor};
 use crate::error::AppError;
+use crate::language::Language;
 use crate::model::Contest;
 use crate::ui::{Event, Reporter};
 use app::WatchApp;
@@ -70,6 +73,7 @@ impl FrontendPreferences {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrontendAction {
     RunTests,
+    OpenSource,
     ToggleDebug,
     ToggleSamples,
     StartStress,
@@ -79,8 +83,9 @@ pub(super) enum FrontendAction {
 }
 
 impl FrontendAction {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::RunTests,
+        Self::OpenSource,
         Self::ToggleDebug,
         Self::ToggleSamples,
         Self::StartStress,
@@ -92,6 +97,7 @@ impl FrontendAction {
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::RunTests => "Run Tests",
+            Self::OpenSource => "Open Source",
             Self::ToggleDebug => "Toggle Debug",
             Self::ToggleSamples => "Toggle Samples",
             Self::StartStress => "Start Stress",
@@ -104,6 +110,7 @@ impl FrontendAction {
     pub(super) const fn shortcut(self) -> Option<&'static str> {
         match self {
             Self::RunTests => Some("r"),
+            Self::OpenSource => None,
             Self::ToggleDebug => Some("d"),
             Self::ToggleSamples => Some("s"),
             Self::StartStress => Some("S"),
@@ -119,6 +126,9 @@ impl FrontendAction {
         contest_switch_available: bool,
     ) -> FrontendActionAvailability {
         match self {
+            Self::OpenSource if app.current_problem().is_none() => {
+                FrontendActionAvailability::Unavailable("no selected problem")
+            }
             Self::RunTests | Self::StartStress
                 if app
                     .current_problem()
@@ -154,6 +164,7 @@ impl FrontendAction {
                 FrontendActionAvailability::Unavailable("not in a workspace")
             }
             Self::RunTests
+            | Self::OpenSource
             | Self::ToggleDebug
             | Self::ToggleSamples
             | Self::StartStress
@@ -182,6 +193,318 @@ impl FrontendAction {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OpenSourceModal {
+    problem: usize,
+    pub(super) problem_index: String,
+    source_root: PathBuf,
+    selected_language: Language,
+    pub(super) error: Option<String>,
+}
+
+impl OpenSourceModal {
+    pub(super) fn selected_language(&self) -> Language {
+        self.selected_language
+    }
+
+    pub(super) fn path_for(&self, language: Language) -> io::Result<PathBuf> {
+        crate::workspace::source_file_path(&self.source_root, &self.problem_index, language)
+    }
+
+    pub(super) fn selected_path(&self) -> io::Result<PathBuf> {
+        self.path_for(self.selected_language)
+    }
+
+    pub(super) fn current_language(&self, app: &WatchApp) -> Option<Language> {
+        let source = app.problems().get(self.problem)?.source.as_ref()?;
+        (self.path_for(source.language).ok()? == source.path).then_some(source.language)
+    }
+}
+
+fn source_modal_escape_closes(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Escape
+}
+
+#[derive(Debug)]
+struct OpenSourceController {
+    destination: PathBuf,
+    default_language: Language,
+    modal: Option<OpenSourceModal>,
+    discard_input_batch: bool,
+}
+
+impl OpenSourceController {
+    fn new(destination: &Path, default_language: Language) -> Self {
+        Self {
+            destination: destination.to_path_buf(),
+            default_language,
+            modal: None,
+            discard_input_batch: false,
+        }
+    }
+
+    fn modal(&self) -> Option<&OpenSourceModal> {
+        self.modal.as_ref()
+    }
+
+    fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    fn selected_path(&self) -> io::Result<PathBuf> {
+        let modal = self
+            .modal
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Open Source modal is not active"))?;
+        modal.selected_path()
+    }
+
+    fn open(&mut self, app: &WatchApp) -> bool {
+        let Some(problem) = app.current_problem() else {
+            return false;
+        };
+        let Some(problem_number) = app.selected_problem() else {
+            return false;
+        };
+        let problem_index = problem.index.clone();
+        let current_language = problem.source.as_ref().and_then(|source| {
+            crate::workspace::source_file_path(&self.destination, &problem_index, source.language)
+                .ok()
+                .filter(|path| *path == source.path)
+                .map(|_| source.language)
+        });
+        self.discard_input_batch = false;
+        self.modal = Some(OpenSourceModal {
+            problem: problem_number,
+            problem_index,
+            source_root: self.destination.clone(),
+            selected_language: current_language.unwrap_or(self.default_language),
+            error: None,
+        });
+        true
+    }
+
+    fn close(&mut self) {
+        self.modal = None;
+    }
+
+    fn take_discard_input_batch(&mut self) -> bool {
+        std::mem::take(&mut self.discard_input_batch)
+    }
+
+    fn handle_key(
+        &mut self,
+        app: &mut WatchApp,
+        key: KeyEvent,
+        editor: &mut dyn SourceEditorHost,
+        creator: &mut dyn SourceCreator,
+    ) -> io::Result<bool> {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(false);
+        }
+
+        let changed = match key.code {
+            KeyCode::Escape if source_modal_escape_closes(key) => {
+                self.close();
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let modal = self.modal.as_mut().expect("active modal must exist");
+                modal.selected_language = match modal.selected_language {
+                    Language::Cpp => Language::Python,
+                    Language::Python => Language::Cpp,
+                };
+                modal.error = None;
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let modal = self.modal.as_mut().expect("active modal must exist");
+                modal.selected_language = match modal.selected_language {
+                    Language::Cpp => Language::Python,
+                    Language::Python => Language::Cpp,
+                };
+                modal.error = None;
+                true
+            }
+            KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                return self.open_selected(app, false, editor, creator);
+            }
+            KeyCode::Char('i') if key.kind == KeyEventKind::Press => {
+                return self.open_selected(app, true, editor, creator);
+            }
+            _ => false,
+        };
+        Ok(changed)
+    }
+
+    fn open_selected(
+        &mut self,
+        app: &mut WatchApp,
+        create: bool,
+        editor: &mut dyn SourceEditorHost,
+        creator: &mut dyn SourceCreator,
+    ) -> io::Result<bool> {
+        let (problem, problem_index, language) = {
+            let modal = self.modal.as_ref().expect("active modal must exist");
+            (
+                modal.problem,
+                modal.problem_index.clone(),
+                modal.selected_language,
+            )
+        };
+        let target = match self.selected_path() {
+            Ok(target) => target,
+            Err(error) => {
+                self.set_error(error.to_string());
+                return Ok(true);
+            }
+        };
+        let exists = target.is_file();
+        if create == exists {
+            return Ok(false);
+        }
+
+        let resolved = match editor.resolve() {
+            Ok(editor) => editor,
+            Err(error) => {
+                self.set_error(error);
+                return Ok(true);
+            }
+        };
+
+        let target = if create {
+            match creator.create(&self.destination, &problem_index, language) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.set_error(error);
+                    return Ok(true);
+                }
+            }
+        } else {
+            target
+        };
+
+        app.source_changed(problem, target.clone(), language);
+        let launch = match resolved.mode {
+            EditorLaunchMode::External => editor.launch_external(&resolved, &target),
+            EditorLaunchMode::Terminal => {
+                // The terminal lifecycle replaces its parser and flushes platform input, but the
+                // frontend may already have collected later events in this batch. Do not replay
+                // those pre-editor keys or pointers after the blocking editor returns.
+                self.discard_input_batch = true;
+                editor.launch_terminal(&resolved, &target)
+            }
+        };
+        match launch {
+            Ok(()) => self.close(),
+            Err(SourceLaunchError::Recoverable(error)) => self.set_error(error),
+            Err(SourceLaunchError::TerminalRestore(error)) => {
+                return Err(io::Error::other(error));
+            }
+        }
+        Ok(true)
+    }
+
+    fn set_error(&mut self, error: String) {
+        if let Some(modal) = self.modal.as_mut() {
+            modal.error = Some(error);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SourceLaunchError {
+    Recoverable(String),
+    TerminalRestore(String),
+}
+
+trait SourceEditorHost {
+    fn resolve(&mut self) -> Result<ResolvedEditor, String>;
+    fn launch_external(
+        &mut self,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> Result<(), SourceLaunchError>;
+    fn launch_terminal(
+        &mut self,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> Result<(), SourceLaunchError>;
+}
+
+struct LiveSourceEditorHost<'a> {
+    terminal: &'a mut TerminaSession,
+    config: &'a Config,
+}
+
+impl SourceEditorHost for LiveSourceEditorHost<'_> {
+    fn resolve(&mut self) -> Result<ResolvedEditor, String> {
+        editor::resolve(self.config).map_err(|error| error.to_string())
+    }
+
+    fn launch_external(
+        &mut self,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> Result<(), SourceLaunchError> {
+        editor::launch(editor, target)
+            .map_err(|error| SourceLaunchError::Recoverable(error.to_string()))
+    }
+
+    fn launch_terminal(
+        &mut self,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> Result<(), SourceLaunchError> {
+        self.terminal
+            .suspend_and_run(|| editor::launch(editor, target))
+            .map_err(|error| {
+                let terminal_restore_failed = matches!(
+                    error,
+                    terminal::SuspendedRunError::SuspendAndResume { .. }
+                        | terminal::SuspendedRunError::Resume(_)
+                        | terminal::SuspendedRunError::OperationAndResume { .. }
+                );
+                let message = error.to_string();
+                if terminal_restore_failed {
+                    SourceLaunchError::TerminalRestore(message)
+                } else {
+                    SourceLaunchError::Recoverable(message)
+                }
+            })
+    }
+}
+
+trait SourceCreator {
+    fn create(
+        &mut self,
+        destination: &Path,
+        problem_index: &str,
+        language: Language,
+    ) -> Result<PathBuf, String>;
+}
+
+struct DefaultSourceCreator;
+
+impl SourceCreator for DefaultSourceCreator {
+    fn create(
+        &mut self,
+        destination: &Path,
+        problem_index: &str,
+        language: Language,
+    ) -> Result<PathBuf, String> {
+        let mut reporter = SourceCreationReporter;
+        crate::commands::create_source(destination, problem_index, language, &mut reporter)
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct SourceCreationReporter;
+
+impl Reporter for SourceCreationReporter {
+    fn report(&mut self, _event: Event<'_>) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,6 +1350,7 @@ impl<'a> SessionChannels<'a> {
 
 pub(crate) struct SessionRuntime<'a> {
     current_destination: &'a Path,
+    config: &'a Config,
     stress_setup: StressSetupContext<'a>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
@@ -1036,6 +1360,7 @@ pub(crate) struct SessionRuntime<'a> {
 impl<'a> SessionRuntime<'a> {
     pub(crate) fn new(
         current_destination: &'a Path,
+        config: &'a Config,
         contest: &'a Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
@@ -1043,6 +1368,7 @@ impl<'a> SessionRuntime<'a> {
     ) -> Self {
         Self {
             current_destination,
+            config,
             stress_setup: StressSetupContext::new(current_destination, contest),
             sample_counts,
             stress_cases,
@@ -1073,6 +1399,13 @@ struct FrontendInputContext<'run, 'controller, 'resolver, 'palette> {
     terminal: TerminalInputContext<'run>,
     contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
     command_palette: Option<&'palette mut CommandPalette>,
+    open_source: Option<OpenSourceInputContext<'palette>>,
+}
+
+struct OpenSourceInputContext<'a> {
+    controller: &'a mut OpenSourceController,
+    editor: &'a mut dyn SourceEditorHost,
+    creator: &'a mut dyn SourceCreator,
 }
 
 struct StressInitializationReporter;
@@ -1387,6 +1720,7 @@ pub(crate) fn run(
 ) -> io::Result<SessionExit> {
     let SessionRuntime {
         current_destination,
+        config,
         stress_setup,
         sample_counts,
         stress_cases,
@@ -1408,6 +1742,7 @@ pub(crate) fn run(
         contest_switch_task,
     );
     let mut command_palette = CommandPalette::default();
+    let mut open_source = OpenSourceController::new(current_destination, config.defaults.language);
 
     let mut dirty = true;
 
@@ -1421,7 +1756,13 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
+        if contains_global_quit_event(
+            &terminal_events,
+            &app,
+            &contest_switch,
+            &command_palette,
+            &open_source,
+        ) {
             app.quit();
             break;
         }
@@ -1460,7 +1801,13 @@ pub(crate) fn run(
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
 
-        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
+        if contains_global_quit_event(
+            &terminal_events,
+            &app,
+            &contest_switch,
+            &command_palette,
+            &open_source,
+        ) {
             app.quit();
             break;
         }
@@ -1483,8 +1830,11 @@ pub(crate) fn run(
                     &mut detail_layout,
                     render_mouse_mode,
                     contest_switch.available,
-                    contest_switch.modal(),
-                    command_palette.is_active().then_some(&command_palette),
+                    view::FrontendOverlays {
+                        switch_modal: contest_switch.modal(),
+                        source_modal: open_source.modal(),
+                        command_palette: command_palette.is_active().then_some(&command_palette),
+                    },
                 );
             })?;
 
@@ -1519,23 +1869,37 @@ pub(crate) fn run(
         }
 
         // qは同じbatch内のresize/mouseより先に扱い、再描画を挟まず終了する。
-        if contains_global_quit_event(&terminal_events, &app, &contest_switch, &command_palette) {
+        if contains_global_quit_event(
+            &terminal_events,
+            &app,
+            &contest_switch,
+            &command_palette,
+            &open_source,
+        ) {
             app.quit();
             continue;
         }
 
         let resize_count_before = resize_event_count(&terminal_events);
+        let mouse_mode = terminal.mouse_mode();
+        let mut editor = LiveSourceEditorHost { terminal, config };
+        let mut creator = DefaultSourceCreator;
         if handle_terminal_events_with_mouse_mode(
             &mut app,
             &mut detail_layout,
             &mut detail_scrollbar_drag,
             &render_info,
             &mut terminal_events,
-            terminal.mouse_mode(),
+            mouse_mode,
             FrontendInputContext {
                 terminal: TerminalInputContext::new(run_tx, Some(stress_setup)),
                 contest_switch: Some(&mut contest_switch),
                 command_palette: Some(&mut command_palette),
+                open_source: Some(OpenSourceInputContext {
+                    controller: &mut open_source,
+                    editor: &mut editor,
+                    creator: &mut creator,
+                }),
             },
         )? {
             dirty = true;
@@ -1638,8 +2002,10 @@ fn contains_global_quit_event(
     app: &WatchApp,
     contest_switch: &ContestSwitchController<'_>,
     command_palette: &CommandPalette,
+    open_source: &OpenSourceController,
 ) -> bool {
     let mut contest_modal_active = contest_switch.modal_active();
+    let mut source_modal_active = open_source.modal_active();
     let mut command_palette = command_palette.clone();
 
     for event in events {
@@ -1657,6 +2023,13 @@ fn contains_global_quit_event(
             continue;
         }
 
+        if source_modal_active {
+            if source_modal_escape_closes(*key) {
+                source_modal_active = false;
+            }
+            continue;
+        }
+
         if command_palette.is_active() {
             if let CommandPaletteKeyResult::ExecuteRequested(action) =
                 command_palette.handle_key(*key)
@@ -1665,8 +2038,15 @@ fn contains_global_quit_event(
                     .is_available()
             {
                 command_palette.close();
-                if action == FrontendAction::SwitchContest {
-                    contest_modal_active = true;
+                match action {
+                    FrontendAction::SwitchContest => contest_modal_active = true,
+                    FrontendAction::OpenSource => source_modal_active = true,
+                    FrontendAction::RunTests
+                    | FrontendAction::ToggleDebug
+                    | FrontendAction::ToggleSamples
+                    | FrontendAction::StartStress
+                    | FrontendAction::StopStress
+                    | FrontendAction::InitializeStress => {}
                 }
             }
             continue;
@@ -1746,6 +2126,7 @@ fn handle_terminal_events(
             terminal: TerminalInputContext::new(run_tx, None),
             contest_switch: None,
             command_palette: None,
+            open_source: None,
         },
     )
 }
@@ -1810,6 +2191,13 @@ fn handle_terminal_events_with_mouse_mode(
             &mut input,
         )?;
         if input
+            .open_source
+            .as_mut()
+            .is_some_and(|source| source.controller.take_discard_input_batch())
+        {
+            events.clear();
+        }
+        if input
             .contest_switch
             .as_ref()
             .is_some_and(|contest_switch| contest_switch.switch_requested)
@@ -1863,6 +2251,21 @@ fn handle_terminal_event_with_mouse_mode(
 
     if let TerminalEvent::Key(key) = terminal_event
         && input
+            .open_source
+            .as_ref()
+            .is_some_and(|source| source.controller.modal_active())
+    {
+        let source = input
+            .open_source
+            .as_mut()
+            .expect("active Open Source controller must exist");
+        return source
+            .controller
+            .handle_key(app, key, source.editor, source.creator);
+    }
+
+    if let TerminalEvent::Key(key) = terminal_event
+        && input
             .command_palette
             .as_ref()
             .is_some_and(|palette| palette.is_active())
@@ -1897,6 +2300,10 @@ fn handle_terminal_event_with_mouse_mode(
                     action,
                     input.terminal,
                     input.contest_switch.as_deref_mut(),
+                    input
+                        .open_source
+                        .as_mut()
+                        .map(|source| &mut *source.controller),
                 );
             }
         }
@@ -1909,7 +2316,11 @@ fn handle_terminal_event_with_mouse_mode(
         || input
             .command_palette
             .as_ref()
-            .is_some_and(|palette| palette.is_active());
+            .is_some_and(|palette| palette.is_active())
+        || input
+            .open_source
+            .as_ref()
+            .is_some_and(|source| source.controller.modal_active());
     if frontend_interaction_active && matches!(terminal_event, TerminalEvent::Pointer(_)) {
         return Ok(false);
     }
@@ -1973,6 +2384,7 @@ fn handle_key_event_with_stress_context(
             terminal: TerminalInputContext::new(run_tx, stress_setup),
             contest_switch: None,
             command_palette: None,
+            open_source: None,
         },
     )
 }
@@ -2005,6 +2417,10 @@ fn handle_key_event_with_frontend_context(
             action,
             input.terminal,
             input.contest_switch.as_deref_mut(),
+            input
+                .open_source
+                .as_mut()
+                .map(|source| &mut *source.controller),
         );
     }
 
@@ -2022,6 +2438,7 @@ fn execute_frontend_action(
     action: FrontendAction,
     input: TerminalInputContext<'_>,
     contest_switch: Option<&mut ContestSwitchController<'_>>,
+    open_source: Option<&mut OpenSourceController>,
 ) -> io::Result<bool> {
     match action {
         FrontendAction::RunTests => {
@@ -2029,6 +2446,9 @@ fn execute_frontend_action(
                 return Ok(false);
             };
             queue_problem_run(app, problem, input.run_tx)
+        }
+        FrontendAction::OpenSource => {
+            Ok(open_source.is_some_and(|controller| controller.open(app)))
         }
         FrontendAction::ToggleDebug => {
             app.toggle_debug();
@@ -2514,6 +2934,153 @@ mod tests {
                 terminal: TerminalInputContext::new(run_tx, stress_setup),
                 contest_switch,
                 command_palette: Some(command_palette),
+                open_source: None,
+            },
+        )
+    }
+
+    #[derive(Debug)]
+    struct RecordingSourceEditor {
+        mode: EditorLaunchMode,
+        resolve_error: Option<String>,
+        launch_error: Option<String>,
+        terminal_restore_error: Option<String>,
+        resolve_calls: usize,
+        external_targets: Vec<PathBuf>,
+        terminal_targets: Vec<PathBuf>,
+    }
+
+    impl RecordingSourceEditor {
+        fn new(mode: EditorLaunchMode) -> Self {
+            Self {
+                mode,
+                resolve_error: None,
+                launch_error: None,
+                terminal_restore_error: None,
+                resolve_calls: 0,
+                external_targets: Vec::new(),
+                terminal_targets: Vec::new(),
+            }
+        }
+    }
+
+    impl SourceEditorHost for RecordingSourceEditor {
+        fn resolve(&mut self) -> Result<ResolvedEditor, String> {
+            self.resolve_calls += 1;
+            if let Some(error) = self.resolve_error.clone() {
+                return Err(error);
+            }
+            Ok(ResolvedEditor {
+                program: "test-editor".into(),
+                args: Vec::new(),
+                mode: self.mode,
+                source: crate::editor::EditorSource::Config,
+            })
+        }
+
+        fn launch_external(
+            &mut self,
+            _editor: &ResolvedEditor,
+            target: &Path,
+        ) -> Result<(), SourceLaunchError> {
+            self.external_targets.push(target.to_path_buf());
+            self.launch_error
+                .clone()
+                .map_or(Ok(()), |error| Err(SourceLaunchError::Recoverable(error)))
+        }
+
+        fn launch_terminal(
+            &mut self,
+            _editor: &ResolvedEditor,
+            target: &Path,
+        ) -> Result<(), SourceLaunchError> {
+            self.terminal_targets.push(target.to_path_buf());
+            if let Some(error) = self.terminal_restore_error.clone() {
+                return Err(SourceLaunchError::TerminalRestore(error));
+            }
+            self.launch_error
+                .clone()
+                .map_or(Ok(()), |error| Err(SourceLaunchError::Recoverable(error)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSourceCreator {
+        template: String,
+        error: Option<String>,
+        race_contents: Option<String>,
+        calls: Vec<(PathBuf, String, Language)>,
+    }
+
+    impl RecordingSourceCreator {
+        fn new(template: &str) -> Self {
+            Self {
+                template: template.to_string(),
+                error: None,
+                race_contents: None,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl SourceCreator for RecordingSourceCreator {
+        fn create(
+            &mut self,
+            destination: &Path,
+            problem_index: &str,
+            language: Language,
+        ) -> Result<PathBuf, String> {
+            self.calls.push((
+                destination.to_path_buf(),
+                problem_index.to_string(),
+                language,
+            ));
+            if let Some(error) = self.error.clone() {
+                return Err(error);
+            }
+            if let Some(contents) = self.race_contents.take() {
+                let path = crate::workspace::source_file_path(destination, problem_index, language)
+                    .map_err(|error| error.to_string())?;
+                fs::write(path, contents).map_err(|error| error.to_string())?;
+            }
+            crate::workspace::create_source_file(
+                destination,
+                problem_index,
+                language,
+                &self.template,
+            )
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    fn handle_open_source_events(
+        app: &mut WatchApp,
+        render_info: &view::RenderInfo,
+        events: &mut VecDeque<TerminalEvent>,
+        controller: &mut OpenSourceController,
+        editor: &mut dyn SourceEditorHost,
+        creator: &mut dyn SourceCreator,
+        command_palette: Option<&mut CommandPalette>,
+    ) -> io::Result<bool> {
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        super::handle_terminal_events_with_mouse_mode(
+            app,
+            &mut detail_layout,
+            &mut drag,
+            render_info,
+            events,
+            MouseMode::Cells,
+            FrontendInputContext {
+                terminal: TerminalInputContext::new(&run_tx, None),
+                contest_switch: None,
+                command_palette,
+                open_source: Some(OpenSourceInputContext {
+                    controller,
+                    editor,
+                    creator,
+                }),
             },
         )
     }
@@ -2634,6 +3201,8 @@ mod tests {
             ("deb", vec!["Toggle Debug"]),
             ("sam", vec!["Toggle Samples"]),
             ("tes", vec!["Run Tests"]),
+            ("open", vec!["Open Source"]),
+            ("sou", vec!["Open Source"]),
             ("Sw", vec!["Switch Contest"]),
             ("sW cOn", vec!["Switch Contest"]),
             ("to sam", vec!["Toggle Samples"]),
@@ -2656,7 +3225,7 @@ mod tests {
             palette.handle_key(key(KeyCode::Down, KeyEventKind::Press)),
             CommandPaletteKeyResult::Handled(true)
         );
-        assert_eq!(palette.selected_action(), Some(FrontendAction::ToggleDebug));
+        assert_eq!(palette.selected_action(), Some(FrontendAction::OpenSource));
         palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
         assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
         palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
@@ -2731,7 +3300,10 @@ mod tests {
                     Some(action)
                 );
             } else {
-                assert_eq!(action, FrontendAction::StopStress);
+                assert!(matches!(
+                    action,
+                    FrontendAction::OpenSource | FrontendAction::StopStress
+                ));
             }
 
             let mut palette = CommandPalette::default();
@@ -2747,6 +3319,577 @@ mod tests {
 
         assert_eq!(FrontendAction::StopStress.label(), "Stop Stress");
         assert_eq!(FrontendAction::StopStress.shortcut(), None);
+        assert_eq!(FrontendAction::OpenSource.label(), "Open Source");
+        assert_eq!(FrontendAction::OpenSource.shortcut(), None);
+    }
+
+    #[test]
+    fn open_source_action_order_availability_and_palette_activation_are_deterministic() {
+        assert_eq!(
+            FrontendAction::ALL,
+            [
+                FrontendAction::RunTests,
+                FrontendAction::OpenSource,
+                FrontendAction::ToggleDebug,
+                FrontendAction::ToggleSamples,
+                FrontendAction::StartStress,
+                FrontendAction::StopStress,
+                FrontendAction::InitializeStress,
+                FrontendAction::SwitchContest,
+            ]
+        );
+
+        let empty_contest = Contest {
+            contest_id: "empty".to_string(),
+            problems: Vec::new(),
+        };
+        let empty = WatchApp::new(&empty_contest, Vec::new()).unwrap();
+        assert_eq!(
+            FrontendAction::OpenSource.availability(&empty, false),
+            FrontendActionAvailability::Unavailable("no selected problem")
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app();
+        assert_eq!(
+            FrontendAction::OpenSource.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+        let mut controller = OpenSourceController::new(temp.path(), Language::Cpp);
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut creator = RecordingSourceCreator::new("template");
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "open sou".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut editor,
+                &mut creator,
+                Some(&mut palette),
+            )
+            .unwrap()
+        );
+        assert!(!palette.is_active());
+        assert!(controller.modal_active());
+        assert_eq!(controller.modal().unwrap().problem_index, "A");
+    }
+
+    #[test]
+    fn open_source_initial_selection_uses_canonical_current_then_default_without_reordering() {
+        let temp = tempfile::tempdir().unwrap();
+        for (current, default, expected) in [
+            (Some(Language::Cpp), Language::Python, Language::Cpp),
+            (Some(Language::Python), Language::Cpp, Language::Python),
+            (None, Language::Cpp, Language::Cpp),
+            (None, Language::Python, Language::Python),
+        ] {
+            let mut app = app();
+            if let Some(language) = current {
+                let path = crate::workspace::source_file_path(temp.path(), "A", language).unwrap();
+                app.source_changed(0, path, language);
+            }
+            let mut controller = OpenSourceController::new(temp.path(), default);
+
+            assert!(controller.open(&app));
+            let modal = controller.modal().unwrap();
+            assert_eq!(Language::ALL, [Language::Cpp, Language::Python]);
+            assert_eq!(modal.selected_language(), expected);
+            assert_eq!(modal.current_language(&app), current);
+            assert_eq!(
+                modal.path_for(Language::Cpp).unwrap(),
+                temp.path().join("A.cpp")
+            );
+            assert_eq!(
+                modal.path_for(Language::Python).unwrap(),
+                temp.path().join("A.py")
+            );
+        }
+    }
+
+    #[test]
+    fn existing_source_open_switches_current_language_and_dispatches_exact_mode_and_path() {
+        for (current, selected, mode) in [
+            (Language::Cpp, Language::Python, EditorLaunchMode::External),
+            (Language::Python, Language::Cpp, EditorLaunchMode::Terminal),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let cpp = temp.path().join("A.cpp");
+            let python = temp.path().join("A.py");
+            fs::write(&cpp, "cpp user source").unwrap();
+            fs::write(&python, "python user source").unwrap();
+            let current_path = match current {
+                Language::Cpp => cpp.clone(),
+                Language::Python => python.clone(),
+            };
+            let selected_path = match selected {
+                Language::Cpp => cpp.clone(),
+                Language::Python => python.clone(),
+            };
+            let mut app = app();
+            app.source_changed(0, current_path, current);
+            let mut controller = OpenSourceController::new(temp.path(), Language::Cpp);
+            assert!(controller.open(&app));
+            let mut editor = RecordingSourceEditor::new(mode);
+            let mut creator = RecordingSourceCreator::new("unused");
+            let mut events = VecDeque::from([
+                TerminalEvent::Key(key(KeyCode::Down, KeyEventKind::Press)),
+                TerminalEvent::Key(key(KeyCode::Char('i'), KeyEventKind::Press)),
+                TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            ]);
+
+            assert!(
+                handle_open_source_events(
+                    &mut app,
+                    &view::RenderInfo::default(),
+                    &mut events,
+                    &mut controller,
+                    &mut editor,
+                    &mut creator,
+                    None,
+                )
+                .unwrap()
+            );
+            assert!(!controller.modal_active());
+            let source = app.current_problem().unwrap().source.as_ref().unwrap();
+            assert_eq!(source.language, selected);
+            assert_eq!(source.path, selected_path);
+            match mode {
+                EditorLaunchMode::External => {
+                    assert_eq!(editor.external_targets, [selected_path]);
+                    assert!(editor.terminal_targets.is_empty());
+                }
+                EditorLaunchMode::Terminal => {
+                    assert_eq!(editor.terminal_targets, [selected_path]);
+                    assert!(editor.external_targets.is_empty());
+                }
+            }
+            assert_eq!(fs::read_to_string(cpp).unwrap(), "cpp user source");
+            assert_eq!(fs::read_to_string(python).unwrap(), "python user source");
+            assert!(creator.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_source_enter_is_inert_and_create_open_resolves_before_safe_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app();
+        let mut controller = OpenSourceController::new(temp.path(), Language::Python);
+        assert!(controller.open(&app));
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut creator = RecordingSourceCreator::new("print('created')\n");
+        let mut enter =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        assert!(
+            !handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut enter,
+                &mut controller,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(!temp.path().join("A.py").exists());
+        assert_eq!(editor.resolve_calls, 0);
+        assert!(creator.calls.is_empty());
+
+        let mut create = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('i'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut create,
+                &mut controller,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        let target = temp.path().join("A.py");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "print('created')\n");
+        assert_eq!(editor.resolve_calls, 1);
+        assert_eq!(
+            creator.calls,
+            [(temp.path().to_path_buf(), "A".into(), Language::Python)]
+        );
+        assert_eq!(
+            editor.external_targets.as_slice(),
+            std::slice::from_ref(&target)
+        );
+        let source = app.current_problem().unwrap().source.as_ref().unwrap();
+        assert_eq!(source.path, target);
+        assert_eq!(source.language, Language::Python);
+        assert!(!controller.modal_active());
+    }
+
+    #[test]
+    fn create_open_failures_preserve_filesystem_and_current_source_at_each_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let cpp = temp.path().join("A.cpp");
+        fs::write(&cpp, "current cpp").unwrap();
+
+        let mut app = app();
+        app.source_changed(0, cpp.clone(), Language::Cpp);
+        let mut controller = OpenSourceController::new(temp.path(), Language::Python);
+        assert!(controller.open(&app));
+        controller.modal.as_mut().unwrap().selected_language = Language::Python;
+        let mut unresolved = RecordingSourceEditor::new(EditorLaunchMode::External);
+        unresolved.resolve_error = Some("No editor configured.".to_string());
+        let mut creator = RecordingSourceCreator::new("created");
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('i'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut unresolved,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(!temp.path().join("A.py").exists());
+        assert!(creator.calls.is_empty());
+        assert_eq!(
+            app.current_problem().unwrap().source.as_ref().unwrap().path,
+            cpp
+        );
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("No editor")
+        );
+
+        controller.modal.as_mut().unwrap().error = None;
+        let mut resolved = RecordingSourceEditor::new(EditorLaunchMode::External);
+        creator.error = Some("template resolution failed".to_string());
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('i'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut resolved,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(resolved.external_targets.is_empty());
+        assert_eq!(
+            app.current_problem().unwrap().source.as_ref().unwrap().path,
+            cpp
+        );
+
+        creator.error = None;
+        resolved.launch_error = Some("spawn failed".to_string());
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('i'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut resolved,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        let python = temp.path().join("A.py");
+        assert_eq!(fs::read_to_string(&python).unwrap(), "created");
+        assert!(controller.modal_active());
+        assert_eq!(
+            controller.modal().unwrap().current_language(&app),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            app.current_problem().unwrap().source.as_ref().unwrap().path,
+            python
+        );
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("spawn failed")
+        );
+    }
+
+    #[test]
+    fn create_open_race_uses_no_clobber_core_and_never_launches_or_switches() {
+        let temp = tempfile::tempdir().unwrap();
+        let cpp = temp.path().join("A.cpp");
+        fs::write(&cpp, "current cpp").unwrap();
+        let mut app = app();
+        app.source_changed(0, cpp.clone(), Language::Cpp);
+        let mut controller = OpenSourceController::new(temp.path(), Language::Python);
+        assert!(controller.open(&app));
+        controller.modal.as_mut().unwrap().selected_language = Language::Python;
+        assert!(!controller.selected_path().unwrap().exists());
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut creator = RecordingSourceCreator::new("must not win");
+        creator.race_contents = Some("race winner".to_string());
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('i'),
+            KeyEventKind::Press,
+        ))]);
+
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("A.py")).unwrap(),
+            "race winner"
+        );
+        assert!(editor.external_targets.is_empty());
+        assert_eq!(
+            app.current_problem().unwrap().source.as_ref().unwrap().path,
+            cpp
+        );
+        assert!(controller.modal_active());
+    }
+
+    #[test]
+    fn terminal_restore_failure_is_fatal_after_current_source_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let python = temp.path().join("A.py");
+        fs::write(&python, "source").unwrap();
+        let mut app = app();
+        let mut controller = OpenSourceController::new(temp.path(), Language::Python);
+        assert!(controller.open(&app));
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::Terminal);
+        editor.terminal_restore_error = Some("failed to restore the TUI terminal".to_string());
+        let mut creator = RecordingSourceCreator::new("unused");
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        let error = handle_open_source_events(
+            &mut app,
+            &view::RenderInfo::default(),
+            &mut events,
+            &mut controller,
+            &mut editor,
+            &mut creator,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("restore the TUI terminal"));
+        assert_eq!(
+            app.current_problem().unwrap().source.as_ref().unwrap().path,
+            python
+        );
+        assert!(controller.modal_active());
+    }
+
+    #[test]
+    fn terminal_editor_discards_the_remainder_of_the_collected_input_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("A.cpp");
+        fs::write(&source_path, "source").unwrap();
+        let mut app = app();
+        let mut controller = OpenSourceController::new(temp.path(), Language::Cpp);
+        assert!(controller.open(&app));
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::Terminal);
+        let mut creator = RecordingSourceCreator::new("unused");
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('d'), KeyEventKind::Press)),
+            TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, 5, 5)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+
+        assert!(events.is_empty());
+        assert!(!app.debug_enabled());
+        assert_eq!(app.selected_case(), 0);
+        assert!(!app.should_quit());
+        assert_eq!(editor.terminal_targets, [source_path]);
+        assert!(!controller.modal_active());
+    }
+
+    #[test]
+    fn open_source_same_batch_quit_and_modal_input_follow_shared_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("abc123");
+        let context = workspace_context(temp.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".into());
+        let contest_switch = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut app = app();
+        let mut source = OpenSourceController::new(temp.path(), Language::Cpp);
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "open".to_string();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_global_quit_event(
+            &events,
+            &app,
+            &contest_switch,
+            &palette,
+            &source,
+        ));
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut creator = RecordingSourceCreator::new("unused");
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut source,
+                &mut editor,
+                &mut creator,
+                Some(&mut palette),
+            )
+            .unwrap()
+        );
+        assert!(source.modal_active());
+        assert!(!app.should_quit());
+
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Escape, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(contains_global_quit_event(
+            &events,
+            &app,
+            &contest_switch,
+            &palette,
+            &source,
+        ));
+        assert!(
+            handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut source,
+                &mut editor,
+                &mut creator,
+                Some(&mut palette),
+            )
+            .unwrap()
+        );
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn open_source_modal_consumes_global_actions_and_suppresses_underlying_pointers() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("A.cpp"), "source").unwrap();
+        let mut app = app();
+        let mut source = OpenSourceController::new(temp.path(), Language::Cpp);
+        assert!(source.open(&app));
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut creator = RecordingSourceCreator::new("unused");
+        let mut keys = VecDeque::from(['r', 'S', ':', 'q'].map(|character| {
+            TerminalEvent::Key(key(KeyCode::Char(character), KeyEventKind::Press))
+        }));
+        assert!(
+            !handle_open_source_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut keys,
+                &mut source,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(!app.should_quit());
+        assert_eq!(
+            app.current_problem().unwrap().run.phase,
+            app::RunPhase::Idle
+        );
+        assert!(source.modal_active());
+
+        let samples_info = view::RenderInfo {
+            max_detail_scroll: Some(20),
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
+        };
+        let mut pointers = VecDeque::from([
+            TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, 5, 5)),
+            TerminalEvent::Pointer(pointer(PointerKind::Down(PointerButton::Left), 5, 5)),
+            TerminalEvent::Pointer(pointer(PointerKind::Drag(PointerButton::Left), 5, 8)),
+        ]);
+        assert!(
+            !handle_open_source_events(
+                &mut app,
+                &samples_info,
+                &mut pointers,
+                &mut source,
+                &mut editor,
+                &mut creator,
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.detail_scroll(), 0);
+        assert!(source.modal_active());
     }
 
     #[test]
@@ -2932,6 +4075,7 @@ mod tests {
             FrontendAction::StopStress,
             TerminalInputContext::new(&run_tx, None),
             None,
+            None,
         )
         .unwrap_err();
 
@@ -3085,6 +4229,7 @@ mod tests {
             let mut app = app();
             let (run_tx, _run_rx) = mpsc::channel();
             let mut palette = CommandPalette::default();
+            let source = OpenSourceController::new(Path::new("."), Language::Cpp);
             let mut events = VecDeque::from([
                 TerminalEvent::Key(key(KeyCode::Char(':'), KeyEventKind::Press)),
                 TerminalEvent::Key(key(KeyCode::Char(character), KeyEventKind::Press)),
@@ -3095,6 +4240,7 @@ mod tests {
                 &app,
                 &controller,
                 &palette,
+                &source,
             ));
             assert!(
                 handle_frontend_terminal_events(
@@ -3130,6 +4276,7 @@ mod tests {
         let mut app = app();
         let (run_tx, _run_rx) = mpsc::channel();
         let mut palette = CommandPalette::default();
+        let source = OpenSourceController::new(Path::new("."), Language::Cpp);
         palette.open();
         palette.query = "deb".to_string();
         let mut events = VecDeque::from([
@@ -3142,6 +4289,7 @@ mod tests {
             &app,
             &controller,
             &palette,
+            &source,
         ));
         assert!(
             handle_frontend_terminal_events(
@@ -3286,6 +4434,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, None),
                     contest_switch: None,
                     command_palette: Some(&mut palette),
+                    open_source: None,
                 },
             )
             .unwrap()
@@ -4824,11 +5973,13 @@ mod tests {
             &mut fresh_resolve,
             successful_create_task(),
         );
+        let source = OpenSourceController::new(Path::new("."), Language::Cpp);
         assert!(!contains_global_quit_event(
             &queued,
             &app,
             &fresh,
             &CommandPalette::default(),
+            &source,
         ));
 
         // The modal consumes these keys before the existing application handler can mutate app.
@@ -6641,6 +7792,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, None),
                     contest_switch: None,
                     command_palette: None,
+                    open_source: None,
                 },
             )
             .unwrap()
