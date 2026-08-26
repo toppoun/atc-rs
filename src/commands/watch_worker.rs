@@ -11,16 +11,16 @@ use std::time::Duration;
 use crate::attempt::AttemptOutcome;
 use crate::config::RunnerConfig;
 use crate::model::Problem;
-use crate::tui::message::{Message, RunRequest};
+use crate::tui::message::{Message, RunRequest, RunWorkerCommand};
 
 use super::attempt_executor::{ActiveAttempt, AttemptCompletion, AttemptExecutor};
-use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler};
+use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler, StressCancellation};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const MAX_RUN_REQUESTS_PER_TICK: usize = 64;
+const MAX_RUN_COMMANDS_PER_TICK: usize = 64;
 
 pub(super) struct RunWorker {
-    request_tx: Sender<RunRequest>,
+    command_tx: Sender<RunWorkerCommand>,
     control: Arc<WorkerControl>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
@@ -90,7 +90,7 @@ impl RunWorker {
         + Send
         + 'static,
     ) -> io::Result<Self> {
-        let (request_tx, request_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let control = Arc::new(WorkerControl::default());
         let thread_control = Arc::clone(&control);
@@ -101,7 +101,7 @@ impl RunWorker {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     scheduler_loop(
-                        request_rx,
+                        command_rx,
                         completion_rx,
                         completion_tx,
                         thread_control,
@@ -125,7 +125,7 @@ impl RunWorker {
             })?;
 
         Ok(Self {
-            request_tx,
+            command_tx,
             control,
             handle: Some(handle),
         })
@@ -141,8 +141,8 @@ impl RunWorker {
         Self::start_with(message_tx, spawn_attempt)
     }
 
-    pub fn sender(&self) -> Sender<RunRequest> {
-        self.request_tx.clone()
+    pub fn sender(&self) -> Sender<RunWorkerCommand> {
+        self.command_tx.clone()
     }
 
     pub fn request_stop(&self) {
@@ -174,7 +174,7 @@ impl Drop for RunWorker {
 }
 
 fn scheduler_loop(
-    request_rx: Receiver<RunRequest>,
+    command_rx: Receiver<RunWorkerCommand>,
     completion_rx: Receiver<AttemptCompletion>,
     completion_tx: Sender<AttemptCompletion>,
     control: Arc<WorkerControl>,
@@ -186,7 +186,7 @@ fn scheduler_loop(
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scheduler_loop_inner(
-            &request_rx,
+            &command_rx,
             &completion_rx,
             &completion_tx,
             &control,
@@ -204,7 +204,7 @@ fn scheduler_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn scheduler_loop_inner(
-    request_rx: &Receiver<RunRequest>,
+    command_rx: &Receiver<RunWorkerCommand>,
     completion_rx: &Receiver<AttemptCompletion>,
     completion_tx: &Sender<AttemptCompletion>,
     control: &WorkerControl,
@@ -222,7 +222,7 @@ fn scheduler_loop_inner(
             continue;
         }
 
-        match drain_requests(request_rx, scheduler, active.as_ref(), control)? {
+        match drain_commands(command_rx, scheduler, active.as_ref(), control)? {
             RequestDrain::Open => {}
             RequestDrain::Disconnected | RequestDrain::Shutdown => return Ok(()),
         }
@@ -272,10 +272,10 @@ fn scheduler_loop_inner(
             }
         }
 
-        match request_rx.recv_timeout(WORKER_POLL_INTERVAL) {
-            Ok(request) => {
+        match command_rx.recv_timeout(WORKER_POLL_INTERVAL) {
+            Ok(command) => {
                 let Some(result) =
-                    control.while_running(|| process_request(scheduler, active.as_ref(), request))
+                    control.while_running(|| process_command(scheduler, active.as_ref(), command))
                 else {
                     return Ok(());
                 };
@@ -287,17 +287,17 @@ fn scheduler_loop_inner(
     }
 }
 
-fn drain_requests(
-    request_rx: &Receiver<RunRequest>,
+fn drain_commands(
+    command_rx: &Receiver<RunWorkerCommand>,
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
     control: &WorkerControl,
 ) -> io::Result<RequestDrain> {
-    for _ in 0..MAX_RUN_REQUESTS_PER_TICK {
-        match request_rx.try_recv() {
-            Ok(request) => {
+    for _ in 0..MAX_RUN_COMMANDS_PER_TICK {
+        match command_rx.try_recv() {
+            Ok(command) => {
                 let Some(result) =
-                    control.while_running(|| process_request(scheduler, active, request))
+                    control.while_running(|| process_command(scheduler, active, command))
                 else {
                     return Ok(RequestDrain::Shutdown);
                 };
@@ -311,7 +311,20 @@ fn drain_requests(
     Ok(RequestDrain::Open)
 }
 
-fn process_request(
+fn process_command(
+    scheduler: &mut RunScheduler,
+    active: Option<&ActiveAttempt>,
+    command: RunWorkerCommand,
+) -> io::Result<()> {
+    match command {
+        RunWorkerCommand::Run(request) => process_run_request(scheduler, active, request),
+        RunWorkerCommand::CancelStress { problem, run_id } => {
+            process_stress_cancellation(scheduler, active, problem, run_id)
+        }
+    }
+}
+
+fn process_run_request(
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
     request: RunRequest,
@@ -326,6 +339,32 @@ fn process_request(
         } => {
             let active = active.ok_or_else(|| {
                 io::Error::other("scheduler requested cancellation without a physical attempt")
+            })?;
+            ensure_identity(scheduler, active)?;
+            active.request_cancel();
+            Ok(())
+        }
+    }
+}
+
+fn process_stress_cancellation(
+    scheduler: &mut RunScheduler,
+    active: Option<&ActiveAttempt>,
+    problem: usize,
+    run_id: crate::tui::message::RunId,
+) -> io::Result<()> {
+    match scheduler.cancel_stress(problem, run_id) {
+        StressCancellation::Ignored
+        | StressCancellation::Accepted {
+            cancel_active: false,
+        } => Ok(()),
+        StressCancellation::Accepted {
+            cancel_active: true,
+        } => {
+            let active = active.ok_or_else(|| {
+                io::Error::other(
+                    "scheduler requested stress cancellation without a physical attempt",
+                )
             })?;
             ensure_identity(scheduler, active)?;
             active.request_cancel();
@@ -552,7 +591,7 @@ mod tests {
 
     struct FakeWorker {
         worker: RunWorker,
-        request_tx: Sender<RunRequest>,
+        request_tx: Sender<RunWorkerCommand>,
         spawned_rx: Receiver<SpawnedAttempt>,
         message_rx: Receiver<Message>,
         active_count: Arc<AtomicUsize>,
@@ -630,7 +669,7 @@ mod tests {
         }
 
         fn send(&self, problem: usize, run_id: u64) {
-            self.request_tx.send(request(problem, run_id)).unwrap();
+            send_run(&self.request_tx, request(problem, run_id));
         }
 
         fn spawned(&self) -> SpawnedAttempt {
@@ -671,6 +710,10 @@ mod tests {
             },
             ..request(problem, run_id)
         }
+    }
+
+    fn send_run(sender: &Sender<RunWorkerCommand>, request: RunRequest) {
+        sender.send(RunWorkerCommand::Run(request)).unwrap();
     }
 
     fn wait_cancel_requested(cancellation: &AttemptCancellation) {
@@ -865,7 +908,7 @@ mod tests {
     fn latest_stress_failure_is_published_without_requeue() {
         let fake = FakeWorker::start();
         let stress = stress_request(0, 1);
-        fake.request_tx.send(stress).unwrap();
+        send_run(&fake.request_tx, stress);
         let active = fake.spawned();
         assert_eq!(active.request, stress);
 
@@ -881,6 +924,100 @@ mod tests {
         );
         assert!(fake.spawned_rx.try_recv().is_err());
         fake.stop();
+    }
+
+    #[test]
+    fn explicit_active_stress_cancellation_uses_attempt_token_and_allows_restart() {
+        let fake = FakeWorker::start();
+        let first_request = stress_request(0, 10);
+        send_run(&fake.request_tx, first_request);
+        let first = fake.spawned();
+        assert_eq!(first.request, first_request);
+
+        fake.request_tx
+            .send(RunWorkerCommand::CancelStress {
+                problem: 0,
+                run_id: 10,
+            })
+            .unwrap();
+        wait_cancel_requested(&first.cancellation);
+
+        let second_request = stress_request(0, 11);
+        send_run(&fake.request_tx, second_request);
+        first.finish(Finish::Cancelled);
+        let second = fake.spawned();
+        assert_eq!(second.request, second_request);
+        assert!(!second.cancellation.is_requested());
+        second.finish(Finish::Completed);
+
+        let messages = messages_until(&fake.message_rx, |message| {
+            matches!(message, Message::RunCompleted { run_id: 11, .. })
+        });
+        assert!(messages.iter().all(|message| {
+            !matches!(
+                message,
+                Message::RunCompleted { run_id: 10, .. }
+                    | Message::RunFailed { run_id: 10, .. }
+                    | Message::RunRequeued { run_id: 10, .. }
+            )
+        }));
+        fake.stop();
+    }
+
+    #[test]
+    fn newer_stress_then_old_stop_preserves_new_physical_attempt() {
+        let fake = FakeWorker::start();
+        let old_request = stress_request(0, 10);
+        send_run(&fake.request_tx, old_request);
+        let old = fake.spawned();
+
+        let new_request = stress_request(0, 11);
+        send_run(&fake.request_tx, new_request);
+        wait_cancel_requested(&old.cancellation);
+        fake.request_tx
+            .send(RunWorkerCommand::CancelStress {
+                problem: old_request.problem,
+                run_id: old_request.run_id,
+            })
+            .unwrap();
+        old.finish(Finish::Cancelled);
+
+        let new = fake.spawned();
+        assert_eq!(new.request, new_request);
+        assert!(!new.cancellation.is_requested());
+        new.finish(Finish::Completed);
+        messages_until(&fake.message_rx, |message| {
+            matches!(message, Message::RunCompleted { run_id: 11, .. })
+        });
+        fake.stop();
+    }
+
+    #[test]
+    fn stale_stress_cancellation_does_not_touch_newer_physical_attempt() {
+        let mut scheduler = RunScheduler::default();
+        let current = stress_request(0, 11);
+        scheduler.request_arrived(current);
+        assert_eq!(scheduler.start_next(), Some(current));
+
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (cancellation_tx, cancellation_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active = spawn_with(current, completion_tx, move |cancellation| {
+            cancellation_tx.send(Arc::clone(&cancellation)).unwrap();
+            release_rx.recv().unwrap();
+            run_attempt(&cancellation, |_| Ok(()))
+        })
+        .unwrap();
+        let cancellation = cancellation_rx.recv().unwrap();
+
+        process_stress_cancellation(&mut scheduler, Some(&active), 0, 10).unwrap();
+        assert!(!cancellation.is_requested());
+
+        release_tx.send(()).unwrap();
+        completion_rx.recv().unwrap();
+        assert!(matches!(active.join().unwrap(), AttemptOutcome::Completed));
+        let retired = scheduler.retire_active().unwrap();
+        assert!(retired.is_latest());
     }
 
     #[test]
@@ -994,14 +1131,14 @@ mod tests {
     #[test]
     fn bounded_request_drain_leaves_excess_for_the_next_tick() {
         let (tx, rx) = mpsc::channel();
-        for run_id in 1..=(MAX_RUN_REQUESTS_PER_TICK as u64 + 5) {
-            tx.send(request(run_id as usize, run_id)).unwrap();
+        for run_id in 1..=(MAX_RUN_COMMANDS_PER_TICK as u64 + 5) {
+            send_run(&tx, request(run_id as usize, run_id));
         }
         let mut scheduler = RunScheduler::default();
         let control = WorkerControl::default();
 
         assert_eq!(
-            drain_requests(&rx, &mut scheduler, None, &control).unwrap(),
+            drain_commands(&rx, &mut scheduler, None, &control).unwrap(),
             RequestDrain::Open
         );
         assert_eq!(rx.try_iter().count(), 5);
@@ -1038,13 +1175,11 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
+        send_run(&request_tx, request(0, 1));
         let (spawned, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(spawned, request(0, 1));
         for problem in 1..=100 {
-            request_tx
-                .send(request(problem, problem as u64 + 1))
-                .unwrap();
+            send_run(&request_tx, request(problem, problem as u64 + 1));
         }
         wait_cancel_requested(&cancellation);
 
@@ -1114,9 +1249,9 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
+        send_run(&request_tx, request(0, 1));
         let (_, first_cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        request_tx.send(request(1, 2)).unwrap();
+        send_run(&request_tx, request(1, 2));
         wait_cancel_requested(&first_cancellation);
         release_tx.send(()).unwrap();
 
@@ -1171,8 +1306,8 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
-        request_tx.send(request(1, 2)).unwrap();
+        send_run(&request_tx, request(0, 1));
+        send_run(&request_tx, request(1, 2));
         spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         assert!(matches!(
@@ -1208,13 +1343,13 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
+        send_run(&request_tx, request(0, 1));
         assert!(matches!(
             message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Message::WorkerFailed(error) if error.to_string().contains("fake spawn failure")
         ));
 
-        let _ = request_tx.send(request(1, 2));
+        let _ = request_tx.send(RunWorkerCommand::Run(request(1, 2)));
         assert!(spawned_rx.try_recv().is_err());
         assert!(
             worker
@@ -1269,10 +1404,10 @@ mod tests {
             }
         });
 
-        request_tx.send(request(0, 1)).unwrap();
+        send_run(&request_tx, request(0, 1));
         let (spawned, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(spawned, request(0, 1));
-        request_tx.send(request(1, 2)).unwrap();
+        send_run(&request_tx, request(1, 2));
         wait_cancel_requested(&cancellation);
         drop(request_tx);
         release_tx.send(()).unwrap();
@@ -1317,7 +1452,7 @@ mod tests {
             })
         })
         .unwrap();
-        worker.sender().send(request(0, 1)).unwrap();
+        send_run(&worker.sender(), request(0, 1));
 
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let error = worker.join().unwrap_err();
@@ -1331,8 +1466,8 @@ mod tests {
             RunWorker::start_with(message_tx, |_, _| panic!("fake scheduler helper panic"))
                 .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
-        let _ = request_tx.send(request(1, 2));
+        send_run(&request_tx, request(0, 1));
+        let _ = request_tx.send(RunWorkerCommand::Run(request(1, 2)));
 
         assert!(matches!(
             message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1368,7 +1503,7 @@ mod tests {
             })
         })
         .unwrap();
-        worker.sender().send(request(0, 1)).unwrap();
+        send_run(&worker.sender(), request(0, 1));
 
         assert!(matches!(
             message_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1522,7 +1657,7 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        request_tx.send(request(0, 1)).unwrap();
+        send_run(&request_tx, request(0, 1));
         spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let mut latest = std::collections::HashMap::new();
@@ -1540,7 +1675,7 @@ mod tests {
                 kind: crate::tui::message::RunKind::Samples,
             };
             latest.insert(problem, request);
-            request_tx.send(request).unwrap();
+            send_run(&request_tx, request);
         }
         let sentinel = RunRequest {
             run_id: 1_002,
@@ -1550,7 +1685,7 @@ mod tests {
             kind: crate::tui::message::RunKind::Samples,
         };
         latest.insert(sentinel.problem, sentinel);
-        request_tx.send(sentinel).unwrap();
+        send_run(&request_tx, sentinel);
 
         loop {
             let spawned = spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1665,10 +1800,10 @@ mod tests {
             })
             .unwrap();
             let request_tx = worker.sender();
-            request_tx.send(request(0, iteration * 10 + 1)).unwrap();
+            send_run(&request_tx, request(0, iteration * 10 + 1));
             let (_, cancellation) = spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            request_tx.send(request(1, iteration * 10 + 2)).unwrap();
-            request_tx.send(request(2, iteration * 10 + 3)).unwrap();
+            send_run(&request_tx, request(1, iteration * 10 + 2));
+            send_run(&request_tx, request(2, iteration * 10 + 3));
             wait_cancel_requested(&cancellation);
 
             worker.request_stop();

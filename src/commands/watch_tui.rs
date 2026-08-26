@@ -701,7 +701,7 @@ struct ContestSession {
     detail_analysis_worker: Option<DetailAnalysisWorker>,
     input: PreparedWatchInput,
     message_rx: mpsc::Receiver<Message>,
-    run_tx: mpsc::Sender<crate::tui::message::RunRequest>,
+    run_tx: mpsc::Sender<crate::tui::message::RunWorkerCommand>,
     detail_analysis_tx: mpsc::Sender<crate::tui::SessionDetailAnalysisCommand>,
     detail_analysis_rx: mpsc::Receiver<crate::tui::SessionDetailAnalysisResult>,
 }
@@ -940,7 +940,7 @@ mod tests {
     use super::*;
     use crate::language::Language;
     use crate::model::{Problem, Sample};
-    use crate::tui::message::{RunKind, RunRequest, TestEvent};
+    use crate::tui::message::{RunKind, RunRequest, RunWorkerCommand, TestEvent};
 
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
         match PreparedWatchInput::resolve_for_switch(root, contest_id) {
@@ -1738,13 +1738,13 @@ mod tests {
         };
         session
             .run_tx
-            .send(RunRequest {
+            .send(RunWorkerCommand::Run(RunRequest {
                 run_id: 1,
                 problem: 0,
                 language: Language::Cpp,
                 debug: false,
                 kind: RunKind::Samples,
-            })
+            }))
             .unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 

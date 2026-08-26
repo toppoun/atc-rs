@@ -30,7 +30,7 @@ pub(crate) use detail_layout::{
     DetailAnalysisResult as SessionDetailAnalysisResult,
 };
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
-use message::{Message, RunRequest};
+use message::{Message, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
@@ -73,16 +73,18 @@ pub(super) enum FrontendAction {
     ToggleDebug,
     ToggleSamples,
     StartStress,
+    StopStress,
     InitializeStress,
     SwitchContest,
 }
 
 impl FrontendAction {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::RunTests,
         Self::ToggleDebug,
         Self::ToggleSamples,
         Self::StartStress,
+        Self::StopStress,
         Self::InitializeStress,
         Self::SwitchContest,
     ];
@@ -93,19 +95,21 @@ impl FrontendAction {
             Self::ToggleDebug => "Toggle Debug",
             Self::ToggleSamples => "Toggle Samples",
             Self::StartStress => "Start Stress",
+            Self::StopStress => "Stop Stress",
             Self::InitializeStress => "Initialize Stress",
             Self::SwitchContest => "Switch Contest",
         }
     }
 
-    pub(super) const fn shortcut(self) -> &'static str {
+    pub(super) const fn shortcut(self) -> Option<&'static str> {
         match self {
-            Self::RunTests => "r",
-            Self::ToggleDebug => "d",
-            Self::ToggleSamples => "s",
-            Self::StartStress => "S",
-            Self::InitializeStress => "i",
-            Self::SwitchContest => "c",
+            Self::RunTests => Some("r"),
+            Self::ToggleDebug => Some("d"),
+            Self::ToggleSamples => Some("s"),
+            Self::StartStress => Some("S"),
+            Self::StopStress => None,
+            Self::InitializeStress => Some("i"),
+            Self::SwitchContest => Some("c"),
         }
     }
 
@@ -143,6 +147,9 @@ impl FrontendAction {
             {
                 FrontendActionAvailability::Unavailable("stress initialization not required")
             }
+            Self::StopStress if app.active_stress_identity().is_none() => {
+                FrontendActionAvailability::Unavailable("stress is not running")
+            }
             Self::SwitchContest if !contest_switch_available => {
                 FrontendActionAvailability::Unavailable("not in a workspace")
             }
@@ -150,6 +157,7 @@ impl FrontendAction {
             | Self::ToggleDebug
             | Self::ToggleSamples
             | Self::StartStress
+            | Self::StopStress
             | Self::InitializeStress
             | Self::SwitchContest => FrontendActionAvailability::Available,
         }
@@ -996,7 +1004,7 @@ impl<'a> StressSetupContext<'a> {
 
 pub(crate) struct SessionChannels<'a> {
     message_rx: &'a Receiver<Message>,
-    run_tx: &'a Sender<RunRequest>,
+    run_tx: &'a Sender<RunWorkerCommand>,
     detail_analysis_tx: &'a Sender<DetailAnalysisCommand>,
     detail_analysis_rx: &'a Receiver<DetailAnalysisResult>,
 }
@@ -1004,7 +1012,7 @@ pub(crate) struct SessionChannels<'a> {
 impl<'a> SessionChannels<'a> {
     pub(crate) fn new(
         message_rx: &'a Receiver<Message>,
-        run_tx: &'a Sender<RunRequest>,
+        run_tx: &'a Sender<RunWorkerCommand>,
         detail_analysis_tx: &'a Sender<DetailAnalysisCommand>,
         detail_analysis_rx: &'a Receiver<DetailAnalysisResult>,
     ) -> Self {
@@ -1045,12 +1053,15 @@ impl<'a> SessionRuntime<'a> {
 
 #[derive(Clone, Copy)]
 struct TerminalInputContext<'a> {
-    run_tx: &'a Sender<RunRequest>,
+    run_tx: &'a Sender<RunWorkerCommand>,
     stress_setup: Option<StressSetupContext<'a>>,
 }
 
 impl<'a> TerminalInputContext<'a> {
-    fn new(run_tx: &'a Sender<RunRequest>, stress_setup: Option<StressSetupContext<'a>>) -> Self {
+    fn new(
+        run_tx: &'a Sender<RunWorkerCommand>,
+        stress_setup: Option<StressSetupContext<'a>>,
+    ) -> Self {
         Self {
             run_tx,
             stress_setup,
@@ -1116,8 +1127,11 @@ impl DetailScrollbarDragState {
     }
 }
 
-fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Result<()> {
-    run_tx.send(request).map_err(|_| {
+fn send_run_worker_command(
+    run_tx: &Sender<RunWorkerCommand>,
+    command: RunWorkerCommand,
+) -> io::Result<()> {
+    run_tx.send(command).map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
             "run worker request channel disconnected",
@@ -1125,10 +1139,14 @@ fn send_run_request(run_tx: &Sender<RunRequest>, request: RunRequest) -> io::Res
     })
 }
 
+fn send_run_request(run_tx: &Sender<RunWorkerCommand>, request: RunRequest) -> io::Result<()> {
+    send_run_worker_command(run_tx, RunWorkerCommand::Run(request))
+}
+
 fn queue_problem_run(
     app: &mut WatchApp,
     problem: usize,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
 ) -> io::Result<bool> {
     let Some(request) = app.queue_run(problem) else {
         return Ok(false);
@@ -1142,7 +1160,7 @@ fn queue_problem_run(
 fn queue_problem_stress(
     app: &mut WatchApp,
     problem: usize,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
     setup: StressSetupContext<'_>,
 ) -> io::Result<bool> {
     queue_problem_stress_with_seed(app, problem, run_tx, setup, crate::stress::automatic_seed)
@@ -1151,7 +1169,7 @@ fn queue_problem_stress(
 fn queue_problem_stress_with_seed(
     app: &mut WatchApp,
     problem: usize,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
     setup: StressSetupContext<'_>,
     automatic_seed: impl FnOnce() -> io::Result<u64>,
 ) -> io::Result<bool> {
@@ -1219,7 +1237,7 @@ fn initialize_problem_stress(
 fn handle_messages(
     app: &mut WatchApp,
     message_rx: &Receiver<Message>,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
 ) -> io::Result<bool> {
     let mut changed = false;
 
@@ -1715,7 +1733,7 @@ fn handle_terminal_events(
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
     render_info: &view::RenderInfo,
     events: &mut VecDeque<TerminalEvent>,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
 ) -> io::Result<bool> {
     handle_terminal_events_with_mouse_mode(
         app,
@@ -1936,7 +1954,7 @@ fn handle_terminal_event_with_mouse_mode(
 fn handle_key_event(
     app: &mut WatchApp,
     key: KeyEvent,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
 ) -> io::Result<bool> {
     handle_key_event_with_stress_context(app, key, run_tx, None)
 }
@@ -1945,7 +1963,7 @@ fn handle_key_event(
 fn handle_key_event_with_stress_context(
     app: &mut WatchApp,
     key: KeyEvent,
-    run_tx: &Sender<RunRequest>,
+    run_tx: &Sender<RunWorkerCommand>,
     stress_setup: Option<StressSetupContext<'_>>,
 ) -> io::Result<bool> {
     handle_key_event_with_frontend_context(
@@ -2033,6 +2051,16 @@ fn execute_frontend_action(
                 return Ok(false);
             };
             queue_problem_stress(app, problem, input.run_tx, stress_setup)
+        }
+        FrontendAction::StopStress => {
+            let Some((problem, run_id)) = app.active_stress_identity() else {
+                return Ok(false);
+            };
+            send_run_worker_command(
+                input.run_tx,
+                RunWorkerCommand::CancelStress { problem, run_id },
+            )?;
+            Ok(app.cancel_stress(problem, run_id))
         }
         FrontendAction::InitializeStress => {
             let Some(problem) = app.selected_problem() else {
@@ -2354,7 +2382,7 @@ mod tests {
         code: KeyCode,
         destination: &Path,
         contest: &Contest,
-        run_tx: &Sender<RunRequest>,
+        run_tx: &Sender<RunWorkerCommand>,
     ) -> io::Result<bool> {
         handle_key_event_with_stress_context(
             app,
@@ -2419,6 +2447,23 @@ mod tests {
         }
     }
 
+    fn run_request(command: RunWorkerCommand) -> RunRequest {
+        match command {
+            RunWorkerCommand::Run(request) => request,
+            RunWorkerCommand::CancelStress { problem, run_id } => {
+                panic!("expected run command, got stress cancellation {problem}/{run_id}")
+            }
+        }
+    }
+
+    fn received_run(receiver: &Receiver<RunWorkerCommand>) -> RunRequest {
+        run_request(receiver.try_recv().unwrap())
+    }
+
+    fn received_runs(receiver: &Receiver<RunWorkerCommand>) -> Vec<RunRequest> {
+        receiver.try_iter().map(run_request).collect()
+    }
+
     fn resize(columns: u16, rows: u16) -> TerminalEvent {
         TerminalEvent::Resize(terminal::TerminalSize { columns, rows })
     }
@@ -2433,7 +2478,7 @@ mod tests {
         app: &mut WatchApp,
         render_info: &view::RenderInfo,
         events: &mut VecDeque<TerminalEvent>,
-        run_tx: &Sender<RunRequest>,
+        run_tx: &Sender<RunWorkerCommand>,
     ) -> io::Result<bool> {
         let mut detail_layout = detail_layout::DetailLayout::default();
         let mut drag = DetailScrollbarDragState::default();
@@ -2451,7 +2496,7 @@ mod tests {
         app: &mut WatchApp,
         render_info: &view::RenderInfo,
         events: &mut VecDeque<TerminalEvent>,
-        run_tx: &Sender<RunRequest>,
+        run_tx: &Sender<RunWorkerCommand>,
         stress_setup: Option<StressSetupContext<'_>>,
         contest_switch: Option<&mut ContestSwitchController<'_>>,
         command_palette: &mut CommandPalette,
@@ -2580,7 +2625,11 @@ mod tests {
             ("sw", vec!["Switch Contest"]),
             ("con", vec!["Switch Contest"]),
             ("sta", vec!["Start Stress"]),
-            ("str", vec!["Start Stress", "Initialize Stress"]),
+            (
+                "str",
+                vec!["Start Stress", "Stop Stress", "Initialize Stress"],
+            ),
+            ("stop", vec!["Stop Stress"]),
             ("ini", vec!["Initialize Stress"]),
             ("deb", vec!["Toggle Debug"]),
             ("sam", vec!["Toggle Samples"]),
@@ -2627,10 +2676,13 @@ mod tests {
             palette.filtered_actions(),
             [
                 FrontendAction::StartStress,
+                FrontendAction::StopStress,
                 FrontendAction::InitializeStress
             ]
         );
         assert_eq!(palette.selected_action(), Some(FrontendAction::StartStress));
+        palette.handle_key(key(KeyCode::Down, KeyEventKind::Press));
+        assert_eq!(palette.selected_action(), Some(FrontendAction::StopStress));
         palette.handle_key(key(KeyCode::Down, KeyEventKind::Press));
         assert_eq!(
             palette.selected_action(),
@@ -2669,11 +2721,18 @@ mod tests {
     #[test]
     fn initial_shortcuts_and_palette_selection_resolve_to_the_same_frontend_actions() {
         for (index, action) in FrontendAction::ALL.into_iter().enumerate() {
-            let shortcut = action.shortcut().chars().next().unwrap();
-            assert_eq!(
-                FrontendAction::from_shortcut(key(KeyCode::Char(shortcut), KeyEventKind::Press)),
-                Some(action)
-            );
+            if let Some(shortcut) = action.shortcut() {
+                let shortcut = shortcut.chars().next().unwrap();
+                assert_eq!(
+                    FrontendAction::from_shortcut(key(
+                        KeyCode::Char(shortcut),
+                        KeyEventKind::Press,
+                    )),
+                    Some(action)
+                );
+            } else {
+                assert_eq!(action, FrontendAction::StopStress);
+            }
 
             let mut palette = CommandPalette::default();
             palette.open();
@@ -2685,6 +2744,9 @@ mod tests {
                 CommandPaletteKeyResult::ExecuteRequested(action)
             );
         }
+
+        assert_eq!(FrontendAction::StopStress.label(), "Stop Stress");
+        assert_eq!(FrontendAction::StopStress.shortcut(), None);
     }
 
     #[test]
@@ -2701,6 +2763,10 @@ mod tests {
         assert_eq!(
             FrontendAction::InitializeStress.availability(&app, false),
             FrontendActionAvailability::Unavailable("stress initialization not required")
+        );
+        assert_eq!(
+            FrontendAction::StopStress.availability(&app, false),
+            FrontendActionAvailability::Unavailable("stress is not running")
         );
         assert_eq!(
             FrontendAction::SwitchContest.availability(&app, false),
@@ -2727,6 +2793,13 @@ mod tests {
         );
         assert_eq!(
             FrontendAction::SwitchContest.availability(&app, true),
+            FrontendActionAvailability::Available
+        );
+
+        let stress = app.queue_stress(0, 123).unwrap();
+        assert_eq!(app.active_stress_identity(), Some((0, stress.run_id)));
+        assert_eq!(
+            FrontendAction::StopStress.availability(&app, false),
             FrontendActionAvailability::Available
         );
     }
@@ -2786,6 +2859,85 @@ mod tests {
         );
         assert!(palette.is_active());
         assert!(!standalone.modal_active());
+
+        palette.query = "stop".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            !handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                Some(&mut standalone),
+                &mut palette,
+            )
+            .unwrap()
+        );
+        assert!(palette.is_active());
+    }
+
+    #[test]
+    fn palette_stop_stress_targets_active_generation_independent_of_selection() {
+        let mut app = app_with_problems(&[1, 1]);
+        assert!(app.source_changed(1, PathBuf::from("B.py"), Language::Python));
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let stress = app.queue_stress(0, 123).unwrap();
+        assert!(app.run_started(0, stress.run_id));
+        assert!(app.select_problem(1));
+        let (run_tx, run_rx) = mpsc::channel();
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "stop".to_string();
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        assert!(
+            handle_frontend_terminal_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &run_tx,
+                None,
+                None,
+                &mut palette,
+            )
+            .unwrap()
+        );
+
+        assert!(!palette.is_active());
+        assert_eq!(app.selected_problem(), Some(1));
+        assert_eq!(app.problems()[0].stress.phase, app::StressPhase::Cancelled);
+        assert_eq!(app.problems()[1].stress.phase, app::StressPhase::Idle);
+        assert_eq!(
+            run_rx.try_recv().unwrap(),
+            RunWorkerCommand::CancelStress {
+                problem: 0,
+                run_id: stress.run_id,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_stop_submission_does_not_cancel_logical_stress() {
+        let mut app = app_with_problems(&[1]);
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let stress = app.queue_stress(0, 123).unwrap();
+        let (run_tx, run_rx) = mpsc::channel();
+        drop(run_rx);
+
+        let error = execute_frontend_action(
+            &mut app,
+            FrontendAction::StopStress,
+            TerminalInputContext::new(&run_tx, None),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(app.active_stress_identity(), Some((0, stress.run_id)));
+        assert_eq!(app.problems()[0].stress.phase, app::StressPhase::Queued);
     }
 
     #[test]
@@ -2835,7 +2987,7 @@ mod tests {
             .unwrap()
         );
         assert!(!palette.is_active());
-        assert_eq!(run_rx.try_recv().unwrap().problem, 1);
+        assert_eq!(received_run(&run_rx).problem, 1);
     }
 
     #[test]
@@ -5007,7 +5159,7 @@ mod tests {
         );
 
         // 256件だけRunRequestが作られている
-        let first_requests: Vec<_> = run_rx.try_iter().collect();
+        let first_requests = received_runs(&run_rx);
 
         assert_eq!(first_requests.len(), MAX_MESSAGES_PER_TICK);
         assert_eq!(first_requests[0].run_id, 1);
@@ -5029,7 +5181,7 @@ mod tests {
             Language::Python
         );
 
-        let second_requests: Vec<_> = run_rx.try_iter().collect();
+        let second_requests = received_runs(&run_rx);
 
         assert_eq!(second_requests.len(), 1);
         assert_eq!(second_requests[0].run_id, MAX_MESSAGES_PER_TICK as u64 + 1);
@@ -5283,7 +5435,7 @@ mod tests {
         assert_eq!(app.selected_case(), 0);
 
         // source変更からworkerへのRunRequestも作られている
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
 
         assert_eq!(request.run_id, 1);
         assert_eq!(request.problem, 1);
@@ -5337,7 +5489,7 @@ mod tests {
 
         assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
 
-        let requests: Vec<_> = run_rx.try_iter().collect();
+        let requests = received_runs(&run_rx);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].run_id, 1);
         assert_eq!(requests[1].run_id, 2);
@@ -7030,7 +7182,7 @@ mod tests {
             .unwrap()
         );
 
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
 
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
@@ -7078,7 +7230,7 @@ mod tests {
         );
 
         assert_eq!(seed_calls.get(), 1);
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
         assert_eq!(request.run_id, 1);
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
@@ -7110,7 +7262,7 @@ mod tests {
                 .unwrap()
         );
 
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
         assert!(matches!(
@@ -7289,7 +7441,7 @@ mod tests {
             handle_stress_setup_key(&mut app, KeyCode::Char('S'), temp.path(), &contest, &run_tx,)
                 .unwrap()
         );
-        let queued = run_rx.try_recv().unwrap();
+        let queued = received_run(&run_rx);
         assert_eq!(
             app.current_problem().unwrap().stress.phase,
             app::StressPhase::Queued
@@ -7397,7 +7549,7 @@ mod tests {
                 .unwrap()
         );
         assert!(matches!(
-            run_rx.try_recv().unwrap().kind,
+            received_run(&run_rx).kind,
             message::RunKind::Stress { count: None, .. }
         ));
 
@@ -7447,7 +7599,7 @@ mod tests {
                 .unwrap()
         );
         assert!(matches!(
-            run_rx.try_recv().unwrap().kind,
+            received_run(&run_rx).kind,
             message::RunKind::Stress { count: None, .. }
         ));
         assert_eq!(
@@ -7473,7 +7625,7 @@ mod tests {
             .unwrap()
         );
 
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
     }
@@ -7509,7 +7661,7 @@ mod tests {
             )
             .unwrap()
         );
-        let first = run_rx.try_recv().unwrap();
+        let first = received_run(&run_rx);
         assert!(first.debug);
 
         assert!(
@@ -7596,7 +7748,7 @@ mod tests {
 
         assert!(app.debug_enabled());
 
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
 
         assert_eq!(request.problem, 0);
         assert_eq!(request.language, Language::Cpp);
@@ -7621,7 +7773,7 @@ mod tests {
 
         assert!(!app.debug_enabled());
 
-        let request = run_rx.try_recv().unwrap();
+        let request = received_run(&run_rx);
         assert!(!request.debug);
     }
     #[test]
@@ -7686,7 +7838,7 @@ mod tests {
             .unwrap();
         assert!(handle_messages(&mut app, &message_rx, &run_tx).unwrap());
 
-        let requests: Vec<_> = run_rx.try_iter().collect();
+        let requests = received_runs(&run_rx);
         assert_eq!(requests.len(), 4);
         assert_eq!(
             requests
@@ -7759,7 +7911,7 @@ mod tests {
             }
         }
 
-        let requests: Vec<_> = run_rx.try_iter().collect();
+        let requests = received_runs(&run_rx);
         assert_eq!(requests.len(), 300);
         assert_eq!(
             requests

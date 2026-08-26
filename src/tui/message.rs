@@ -33,6 +33,12 @@ pub struct RunRequest {
     pub kind: RunKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWorkerCommand {
+    Run(RunRequest),
+    CancelStress { problem: usize, run_id: RunId },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestEvent {
     NoSamples,

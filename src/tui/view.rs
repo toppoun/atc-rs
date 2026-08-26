@@ -180,9 +180,14 @@ fn fit_command_palette_row(text: &str, width: usize) -> String {
     fitted
 }
 
-fn command_palette_row(marker: &str, label: &str, shortcut: &str, width: usize) -> String {
+fn command_palette_row(marker: &str, label: &str, shortcut: Option<&str>, width: usize) -> String {
+    let shortcut = shortcut.unwrap_or("");
     let aligned = format!("{marker} {label:<COMMAND_PALETTE_LABEL_WIDTH$} {shortcut}");
-    let compact = format!("{marker} {label} {shortcut}");
+    let compact = if shortcut.is_empty() {
+        format!("{marker} {label}")
+    } else {
+        format!("{marker} {label} {shortcut}")
+    };
     let base = if UnicodeWidthStr::width(aligned.as_str()) <= width {
         aligned
     } else if UnicodeWidthStr::width(compact.as_str()) <= width {
@@ -1366,6 +1371,7 @@ mod tests {
 
     #[test]
     fn command_palette_renders_query_selection_shortcuts_and_dedicated_unavailable_status() {
+        let mut active_app = app();
         let app = app();
         let mut palette = CommandPalette::default();
         palette.open();
@@ -1393,14 +1399,43 @@ mod tests {
         let rendered =
             rendered_frontend_text_with_palette(&app, true, None, Some(&palette), 100, 20);
         assert!(rendered.contains("Start Stress"));
+        assert!(rendered.contains("Stop Stress"));
         assert!(rendered.contains("Initialize Stress"));
         assert!(!rendered.contains("unavailable —"));
         assert!(rendered.contains("Unavailable: no source file"));
 
-        palette.selected = 1;
+        palette.selected = 2;
         let rendered =
             rendered_frontend_text_with_palette(&app, true, None, Some(&palette), 100, 20);
         assert!(rendered.contains("Unavailable: stress initialization not required"));
+
+        palette.query = "stop".to_string();
+        palette.selected = 0;
+        let rendered =
+            rendered_frontend_text_with_palette(&app, true, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("> Stop Stress"));
+        assert!(rendered.contains("Unavailable: stress is not running"));
+        let unavailable =
+            rendered_frontend_buffer_with_palette(&app, true, None, Some(&palette), 100, 20);
+        assert!(unavailable.content().iter().any(|cell| {
+            cell.symbol() == "S"
+                && cell.fg == Color::DarkGray
+                && cell.modifier.contains(Modifier::REVERSED)
+        }));
+
+        assert!(active_app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(active_app.queue_stress(0, 123).is_some());
+        let rendered =
+            rendered_frontend_text_with_palette(&active_app, true, None, Some(&palette), 100, 20);
+        assert!(rendered.contains("> Stop Stress"));
+        assert!(!rendered.contains("Unavailable:"));
+        let available =
+            rendered_frontend_buffer_with_palette(&active_app, true, None, Some(&palette), 100, 20);
+        assert!(available.content().iter().any(|cell| {
+            cell.symbol() == "S"
+                && cell.fg != Color::DarkGray
+                && cell.modifier.contains(Modifier::REVERSED)
+        }));
     }
 
     #[test]
@@ -1426,8 +1461,10 @@ mod tests {
         let frame = Rect::new(0, 0, 76, 20);
         let mut palette = CommandPalette::default();
         palette.open();
+        let action_count = palette.filtered_actions().len();
 
-        let unavailable_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let unavailable_layout =
+            command_palette_layout(frame, action_count, palette.selected_index());
         let unavailable_buffer = rendered_frontend_buffer_with_palette(
             &app,
             false,
@@ -1451,7 +1488,8 @@ mod tests {
         }));
 
         assert!(palette.select_next());
-        let available_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let available_layout =
+            command_palette_layout(frame, action_count, palette.selected_index());
         let available_buffer = rendered_frontend_buffer_with_palette(
             &app,
             false,
@@ -1552,11 +1590,8 @@ mod tests {
         let mut palette = CommandPalette::default();
         palette.open();
         let frame = Rect::new(0, 0, 100, 11);
-        let layout = command_palette_layout(
-            frame,
-            palette.filtered_actions().len(),
-            palette.selected_index(),
-        );
+        let action_count = palette.filtered_actions().len();
+        let layout = command_palette_layout(frame, action_count, palette.selected_index());
         assert_eq!(layout.command_capacity, 4);
         assert!(layout.show_scrollbar);
 
@@ -1589,7 +1624,7 @@ mod tests {
                 == "█"
         }));
 
-        for expected in 1..=4 {
+        for expected in 1..=5 {
             assert!(palette.select_next());
             assert_eq!(palette.selected_index(), expected);
             let rendered = rendered_frontend_text_with_palette(
@@ -1602,8 +1637,8 @@ mod tests {
             );
             assert!(rendered.contains(palette.selected_action().unwrap().label()));
         }
-        let shifted = command_palette_layout(frame, 6, palette.selected_index());
-        assert_eq!(shifted.viewport, 1..5);
+        let shifted = command_palette_layout(frame, action_count, palette.selected_index());
+        assert_eq!(shifted.viewport, 2..6);
         let rendered = rendered_frontend_text_with_palette(
             &app,
             false,
@@ -1617,9 +1652,12 @@ mod tests {
 
         palette.selected = 0;
         assert!(palette.select_previous());
-        assert_eq!(palette.selected_index(), 5);
-        let wrapped = command_palette_layout(frame, 6, palette.selected_index());
-        assert_eq!(wrapped.viewport, 2..6);
+        assert_eq!(palette.selected_index(), action_count - 1);
+        let wrapped = command_palette_layout(frame, action_count, palette.selected_index());
+        assert_eq!(
+            wrapped.viewport,
+            action_count - layout.command_capacity..action_count
+        );
         let rendered = rendered_frontend_text_with_palette(
             &app,
             false,
@@ -1632,8 +1670,8 @@ mod tests {
 
         palette.query = "str".to_string();
         palette.reset_selection();
-        let filtered = command_palette_layout(frame, 2, palette.selected_index());
-        assert_eq!(filtered.viewport, 0..2);
+        let filtered = command_palette_layout(frame, 3, palette.selected_index());
+        assert_eq!(filtered.viewport, 0..3);
         assert!(!filtered.show_scrollbar);
         let rendered = rendered_frontend_text_with_palette(
             &app,
@@ -1644,6 +1682,7 @@ mod tests {
             frame.height,
         );
         assert!(rendered.contains("> Start Stress"));
+        assert!(rendered.contains("Stop Stress"));
         assert!(rendered.contains("Initialize Stress"));
     }
 
@@ -1812,7 +1851,8 @@ mod tests {
         let mut palette = CommandPalette::default();
         palette.open();
         let frame = Rect::new(0, 0, 76, 10);
-        let layout = command_palette_layout(frame, 6, 0);
+        let action_count = palette.filtered_actions().len();
+        let layout = command_palette_layout(frame, action_count, 0);
         let buffer = rendered_frontend_buffer_with_palette(
             &app,
             false,
@@ -1835,7 +1875,8 @@ mod tests {
         }
 
         assert!(palette.select_next());
-        let available_layout = command_palette_layout(frame, 6, palette.selected_index());
+        let available_layout =
+            command_palette_layout(frame, action_count, palette.selected_index());
         let available_buffer = rendered_frontend_buffer_with_palette(
             &app,
             false,
@@ -1877,16 +1918,21 @@ mod tests {
 
     #[test]
     fn command_palette_rows_truncate_unicode_safely_and_prioritize_label() {
-        let medium = command_palette_row(">", "Switch Contest", "c", 30);
+        let medium = command_palette_row(">", "Switch Contest", Some("c"), 30);
         assert_eq!(UnicodeWidthStr::width(medium.as_str()), 30);
         assert!(medium.contains("Switch Contest"));
         assert!(medium.contains(" c"));
         assert!(!medium.contains("Unavailable"));
 
-        let narrow = command_palette_row(">", "Run Tests", "r", 10);
+        let narrow = command_palette_row(">", "Run Tests", Some("r"), 10);
         assert_eq!(UnicodeWidthStr::width(narrow.as_str()), 10);
         assert!(narrow.starts_with("> Run"));
         assert!(narrow.contains('…'));
+
+        let no_shortcut = command_palette_row(">", "Stop Stress", None, 30);
+        assert_eq!(UnicodeWidthStr::width(no_shortcut.as_str()), 30);
+        assert!(no_shortcut.contains("Stop Stress"));
+        assert!(!no_shortcut.contains("None"));
 
         for width in 0..=12 {
             let fitted =

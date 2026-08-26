@@ -666,6 +666,54 @@ impl WatchApp {
         }
     }
 
+    /// `queue_stress` is the only transition that creates an active stress generation, and it
+    /// retires every other active stress before installing the new one. All event transitions
+    /// preserve that identity or move it to a terminal phase, so valid app state has at most one
+    /// active stress. Still require a unique, well-formed identity here so cancellation fails
+    /// closed instead of choosing an arbitrary generation if that invariant is ever violated.
+    pub fn active_stress_identity(&self) -> Option<(usize, RunId)> {
+        let mut active = self
+            .problems
+            .iter()
+            .enumerate()
+            .filter_map(|(problem, state)| {
+                matches!(
+                    state.stress.phase,
+                    StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
+                )
+                .then_some((problem, state.stress.id))
+            });
+        let (problem, run_id) = active.next()?;
+        if active.next().is_some() {
+            return None;
+        }
+        run_id.map(|run_id| (problem, run_id))
+    }
+
+    pub fn cancel_stress(&mut self, problem: usize, run_id: RunId) -> bool {
+        let affects_current_detail = self.selected_problem == problem
+            && self
+                .problems
+                .get(problem)
+                .is_some_and(|problem| problem.detail_mode == DetailMode::Stress);
+        let Some(stress) = self.current_stress_mut(problem, run_id) else {
+            return false;
+        };
+        if !matches!(
+            stress.phase,
+            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
+        ) {
+            return false;
+        }
+
+        stress.phase = StressPhase::Cancelled;
+        self.problems[problem].stress_setup = StressSetupState::None;
+        if affects_current_detail {
+            self.invalidate_detail();
+        }
+        true
+    }
+
     pub fn queue_run(&mut self, problem: usize) -> Option<RunRequest> {
         let (language, total_cases) = {
             let problem_state = self.problems.get(problem)?;
@@ -2813,6 +2861,149 @@ mod tests {
         assert_eq!(app.problems[0].detail_mode, DetailMode::Stress);
         assert_eq!(app.problems[0].stress.phase, StressPhase::Queued);
         assert_eq!(app.problems[0].stress.base_seed, Some(1234));
+    }
+
+    #[test]
+    fn active_stress_identity_uses_logical_phase_and_run_id() {
+        for (phase, expected_active) in [
+            (StressPhase::Queued, true),
+            (StressPhase::Compiling, true),
+            (StressPhase::Running, true),
+            (StressPhase::Finished, false),
+            (StressPhase::Failed, false),
+            (StressPhase::Cancelled, false),
+            (StressPhase::Error, false),
+            (StressPhase::Idle, false),
+        ] {
+            let mut app = WatchApp::new(&contest(1), vec![1]).unwrap();
+            assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
+            let stress = app.queue_stress(0, 123).unwrap();
+            app.problems[0].stress.phase = phase;
+
+            assert_eq!(
+                app.active_stress_identity(),
+                expected_active.then_some((0, stress.run_id)),
+                "phase {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_stress_identity_is_unique_across_public_transitions_and_fails_closed() {
+        let mut app = WatchApp::new(&contest(2), vec![1, 1]).unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(app.source_changed(1, PathBuf::from("B.py"), Language::Python));
+
+        let first = app.queue_stress(0, 100).unwrap();
+        assert_eq!(app.active_stress_identity(), Some((0, first.run_id)));
+
+        let second = app.queue_stress(1, 200).unwrap();
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Cancelled);
+        assert_eq!(app.problems[0].stress.id, None);
+        assert_eq!(app.active_stress_identity(), Some((1, second.run_id)));
+
+        // Even corrupted internal state must never make Stop Stress choose an arbitrary target.
+        app.problems[0].stress.id = Some(first.run_id);
+        app.problems[0].stress.phase = StressPhase::Running;
+        assert_eq!(app.active_stress_identity(), None);
+    }
+
+    #[test]
+    fn cancelling_active_stress_is_selection_independent_terminal_and_restartable() {
+        let mut app = WatchApp::new(&contest(2), vec![1, 1]).unwrap();
+        assert!(app.source_changed(1, PathBuf::from("B.py"), Language::Python));
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let first = app.queue_stress(0, 100).unwrap();
+        assert!(app.run_started(0, first.run_id));
+        assert!(app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Started {
+                base_seed: 100,
+                case_limit: None,
+            },
+        ));
+        assert!(app.select_problem(1));
+
+        assert_eq!(app.active_stress_identity(), Some((0, first.run_id)));
+        assert!(app.cancel_stress(0, first.run_id));
+        assert_eq!(app.selected_problem(), Some(1));
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Cancelled);
+        assert_eq!(app.problems[1].stress.phase, StressPhase::Idle);
+        assert_eq!(app.active_stress_identity(), None);
+
+        assert!(!app.run_started(0, first.run_id));
+        assert!(!app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Started {
+                base_seed: 100,
+                case_limit: None,
+            },
+        ));
+        assert!(!app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Progress {
+                case_number: 1,
+                seed: 100,
+                passed: 1,
+                elapsed: Duration::from_millis(1),
+                cases_per_second: 1_000.0,
+            },
+        ));
+        assert!(!app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 1,
+                base_seed: 100,
+                seed: 100,
+                input: "late input".to_string(),
+                expected: "late expected".to_string(),
+                actual: "late actual".to_string(),
+                stderr: "late stderr".to_string(),
+                candidate_elapsed: Duration::from_millis(1),
+                elapsed: Duration::from_millis(1),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+        assert!(!app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Finished {
+                cases: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(!app.stress_event(
+            0,
+            first.run_id,
+            StressEvent::Cancelled {
+                cases: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(!app.run_completed(0, first.run_id));
+        assert!(!app.run_failed(0, first.run_id, "late failure".to_string()));
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Cancelled);
+        assert_eq!(app.problems[0].stress.passed, 0);
+        assert!(app.problems[0].stress.failure.is_none());
+        assert!(app.problems[0].stress.error.is_none());
+
+        let sample = app.queue_run(1).unwrap();
+        assert!(matches!(sample.kind, RunKind::Samples));
+        assert!(sample.run_id > first.run_id);
+        assert!(app.run_started(1, sample.run_id));
+        assert!(app.run_completed(1, sample.run_id));
+
+        let second = app.queue_stress(0, 200).unwrap();
+        assert!(second.run_id > sample.run_id);
+        assert_eq!(app.active_stress_identity(), Some((0, second.run_id)));
+        assert_eq!(app.selected_problem(), Some(1));
+        assert!(app.run_started(0, second.run_id));
+        assert_eq!(app.problems[0].stress.phase, StressPhase::Running);
     }
 
     #[test]

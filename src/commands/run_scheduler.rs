@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::tui::message::{RunId, RunRequest};
+use crate::tui::message::{RunId, RunKind, RunRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestArrival {
@@ -9,9 +9,16 @@ pub(super) enum RequestArrival {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StressCancellation {
+    Ignored,
+    Accepted { cancel_active: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveLogicalState {
     Latest,
     Obsolete,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -89,6 +96,45 @@ impl RunScheduler {
         debug_assert!(self.invariants_hold());
 
         RequestArrival::Accepted { cancel_active }
+    }
+
+    pub(super) fn cancel_stress(&mut self, problem: usize, run_id: RunId) -> StressCancellation {
+        let matches_stress = |request: &RunRequest| {
+            request.problem == problem
+                && request.run_id == run_id
+                && matches!(request.kind, RunKind::Stress { .. })
+        };
+
+        if self.foreground.as_ref().is_some_and(matches_stress) {
+            self.foreground = None;
+            debug_assert!(self.invariants_hold());
+            return StressCancellation::Accepted {
+                cancel_active: false,
+            };
+        }
+
+        if let Some(position) = self.pending.iter().position(matches_stress) {
+            self.pending.remove(position);
+            debug_assert!(self.invariants_hold());
+            return StressCancellation::Accepted {
+                cancel_active: false,
+            };
+        }
+
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| matches_stress(&active.request))
+        else {
+            debug_assert!(self.invariants_hold());
+            return StressCancellation::Ignored;
+        };
+
+        active.logical_state = ActiveLogicalState::Cancelled;
+        let cancel_active = !std::mem::replace(&mut active.cancel_requested, true);
+        debug_assert!(self.invariants_hold());
+
+        StressCancellation::Accepted { cancel_active }
     }
 
     pub(super) fn start_next(&mut self) -> Option<RunRequest> {
@@ -199,11 +245,23 @@ impl RunScheduler {
                     }
                 }
                 ActiveLogicalState::Obsolete => {
+                    // The newer same-problem request may already have been explicitly
+                    // cancelled, so latest_seen remains authoritative even when no queued
+                    // replacement remains.
                     if self
                         .latest_seen
                         .get(&active.request.problem)
                         .is_none_or(|latest| *latest <= active.request.run_id)
-                        || !logical_problems.contains(&active.request.problem)
+                    {
+                        return false;
+                    }
+                }
+                ActiveLogicalState::Cancelled => {
+                    if !matches!(active.request.kind, RunKind::Stress { .. })
+                        || self
+                            .latest_seen
+                            .get(&active.request.problem)
+                            .is_none_or(|latest| *latest < active.request.run_id)
                     {
                         return false;
                     }
@@ -630,6 +688,210 @@ mod tests {
         assert!(!retired.requeue_eligible);
         assert!(!scheduler.requeue_retired(retired));
         assert!(scheduler.start_next().is_none());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn queued_stress_cancellation_removes_exact_generation_before_it_can_start() {
+        let mut scheduler = RunScheduler::default();
+        let sample = request(0, 1);
+        let stress = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(1, 2)
+        };
+        start(&mut scheduler, sample);
+        assert_eq!(
+            scheduler.request_arrived(stress),
+            RequestArrival::Accepted {
+                cancel_active: true
+            }
+        );
+
+        assert_eq!(
+            scheduler.cancel_stress(stress.problem, stress.run_id),
+            StressCancellation::Accepted {
+                cancel_active: false
+            }
+        );
+        let retired = scheduler.retire_active().unwrap();
+        assert!(scheduler.requeue_retired(retired));
+        assert_eq!(scheduler.start_next(), Some(sample));
+        assert!(scheduler.retire_active().is_some());
+        assert!(scheduler.start_next().is_none());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn cancelling_same_problem_queued_stress_does_not_resurrect_obsolete_attempt() {
+        let mut scheduler = RunScheduler::default();
+        let sample = request(0, 1);
+        let stress = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(0, 2)
+        };
+        start(&mut scheduler, sample);
+        assert_eq!(
+            scheduler.request_arrived(stress),
+            RequestArrival::Accepted {
+                cancel_active: true
+            }
+        );
+
+        assert_eq!(
+            scheduler.cancel_stress(stress.problem, stress.run_id),
+            StressCancellation::Accepted {
+                cancel_active: false
+            }
+        );
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!retired.is_latest());
+        assert!(!scheduler.requeue_retired(retired));
+        assert!(scheduler.start_next().is_none());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn active_stress_cancellation_is_identity_scoped_and_terminal() {
+        let mut scheduler = RunScheduler::default();
+        let stress = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 42,
+                count: None,
+            },
+            ..request(0, 10)
+        };
+        start(&mut scheduler, stress);
+
+        assert_eq!(scheduler.cancel_stress(0, 9), StressCancellation::Ignored);
+        assert_eq!(scheduler.cancel_stress(1, 10), StressCancellation::Ignored);
+        assert_eq!(
+            scheduler.cancel_stress(0, 10),
+            StressCancellation::Accepted {
+                cancel_active: true
+            }
+        );
+        assert_eq!(
+            scheduler.cancel_stress(0, 10),
+            StressCancellation::Accepted {
+                cancel_active: false
+            }
+        );
+
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!retired.is_latest());
+        assert!(!scheduler.requeue_retired(retired));
+        assert!(scheduler.start_next().is_none());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn stale_stress_cancellation_cannot_remove_a_newer_generation() {
+        let mut scheduler = RunScheduler::default();
+        let old = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 10,
+                count: None,
+            },
+            ..request(0, 10)
+        };
+        let new = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 11,
+                count: None,
+            },
+            ..request(0, 11)
+        };
+        scheduler.request_arrived(old);
+        scheduler.request_arrived(new);
+
+        assert_eq!(
+            scheduler.cancel_stress(old.problem, old.run_id),
+            StressCancellation::Ignored
+        );
+        assert_eq!(scheduler.start_next(), Some(new));
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn cancelling_old_active_stress_before_new_arrival_preserves_new_generation() {
+        let mut scheduler = RunScheduler::default();
+        let old = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 10,
+                count: None,
+            },
+            ..request(0, 10)
+        };
+        let new = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 11,
+                count: None,
+            },
+            ..request(0, 11)
+        };
+        start(&mut scheduler, old);
+
+        assert_eq!(
+            scheduler.cancel_stress(old.problem, old.run_id),
+            StressCancellation::Accepted {
+                cancel_active: true
+            }
+        );
+        assert_eq!(
+            scheduler.request_arrived(new),
+            RequestArrival::Accepted {
+                cancel_active: false
+            }
+        );
+
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!retired.is_latest());
+        assert!(!scheduler.requeue_retired(retired));
+        assert_eq!(scheduler.start_next(), Some(new));
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn newer_active_replacement_then_old_stop_preserves_new_generation() {
+        let mut scheduler = RunScheduler::default();
+        let old = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 10,
+                count: None,
+            },
+            ..request(0, 10)
+        };
+        let new = RunRequest {
+            kind: RunKind::Stress {
+                base_seed: 11,
+                count: None,
+            },
+            ..request(0, 11)
+        };
+        start(&mut scheduler, old);
+        assert_eq!(
+            scheduler.request_arrived(new),
+            RequestArrival::Accepted {
+                cancel_active: true
+            }
+        );
+
+        assert_eq!(
+            scheduler.cancel_stress(old.problem, old.run_id),
+            StressCancellation::Accepted {
+                cancel_active: false
+            }
+        );
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!retired.is_latest());
+        assert!(!scheduler.requeue_retired(retired));
+        assert_eq!(scheduler.start_next(), Some(new));
         assert_invariants(&scheduler);
     }
 
