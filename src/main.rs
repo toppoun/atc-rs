@@ -13,6 +13,9 @@ mod comparator;
 mod config;
 mod debug;
 mod doctor;
+// This slice establishes the boundary for later frontend actions; no production caller exists yet.
+#[allow(dead_code)]
+mod editor;
 mod error;
 mod language;
 mod model;

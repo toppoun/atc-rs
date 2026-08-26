@@ -103,6 +103,7 @@ dependencies = [
  "reqwest",
  "scraper",
  "serde",
+ "shlex",
  "tempfile",
  "termina",
  "toml",

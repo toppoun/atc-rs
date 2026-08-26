@@ -5,7 +5,12 @@ use std::process::{Command, Output};
 const INITIAL_CONFIG: &[u8] = b"# atc configuration\n\
 #\n\
 # Add only the settings you want to override.\n\
-# See the configuration documentation for available settings.\n";
+# See the configuration documentation for available settings.\n\
+#\n\
+# [editor]\n\
+# command = \"nvim\"\n\
+# args = []\n\
+# mode = \"terminal\"\n";
 
 fn isolated_config_file(base: &Path) -> PathBuf {
     base.join("atc").join("config.toml")

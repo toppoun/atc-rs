@@ -1,3 +1,4 @@
+use crate::editor::EditorConfig;
 use crate::error::AppError;
 use crate::language::Language;
 use serde::Deserialize;
@@ -8,7 +9,12 @@ use std::str::FromStr;
 pub(crate) const INITIAL_CONFIG: &str = "# atc configuration\n\
 #\n\
 # Add only the settings you want to override.\n\
-# See the configuration documentation for available settings.\n";
+# See the configuration documentation for available settings.\n\
+#\n\
+# [editor]\n\
+# command = \"nvim\"\n\
+# args = []\n\
+# mode = \"terminal\"\n";
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +25,9 @@ pub struct Config {
 
     #[serde(default)]
     pub runner: RunnerConfig,
+
+    #[serde(default)]
+    pub(crate) editor: Option<EditorConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +71,7 @@ pub(crate) struct ResolvedConfig {
 struct ConfigOverrides {
     defaults: DefaultsOverrides,
     runner: RunnerOverrides,
+    editor: Option<EditorConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,6 +246,10 @@ impl Config {
             ));
         }
 
+        if let Some(editor) = &self.editor {
+            editor.validate()?;
+        }
+
         Ok(())
     }
 }
@@ -284,6 +298,7 @@ impl ConfigOverrides {
                     .compile_timeout_seconds
                     .unwrap_or(runner_defaults.compile_timeout_seconds),
             },
+            editor: self.editor,
         };
 
         (config, sources)
@@ -308,6 +323,7 @@ fn config_io_error(path: &Path, action: &str, source: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::EditorLaunchMode;
     use tempfile::tempdir;
 
     #[test]
@@ -325,7 +341,12 @@ mod tests {
             b"# atc configuration\n\
 #\n\
 # Add only the settings you want to override.\n\
-# See the configuration documentation for available settings.\n"
+# See the configuration documentation for available settings.\n\
+#\n\
+# [editor]\n\
+# command = \"nvim\"\n\
+# args = []\n\
+# mode = \"terminal\"\n"
         );
         assert!(!INITIAL_CONFIG.as_bytes().contains(&b'\r'));
         assert_eq!(Config::parse(INITIAL_CONFIG).unwrap(), Config::default());
@@ -612,6 +633,66 @@ mod tests {
                 error,
                 AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
             ));
+        }
+    }
+
+    #[test]
+    fn editor_override_is_optional_and_infers_modes_from_its_command() {
+        let absent = Config::parse("").unwrap();
+        assert_eq!(absent.editor, None);
+
+        let terminal = Config::parse("[editor]\ncommand = \"nvim\"\n").unwrap();
+        let terminal = terminal.editor.unwrap();
+        assert!(terminal.args.is_empty());
+        assert_eq!(terminal.mode, None);
+        assert_eq!(terminal.launch_mode(), EditorLaunchMode::Terminal);
+
+        let external = Config::parse("[editor]\ncommand = \"code\"\n").unwrap();
+        assert_eq!(
+            external.editor.unwrap().launch_mode(),
+            EditorLaunchMode::External
+        );
+    }
+
+    #[test]
+    fn editor_override_preserves_args_and_explicit_mode_wins() {
+        let config = Config::parse(
+            "[editor]\n\
+             command = \"code\"\n\
+             args = [\"--first\", \"second value\"]\n\
+             mode = \"terminal\"\n",
+        )
+        .unwrap();
+        let editor = config.editor.unwrap();
+
+        assert_eq!(editor.command, "code");
+        assert_eq!(editor.args, ["--first", "second value"]);
+        assert_eq!(editor.mode, Some(EditorLaunchMode::Terminal));
+        assert_eq!(editor.launch_mode(), EditorLaunchMode::Terminal);
+    }
+
+    #[test]
+    fn explicit_editor_table_requires_a_nonempty_command() {
+        for contents in [
+            "[editor]\n",
+            "[editor]\nargs = [\"--foo\"]\n",
+            "[editor]\nmode = \"external\"\n",
+            "[editor]\ncommand = \"\"\n",
+            "[editor]\ncommand = \"   \"\n",
+        ] {
+            let error = Config::parse(contents).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn editor_override_rejects_unknown_modes_and_fields() {
+        for contents in [
+            "[editor]\ncommand = \"nvim\"\nmode = \"embedded\"\n",
+            "[editor]\ncommand = \"nvim\"\nunexpected = true\n",
+        ] {
+            let error = Config::parse(contents).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{contents:?}");
         }
     }
 }
