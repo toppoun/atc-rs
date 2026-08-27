@@ -385,8 +385,7 @@ impl ProbeChild {
                     ),
                     kill_error,
                 );
-                let reaper_error = self.reap_in_background().err();
-                Err(with_cleanup_error(timeout_error, reaper_error))
+                self.defer_reap_after_timeout(timeout_error)
             }
             Err(wait_error) => {
                 let wait_error = with_cleanup_error(wait_error, kill_error);
@@ -408,6 +407,11 @@ impl ProbeChild {
                 Err(error)
             }
         }
+    }
+
+    fn defer_reap_after_timeout(&mut self, timeout_error: io::Error) -> io::Result<()> {
+        self.reap_in_background()
+            .map_err(|reaper_error| with_cleanup_error(timeout_error, Some(reaper_error)))
     }
 }
 
@@ -907,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_reaper_transfer_returns_child_ownership_to_the_caller() {
+    fn accepted_reaper_transfer_completes_deferred_reap_without_error() {
         let root = TempDir::new().expect("temp dir");
         let script = write_version_script(
             root.path(),
@@ -921,13 +925,53 @@ mod tests {
             .expect("spawn reaper transfer child");
         let process_id = child.id();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let reaper = RootReaper { sender };
+        let mut probe_child = super::ProbeChild::new_unattached(child, reaper);
+
+        probe_child
+            .defer_reap_after_timeout(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "synthetic synchronous reap timeout",
+            ))
+            .expect("accepted transfer must complete deferred cleanup");
+
+        assert!(probe_child.child.is_none());
+        let mut child = receiver.try_recv().expect("transferred child");
+        assert_eq!(child.id(), process_id);
+        child.kill().expect("terminate transferred child");
+        child.wait().expect("reap transferred child");
+    }
+
+    #[test]
+    fn failed_reaper_transfer_returns_child_ownership_to_the_probe() {
+        let root = TempDir::new().expect("temp dir");
+        let script = write_version_script(
+            root.path(),
+            "failed-reaper-transfer-version",
+            "ping.exe 127.0.0.1 -n 6 >nul",
+            "sleep 5",
+        );
+        let child = Command::new(&script)
+            .arg("--version")
+            .spawn()
+            .expect("spawn failed reaper transfer child");
+        let process_id = child.id();
+        let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);
         let reaper = RootReaper { sender };
+        let mut probe_child = super::ProbeChild::new_unattached(child, reaper);
 
-        let (mut child, error) = reaper.submit(child).unwrap_err();
+        let error = probe_child
+            .defer_reap_after_timeout(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "synthetic synchronous reap timeout",
+            ))
+            .unwrap_err();
 
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("root reaper stopped"));
+        let mut child = probe_child.child.take().expect("returned child ownership");
         assert_eq!(child.id(), process_id);
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         child.kill().expect("terminate returned child");
         child.wait().expect("reap returned child");
     }
