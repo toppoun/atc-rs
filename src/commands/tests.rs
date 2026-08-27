@@ -620,6 +620,7 @@ fn normal_cpp_build_neither_materializes_nor_requires_debug_header() {
     .unwrap();
     let runner_config = RunnerConfig {
         cpp_compiler: compiler,
+        compile_timeout_seconds: 60.0,
         ..RunnerConfig::default()
     };
     let mut reporter = RecordingReporter::default();
@@ -672,6 +673,7 @@ fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() 
     .unwrap();
     let runner_config = RunnerConfig {
         cpp_compiler: compiler,
+        compile_timeout_seconds: 60.0,
         ..RunnerConfig::default()
     };
     let cache_dir = temp.path().join("cache root with spaces");
