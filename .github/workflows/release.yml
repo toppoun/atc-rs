@@ -3,14 +3,35 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+*"
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "atc-rs") | .version')"
+          if [[ -z "${package_version}" || "${package_version}" == "null" ]]; then
+            echo "could not determine the atc-rs package version" >&2
+            exit 1
+          elif [[ "v${package_version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match Cargo package version ${package_version}" >&2
+            exit 1
+          fi
+
   windows:
     name: Windows x86_64
+    needs: validate
     runs-on: windows-latest
 
     steps:
@@ -23,20 +44,29 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Verify host architecture
+        shell: pwsh
+        run: |
+          rustc -vV
+          $hostTriple = (rustc -vV | Select-String '^host: ').Line.Split()[-1]
+          if ($hostTriple -ne 'x86_64-pc-windows-msvc') {
+            throw "unexpected Windows Rust host: $hostTriple"
+          }
+
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast
 
       - name: Build
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist
           Compress-Archive `
-            -Path target/release/atc.exe `
+            -Path target/x86_64-pc-windows-msvc/release/atc.exe `
             -DestinationPath "dist/atc-${{ github.ref_name }}-windows-x86_64.zip"
 
       - name: Upload artifact
@@ -48,6 +78,7 @@ jobs:
 
   macos:
     name: macOS Apple Silicon
+    needs: validate
     runs-on: macos-latest
 
     steps:
@@ -59,16 +90,26 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Verify host architecture
+        run: |
+          uname -m
+          rustc -vV
+          test "$(uname -m)" = "arm64"
+          test "$(rustc -vV | awk '/^host: / { print $2 }')" = "aarch64-apple-darwin"
+
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast
 
       - name: Build
-        run: cargo build --release --locked
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          file target/aarch64-apple-darwin/release/atc
+          file target/aarch64-apple-darwin/release/atc | grep -Eq 'Mach-O 64-bit executable arm64'
 
       - name: Package
         run: |
           mkdir -p dist
-          tar -C target/release \
+          tar -C target/aarch64-apple-darwin/release \
             -czf "dist/atc-${{ github.ref_name }}-macos-aarch64.tar.gz" \
             atc
 
@@ -82,6 +123,7 @@ jobs:
   release:
     name: GitHub Release
     needs:
+      - validate
       - windows
       - macos
 
@@ -113,7 +155,8 @@ jobs:
             "--generate-notes"
           )
 
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          version_without_build="${GITHUB_REF_NAME%%+*}"
+          if [[ "${version_without_build}" == *-* ]]; then
             args+=("--prerelease" "--latest=false")
           fi
 
