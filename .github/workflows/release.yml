@@ -27,6 +27,8 @@ jobs:
         run: cargo test --locked --all-features --no-fail-fast
 
       - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked
 
       - name: Package
