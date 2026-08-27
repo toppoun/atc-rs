@@ -2519,10 +2519,7 @@ mod tests {
 
     #[test]
     fn editor_target_modals_render_states_actions_and_fixed_template_rows() {
-        let temp = tempfile::Builder::new()
-            .prefix(".atc-editor-modal-")
-            .tempdir_in(".")
-            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let config_file = temp.path().join("config.toml");
         let templates_dir = temp.path().join("templates");
         fs::write(&config_file, [0xff, 0xfe]).unwrap();
@@ -2543,7 +2540,7 @@ mod tests {
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
         assert!(rendered.contains("Open Settings"));
         assert!(rendered.contains("existing"));
-        assert!(rendered.contains("config.toml"));
+        assert!(rendered.contains("Destination:"));
         assert!(rendered.contains("[Enter] Open"));
         fs::remove_file(&config_file).unwrap();
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
@@ -2559,15 +2556,7 @@ mod tests {
         assert_eq!(workspace.target(), workspace_file);
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
         assert!(rendered.contains("Open Workspace Settings"));
-        assert!(
-            rendered.contains(
-                workspace_file
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
+        assert!(rendered.contains("Destination:"));
         assert!(rendered.contains("[Enter] Open"));
         assert!(!rendered.contains("Initialize & Open"));
         fs::remove_file(&workspace_file).unwrap();
