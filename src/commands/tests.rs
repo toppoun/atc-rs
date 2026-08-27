@@ -1451,6 +1451,191 @@ fn refresh_rebuilds_metadata_and_tests_without_touching_sources() {
 }
 
 #[test]
+fn prepared_refresh_owns_staging_without_mutating_live_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    create_workspace(&destination, "abc466");
+    let old_tests = destination.join("tests/OLD");
+    std::fs::create_dir_all(&old_tests).unwrap();
+    std::fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+    std::fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+    let metadata_before = std::fs::read(destination.join(".atc/contest.toml")).unwrap();
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = RecordingReporter::default();
+
+    let prepared = prepare_refresh(&destination, "abc466", false, &client, &mut reporter)
+        .expect("fixture refresh preparation should succeed");
+    let staging = prepared.staging_path().to_path_buf();
+
+    assert!(staging.is_dir());
+    assert_eq!(
+        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
+        metadata_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(old_tests.join("sample-1.in")).unwrap(),
+        "old input\n"
+    );
+    assert!(!destination.join("tests/A").exists());
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("refreshed:"))
+    );
+
+    drop(prepared);
+
+    assert!(!staging.exists());
+    assert_eq!(
+        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
+        metadata_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(old_tests.join("sample-1.out")).unwrap(),
+        "old output\n"
+    );
+}
+
+#[test]
+fn applying_prepared_refresh_installs_data_and_reports_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    create_workspace(&destination, "abc466");
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = RecordingReporter::default();
+
+    let prepared = prepare_refresh(&destination, "abc466", false, &client, &mut reporter)
+        .expect("fixture refresh preparation should succeed");
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("refreshed:"))
+    );
+
+    apply_refresh(prepared, &mut reporter).expect("prepared refresh should apply");
+
+    assert_eq!(
+        workspace::load_metadata(&destination)
+            .unwrap()
+            .problems
+            .len(),
+        7
+    );
+    assert!(destination.join("tests/A/sample-1.in").is_file());
+    assert_eq!(
+        reporter
+            .events
+            .iter()
+            .filter(|event| event.starts_with("refreshed:"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn prepared_refresh_rejects_destination_metadata_changes_before_apply() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    create_workspace(&destination, "abc466");
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = RecordingReporter::default();
+    let prepared = prepare_refresh(&destination, "abc466", false, &client, &mut reporter)
+        .expect("fixture refresh preparation should succeed");
+    let changed = old_contest("arc001");
+    workspace::save_metadata(&destination, &changed).unwrap();
+    let changed_bytes = std::fs::read(destination.join(".atc/contest.toml")).unwrap();
+
+    let error = apply_refresh(prepared, &mut reporter)
+        .expect_err("changed destination metadata must invalidate prepared data");
+
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::Interrupted
+    ));
+    assert_eq!(
+        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
+        changed_bytes
+    );
+    assert!(!destination.join("tests/A").exists());
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("refreshed:"))
+    );
+}
+
+#[test]
+fn prepared_refresh_rejects_a_replaced_destination_with_identical_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    create_workspace(&destination, "abc466");
+    let client = atcoder::AtCoderClient::fixture(fixture_root());
+    let mut reporter = RecordingReporter::default();
+    let prepared = prepare_refresh(&destination, "abc466", false, &client, &mut reporter)
+        .expect("fixture refresh preparation should succeed");
+    let staging_name = prepared
+        .staging_path()
+        .file_name()
+        .expect("staging directory should have a name")
+        .to_owned();
+
+    let displaced = temp.path().join("displaced-abc466");
+    std::fs::rename(&destination, &displaced).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::create_dir(destination.join(".atc")).unwrap();
+    std::fs::copy(
+        displaced.join(".atc/contest.toml"),
+        destination.join(".atc/contest.toml"),
+    )
+    .unwrap();
+    let replacement_tests = destination.join("tests/OLD");
+    std::fs::create_dir_all(&replacement_tests).unwrap();
+    std::fs::write(replacement_tests.join("sample-1.in"), "replacement input\n").unwrap();
+    std::fs::write(
+        replacement_tests.join("sample-1.out"),
+        "replacement output\n",
+    )
+    .unwrap();
+
+    // Keep the prepared staging reachable at its owned path. This proves the
+    // rejection comes from physical destination identity, not a missing stage.
+    std::fs::rename(
+        displaced.join(&staging_name),
+        destination.join(&staging_name),
+    )
+    .unwrap();
+    let replacement_metadata = std::fs::read(destination.join(".atc/contest.toml")).unwrap();
+
+    let error = apply_refresh(prepared, &mut reporter)
+        .expect_err("a physically replaced destination must invalidate prepared data");
+
+    assert!(matches!(
+        error,
+        AppError::Io(source) if source.kind() == io::ErrorKind::Interrupted
+    ));
+    assert_eq!(
+        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
+        replacement_metadata
+    );
+    assert_eq!(
+        std::fs::read_to_string(replacement_tests.join("sample-1.in")).unwrap(),
+        "replacement input\n"
+    );
+    assert!(!destination.join("tests/A").exists());
+    assert!(!destination.join(staging_name).exists());
+    assert!(displaced.join(".atc/contest.toml").is_file());
+    assert!(
+        !reporter
+            .events
+            .iter()
+            .any(|event| event.starts_with("refreshed:"))
+    );
+}
+
+#[test]
 fn refresh_sample_failure_is_fatal_and_preserves_old_metadata_and_tests() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("mini");

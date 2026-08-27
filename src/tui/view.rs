@@ -22,8 +22,8 @@ use super::detail_scrollbar::{
 use super::mouse::MouseMode;
 use super::{
     CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
-    OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, SwitchContestModal,
-    SwitchContestModalState,
+    OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
+    RefreshContestModalState, SwitchContestModal, SwitchContestModalState,
 };
 use crate::language::Language;
 
@@ -219,6 +219,7 @@ pub struct RenderInfo {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FrontendOverlays<'a> {
     pub(super) switch_modal: Option<&'a SwitchContestModal>,
+    pub(super) refresh_modal: Option<&'a RefreshContestModal>,
     pub(super) source_modal: Option<&'a OpenSourceModal>,
     pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
@@ -426,7 +427,9 @@ pub(super) fn render_frontend_with_mouse_mode(
 
     frame.render_widget(footer, rows[2]);
 
-    if let Some(modal) = overlays.switch_modal {
+    if let Some(modal) = overlays.refresh_modal {
+        render_refresh_contest_modal(frame, modal);
+    } else if let Some(modal) = overlays.switch_modal {
         render_switch_contest_modal(frame, modal);
     } else if let Some(modal) = overlays.source_modal {
         render_open_source_modal(frame, app, modal);
@@ -885,9 +888,12 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
             };
             lines.push(Line::raw(""));
             lines.push(Line::raw(format!("{verb} {}", modal.contest_id)));
-            for progress in modal.progress.iter().rev().take(5).rev() {
-                lines.push(Line::raw(progress.display_line()));
-            }
+            append_recent_contest_progress(
+                &mut lines,
+                &modal.progress,
+                5,
+                usize::from(width.saturating_sub(2)),
+            );
             lines.push(Line::raw(""));
             lines.push(Line::raw(format!(
                 "{noun} is running and cannot be cancelled."
@@ -921,6 +927,83 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(modal, area);
+}
+
+fn append_recent_contest_progress(
+    lines: &mut Vec<Line<'static>>,
+    progress: &[super::ContestOperationProgress],
+    capacity: usize,
+    width: usize,
+) {
+    lines.extend(
+        progress
+            .iter()
+            .rev()
+            .take(capacity)
+            .rev()
+            .map(|progress| Line::raw(fit_command_palette_row(&progress.display_line(), width))),
+    );
+}
+
+fn render_refresh_contest_modal(frame: &mut Frame, modal: &RefreshContestModal) {
+    let frame_area = frame.area();
+    let width = frame_area.width.min(76);
+    let height = frame_area.height.min(14);
+    let area = Rect::new(
+        frame_area
+            .x
+            .saturating_add(frame_area.width.saturating_sub(width) / 2),
+        frame_area
+            .y
+            .saturating_add(frame_area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    let line_width = usize::from(width.saturating_sub(2));
+    let mut lines = vec![Line::raw(fit_command_palette_row(
+        &format!("Contest: {}", modal.contest_id),
+        line_width,
+    ))];
+
+    match modal.state {
+        RefreshContestModalState::Running => {
+            lines.push(Line::raw(""));
+            append_recent_contest_progress(&mut lines, &modal.progress, 7, line_width);
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(fit_command_palette_row(
+                "Refresh is running and cannot be cancelled.",
+                line_width,
+            )));
+        }
+        RefreshContestModalState::Failed => {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Refresh failed:",
+                Style::default().fg(Color::Red),
+            ));
+            if let Some(error) = modal.error.as_deref() {
+                lines.push(Line::styled(
+                    fit_command_palette_row(error, line_width),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(fit_command_palette_row(
+                "[Enter] Retry   [Esc] Close",
+                line_width,
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(" Refresh Contest ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -1435,6 +1518,41 @@ mod tests {
         text
     }
 
+    fn rendered_refresh_text(
+        app: &WatchApp,
+        modal: &RefreshContestModal,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        refresh_modal: Some(modal),
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn rendered_frontend_buffer_with_palette(
         app: &WatchApp,
         switch_available: bool,
@@ -1456,6 +1574,7 @@ mod tests {
                     switch_available,
                     FrontendOverlays {
                         switch_modal: modal,
+                        refresh_modal: None,
                         source_modal: None,
                         editor_target_modal: None,
                         command_palette: palette,
@@ -2490,7 +2609,7 @@ mod tests {
 
         let creating = SwitchContestModal {
             state: SwitchContestModalState::Creating,
-            progress: vec![super::super::ContestSwitchProgress::ProblemFetching {
+            progress: vec![super::super::ContestOperationProgress::ProblemFetching {
                 index: "A".to_string(),
                 current: 1,
                 total: 2,
@@ -2515,7 +2634,7 @@ mod tests {
         let repairing = SwitchContestModal {
             state: SwitchContestModalState::Repairing,
             mutation: Some(super::super::ContestSwitchMutation::Repair),
-            progress: vec![super::super::ContestSwitchProgress::WorkspaceRepaired {
+            progress: vec![super::super::ContestOperationProgress::WorkspaceRepaired {
                 destination: PathBuf::from("D:/atcoder/ABC/abc470"),
             }],
             ..repair
@@ -2533,6 +2652,50 @@ mod tests {
         let rendered = rendered_frontend_text(&app, true, Some(&failed));
         assert!(rendered.contains("Repair & Switch failed:"));
         assert!(rendered.contains("[Enter] Retry"));
+    }
+
+    #[test]
+    fn refresh_modal_renders_progress_failure_help_and_tiny_frames() {
+        let app = app();
+        let running = RefreshContestModal {
+            contest_id: "abc469".to_string(),
+            state: RefreshContestModalState::Running,
+            progress: vec![
+                super::super::ContestOperationProgress::ContestFetched {
+                    contest_id: "abc469".to_string(),
+                    problems: 7,
+                },
+                super::super::ContestOperationProgress::ProblemFetching {
+                    index: "C".to_string(),
+                    current: 3,
+                    total: 7,
+                },
+            ],
+            error: None,
+        };
+        let rendered = rendered_refresh_text(&app, &running, 100, 20);
+        assert!(rendered.contains("Refresh Contest"));
+        assert!(rendered.contains("Contest: abc469"));
+        assert!(rendered.contains("Found 7 problems in abc469"));
+        assert!(rendered.contains("[3/7] Fetching C..."));
+        assert!(rendered.contains("cannot be cancelled"));
+        assert!(!rendered.contains("Contest refreshed"));
+
+        let failed = RefreshContestModal {
+            state: RefreshContestModalState::Failed,
+            error: Some("network unavailable ".repeat(30)),
+            ..running
+        };
+        let rendered = rendered_refresh_text(&app, &failed, 48, 14);
+        assert!(rendered.contains("Refresh failed:"));
+        assert!(rendered.contains("network unavailable"));
+        assert!(rendered.contains("[Enter] Retry"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(rendered.contains('…'));
+
+        for (width, height) in [(32, 10), (16, 6), (8, 4), (1, 1), (0, 0)] {
+            let _ = rendered_refresh_text(&app, &failed, width, height);
+        }
     }
 
     fn wrap_text(text: &str, width: u16) -> Text<'static> {

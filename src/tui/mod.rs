@@ -43,6 +43,7 @@ use terminal::{
 };
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
+const MAX_CONTEST_PROGRESS_HISTORY: usize = 256;
 const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
@@ -82,11 +83,12 @@ pub(super) enum FrontendAction {
     StartStress,
     StopStress,
     InitializeStress,
+    RefreshContest,
     SwitchContest,
 }
 
 impl FrontendAction {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::RunTests,
         Self::OpenSource,
         Self::OpenSettings,
@@ -97,6 +99,7 @@ impl FrontendAction {
         Self::StartStress,
         Self::StopStress,
         Self::InitializeStress,
+        Self::RefreshContest,
         Self::SwitchContest,
     ];
 
@@ -112,6 +115,7 @@ impl FrontendAction {
             Self::StartStress => "Start Stress",
             Self::StopStress => "Stop Stress",
             Self::InitializeStress => "Initialize Stress",
+            Self::RefreshContest => "Refresh Contest",
             Self::SwitchContest => "Switch Contest",
         }
     }
@@ -126,6 +130,7 @@ impl FrontendAction {
             Self::StartStress => Some("S"),
             Self::StopStress => None,
             Self::InitializeStress => Some("i"),
+            Self::RefreshContest => None,
             Self::SwitchContest => Some("c"),
         }
     }
@@ -179,6 +184,7 @@ impl FrontendAction {
             | Self::StartStress
             | Self::StopStress
             | Self::InitializeStress
+            | Self::RefreshContest
             | Self::SwitchContest => FrontendActionAvailability::Available,
         }
     }
@@ -1009,10 +1015,88 @@ impl CommandPalette {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionExit {
     Quit,
     SwitchContest,
+    RefreshContest(RefreshResumeState),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshResumeState {
+    problem_index: Option<String>,
+    source_language: Option<Language>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshFrontendState {
+    resume: RefreshResumeState,
+    error: Option<String>,
+}
+
+impl RefreshFrontendState {
+    pub(crate) fn after_success(resume: RefreshResumeState) -> Self {
+        Self {
+            resume,
+            error: None,
+        }
+    }
+
+    pub(crate) fn after_apply_failure(resume: RefreshResumeState, error: String) -> Self {
+        Self {
+            resume,
+            error: Some(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+impl RefreshResumeState {
+    fn capture(app: &WatchApp, destination: &Path) -> Self {
+        let Some(problem) = app.current_problem() else {
+            return Self::default();
+        };
+        let problem_index = problem.index.clone();
+        let source_language = problem.source.as_ref().and_then(|source| {
+            crate::workspace::source_file_path(destination, &problem_index, source.language)
+                .ok()
+                .filter(|path| *path == source.path)
+                .map(|_| source.language)
+        });
+        Self {
+            problem_index: Some(problem_index),
+            source_language,
+        }
+    }
+
+    fn apply(&self, app: &mut WatchApp, destination: &Path) {
+        let Some(problem_index) = self.problem_index.as_deref() else {
+            return;
+        };
+        let Some(problem) = app
+            .problems()
+            .iter()
+            .position(|problem| problem.index == problem_index)
+        else {
+            return;
+        };
+        app.select_problem(problem);
+
+        let Some(language) = self.source_language else {
+            return;
+        };
+        let Ok(path) = crate::workspace::source_file_path(destination, problem_index, language)
+        else {
+            return;
+        };
+        if path.is_file() {
+            app.source_changed(problem, path, language);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1085,7 +1169,7 @@ pub(crate) enum ContestSwitchMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ContestSwitchProgress {
+pub(crate) enum ContestOperationProgress {
     ContestFetching {
         contest_id: String,
     },
@@ -1117,7 +1201,7 @@ pub(crate) enum ContestSwitchProgress {
     },
 }
 
-impl ContestSwitchProgress {
+impl ContestOperationProgress {
     pub(super) fn display_line(&self) -> String {
         match self {
             Self::ContestFetching { .. } => "Fetching contest...".to_string(),
@@ -1145,6 +1229,16 @@ impl ContestSwitchProgress {
     }
 }
 
+fn push_contest_progress(
+    history: &mut Vec<ContestOperationProgress>,
+    progress: ContestOperationProgress,
+) {
+    if history.len() == MAX_CONTEST_PROGRESS_HISTORY {
+        history.remove(0);
+    }
+    history.push(progress);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContestSwitchRequest {
     pub(crate) mutation: ContestSwitchMutation,
@@ -1156,25 +1250,25 @@ pub(crate) type ContestSwitchTask = Arc<
     dyn Fn(ContestSwitchRequest, &mut dyn Reporter) -> Result<(), AppError> + Send + Sync + 'static,
 >;
 
-enum ContestSwitchOperationMessage {
-    Progress(ContestSwitchProgress),
+enum ContestOperationMessage {
+    Progress(ContestOperationProgress),
     Finished(Result<(), String>),
 }
 
-struct ContestSwitchReporter {
-    tx: Sender<ContestSwitchOperationMessage>,
+struct ContestOperationReporter {
+    tx: Sender<ContestOperationMessage>,
 }
 
-impl Reporter for ContestSwitchReporter {
+impl Reporter for ContestOperationReporter {
     fn report(&mut self, event: Event<'_>) {
         let progress = match event {
-            Event::ContestFetching { contest_id } => ContestSwitchProgress::ContestFetching {
+            Event::ContestFetching { contest_id } => ContestOperationProgress::ContestFetching {
                 contest_id: contest_id.to_owned(),
             },
             Event::ContestFetched {
                 contest_id,
                 problems,
-            } => ContestSwitchProgress::ContestFetched {
+            } => ContestOperationProgress::ContestFetched {
                 contest_id: contest_id.to_owned(),
                 problems,
             },
@@ -1182,49 +1276,49 @@ impl Reporter for ContestSwitchReporter {
                 index,
                 current,
                 total,
-            } => ContestSwitchProgress::ProblemFetching {
+            } => ContestOperationProgress::ProblemFetching {
                 index: index.to_owned(),
                 current,
                 total,
             },
-            Event::ProblemFetched { index, samples } => ContestSwitchProgress::ProblemFetched {
+            Event::ProblemFetched { index, samples } => ContestOperationProgress::ProblemFetched {
                 index: index.to_owned(),
                 samples,
             },
             Event::ProblemFetchFailed { index, error } => {
-                ContestSwitchProgress::ProblemFetchFailed {
+                ContestOperationProgress::ProblemFetchFailed {
                     index: index.to_owned(),
                     error: error.to_owned(),
                 }
             }
-            Event::WorkspaceCreated { destination } => ContestSwitchProgress::WorkspaceCreated {
+            Event::WorkspaceCreated { destination } => ContestOperationProgress::WorkspaceCreated {
                 destination: destination.to_path_buf(),
             },
             Event::WorkspaceRefreshed { destination } => {
-                ContestSwitchProgress::WorkspaceRefreshed {
+                ContestOperationProgress::WorkspaceRefreshed {
                     destination: destination.to_path_buf(),
                 }
             }
-            Event::WorkspaceRepaired { destination } => ContestSwitchProgress::WorkspaceRepaired {
-                destination: destination.to_path_buf(),
-            },
+            Event::WorkspaceRepaired { destination } => {
+                ContestOperationProgress::WorkspaceRepaired {
+                    destination: destination.to_path_buf(),
+                }
+            }
             _ => return,
         };
 
-        let _ = self
-            .tx
-            .send(ContestSwitchOperationMessage::Progress(progress));
+        let _ = self.tx.send(ContestOperationMessage::Progress(progress));
     }
 }
 
-struct ActiveContestSwitchOperation {
-    rx: Receiver<ContestSwitchOperationMessage>,
+struct ActiveContestOperation {
+    rx: Receiver<ContestOperationMessage>,
     handle: JoinHandle<()>,
 }
 
 struct ContestSwitchOperation {
     task: ContestSwitchTask,
-    active: Option<ActiveContestSwitchOperation>,
+    active: Option<ActiveContestOperation>,
 }
 
 impl ContestSwitchOperation {
@@ -1249,22 +1343,22 @@ impl ContestSwitchOperation {
         let handle = thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                let mut reporter = ContestSwitchReporter { tx: tx.clone() };
+                let mut reporter = ContestOperationReporter { tx: tx.clone() };
                 let result = task(request, &mut reporter).map_err(|error| error.to_string());
                 drop(reporter);
-                let _ = tx.send(ContestSwitchOperationMessage::Finished(result));
+                let _ = tx.send(ContestOperationMessage::Finished(result));
             })?;
 
-        self.active = Some(ActiveContestSwitchOperation { rx, handle });
+        self.active = Some(ActiveContestOperation { rx, handle });
         Ok(())
     }
 
-    fn try_recv(&mut self) -> Option<ContestSwitchOperationMessage> {
+    fn try_recv(&mut self) -> Option<ContestOperationMessage> {
         let result = self.active.as_ref()?.rx.try_recv();
         match result {
-            Ok(ContestSwitchOperationMessage::Finished(result)) => {
+            Ok(ContestOperationMessage::Finished(result)) => {
                 let join_result = self.join_active();
-                Some(ContestSwitchOperationMessage::Finished(match join_result {
+                Some(ContestOperationMessage::Finished(match join_result {
                     Ok(()) => result,
                     Err(error) => Err(error.to_string()),
                 }))
@@ -1278,7 +1372,7 @@ impl ContestSwitchOperation {
                         "contest switch worker disconnected before reporting completion",
                     ))
                 });
-                Some(ContestSwitchOperationMessage::Finished(
+                Some(ContestOperationMessage::Finished(
                     result.map_err(|error| error.to_string()),
                 ))
             }
@@ -1309,7 +1403,7 @@ pub(super) struct SwitchContestModal {
     pub(super) error: Option<String>,
     target: Option<ContestSwitchTarget>,
     pub(super) state: SwitchContestModalState,
-    pub(super) progress: Vec<ContestSwitchProgress>,
+    pub(super) progress: Vec<ContestOperationProgress>,
     pub(super) mutation: Option<ContestSwitchMutation>,
 }
 
@@ -1613,24 +1707,261 @@ impl<'a> ContestSwitchController<'a> {
         let mut changed = false;
         for _ in 0..MAX_MESSAGES_PER_TICK {
             match self.operation.try_recv() {
-                Some(ContestSwitchOperationMessage::Progress(progress)) => {
+                Some(ContestOperationMessage::Progress(progress)) => {
                     if let Some(modal) = self.modal.as_mut()
                         && modal.state.is_running()
                     {
-                        modal.progress.push(progress);
+                        push_contest_progress(&mut modal.progress, progress);
                         changed = true;
                     }
                 }
-                Some(ContestSwitchOperationMessage::Finished(Ok(()))) => {
+                Some(ContestOperationMessage::Finished(Ok(()))) => {
                     self.switch_requested = true;
                     changed = true;
                     break;
                 }
-                Some(ContestSwitchOperationMessage::Finished(Err(error))) => {
+                Some(ContestOperationMessage::Finished(Err(error))) => {
                     if let Some(modal) = self.modal.as_mut() {
                         modal.state = SwitchContestModalState::Failed;
                         modal.error = Some(error);
                     }
+                    changed = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        changed
+    }
+}
+
+pub(crate) type RefreshContestTask =
+    Arc<dyn Fn(&mut dyn Reporter) -> Result<(), AppError> + Send + Sync + 'static>;
+pub(crate) type RefreshPreparedCheck =
+    Arc<dyn Fn() -> Result<bool, String> + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefreshContestModalState {
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RefreshContestModal {
+    pub(super) contest_id: String,
+    pub(super) state: RefreshContestModalState,
+    pub(super) progress: Vec<ContestOperationProgress>,
+    pub(super) error: Option<String>,
+}
+
+struct RefreshContestOperation {
+    task: RefreshContestTask,
+    active: Option<ActiveContestOperation>,
+}
+
+impl RefreshContestOperation {
+    fn new(task: RefreshContestTask) -> Self {
+        Self { task, active: None }
+    }
+
+    fn start(&mut self) -> io::Result<()> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a contest refresh operation is already running",
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let task = Arc::clone(&self.task);
+        let handle = thread::Builder::new()
+            .name("atc-tui-contest-refresh".to_string())
+            .spawn(move || {
+                let mut reporter = ContestOperationReporter { tx: tx.clone() };
+                let result = task(&mut reporter).map_err(|error| error.to_string());
+                drop(reporter);
+                let _ = tx.send(ContestOperationMessage::Finished(result));
+            })?;
+
+        self.active = Some(ActiveContestOperation { rx, handle });
+        Ok(())
+    }
+
+    fn try_recv(&mut self) -> Option<ContestOperationMessage> {
+        let result = self.active.as_ref()?.rx.try_recv();
+        match result {
+            Ok(ContestOperationMessage::Finished(result)) => {
+                let join_result = self.join_active();
+                Some(ContestOperationMessage::Finished(match join_result {
+                    Ok(()) => result,
+                    Err(error) => Err(error.to_string()),
+                }))
+            }
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                let result = self.join_active().and_then(|()| {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "contest refresh worker disconnected before reporting completion",
+                    ))
+                });
+                Some(ContestOperationMessage::Finished(
+                    result.map_err(|error| error.to_string()),
+                ))
+            }
+        }
+    }
+
+    fn join_active(&mut self) -> io::Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        active
+            .handle
+            .join()
+            .map_err(|_| io::Error::other("contest refresh worker panicked"))
+    }
+}
+
+impl Drop for RefreshContestOperation {
+    fn drop(&mut self) {
+        let _ = self.join_active();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshContestKeyResult {
+    NotHandled,
+    Handled,
+}
+
+struct RefreshContestController {
+    contest_id: String,
+    modal: Option<RefreshContestModal>,
+    operation: RefreshContestOperation,
+    prepared_check: RefreshPreparedCheck,
+    refresh_requested: bool,
+}
+
+impl RefreshContestController {
+    fn new(
+        contest_id: &str,
+        task: RefreshContestTask,
+        prepared_check: RefreshPreparedCheck,
+        initial_error: Option<String>,
+    ) -> Self {
+        Self {
+            contest_id: contest_id.to_owned(),
+            modal: initial_error.map(|error| RefreshContestModal {
+                contest_id: contest_id.to_owned(),
+                state: RefreshContestModalState::Failed,
+                progress: Vec::new(),
+                error: Some(error),
+            }),
+            operation: RefreshContestOperation::new(task),
+            prepared_check,
+            refresh_requested: false,
+        }
+    }
+
+    fn modal(&self) -> Option<&RefreshContestModal> {
+        self.modal.as_ref()
+    }
+
+    fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    fn modal_is_running(&self) -> bool {
+        self.modal
+            .as_ref()
+            .is_some_and(|modal| modal.state == RefreshContestModalState::Running)
+    }
+
+    fn open(&mut self) -> bool {
+        if self.modal_active() {
+            return false;
+        }
+        self.start()
+    }
+
+    fn start(&mut self) -> bool {
+        self.refresh_requested = false;
+        self.modal = Some(RefreshContestModal {
+            contest_id: self.contest_id.clone(),
+            state: RefreshContestModalState::Running,
+            progress: Vec::new(),
+            error: None,
+        });
+        if let Err(error) = self.operation.start() {
+            let modal = self.modal.as_mut().expect("refresh modal must exist");
+            modal.state = RefreshContestModalState::Failed;
+            modal.error = Some(error.to_string());
+        }
+        true
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> RefreshContestKeyResult {
+        if !self.modal_active() {
+            return RefreshContestKeyResult::NotHandled;
+        }
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return RefreshContestKeyResult::Handled;
+        }
+        if self.modal_is_running() {
+            return RefreshContestKeyResult::Handled;
+        }
+
+        match key.code {
+            KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                self.start();
+            }
+            KeyCode::Escape if key.kind == KeyEventKind::Press => {
+                self.modal = None;
+            }
+            _ => {}
+        }
+        RefreshContestKeyResult::Handled
+    }
+
+    fn fail(&mut self, error: String) {
+        let modal = self.modal.get_or_insert_with(|| RefreshContestModal {
+            contest_id: self.contest_id.clone(),
+            state: RefreshContestModalState::Failed,
+            progress: Vec::new(),
+            error: None,
+        });
+        modal.state = RefreshContestModalState::Failed;
+        modal.error = Some(error);
+    }
+
+    fn handle_operation_messages(&mut self) -> bool {
+        let mut changed = false;
+        for _ in 0..MAX_MESSAGES_PER_TICK {
+            match self.operation.try_recv() {
+                Some(ContestOperationMessage::Progress(progress)) => {
+                    if let Some(modal) = self.modal.as_mut()
+                        && modal.state == RefreshContestModalState::Running
+                    {
+                        push_contest_progress(&mut modal.progress, progress);
+                        changed = true;
+                    }
+                }
+                Some(ContestOperationMessage::Finished(Ok(()))) => {
+                    match (self.prepared_check)() {
+                        Ok(true) => self.refresh_requested = true,
+                        Ok(false) => self.fail(
+                            "refresh preparation completed without retained prepared data"
+                                .to_string(),
+                        ),
+                        Err(error) => self.fail(error),
+                    }
+                    changed = true;
+                    break;
+                }
+                Some(ContestOperationMessage::Finished(Err(error))) => {
+                    self.fail(error);
                     changed = true;
                     break;
                 }
@@ -1716,6 +2047,32 @@ pub(crate) struct SessionRuntime<'a> {
     channels: SessionChannels<'a>,
 }
 
+pub(crate) struct SessionFrontend<R> {
+    refresh_state: Option<RefreshFrontendState>,
+    resolve_contest_switch: R,
+    contest_switch_task: ContestSwitchTask,
+    refresh_task: RefreshContestTask,
+    refresh_prepared_check: RefreshPreparedCheck,
+}
+
+impl<R> SessionFrontend<R> {
+    pub(crate) fn new(
+        refresh_state: Option<RefreshFrontendState>,
+        resolve_contest_switch: R,
+        contest_switch_task: ContestSwitchTask,
+        refresh_task: RefreshContestTask,
+        refresh_prepared_check: RefreshPreparedCheck,
+    ) -> Self {
+        Self {
+            refresh_state,
+            resolve_contest_switch,
+            contest_switch_task,
+            refresh_task,
+            refresh_prepared_check,
+        }
+    }
+}
+
 impl<'a> SessionRuntime<'a> {
     pub(crate) fn new(
         current_destination: &'a Path,
@@ -1757,6 +2114,7 @@ impl<'a> TerminalInputContext<'a> {
 struct FrontendInputContext<'run, 'controller, 'resolver, 'palette, 'editor> {
     terminal: TerminalInputContext<'run>,
     contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
+    contest_refresh: Option<&'controller mut RefreshContestController>,
     command_palette: Option<&'palette mut CommandPalette>,
     open_source: Option<OpenSourceInputContext<'palette>>,
     editor_targets: Option<&'palette mut EditorTargetController>,
@@ -2070,14 +2428,23 @@ fn send_detail_analysis_command(
     })
 }
 
-pub(crate) fn run(
+pub(crate) fn run<R>(
     terminal: &mut TerminaSession,
     app_context: &AppContext,
     preferences: &mut FrontendPreferences,
     runtime: SessionRuntime<'_>,
-    mut resolve_contest_switch: impl FnMut(&str) -> ContestSwitchResolution,
-    contest_switch_task: ContestSwitchTask,
-) -> io::Result<SessionExit> {
+    frontend: SessionFrontend<R>,
+) -> io::Result<SessionExit>
+where
+    R: FnMut(&str) -> ContestSwitchResolution,
+{
+    let SessionFrontend {
+        refresh_state: refresh_frontend_state,
+        mut resolve_contest_switch,
+        contest_switch_task,
+        refresh_task,
+        refresh_prepared_check,
+    } = frontend;
     let SessionRuntime {
         current_destination,
         config,
@@ -2095,11 +2462,23 @@ pub(crate) fn run(
     let mut app =
         WatchApp::new_with_stress_cases(stress_setup.contest, sample_counts, stress_cases)?;
     preferences.apply(&mut app);
+    let initial_refresh_error = refresh_frontend_state
+        .as_ref()
+        .and_then(|state| state.error.clone());
+    if let Some(state) = refresh_frontend_state.as_ref() {
+        state.resume.apply(&mut app, current_destination);
+    }
     let mut contest_switch = ContestSwitchController::new(
         app_context,
         current_destination,
         &mut resolve_contest_switch,
         contest_switch_task,
+    );
+    let mut contest_refresh = RefreshContestController::new(
+        app.contest_id(),
+        refresh_task,
+        refresh_prepared_check,
+        initial_refresh_error,
     );
     let mut command_palette = CommandPalette::default();
     let mut open_source = OpenSourceController::new(current_destination, config.defaults.language);
@@ -2127,6 +2506,7 @@ pub(crate) fn run(
             &terminal_events,
             &app,
             &contest_switch,
+            contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
             editor_targets.modal_active(),
@@ -2152,6 +2532,15 @@ pub(crate) fn run(
         if contest_switch.switch_requested {
             break;
         }
+        if contest_refresh.handle_operation_messages() {
+            dirty = true;
+        }
+        if contest_refresh.refresh_requested {
+            // Capture the most recent canonical source transition possible before the
+            // frontend yields to the outer shutdown/apply lifecycle.
+            handle_messages(&mut app, message_rx, run_tx)?;
+            break;
+        }
 
         if handle_detail_analysis_results(
             &mut detail_layout,
@@ -2173,6 +2562,7 @@ pub(crate) fn run(
             &terminal_events,
             &app,
             &contest_switch,
+            contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
             editor_targets.modal_active(),
@@ -2201,6 +2591,7 @@ pub(crate) fn run(
                     contest_switch.workspace_available,
                     view::FrontendOverlays {
                         switch_modal: contest_switch.modal(),
+                        refresh_modal: contest_refresh.modal(),
                         source_modal: open_source.modal(),
                         editor_target_modal: editor_targets.modal(),
                         command_palette: command_palette.is_active().then_some(&command_palette),
@@ -2243,6 +2634,7 @@ pub(crate) fn run(
             &terminal_events,
             &app,
             &contest_switch,
+            contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
             editor_targets.modal_active(),
@@ -2265,6 +2657,7 @@ pub(crate) fn run(
             FrontendInputContext {
                 terminal: TerminalInputContext::new(run_tx, Some(stress_setup)),
                 contest_switch: Some(&mut contest_switch),
+                contest_refresh: Some(&mut contest_refresh),
                 command_palette: Some(&mut command_palette),
                 open_source: Some(OpenSourceInputContext {
                     controller: &mut open_source,
@@ -2282,6 +2675,9 @@ pub(crate) fn run(
         if contest_switch.switch_requested {
             break;
         }
+        if contest_refresh.refresh_requested {
+            break;
+        }
         if resize_event_count(&terminal_events) < resize_count_before {
             discard_stale_pixel_events(&mut terminal_events);
             terminal.note_resize_dispatched();
@@ -2289,7 +2685,12 @@ pub(crate) fn run(
     }
 
     preferences.capture(&app);
-    if contest_switch.switch_requested {
+    if contest_refresh.refresh_requested {
+        Ok(SessionExit::RefreshContest(RefreshResumeState::capture(
+            &app,
+            current_destination,
+        )))
+    } else if contest_switch.switch_requested {
         Ok(SessionExit::SwitchContest)
     } else {
         Ok(SessionExit::Quit)
@@ -2376,11 +2777,13 @@ fn contains_global_quit_event(
     events: &VecDeque<TerminalEvent>,
     app: &WatchApp,
     contest_switch: &ContestSwitchController<'_>,
+    refresh_modal_state: Option<RefreshContestModalState>,
     command_palette: &CommandPalette,
     open_source: &OpenSourceController,
     editor_target_modal_active: bool,
 ) -> bool {
     let mut contest_modal_active = contest_switch.modal_active();
+    let mut refresh_modal_state = refresh_modal_state;
     let mut source_modal_active = open_source.modal_active();
     let mut editor_target_modal_active = editor_target_modal_active;
     let mut command_palette = command_palette.clone();
@@ -2389,6 +2792,21 @@ fn contains_global_quit_event(
         let TerminalEvent::Key(key) = event else {
             continue;
         };
+
+        if let Some(state) = refresh_modal_state {
+            if state == RefreshContestModalState::Failed
+                && key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Escape
+            {
+                refresh_modal_state = None;
+            } else if state == RefreshContestModalState::Failed
+                && key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Enter
+            {
+                refresh_modal_state = Some(RefreshContestModalState::Running);
+            }
+            continue;
+        }
 
         if contest_modal_active {
             if key.kind == KeyEventKind::Press
@@ -2423,6 +2841,9 @@ fn contains_global_quit_event(
             {
                 command_palette.close();
                 match action {
+                    FrontendAction::RefreshContest => {
+                        refresh_modal_state = Some(RefreshContestModalState::Running)
+                    }
                     FrontendAction::SwitchContest => contest_modal_active = true,
                     FrontendAction::OpenSource => source_modal_active = true,
                     FrontendAction::OpenSettings
@@ -2512,6 +2933,7 @@ fn handle_terminal_events(
         FrontendInputContext {
             terminal: TerminalInputContext::new(run_tx, None),
             contest_switch: None,
+            contest_refresh: None,
             command_palette: None,
             open_source: None,
             editor_targets: None,
@@ -2627,6 +3049,16 @@ fn handle_terminal_event_with_mouse_mode(
     input: &mut FrontendInputContext<'_, '_, '_, '_, '_>,
 ) -> io::Result<bool> {
     if let TerminalEvent::Key(key) = terminal_event
+        && let Some(contest_refresh) = input.contest_refresh.as_deref_mut()
+        && contest_refresh.modal_active()
+    {
+        match contest_refresh.handle_key(key) {
+            RefreshContestKeyResult::NotHandled => {}
+            RefreshContestKeyResult::Handled => return Ok(true),
+        }
+    }
+
+    if let TerminalEvent::Key(key) = terminal_event
         && let Some(contest_switch) = input.contest_switch.as_deref_mut()
         && contest_switch.modal_active()
     {
@@ -2707,6 +3139,7 @@ fn handle_terminal_event_with_mouse_mode(
                     action,
                     input.terminal,
                     input.contest_switch.as_deref_mut(),
+                    input.contest_refresh.as_deref_mut(),
                     input
                         .open_source
                         .as_mut()
@@ -2718,9 +3151,13 @@ fn handle_terminal_event_with_mouse_mode(
     }
 
     let frontend_interaction_active = input
-        .contest_switch
+        .contest_refresh
         .as_ref()
-        .is_some_and(|contest_switch| contest_switch.modal_active())
+        .is_some_and(|contest_refresh| contest_refresh.modal_active())
+        || input
+            .contest_switch
+            .as_ref()
+            .is_some_and(|contest_switch| contest_switch.modal_active())
         || input
             .command_palette
             .as_ref()
@@ -2795,6 +3232,7 @@ fn handle_key_event_with_stress_context(
         &mut FrontendInputContext {
             terminal: TerminalInputContext::new(run_tx, stress_setup),
             contest_switch: None,
+            contest_refresh: None,
             command_palette: None,
             open_source: None,
             editor_targets: None,
@@ -2831,6 +3269,7 @@ fn handle_key_event_with_frontend_context(
             action,
             input.terminal,
             input.contest_switch.as_deref_mut(),
+            input.contest_refresh.as_deref_mut(),
             input
                 .open_source
                 .as_mut()
@@ -2853,6 +3292,7 @@ fn execute_frontend_action(
     action: FrontendAction,
     input: TerminalInputContext<'_>,
     contest_switch: Option<&mut ContestSwitchController<'_>>,
+    contest_refresh: Option<&mut RefreshContestController>,
     open_source: Option<&mut OpenSourceController>,
     editor_targets: Option<&mut EditorTargetController>,
 ) -> io::Result<bool> {
@@ -2927,6 +3367,9 @@ fn execute_frontend_action(
                 return Ok(false);
             };
             Ok(initialize_problem_stress(app, problem, stress_setup))
+        }
+        FrontendAction::RefreshContest => {
+            Ok(contest_refresh.is_some_and(RefreshContestController::open))
         }
         FrontendAction::SwitchContest => {
             Ok(contest_switch.is_some_and(|controller| controller.open()))
@@ -3370,6 +3813,7 @@ mod tests {
             FrontendInputContext {
                 terminal: TerminalInputContext::new(run_tx, stress_setup),
                 contest_switch,
+                contest_refresh: None,
                 command_palette: Some(command_palette),
                 open_source: None,
                 editor_targets: None,
@@ -3514,6 +3958,7 @@ mod tests {
             FrontendInputContext {
                 terminal: TerminalInputContext::new(&run_tx, None),
                 contest_switch: None,
+                contest_refresh: None,
                 command_palette,
                 open_source: Some(OpenSourceInputContext {
                     controller,
@@ -3566,6 +4011,7 @@ mod tests {
             FrontendInputContext {
                 terminal: TerminalInputContext::new(&run_tx, None),
                 contest_switch,
+                contest_refresh: None,
                 command_palette,
                 open_source: None,
                 editor_targets: Some(controller),
@@ -3639,6 +4085,51 @@ mod tests {
             .collect()
     }
 
+    fn prepared_check(ready: Arc<std::sync::atomic::AtomicBool>) -> RefreshPreparedCheck {
+        Arc::new(move || Ok(ready.load(std::sync::atomic::Ordering::Acquire)))
+    }
+
+    fn wait_for_refresh_operation(controller: &mut RefreshContestController) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while controller.operation.active.is_some() && std::time::Instant::now() < deadline {
+            controller.handle_operation_messages();
+            thread::yield_now();
+        }
+        controller.handle_operation_messages();
+        assert!(
+            controller.operation.active.is_none(),
+            "contest refresh operation did not finish"
+        );
+    }
+
+    fn handle_refresh_frontend_events(
+        app: &mut WatchApp,
+        events: &mut VecDeque<TerminalEvent>,
+        refresh: &mut RefreshContestController,
+        palette: Option<&mut CommandPalette>,
+    ) -> io::Result<bool> {
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        super::handle_terminal_events_with_mouse_mode(
+            app,
+            &mut detail_layout,
+            &mut drag,
+            &view::RenderInfo::default(),
+            events,
+            MouseMode::Cells,
+            FrontendInputContext {
+                terminal: TerminalInputContext::new(&run_tx, None),
+                contest_switch: None,
+                contest_refresh: Some(refresh),
+                command_palette: palette,
+                open_source: None,
+                editor_targets: None,
+                editor: None,
+            },
+        )
+    }
+
     #[test]
     fn command_palette_opens_closes_and_reopens_without_persisting_query() {
         let mut app = app();
@@ -3701,7 +4192,7 @@ mod tests {
     fn command_palette_search_is_case_insensitive_word_prefix_matching() {
         for (query, expected) in [
             ("sw", vec!["Switch Contest"]),
-            ("con", vec!["Switch Contest"]),
+            ("con", vec!["Refresh Contest", "Switch Contest"]),
             ("sta", vec!["Start Stress"]),
             (
                 "str",
@@ -3832,6 +4323,7 @@ mod tests {
                         | FrontendAction::OpenWorkspaceSettings
                         | FrontendAction::OpenTemplate
                         | FrontendAction::StopStress
+                        | FrontendAction::RefreshContest
                 ));
             }
 
@@ -3853,6 +4345,7 @@ mod tests {
         assert_eq!(FrontendAction::OpenSettings.shortcut(), None);
         assert_eq!(FrontendAction::OpenWorkspaceSettings.shortcut(), None);
         assert_eq!(FrontendAction::OpenTemplate.shortcut(), None);
+        assert_eq!(FrontendAction::RefreshContest.shortcut(), None);
     }
 
     #[test]
@@ -3870,8 +4363,15 @@ mod tests {
                 FrontendAction::StartStress,
                 FrontendAction::StopStress,
                 FrontendAction::InitializeStress,
+                FrontendAction::RefreshContest,
                 FrontendAction::SwitchContest,
             ]
+        );
+        assert_eq!(palette_labels("refresh"), ["Refresh Contest"]);
+        assert_eq!(palette_labels("refresh contest"), ["Refresh Contest"]);
+        assert_eq!(
+            palette_labels("contest"),
+            ["Refresh Contest", "Switch Contest"]
         );
 
         let empty_contest = Contest {
@@ -3890,6 +4390,12 @@ mod tests {
             FrontendAction::OpenSource.availability(&app, false),
             FrontendActionAvailability::Available
         );
+        for workspace_available in [false, true] {
+            assert_eq!(
+                FrontendAction::RefreshContest.availability(&app, workspace_available),
+                FrontendActionAvailability::Available
+            );
+        }
         for action in [FrontendAction::OpenSettings, FrontendAction::OpenTemplate] {
             assert_eq!(
                 action.availability(&empty, false),
@@ -4339,6 +4845,7 @@ mod tests {
             &events,
             &app,
             &contest_switch,
+            None,
             &palette,
             &source,
             false,
@@ -4368,6 +4875,7 @@ mod tests {
             &events,
             &app,
             &contest_switch,
+            None,
             &palette,
             &source,
             false,
@@ -5099,6 +5607,7 @@ mod tests {
                 &events,
                 &app,
                 &contest_switch,
+                None,
                 &palette,
                 &source,
                 false,
@@ -5162,6 +5671,7 @@ mod tests {
                 &close_then_quit,
                 &app,
                 &contest_switch,
+                None,
                 &palette,
                 &source,
                 true,
@@ -5365,6 +5875,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
 
@@ -5528,6 +6039,7 @@ mod tests {
                 &events,
                 &app,
                 &controller,
+                None,
                 &palette,
                 &source,
                 false,
@@ -5578,6 +6090,7 @@ mod tests {
             &events,
             &app,
             &controller,
+            None,
             &palette,
             &source,
             false,
@@ -5724,6 +6237,7 @@ mod tests {
                 FrontendInputContext {
                     terminal: TerminalInputContext::new(&run_tx, None),
                     contest_switch: None,
+                    contest_refresh: None,
                     command_palette: Some(&mut palette),
                     open_source: None,
                     editor_targets: None,
@@ -6767,11 +7281,11 @@ mod tests {
         );
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestSwitchProgress::ContestFetching { contest_id } if contest_id == "abc470"
+            ContestOperationProgress::ContestFetching { contest_id } if contest_id == "abc470"
         )));
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestSwitchProgress::ProblemFetchFailed { index, error }
+            ContestOperationProgress::ProblemFetchFailed { index, error }
                 if index == "A" && error == "sample endpoint unavailable"
         )));
         assert!(controller.operation.active.is_none());
@@ -6870,11 +7384,11 @@ mod tests {
         assert!(modal.error.as_deref().unwrap().contains("repair failed"));
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestSwitchProgress::ContestFetching { contest_id } if contest_id == "abc470"
+            ContestOperationProgress::ContestFetching { contest_id } if contest_id == "abc470"
         )));
         assert!(modal.progress.iter().any(|progress| matches!(
             progress,
-            ContestSwitchProgress::WorkspaceRepaired { destination }
+            ContestOperationProgress::WorkspaceRepaired { destination }
                 if destination == &root.path().join("abc470")
         )));
         assert!(controller.operation.active.is_none());
@@ -7100,7 +7614,7 @@ mod tests {
     #[test]
     fn contest_switch_reporter_copies_relevant_borrowed_events() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ContestSwitchReporter { tx };
+        let mut reporter = ContestOperationReporter { tx };
         let contest_id = String::from("abc470");
         let problem = String::from("A");
         let warning = String::from("samples unavailable");
@@ -7141,44 +7655,356 @@ mod tests {
         drop(destination);
 
         let progress = std::iter::from_fn(|| match rx.try_recv() {
-            Ok(ContestSwitchOperationMessage::Progress(progress)) => Some(progress),
-            Ok(ContestSwitchOperationMessage::Finished(_)) | Err(_) => None,
+            Ok(ContestOperationMessage::Progress(progress)) => Some(progress),
+            Ok(ContestOperationMessage::Finished(_)) | Err(_) => None,
         })
         .collect::<Vec<_>>();
 
         assert_eq!(
             progress,
             [
-                ContestSwitchProgress::ContestFetching {
+                ContestOperationProgress::ContestFetching {
                     contest_id: "abc470".to_string(),
                 },
-                ContestSwitchProgress::ContestFetched {
+                ContestOperationProgress::ContestFetched {
                     contest_id: "abc470".to_string(),
                     problems: 1,
                 },
-                ContestSwitchProgress::ProblemFetching {
+                ContestOperationProgress::ProblemFetching {
                     index: "A".to_string(),
                     current: 1,
                     total: 1,
                 },
-                ContestSwitchProgress::ProblemFetched {
+                ContestOperationProgress::ProblemFetched {
                     index: "A".to_string(),
                     samples: 3,
                 },
-                ContestSwitchProgress::ProblemFetchFailed {
+                ContestOperationProgress::ProblemFetchFailed {
                     index: "A".to_string(),
                     error: "samples unavailable".to_string(),
                 },
-                ContestSwitchProgress::WorkspaceCreated {
+                ContestOperationProgress::WorkspaceCreated {
                     destination: PathBuf::from("workspace/abc470"),
                 },
-                ContestSwitchProgress::WorkspaceRefreshed {
+                ContestOperationProgress::WorkspaceRefreshed {
                     destination: PathBuf::from("workspace/abc470"),
                 },
-                ContestSwitchProgress::WorkspaceRepaired {
+                ContestOperationProgress::WorkspaceRepaired {
                     destination: PathBuf::from("workspace/abc470"),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn contest_progress_history_is_bounded_to_recent_events() {
+        let mut progress = Vec::new();
+        for current in 1..=MAX_CONTEST_PROGRESS_HISTORY + 20 {
+            push_contest_progress(
+                &mut progress,
+                ContestOperationProgress::ProblemFetching {
+                    index: "A".to_string(),
+                    current,
+                    total: MAX_CONTEST_PROGRESS_HISTORY + 20,
+                },
+            );
+        }
+
+        assert_eq!(progress.len(), MAX_CONTEST_PROGRESS_HISTORY);
+        assert!(matches!(
+            progress.first(),
+            Some(ContestOperationProgress::ProblemFetching { current: 21, .. })
+        ));
+    }
+
+    #[test]
+    fn refresh_opens_running_immediately_reports_fetch_progress_and_requires_retained_data() {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_ready = Arc::clone(&ready);
+        let (started_tx, started_rx) = mpsc::channel();
+        let task: RefreshContestTask = Arc::new(move |reporter| {
+            started_tx.send(thread::current().id()).unwrap();
+            reporter.report(Event::ContestFetching {
+                contest_id: "abc123",
+            });
+            reporter.report(Event::ContestFetched {
+                contest_id: "abc123",
+                problems: 2,
+            });
+            reporter.report(Event::ProblemFetching {
+                index: "A",
+                current: 1,
+                total: 2,
+            });
+            reporter.report(Event::ProblemFetched {
+                index: "A",
+                samples: 3,
+            });
+            task_ready.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let mut controller =
+            RefreshContestController::new("abc123", task, prepared_check(Arc::clone(&ready)), None);
+
+        assert!(controller.open());
+        assert_eq!(
+            controller.modal().unwrap().state,
+            RefreshContestModalState::Running
+        );
+        assert_ne!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            thread::current().id()
+        );
+        wait_for_refresh_operation(&mut controller);
+
+        assert!(controller.refresh_requested);
+        assert_eq!(
+            controller.modal().unwrap().progress,
+            [
+                ContestOperationProgress::ContestFetching {
+                    contest_id: "abc123".to_string()
+                },
+                ContestOperationProgress::ContestFetched {
+                    contest_id: "abc123".to_string(),
+                    problems: 2
+                },
+                ContestOperationProgress::ProblemFetching {
+                    index: "A".to_string(),
+                    current: 1,
+                    total: 2
+                },
+                ContestOperationProgress::ProblemFetched {
+                    index: "A".to_string(),
+                    samples: 3
+                },
+            ]
+        );
+
+        let mut missing = RefreshContestController::new(
+            "abc123",
+            Arc::new(|_| Ok(())),
+            Arc::new(|| Ok(false)),
+            None,
+        );
+        missing.open();
+        wait_for_refresh_operation(&mut missing);
+        assert!(!missing.refresh_requested);
+        assert_eq!(
+            missing.modal().unwrap().state,
+            RefreshContestModalState::Failed
+        );
+        assert!(
+            missing
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("without retained prepared data")
+        );
+    }
+
+    #[test]
+    fn running_refresh_owns_all_keys_and_pointer_input() {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_ready = Arc::clone(&ready);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let task_release = Arc::clone(&release_rx);
+        let task: RefreshContestTask = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            task_release.lock().unwrap().recv().unwrap();
+            task_ready.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let mut controller =
+            RefreshContestController::new("abc123", task, prepared_check(ready), None);
+        controller.open();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut app = app_with_problems(&[3, 3]);
+        app.select_problem(1);
+        app.next_case();
+        app.toggle_samples_pane();
+        app.scroll_detail_down(5);
+        let selected = app.selected_problem();
+        let selected_case = app.selected_case();
+        let detail_scroll = app.detail_scroll();
+        let mut events = VecDeque::from(
+            [
+                KeyCode::Escape,
+                KeyCode::Char('q'),
+                KeyCode::Char('r'),
+                KeyCode::Char('S'),
+                KeyCode::Char('i'),
+                KeyCode::Char('c'),
+                KeyCode::Char('d'),
+                KeyCode::Char('s'),
+                KeyCode::Char(':'),
+            ]
+            .map(|code| TerminalEvent::Key(key(code, KeyEventKind::Press))),
+        );
+        events.push_back(TerminalEvent::Pointer(pointer(
+            PointerKind::Down(PointerButton::Left),
+            2,
+            2,
+        )));
+        events.push_back(TerminalEvent::Pointer(pointer(
+            PointerKind::Drag(PointerButton::Left),
+            4,
+            8,
+        )));
+        events.push_back(TerminalEvent::Pointer(pointer(
+            PointerKind::ScrollDown,
+            10,
+            10,
+        )));
+
+        assert!(
+            handle_refresh_frontend_events(&mut app, &mut events, &mut controller, None).unwrap()
+        );
+        assert!(controller.modal_is_running());
+        assert!(!app.should_quit());
+        assert!(!app.debug_enabled());
+        assert!(app.samples_pane_enabled());
+        assert_eq!(app.selected_problem(), selected);
+        assert_eq!(app.selected_case(), selected_case);
+        assert_eq!(app.detail_scroll(), detail_scroll);
+
+        release_tx.send(()).unwrap();
+        wait_for_refresh_operation(&mut controller);
+        assert!(controller.refresh_requested);
+    }
+
+    #[test]
+    fn refresh_resume_is_captured_after_prepare_not_when_the_action_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_ready = Arc::clone(&ready);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let task_release = Arc::clone(&release_rx);
+        let task: RefreshContestTask = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            task_release.lock().unwrap().recv().unwrap();
+            task_ready.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let mut controller =
+            RefreshContestController::new("abc123", task, prepared_check(ready), None);
+        let mut app = app();
+
+        controller.open();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let python =
+            crate::workspace::source_file_path(temp.path(), "A", Language::Python).unwrap();
+        std::fs::write(&python, "print(1)\n").unwrap();
+        app.source_changed(0, python, Language::Python);
+        release_tx.send(()).unwrap();
+        wait_for_refresh_operation(&mut controller);
+        let resume = RefreshResumeState::capture(&app, temp.path());
+
+        assert!(controller.refresh_requested);
+        assert_eq!(resume.problem_index.as_deref(), Some("A"));
+        assert_eq!(resume.source_language, Some(Language::Python));
+    }
+
+    #[test]
+    fn palette_refresh_suppresses_same_batch_quit_and_failed_refresh_retries_fresh() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_attempts = Arc::clone(&attempts);
+        let task: RefreshContestTask = Arc::new(move |reporter| {
+            task_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            reporter.report(Event::ContestFetching {
+                contest_id: "abc123",
+            });
+            Err(io::Error::other("network unavailable").into())
+        });
+        let mut controller =
+            RefreshContestController::new("abc123", task, Arc::new(|| Ok(false)), None);
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "refresh".to_string();
+        let mut app = app();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let context = workspace_context(root.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "unused".to_string());
+        let switch = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let source = OpenSourceController::new(&current, Language::Cpp);
+
+        assert!(!contains_global_quit_event(
+            &events, &app, &switch, None, &palette, &source, false,
+        ));
+        handle_refresh_frontend_events(&mut app, &mut events, &mut controller, Some(&mut palette))
+            .unwrap();
+        assert!(!app.should_quit());
+        wait_for_refresh_operation(&mut controller);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            RefreshContestModalState::Failed
+        );
+        assert_eq!(controller.modal().unwrap().progress.len(), 1);
+
+        assert_eq!(
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            RefreshContestKeyResult::Handled
+        );
+        assert!(controller.modal_is_running());
+        assert!(controller.modal().unwrap().progress.is_empty());
+        wait_for_refresh_operation(&mut controller);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 2);
+
+        let close_then_quit = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Escape, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(contains_global_quit_event(
+            &close_then_quit,
+            &app,
+            &switch,
+            Some(RefreshContestModalState::Failed),
+            &CommandPalette::default(),
+            &source,
+            false,
+        ));
+    }
+
+    #[test]
+    fn refresh_worker_panic_becomes_a_failed_modal() {
+        let mut controller = RefreshContestController::new(
+            "abc123",
+            Arc::new(|_| panic!("injected refresh panic")),
+            Arc::new(|| Ok(false)),
+            None,
+        );
+        controller.open();
+        wait_for_refresh_operation(&mut controller);
+
+        assert!(!controller.refresh_requested);
+        assert_eq!(
+            controller.modal().unwrap().state,
+            RefreshContestModalState::Failed
+        );
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("panicked")
         );
     }
 
@@ -7216,6 +8042,40 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
 
+        assert!(matches!(
+            drop_finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_worker_tx.send(()).unwrap();
+        drop_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop_thread.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_refresh_operation_joins_its_worker() {
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let release_worker_rx = Arc::new(std::sync::Mutex::new(release_worker_rx));
+        let task_release = Arc::clone(&release_worker_rx);
+        let task: RefreshContestTask = Arc::new(move |_| {
+            worker_started_tx.send(()).unwrap();
+            task_release.lock().unwrap().recv().unwrap();
+            Ok(())
+        });
+        let mut operation = RefreshContestOperation::new(task);
+        operation.start().unwrap();
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
+        let drop_thread = thread::spawn(move || {
+            drop(operation);
+            drop_finished_tx.send(()).unwrap();
+        });
         assert!(matches!(
             drop_finished_rx.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
@@ -7271,6 +8131,7 @@ mod tests {
             &queued,
             &app,
             &fresh,
+            None,
             &CommandPalette::default(),
             &source,
             false,
@@ -7300,6 +8161,99 @@ mod tests {
         assert!(next.samples_pane_enabled());
         assert_eq!(next.selected_case(), 0);
         assert_eq!(next.contest_id(), "abc123");
+    }
+
+    #[test]
+    fn refresh_resume_restores_problem_identity_and_canonical_existing_source_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "abc123".to_string(),
+            problems: ["A", "D"]
+                .into_iter()
+                .map(|index| Problem {
+                    index: index.to_string(),
+                    title: format!("Problem {index}"),
+                    task_id: format!("abc123_{}", index.to_ascii_lowercase()),
+                    url: format!("https://example.invalid/{index}"),
+                    sample_count: 1,
+                })
+                .collect(),
+        };
+        let python =
+            crate::workspace::source_file_path(temp.path(), "D", Language::Python).unwrap();
+        std::fs::write(&python, "print(1)\n").unwrap();
+        let mut old = WatchApp::new(&contest, vec![1, 1]).unwrap();
+        old.source_changed(1, python.clone(), Language::Python);
+        let request = old.queue_run(1).unwrap();
+        old.run_started(1, request.run_id);
+        old.next_case();
+        let resume = RefreshResumeState::capture(&old, temp.path());
+
+        let mut fresh = WatchApp::new(&contest, vec![1, 1]).unwrap();
+        resume.apply(&mut fresh, temp.path());
+
+        assert_eq!(fresh.current_problem().unwrap().index, "D");
+        let source = fresh.current_problem().unwrap().source.as_ref().unwrap();
+        assert_eq!(source.path, python);
+        assert_eq!(source.language, Language::Python);
+        assert_eq!(fresh.selected_case(), 0);
+        assert_eq!(
+            fresh.current_problem().unwrap().run.phase,
+            app::RunPhase::Idle
+        );
+        assert_eq!(
+            fresh.current_problem().unwrap().stress.phase,
+            app::StressPhase::Idle
+        );
+        assert_eq!(fresh.current_problem().unwrap().run.id, None);
+    }
+
+    #[test]
+    fn refresh_resume_keeps_selection_when_source_is_missing_and_falls_back_if_problem_is_removed()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let old_contest = contest_with_problems(&[0, 0, 0, 0]);
+        let python =
+            crate::workspace::source_file_path(temp.path(), "D", Language::Python).unwrap();
+        std::fs::write(&python, "print(1)\n").unwrap();
+        let mut old = WatchApp::new(&old_contest, vec![0, 0, 0, 0]).unwrap();
+        old.source_changed(3, python.clone(), Language::Python);
+        let resume = RefreshResumeState::capture(&old, temp.path());
+        std::fs::remove_file(&python).unwrap();
+
+        let mut same_problems = WatchApp::new(&old_contest, vec![0, 0, 0, 0]).unwrap();
+        resume.apply(&mut same_problems, temp.path());
+        assert_eq!(same_problems.current_problem().unwrap().index, "D");
+        assert!(same_problems.current_problem().unwrap().source.is_none());
+
+        let new_contest = contest_with_problems(&[0, 0, 0]);
+        let mut removed = WatchApp::new(&new_contest, vec![0, 0, 0]).unwrap();
+        resume.apply(&mut removed, temp.path());
+        assert_eq!(removed.current_problem().unwrap().index, "A");
+        assert!(removed.current_problem().unwrap().source.is_none());
+    }
+
+    #[test]
+    fn refresh_resume_is_one_shot_and_does_not_change_switch_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut old = app_with_problems(&[0, 0]);
+        old.select_problem(1);
+        old.source_changed(1, PathBuf::from("noncanonical/B.py"), Language::Python);
+        old.toggle_debug();
+        old.toggle_samples_pane();
+        let resume = RefreshResumeState::capture(&old, temp.path());
+        assert_eq!(resume.problem_index.as_deref(), Some("B"));
+        assert_eq!(resume.source_language, None);
+        let mut preferences = FrontendPreferences::default();
+        preferences.capture(&old);
+
+        let mut switched = app_with_problems(&[0, 0]);
+        preferences.apply(&mut switched);
+
+        assert_eq!(switched.current_problem().unwrap().index, "A");
+        assert!(switched.current_problem().unwrap().source.is_none());
+        assert!(switched.debug_enabled());
+        assert!(switched.samples_pane_enabled());
     }
 
     #[test]
@@ -9085,6 +10039,7 @@ mod tests {
                 FrontendInputContext {
                     terminal: TerminalInputContext::new(&run_tx, None),
                     contest_switch: None,
+                    contest_refresh: None,
                     command_palette: None,
                     open_source: None,
                     editor_targets: None,

@@ -44,7 +44,7 @@ use new::new_at_with_install_hook;
 #[cfg(test)]
 use new::{new_at, new_at_in_workspace, prepare_new};
 #[cfg(test)]
-use refresh::{refresh_at, resolve_refresh_contest_id};
+use refresh::{apply_refresh, prepare_refresh, refresh_at, resolve_refresh_contest_id};
 #[cfg(test)]
 use test::{
     find_problem, report_case_result, report_compile_result, run_test_cases, test_problem,

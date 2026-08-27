@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::contest::{ContestTargetHealth, inspect_contest_target};
+use super::refresh::PreparedRefresh;
 use super::watch_worker::RunWorker;
 use crate::tui::detail_analysis::DetailAnalysisWorker;
 use crate::tui::message::Message;
@@ -88,6 +89,174 @@ fn combine_primary_and_cleanup_results<const N: usize>(
 
             let cleanup = std::iter::once(second).chain(errors).collect();
             Err(with_cleanup_errors(Some(first_name), first_error, cleanup))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WatchStageError<E> {
+    context: &'static str,
+    source: E,
+}
+
+impl<E: fmt::Display> fmt::Display for WatchStageError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl<E> std::error::Error for WatchStageError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn io_error_with_context(context: &'static str, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), WatchStageError { context, source })
+}
+
+fn app_error_with_context(context: &'static str, source: AppError) -> io::Error {
+    io::Error::other(WatchStageError { context, source })
+}
+
+#[derive(Debug)]
+enum RefreshRecoveryFailure {
+    Load(AppError),
+    Start(io::Error),
+}
+
+impl fmt::Display for RefreshRecoveryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(error) => write!(formatter, "recovery contest load failed: {error}"),
+            Self::Start(error) => write!(
+                formatter,
+                "recovery contest session startup failed: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RefreshRecoveryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Load(error) => Some(error),
+            Self::Start(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RefreshApplyRecoveryError {
+    apply: AppError,
+    recovery: RefreshRecoveryFailure,
+}
+
+impl fmt::Display for RefreshApplyRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "refresh apply failed: {}; {}",
+            self.apply, self.recovery
+        )
+    }
+}
+
+impl std::error::Error for RefreshApplyRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.apply)
+    }
+}
+
+#[derive(Debug)]
+struct RefreshRebuild<S> {
+    session: S,
+    frontend_state: crate::tui::RefreshFrontendState,
+}
+
+struct RefreshRebuildHooks<Shutdown, Apply, Load, Start> {
+    shutdown: Shutdown,
+    apply: Apply,
+    load: Load,
+    start: Start,
+}
+
+fn rebuild_contest_session_after_refresh<'a, S, I, P, Shutdown, Apply, Load, Start>(
+    old_session: S,
+    prepared: P,
+    destination: &'a Path,
+    contest_id: &'a str,
+    resume: crate::tui::RefreshResumeState,
+    hooks: RefreshRebuildHooks<Shutdown, Apply, Load, Start>,
+) -> io::Result<RefreshRebuild<S>>
+where
+    Shutdown: FnOnce(S) -> io::Result<()>,
+    Apply: FnOnce(P) -> Result<(), AppError>,
+    Load: FnOnce(&'a Path, &'a str) -> Result<I, AppError>,
+    Start: FnOnce(I) -> io::Result<S>,
+{
+    let RefreshRebuildHooks {
+        shutdown,
+        apply,
+        load,
+        start,
+    } = hooks;
+    shutdown(old_session).map_err(|error| {
+        io_error_with_context(
+            "contest session shutdown failed before refresh apply",
+            error,
+        )
+    })?;
+
+    match apply(prepared) {
+        Ok(()) => {
+            let input = load(destination, contest_id).map_err(|error| {
+                app_error_with_context(
+                    "refresh installed but refreshed session could not be loaded",
+                    error,
+                )
+            })?;
+            let session = start(input).map_err(|error| {
+                io_error_with_context(
+                    "refresh installed but refreshed session could not start",
+                    error,
+                )
+            })?;
+            Ok(RefreshRebuild {
+                session,
+                frontend_state: crate::tui::RefreshFrontendState::after_success(resume),
+            })
+        }
+        Err(apply_error) => {
+            let apply_message = format!("refresh apply failed: {apply_error}");
+            let input = match load(destination, contest_id) {
+                Ok(input) => input,
+                Err(recovery) => {
+                    return Err(io::Error::other(RefreshApplyRecoveryError {
+                        apply: apply_error,
+                        recovery: RefreshRecoveryFailure::Load(recovery),
+                    }));
+                }
+            };
+            let session = match start(input) {
+                Ok(session) => session,
+                Err(recovery) => {
+                    return Err(io::Error::other(RefreshApplyRecoveryError {
+                        apply: apply_error,
+                        recovery: RefreshRecoveryFailure::Start(recovery),
+                    }));
+                }
+            };
+            Ok(RefreshRebuild {
+                session,
+                frontend_state: crate::tui::RefreshFrontendState::after_apply_failure(
+                    resume,
+                    apply_message,
+                ),
+            })
         }
     }
 }
@@ -251,7 +420,9 @@ pub(super) fn watch_tui_at(
 
     let mut preferences = crate::tui::FrontendPreferences::default();
     let prepared_switch = Arc::new(Mutex::new(None));
+    let prepared_refresh = Arc::new(Mutex::new(None));
     let switch_task = contest_switch_task(&app_context, Arc::clone(&prepared_switch));
+    let mut refresh_frontend_state = None;
     let result = loop {
         match prepared_switch.lock() {
             Ok(mut pending) => *pending = None,
@@ -261,16 +432,25 @@ pub(super) fn watch_tui_at(
                 ));
             }
         }
+        match prepared_refresh.lock() {
+            Ok(mut pending) => *pending = None,
+            Err(_) => {
+                break Err(io::Error::other("prepared refresh state is poisoned"));
+            }
+        }
         let active_session = session
             .as_mut()
             .expect("an active contest session must exist while the frontend is running");
+        let refresh_task = contest_refresh_task(
+            active_session.input.destination.clone(),
+            active_session.input.contest.contest_id.clone(),
+            Arc::clone(&prepared_refresh),
+        );
+        let refresh_check = prepared_refresh_check(Arc::clone(&prepared_refresh));
         let resolver_prepared = Arc::clone(&prepared_switch);
-        let frontend_result = active_session.run_frontend(
-            &mut terminal,
-            &app_context,
-            &config,
-            &mut preferences,
-            |contest_id| {
+        let frontend = crate::tui::SessionFrontend::new(
+            refresh_frontend_state.take(),
+            |contest_id: &str| {
                 let Some(root) = app_context.workspace_root() else {
                     return crate::tui::ContestSwitchResolution::rejected(
                         None,
@@ -310,6 +490,15 @@ pub(super) fn watch_tui_at(
                 }
             },
             Arc::clone(&switch_task),
+            refresh_task,
+            refresh_check,
+        );
+        let frontend_result = active_session.run_frontend(
+            &mut terminal,
+            &app_context,
+            &config,
+            &mut preferences,
+            frontend,
         );
 
         match frontend_result {
@@ -339,7 +528,67 @@ pub(super) fn watch_tui_at(
                 }
 
                 match ContestSession::start(prepared, &config.runner) {
-                    Ok(new_session) => session = Some(new_session),
+                    Ok(new_session) => {
+                        session = Some(new_session);
+                        refresh_frontend_state = None;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            Ok(crate::tui::SessionExit::RefreshContest(resume)) => {
+                let prepared = match prepared_refresh.lock() {
+                    Ok(mut pending) => match pending.take() {
+                        Some(prepared) => prepared,
+                        None => {
+                            break Err(io::Error::other(
+                                "a refresh exit did not retain its prepared refresh",
+                            ));
+                        }
+                    },
+                    Err(_) => {
+                        break Err(io::Error::other("prepared refresh state is poisoned"));
+                    }
+                };
+                let refresh_destination = prepared.destination().to_path_buf();
+                let refresh_contest_id = prepared.contest_id().to_string();
+                let active_session = session
+                    .as_ref()
+                    .expect("the old contest session must still exist before refresh");
+                if active_session.input.destination != refresh_destination
+                    || active_session.input.contest.contest_id != refresh_contest_id
+                {
+                    break Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "prepared refresh target does not match the active contest session",
+                    ));
+                }
+
+                let old_session = session
+                    .take()
+                    .expect("the old contest session must still exist before refresh");
+                let rebuilt = rebuild_contest_session_after_refresh(
+                    old_session,
+                    prepared,
+                    &refresh_destination,
+                    &refresh_contest_id,
+                    resume,
+                    RefreshRebuildHooks {
+                        shutdown: ContestSession::shutdown,
+                        apply: |prepared| {
+                            let mut reporter = RefreshApplyReporter;
+                            super::refresh::apply_refresh(prepared, &mut reporter)
+                        },
+                        load: |destination, contest_id| {
+                            PreparedWatchInput::load(destination, Some(contest_id))
+                        },
+                        start: |input| ContestSession::start(input, &config.runner),
+                    },
+                );
+                match rebuilt {
+                    Ok(rebuilt) => {
+                        session = Some(rebuilt.session);
+                        refresh_frontend_state = Some(rebuilt.frontend_state);
+                    }
                     Err(error) => break Err(error),
                 }
             }
@@ -523,6 +772,60 @@ fn contest_switch_task(
             Some(prepared);
         Ok(())
     })
+}
+
+fn contest_refresh_task(
+    destination: PathBuf,
+    contest_id: String,
+    prepared_refresh: Arc<Mutex<Option<PreparedRefresh>>>,
+) -> crate::tui::RefreshContestTask {
+    Arc::new(move |reporter| {
+        {
+            let pending = prepared_refresh
+                .lock()
+                .map_err(|_| io::Error::other("prepared refresh state is poisoned"))?;
+            if pending.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a prepared refresh is already retained",
+                )
+                .into());
+            }
+        }
+
+        let atcoder = super::refresh::create_atcoder_client()?;
+        let prepared =
+            super::refresh::prepare_refresh(&destination, &contest_id, false, &atcoder, reporter)?;
+        let mut pending = prepared_refresh
+            .lock()
+            .map_err(|_| io::Error::other("prepared refresh state is poisoned"))?;
+        if pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a prepared refresh was retained concurrently",
+            )
+            .into());
+        }
+        *pending = Some(prepared);
+        Ok(())
+    })
+}
+
+fn prepared_refresh_check(
+    prepared_refresh: Arc<Mutex<Option<PreparedRefresh>>>,
+) -> crate::tui::RefreshPreparedCheck {
+    Arc::new(move || {
+        prepared_refresh
+            .lock()
+            .map(|prepared| prepared.is_some())
+            .map_err(|_| "prepared refresh state is poisoned".to_string())
+    })
+}
+
+struct RefreshApplyReporter;
+
+impl Reporter for RefreshApplyReporter {
+    fn report(&mut self, _event: crate::ui::Event<'_>) {}
 }
 
 fn create_and_prepare_contest_switch(
@@ -810,15 +1113,17 @@ impl ContestSession {
         )
     }
 
-    fn run_frontend(
+    fn run_frontend<R>(
         &mut self,
         terminal: &mut crate::tui::TerminaSession,
         app_context: &AppContext,
         config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
-        resolve_contest_switch: impl FnMut(&str) -> crate::tui::ContestSwitchResolution,
-        contest_switch_task: crate::tui::ContestSwitchTask,
-    ) -> io::Result<crate::tui::SessionExit> {
+        frontend: crate::tui::SessionFrontend<R>,
+    ) -> io::Result<crate::tui::SessionExit>
+    where
+        R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
+    {
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
         let channels = self.channels();
@@ -830,14 +1135,7 @@ impl ContestSession {
             stress_cases,
             channels,
         );
-        crate::tui::run(
-            terminal,
-            app_context,
-            preferences,
-            runtime,
-            resolve_contest_switch,
-            contest_switch_task,
-        )
+        crate::tui::run(terminal, app_context, preferences, runtime, frontend)
     }
 
     fn request_stop(&self) {
@@ -1674,6 +1972,274 @@ mod tests {
         let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
 
         session.shutdown().unwrap();
+    }
+
+    struct PreparedProbe {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for PreparedProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn refresh_rebuild_orders_shutdown_apply_load_and_start() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let rebuilt = rebuild_contest_session_after_refresh(
+            "old-session".to_string(),
+            PreparedProbe {
+                dropped: Arc::clone(&dropped),
+            },
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: {
+                    let order = Arc::clone(&order);
+                    move |session| {
+                        assert_eq!(session, "old-session");
+                        order.lock().unwrap().push("shutdown-start");
+                        order.lock().unwrap().push("shutdown-finished");
+                        Ok(())
+                    }
+                },
+                apply: {
+                    let order = Arc::clone(&order);
+                    move |_| {
+                        assert_eq!(
+                            order.lock().unwrap().last().copied(),
+                            Some("shutdown-finished")
+                        );
+                        order.lock().unwrap().push("apply");
+                        Ok(())
+                    }
+                },
+                load: {
+                    let order = Arc::clone(&order);
+                    move |destination, contest_id| {
+                        assert_eq!(destination, Path::new("abc123"));
+                        assert_eq!(contest_id, "abc123");
+                        order.lock().unwrap().push("load");
+                        Ok("loaded")
+                    }
+                },
+                start: {
+                    let order = Arc::clone(&order);
+                    move |input| {
+                        assert_eq!(input, "loaded");
+                        order.lock().unwrap().push("start");
+                        Ok("new-session".to_string())
+                    }
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt.session, "new-session");
+        assert_eq!(rebuilt.frontend_state.error(), None);
+        assert_eq!(
+            *order.lock().unwrap(),
+            [
+                "shutdown-start",
+                "shutdown-finished",
+                "apply",
+                "load",
+                "start"
+            ]
+        );
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn refresh_shutdown_failure_drops_prepared_data_without_applying() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let apply_called = Arc::new(AtomicBool::new(false));
+        let error = rebuild_contest_session_after_refresh(
+            (),
+            PreparedProbe {
+                dropped: Arc::clone(&dropped),
+            },
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: |_| Err(io::Error::other("worker join failed")),
+                apply: {
+                    let apply_called = Arc::clone(&apply_called);
+                    move |_| {
+                        apply_called.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                },
+                load: |_, _| Ok(()),
+                start: |_| Ok(()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("contest session shutdown failed before refresh apply")
+        );
+        assert!(error.to_string().contains("worker join failed"));
+        assert!(!apply_called.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn refresh_apply_failure_recovers_a_fresh_session_and_reopens_failed_modal() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let rebuilt = rebuild_contest_session_after_refresh(
+            "old",
+            (),
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: {
+                    let order = Arc::clone(&order);
+                    move |_| {
+                        order.lock().unwrap().push("shutdown");
+                        Ok(())
+                    }
+                },
+                apply: {
+                    let order = Arc::clone(&order);
+                    move |_| {
+                        order.lock().unwrap().push("apply");
+                        Err(io::Error::other("replacement rolled back").into())
+                    }
+                },
+                load: {
+                    let order = Arc::clone(&order);
+                    move |_, _| {
+                        order.lock().unwrap().push("recovery-load");
+                        Ok("recovered")
+                    }
+                },
+                start: {
+                    let order = Arc::clone(&order);
+                    move |_| {
+                        order.lock().unwrap().push("recovery-start");
+                        Ok("new")
+                    }
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt.session, "new");
+        assert!(
+            rebuilt
+                .frontend_state
+                .error()
+                .unwrap()
+                .contains("replacement rolled back")
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["shutdown", "apply", "recovery-load", "recovery-start"]
+        );
+    }
+
+    #[test]
+    fn refresh_apply_and_recovery_failures_preserve_both_contexts() {
+        let load_error = rebuild_contest_session_after_refresh(
+            (),
+            (),
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: |_| Ok(()),
+                apply: |_| Err(io::Error::other("apply primary").into()),
+                load: |_, _| Err(io::Error::other("recovery load secondary").into()),
+                start: |_: ()| Ok(()),
+            },
+        )
+        .unwrap_err();
+        assert!(load_error.to_string().contains("apply primary"));
+        assert!(load_error.to_string().contains("recovery load secondary"));
+
+        let start_error = rebuild_contest_session_after_refresh(
+            (),
+            (),
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: |_| Ok(()),
+                apply: |_| Err(io::Error::other("apply primary").into()),
+                load: |_, _| Ok(()),
+                start: |_| Err(io::Error::other("recovery start secondary")),
+            },
+        )
+        .unwrap_err();
+        assert!(start_error.to_string().contains("apply primary"));
+        assert!(start_error.to_string().contains("recovery start secondary"));
+    }
+
+    #[test]
+    fn successful_refresh_with_reload_or_start_failure_is_fatal_with_phase_context() {
+        let load_error = rebuild_contest_session_after_refresh(
+            (),
+            (),
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: |_| Ok(()),
+                apply: |_| Ok(()),
+                load: |_, _| Err(io::Error::other("new metadata unreadable").into()),
+                start: |_: ()| Ok(()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            load_error
+                .to_string()
+                .contains("refresh installed but refreshed session could not be loaded")
+        );
+        assert!(load_error.to_string().contains("new metadata unreadable"));
+
+        let start_error = rebuild_contest_session_after_refresh(
+            (),
+            (),
+            Path::new("abc123"),
+            "abc123",
+            crate::tui::RefreshResumeState::default(),
+            RefreshRebuildHooks {
+                shutdown: |_| Ok(()),
+                apply: |_| Ok(()),
+                load: |_, _| Ok(()),
+                start: |_| Err(io::Error::other("watcher startup failed")),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            start_error
+                .to_string()
+                .contains("refresh installed but refreshed session could not start")
+        );
+        assert!(start_error.to_string().contains("watcher startup failed"));
+    }
+
+    #[test]
+    fn poisoned_prepared_refresh_handoff_fails_closed() {
+        let prepared: Arc<Mutex<Option<PreparedRefresh>>> = Arc::new(Mutex::new(None));
+        let poison = Arc::clone(&prepared);
+        let _ = thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison prepared refresh handoff");
+        })
+        .join();
+
+        let check = prepared_refresh_check(prepared);
+        assert!(check().unwrap_err().contains("poisoned"));
     }
 
     #[test]
