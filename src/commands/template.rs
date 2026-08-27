@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::language::Language;
 use crate::safe_file;
-use crate::template::{builtin_template, source_template_filename};
+use crate::template::{builtin_template, source_template_path};
 use crate::ui::{Event, Reporter};
 use crate::user_config_fs::{self, OptionalUtf8File};
 use std::io;
@@ -62,7 +62,7 @@ fn initialize_source_templates_at_with(
     let targets = selected_languages
         .iter()
         .map(|&language| TemplateTarget {
-            path: templates_dir.join(source_template_filename(language)),
+            path: source_template_path(templates_dir, language),
             contents: builtin_template(language).as_bytes(),
         })
         .collect::<Vec<_>>();
@@ -123,7 +123,7 @@ fn inspect_template_file(path: &Path) -> Result<TemplateFileState, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::resolve_source_template_in;
+    use crate::template::{resolve_source_template_in, source_template_filename};
     use std::fs;
 
     #[derive(Debug, Default)]
@@ -229,7 +229,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let templates_dir = temp.path().join("config").join("templates");
             let reporter = initialize(&templates_dir, &[language]).unwrap();
-            let selected = templates_dir.join(source_template_filename(language));
+            let selected = source_template_path(&templates_dir, language);
             let other = Language::ALL
                 .into_iter()
                 .find(|candidate| *candidate != language)
@@ -239,7 +239,7 @@ mod tests {
                 fs::read(&selected).unwrap(),
                 builtin_template(language).as_bytes()
             );
-            assert!(!templates_dir.join(source_template_filename(other)).exists());
+            assert!(!source_template_path(&templates_dir, other).exists());
             assert_eq!(reporter.events, [format!("created:{}", selected.display())]);
         }
     }

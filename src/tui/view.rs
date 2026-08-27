@@ -21,7 +21,8 @@ use super::detail_scrollbar::{
 };
 use super::mouse::MouseMode;
 use super::{
-    CommandPalette, FrontendActionAvailability, OpenSourceModal, SwitchContestModal,
+    CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
+    OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, SwitchContestModal,
     SwitchContestModalState,
 };
 use crate::language::Language;
@@ -219,6 +220,7 @@ pub struct RenderInfo {
 pub(super) struct FrontendOverlays<'a> {
     pub(super) switch_modal: Option<&'a SwitchContestModal>,
     pub(super) source_modal: Option<&'a OpenSourceModal>,
+    pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
 }
 
@@ -253,7 +255,7 @@ pub(super) fn render_frontend_with_mouse_mode(
     app: &WatchApp,
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
-    contest_switch_available: bool,
+    workspace_available: bool,
     overlays: FrontendOverlays<'_>,
 ) -> RenderInfo {
     let area = frame.area();
@@ -415,7 +417,7 @@ pub(super) fn render_frontend_with_mouse_mode(
     } else {
         "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
     };
-    let footer_text = if contest_switch_available {
+    let footer_text = if workspace_available {
         format!(": commands   c contest   q quit   {footer_base}")
     } else {
         format!(": commands   q quit   {footer_base}")
@@ -428,8 +430,10 @@ pub(super) fn render_frontend_with_mouse_mode(
         render_switch_contest_modal(frame, modal);
     } else if let Some(modal) = overlays.source_modal {
         render_open_source_modal(frame, app, modal);
+    } else if let Some(modal) = overlays.editor_target_modal {
+        render_editor_target_modal(frame, modal);
     } else if let Some(command_palette) = overlays.command_palette {
-        render_command_palette(frame, app, command_palette, contest_switch_available);
+        render_command_palette(frame, app, command_palette, workspace_available);
     }
 
     RenderInfo {
@@ -439,6 +443,192 @@ pub(super) fn render_frontend_with_mouse_mode(
         detail_scrollbar,
         detail_section_headers,
     }
+}
+
+fn editor_modal_geometry(frame_area: Rect, desired_height: u16) -> (Rect, usize) {
+    let width = frame_area.width.min(76);
+    let height = frame_area.height.min(desired_height);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let line_width = usize::from(Block::default().borders(Borders::ALL).inner(area).width);
+    (area, line_width)
+}
+
+fn render_editor_target_modal(frame: &mut Frame, modal: &EditorTargetModal) {
+    match modal {
+        EditorTargetModal::Settings(modal) => render_open_settings_modal(frame, modal),
+        EditorTargetModal::WorkspaceSettings(modal) => {
+            render_open_workspace_settings_modal(frame, modal);
+        }
+        EditorTargetModal::Template(modal) => render_open_template_modal(frame, modal),
+    }
+}
+
+fn render_editor_modal(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'static>>,
+) {
+    let paragraph = Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .title(format!(" {title} "))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn append_modal_error(lines: &mut Vec<Line<'static>>, error: Option<&str>, line_width: usize) {
+    if let Some(error) = error {
+        for line in error.lines() {
+            lines.push(Line::styled(
+                fit_command_palette_row(line, line_width),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+}
+
+fn render_open_settings_modal(frame: &mut Frame, modal: &OpenSettingsModal) {
+    use crate::user_config_fs::EditableFileState;
+
+    let (area, line_width) = editor_modal_geometry(frame.area(), 12);
+    let destination = modal
+        .target()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let (status, action, inspection_error) = match modal.file_state() {
+        Ok(EditableFileState::Existing) => ("existing", "[Enter] Open", None),
+        Ok(EditableFileState::Missing) => ("not initialized", "[i] Initialize & Open", None),
+        Err(error) => ("unavailable", "", Some(error)),
+    };
+    let mut lines = vec![
+        Line::raw(fit_command_palette_row(status, line_width)),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Destination:", line_width)),
+        Line::raw(fit_command_palette_row(
+            &format!("  {destination}"),
+            line_width,
+        )),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row(action, line_width)),
+        Line::raw(fit_command_palette_row("[Esc] Close", line_width)),
+    ];
+    append_modal_error(
+        &mut lines,
+        inspection_error.as_deref().or(modal.error.as_deref()),
+        line_width,
+    );
+    render_editor_modal(frame, area, "Open Settings", lines);
+}
+
+fn render_open_workspace_settings_modal(frame: &mut Frame, modal: &OpenWorkspaceSettingsModal) {
+    use crate::workspace::WorkspaceConfigFileState;
+
+    let (area, line_width) = editor_modal_geometry(frame.area(), 12);
+    let (status, action, inspection_error) = match modal.file_state() {
+        Ok(WorkspaceConfigFileState::Existing) => ("existing", "[Enter] Open", None),
+        Ok(WorkspaceConfigFileState::Missing) => ("workspace settings file is missing", "", None),
+        Err(error) => ("unavailable", "", Some(error)),
+    };
+    let mut lines = vec![
+        Line::raw(fit_command_palette_row(status, line_width)),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Destination:", line_width)),
+        Line::raw(fit_command_palette_row(
+            &format!("  {}", modal.target().display()),
+            line_width,
+        )),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row(action, line_width)),
+        Line::raw(fit_command_palette_row("[Esc] Close", line_width)),
+    ];
+    append_modal_error(
+        &mut lines,
+        inspection_error.as_deref().or(modal.error.as_deref()),
+        line_width,
+    );
+    render_editor_modal(frame, area, "Open Workspace Settings", lines);
+}
+
+fn render_open_template_modal(frame: &mut Frame, modal: &OpenTemplateModal) {
+    use crate::user_config_fs::EditableFileState;
+
+    let (area, line_width) = editor_modal_geometry(frame.area(), 15);
+    let mut lines = Vec::new();
+    let mut inspection_error = None;
+    for language in Language::ALL {
+        let marker = if modal.selected_language() == language {
+            ">"
+        } else {
+            " "
+        };
+        let mut states = Vec::new();
+        if modal.current_language() == Some(language) {
+            states.push("current");
+        }
+        match modal.file_state_for(language) {
+            Ok(EditableFileState::Missing) => states.push("not initialized"),
+            Ok(EditableFileState::Existing) => {}
+            Err(error) => {
+                states.push("unavailable");
+                inspection_error.get_or_insert(error);
+            }
+        }
+        let state = if states.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", states.join(", "))
+        };
+        let row = fit_command_palette_row(
+            &format!("{marker} {:<8}{state}", language_label(language)),
+            line_width,
+        );
+        let style = if modal.selected_language() == language {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(row, style));
+    }
+
+    let destination = modal
+        .selected_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let action = match modal.file_state_for(modal.selected_language()) {
+        Ok(EditableFileState::Existing) => "[Enter] Open",
+        Ok(EditableFileState::Missing) => "[i] Initialize & Open",
+        Err(error) => {
+            inspection_error.get_or_insert(error);
+            ""
+        }
+    };
+    lines.extend([
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Destination:", line_width)),
+        Line::raw(fit_command_palette_row(
+            &format!("  {destination}"),
+            line_width,
+        )),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row(action, line_width)),
+        Line::raw(fit_command_palette_row(
+            "[↑/↓ or j/k] Select   [Esc] Close",
+            line_width,
+        )),
+    ]);
+    append_modal_error(
+        &mut lines,
+        inspection_error.as_deref().or(modal.error.as_deref()),
+        line_width,
+    );
+    render_editor_modal(frame, area, "Open Template", lines);
 }
 
 fn render_open_source_modal(frame: &mut Frame, app: &WatchApp, modal: &OpenSourceModal) {
@@ -541,7 +731,7 @@ fn render_command_palette(
     frame: &mut Frame,
     app: &WatchApp,
     palette: &CommandPalette,
-    contest_switch_available: bool,
+    workspace_available: bool,
 ) {
     let actions = palette.filtered_actions();
     let layout = command_palette_layout(frame.area(), actions.len(), palette.selected_index());
@@ -584,7 +774,7 @@ fn render_command_palette(
         let mut lines = Vec::with_capacity(layout.viewport.len());
         for index in layout.viewport.clone() {
             let action = actions[index];
-            let availability = action.availability(app, contest_switch_available);
+            let availability = action.availability(app, workspace_available);
             let marker = if palette.is_selected(index) { ">" } else { " " };
             let row =
                 command_palette_row(marker, action.label(), action.shortcut(), layout.list_width);
@@ -612,7 +802,7 @@ fn render_command_palette(
     }
     let status = match palette
         .selected_action()
-        .map(|action| action.availability(app, contest_switch_available))
+        .map(|action| action.availability(app, workspace_available))
     {
         Some(FrontendActionAvailability::Unavailable(reason)) => {
             format!("  Unavailable: {reason}")
@@ -1210,6 +1400,41 @@ mod tests {
         text
     }
 
+    fn rendered_editor_target_text(
+        app: &WatchApp,
+        modal: &EditorTargetModal,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        editor_target_modal: Some(modal),
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn rendered_frontend_buffer_with_palette(
         app: &WatchApp,
         switch_available: bool,
@@ -1232,6 +1457,7 @@ mod tests {
                     FrontendOverlays {
                         switch_modal: modal,
                         source_modal: None,
+                        editor_target_modal: None,
                         command_palette: palette,
                     },
                 );
@@ -1798,7 +2024,7 @@ mod tests {
             frame.width,
             frame.height,
         );
-        assert!(rendered.contains("Stop Stress"));
+        assert!(rendered.contains("Open Template"));
         assert!(!rendered.contains("Run Tests"));
 
         palette.selected = 0;
@@ -2164,6 +2390,87 @@ mod tests {
 
         for (width, height) in [(20, 8), (8, 4), (1, 1), (0, 0)] {
             let _ = rendered_open_source_text(&app, controller.modal().unwrap(), width, height);
+        }
+    }
+
+    #[test]
+    fn editor_target_modals_render_states_actions_and_fixed_template_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_file = temp.path().join("config.toml");
+        let templates_dir = temp.path().join("templates");
+        fs::write(&config_file, [0xff, 0xfe]).unwrap();
+        let mut controller = super::super::EditorTargetController::new(
+            temp.path(),
+            Language::Python,
+            Ok(config_file.clone()),
+            Ok(templates_dir.clone()),
+            Some(temp.path()),
+        );
+        let app = app();
+
+        controller.open_settings();
+        let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains("Open Settings"));
+        assert!(rendered.contains("existing"));
+        assert!(rendered.contains(&config_file.display().to_string()));
+        assert!(rendered.contains("[Enter] Open"));
+        fs::remove_file(&config_file).unwrap();
+        let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains("not initialized"));
+        assert!(rendered.contains("[i] Initialize & Open"));
+
+        let workspace_file = crate::workspace::workspace_config_path(temp.path());
+        fs::write(&workspace_file, "malformed = [\n").unwrap();
+        controller.open_workspace_settings();
+        let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains("Open Workspace Settings"));
+        assert!(rendered.contains(&workspace_file.display().to_string()));
+        assert!(rendered.contains("[Enter] Open"));
+        assert!(!rendered.contains("Initialize & Open"));
+        fs::remove_file(&workspace_file).unwrap();
+        let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
+        assert!(rendered.contains("workspace settings file is missing"));
+        assert!(!rendered.contains("[Enter] Open"));
+        assert!(!rendered.contains("Initialize & Open"));
+
+        fs::create_dir(&templates_dir).unwrap();
+        let cpp = crate::template::source_template_path(&templates_dir, Language::Cpp);
+        fs::write(&cpp, "custom").unwrap();
+        controller.open_template(&app);
+        let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
+        let cpp_position = rendered.find("C++").unwrap();
+        let python_position = rendered.find("Python").unwrap();
+        assert!(cpp_position < python_position);
+        assert!(rendered.contains("Python    not initialized"));
+        assert!(rendered.contains("[i] Initialize & Open"));
+        assert!(!rendered.contains("Problem:"));
+    }
+
+    #[test]
+    fn editor_target_modals_truncate_unicode_destinations_and_survive_tiny_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let unicode = temp
+            .path()
+            .join("非常に長いユーザー設定ディレクトリ")
+            .join("さらに長い保存先")
+            .join("config.toml");
+        let mut controller = super::super::EditorTargetController::new(
+            temp.path(),
+            Language::Cpp,
+            Ok(unicode.clone()),
+            Ok(temp.path().join("非常に長いテンプレート保存先")),
+            Some(temp.path()),
+        );
+        let app = app();
+        controller.open_settings();
+
+        let narrow = rendered_editor_target_text(&app, controller.modal().unwrap(), 32, 12);
+        assert!(narrow.contains("Open Settings"));
+        assert!(narrow.contains('…'));
+        assert!(!narrow.contains(&unicode.display().to_string()));
+
+        for (width, height) in [(20, 8), (8, 4), (1, 1), (0, 0)] {
+            let _ = rendered_editor_target_text(&app, controller.modal().unwrap(), width, height);
         }
     }
 

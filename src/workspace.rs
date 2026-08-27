@@ -99,6 +99,12 @@ pub(crate) struct WorkspaceConfigInspection {
     pub(crate) mapping_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceConfigFileState {
+    Missing,
+    Existing,
+}
+
 struct WorkspacePathRule {
     pattern: Regex,
     path: WorkspaceRelativePath,
@@ -241,7 +247,7 @@ fn load_workspace_config_file(path: &Path) -> io::Result<WorkspaceConfig> {
 }
 
 fn load_workspace_config(root: &Path) -> io::Result<Option<WorkspaceConfig>> {
-    let path = root.join(WORKSPACE_CONFIG_FILE);
+    let path = workspace_config_path(root);
 
     if !existing_regular_file(&path, "workspace config")
         .map_err(|error| workspace_config_error(&path, "inspect", error.kind(), error))?
@@ -255,7 +261,7 @@ fn load_workspace_config(root: &Path) -> io::Result<Option<WorkspaceConfig>> {
 pub(crate) fn inspect_workspace_config(
     root: &Path,
 ) -> io::Result<Option<WorkspaceConfigInspection>> {
-    let path = root.join(WORKSPACE_CONFIG_FILE);
+    let path = workspace_config_path(root);
 
     load_workspace_config(root).map(|config| {
         config.map(|config| WorkspaceConfigInspection {
@@ -263,6 +269,23 @@ pub(crate) fn inspect_workspace_config(
             mapping_count: config.paths.len(),
         })
     })
+}
+
+pub(crate) fn workspace_config_path(root: &Path) -> PathBuf {
+    root.join(WORKSPACE_CONFIG_FILE)
+}
+
+pub(crate) fn inspect_workspace_config_file(root: &Path) -> io::Result<WorkspaceConfigFileState> {
+    let path = workspace_config_path(root);
+    if !existing_regular_file(&path, "workspace config")
+        .map_err(|error| workspace_config_error(&path, "inspect", error.kind(), error))?
+    {
+        return Ok(WorkspaceConfigFileState::Missing);
+    }
+
+    fs::File::open(&path)
+        .map_err(|error| workspace_config_error(&path, "open", error.kind(), error))?;
+    Ok(WorkspaceConfigFileState::Existing)
 }
 
 fn load_existing_workspace_config(
@@ -2374,6 +2397,43 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn workspace_config_file_inspection_preserves_policy_without_parsing_contents() {
+        let missing_root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            inspect_workspace_config_file(missing_root.path()).unwrap(),
+            WorkspaceConfigFileState::Missing
+        );
+
+        let invalid_root = tempfile::tempdir().unwrap();
+        let invalid = workspace_config_path(invalid_root.path());
+        fs::write(&invalid, [0xff, 0xfe, 0x80]).unwrap();
+        assert_eq!(
+            inspect_workspace_config_file(invalid_root.path()).unwrap(),
+            WorkspaceConfigFileState::Existing
+        );
+
+        let directory_root = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace_config_path(directory_root.path())).unwrap();
+        assert_eq!(
+            inspect_workspace_config_file(directory_root.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let symlink_root = tempfile::tempdir().unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        if create_file_symlink(external.path(), &workspace_config_path(symlink_root.path())) {
+            assert_eq!(
+                inspect_workspace_config_file(symlink_root.path())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]

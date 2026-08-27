@@ -16,7 +16,7 @@ mod watch_source;
 mod watch_tui;
 mod watch_worker;
 
-pub(crate) use config::config_init;
+pub(crate) use config::{config_init, initialize_config_at};
 pub(crate) use contest::contest;
 pub(crate) use create::{create, create_source};
 pub(crate) use doctor::doctor;
@@ -25,7 +25,7 @@ pub(crate) use login::login;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
 pub(crate) use stress::{stress, stress_init};
-pub(crate) use template::template_init;
+pub(crate) use template::{initialize_source_templates_at, template_init};
 pub(crate) use test::test;
 pub(crate) use watch::watch;
 pub(crate) use watch_tui::watch_tui;

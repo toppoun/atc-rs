@@ -4,9 +4,53 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditableFileState {
+    Missing,
+    Existing,
+}
+
 pub(crate) enum OptionalUtf8File {
     Missing,
     Present(String),
+}
+
+pub(crate) fn inspect_editable_file(
+    path: &Path,
+    kind: &str,
+) -> Result<EditableFileState, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(EditableFileState::Missing);
+        }
+        Err(error) => {
+            return Err(contextual_io_error(
+                error,
+                format!("failed to inspect {kind}: {}", path.display()),
+            )
+            .into());
+        }
+    }
+
+    let metadata = fs::metadata(path).map_err(|error| {
+        contextual_io_error(
+            error,
+            format!("failed to follow {kind}: {}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} must resolve to a regular file: {}", path.display()),
+        )
+        .into());
+    }
+
+    fs::File::open(path).map_err(|error| {
+        contextual_io_error(error, format!("failed to open {kind}: {}", path.display()))
+    })?;
+    Ok(EditableFileState::Existing)
 }
 
 pub(crate) fn optional_directory_exists(path: &Path, kind: &str) -> Result<bool, AppError> {
@@ -147,6 +191,25 @@ impl std::error::Error for ContextualIoError {
 mod tests {
     use super::*;
 
+    fn create_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create file symlink: {error}"),
+        }
+    }
+
     fn create_directory_symlink(target: &Path, link: &Path) -> bool {
         #[cfg(unix)]
         let result = std::os::unix::fs::symlink(target, link);
@@ -220,5 +283,53 @@ mod tests {
 
         assert!(error.to_string().contains("must resolve to a directory"));
         assert_eq!(fs::read(directory).unwrap(), b"race winner");
+    }
+
+    #[test]
+    fn editable_file_inspection_is_content_agnostic_and_follows_regular_file_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert_eq!(
+            inspect_editable_file(&missing, "test file").unwrap(),
+            EditableFileState::Missing
+        );
+
+        let target = temp.path().join("target");
+        fs::write(&target, [0xff, 0xfe, 0x80]).unwrap();
+        assert_eq!(
+            inspect_editable_file(&target, "test file").unwrap(),
+            EditableFileState::Existing
+        );
+
+        let linked = temp.path().join("linked");
+        if create_file_symlink(&target, &linked) {
+            assert_eq!(
+                inspect_editable_file(&linked, "test file").unwrap(),
+                EditableFileState::Existing
+            );
+        }
+    }
+
+    #[test]
+    fn editable_file_inspection_rejects_wrong_and_broken_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(
+            inspect_editable_file(&directory, "test file")
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+
+        let dangling = temp.path().join("dangling");
+        if create_file_symlink(&temp.path().join("absent"), &dangling) {
+            assert!(
+                inspect_editable_file(&dangling, "test file")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("follow test file")
+            );
+        }
     }
 }

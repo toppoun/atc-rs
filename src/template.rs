@@ -25,6 +25,10 @@ pub(crate) fn source_template_filename(language: Language) -> &'static str {
     }
 }
 
+pub(crate) fn source_template_path(templates_dir: &Path, language: Language) -> PathBuf {
+    templates_dir.join(source_template_filename(language))
+}
+
 pub(crate) fn resolve_source_template(language: Language) -> Result<String, AppError> {
     let templates_dir = crate::paths::source_templates_dir()?;
     resolve_source_template_in(&templates_dir, language)
@@ -61,7 +65,7 @@ pub(crate) fn resolve_source_template_with_origin_in(
         });
     }
 
-    let template_path = templates_dir.join(source_template_filename(language));
+    let template_path = source_template_path(templates_dir, language);
     match user_config_fs::read_optional_utf8_file(&template_path, "source template")? {
         OptionalUtf8File::Missing => Ok(ResolvedSourceTemplate {
             contents: builtin_template(language).to_owned(),
@@ -200,6 +204,15 @@ mod tests {
     fn source_template_filenames_are_conventional_and_language_specific() {
         assert_eq!(source_template_filename(Language::Cpp), "cpp.cpp");
         assert_eq!(source_template_filename(Language::Python), "python.py");
+        let root = Path::new("templates");
+        assert_eq!(
+            source_template_path(root, Language::Cpp),
+            root.join(source_template_filename(Language::Cpp))
+        );
+        assert_eq!(
+            source_template_path(root, Language::Python),
+            root.join(source_template_filename(Language::Python))
+        );
     }
 
     #[test]
