@@ -731,7 +731,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn macos_bundle_classification_does_not_require_unicode_parent_directories() {
-        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::ffi::OsStrExt as _;
 
         let path = OsStr::from_bytes(
             b"/Volumes/invalid-\xff/Cursor.app/Contents/Frameworks/Cursor Helper (Plugin)",
@@ -742,6 +742,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_executable_classifier_and_ancestor_order_are_conservative() {
         let vscode =

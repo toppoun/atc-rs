@@ -35,11 +35,6 @@ fn initialize_config_at_with(
     reporter: &mut dyn Reporter,
     installer: &mut dyn FnMut(&Path, &[u8]) -> io::Result<()>,
 ) -> Result<(), AppError> {
-    if inspect_config_file(config_file)? == ConfigFileState::Exists {
-        reporter.report(Event::ConfigFileExists { path: config_file });
-        return Ok(());
-    }
-
     let parent = config_file.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

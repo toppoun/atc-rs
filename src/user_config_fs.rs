@@ -229,6 +229,13 @@ mod tests {
         }
     }
 
+    fn remove_directory_symlink(link: &Path) {
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(link).unwrap();
+    }
+
     #[test]
     fn directory_creation_race_accepts_a_directory_winner() {
         let temp = tempfile::tempdir().unwrap();
@@ -253,7 +260,7 @@ mod tests {
         if !create_directory_symlink(&target, &probe) {
             return;
         }
-        fs::remove_dir(&probe).unwrap();
+        remove_directory_symlink(&probe);
         let mut create = |path: &Path| {
             assert!(create_directory_symlink(&target, path));
             Err(io::ErrorKind::AlreadyExists.into())

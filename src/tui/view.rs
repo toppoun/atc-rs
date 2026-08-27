@@ -2467,6 +2467,7 @@ mod tests {
         app.source_changed(0, cpp.clone(), Language::Cpp);
         let mut controller = super::super::OpenSourceController::new(temp.path(), Language::Python);
         assert!(controller.open(&app));
+        assert_eq!(controller.modal().unwrap().selected_path().unwrap(), cpp);
 
         let rendered = rendered_open_source_text(&app, controller.modal().unwrap(), 100, 20);
         assert!(rendered.contains("Open Source"));
@@ -2476,12 +2477,16 @@ mod tests {
         assert!(cpp_position < python_position);
         assert!(rendered.contains("C++       current"));
         assert!(rendered.contains("Python    not created"));
-        assert!(rendered.contains(&cpp.display().to_string()));
+        assert!(rendered.contains("A.cpp"));
         assert!(rendered.contains("[Enter] Open"));
 
         controller.modal.as_mut().unwrap().selected_language = Language::Python;
+        assert_eq!(
+            controller.modal().unwrap().selected_path().unwrap(),
+            temp.path().join("A.py")
+        );
         let rendered = rendered_open_source_text(&app, controller.modal().unwrap(), 100, 20);
-        assert!(rendered.contains(&temp.path().join("A.py").display().to_string()));
+        assert!(rendered.contains("A.py"));
         assert!(rendered.contains("[i] Create & Open"));
         assert!(rendered.contains("C++       current"));
     }
@@ -2528,10 +2533,14 @@ mod tests {
         let app = app();
 
         controller.open_settings();
+        let EditorTargetModal::Settings(settings) = controller.modal().unwrap() else {
+            panic!("expected settings modal");
+        };
+        assert_eq!(settings.target().unwrap(), config_file);
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
         assert!(rendered.contains("Open Settings"));
         assert!(rendered.contains("existing"));
-        assert!(rendered.contains(&config_file.display().to_string()));
+        assert!(rendered.contains("config.toml"));
         assert!(rendered.contains("[Enter] Open"));
         fs::remove_file(&config_file).unwrap();
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
@@ -2541,9 +2550,21 @@ mod tests {
         let workspace_file = crate::workspace::workspace_config_path(temp.path());
         fs::write(&workspace_file, "malformed = [\n").unwrap();
         controller.open_workspace_settings();
+        let EditorTargetModal::WorkspaceSettings(workspace) = controller.modal().unwrap() else {
+            panic!("expected workspace settings modal");
+        };
+        assert_eq!(workspace.target(), workspace_file);
         let rendered = rendered_editor_target_text(&app, controller.modal().unwrap(), 100, 20);
         assert!(rendered.contains("Open Workspace Settings"));
-        assert!(rendered.contains(&workspace_file.display().to_string()));
+        assert!(
+            rendered.contains(
+                workspace_file
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
         assert!(rendered.contains("[Enter] Open"));
         assert!(!rendered.contains("Initialize & Open"));
         fs::remove_file(&workspace_file).unwrap();

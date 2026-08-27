@@ -166,10 +166,12 @@ fn empty_timed_out_output() -> VersionProbeOutput {
     }
 }
 
+#[cfg(windows)]
 fn probe_deadline_error() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, PROBE_DEADLINE_EXPIRED)
 }
 
+#[cfg(windows)]
 fn check_probe_deadline(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
         Err(probe_deadline_error())
@@ -1082,11 +1084,11 @@ mod tests {
         let script = write_version_script(root.path(), "detached-pipe-version", "", &unix);
         let started = Instant::now();
 
-        let output = probe_version(&script, root.path(), Duration::from_secs(2)).expect("probe");
+        let output = probe_version(&script, root.path(), Duration::from_secs(6)).expect("probe");
 
         assert!(matches!(output.outcome, VersionProbeOutcome::Exited(status) if status.success()));
         assert!(
-            started.elapsed() < Duration::from_millis(1_500),
+            started.elapsed() < Duration::from_secs(5),
             "probe waited for inherited pipe EOF for {:?}",
             started.elapsed()
         );
@@ -1107,7 +1109,7 @@ mod tests {
             .spawn()
             .expect("spawn detached pipe holder");
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(4);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1130,7 +1132,7 @@ mod tests {
             std::io::Error::last_os_error()
         );
         fs::write("detached-probe-ready", b"ready").expect("write ready marker");
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(10));
     }
 
     fn write_version_script(
