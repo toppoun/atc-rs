@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "atc-rs"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
