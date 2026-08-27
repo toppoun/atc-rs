@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked --all-features --no-fail-fast
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Compress-Archive `
+            -Path target/release/atc.exe `
+            -DestinationPath "dist/atc-${{ github.ref_name }}-windows-x86_64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS Apple Silicon
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked --all-features --no-fail-fast
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C target/release \
+            -czf "dist/atc-${{ github.ref_name }}-macos-aarch64.tar.gz" \
+            atc
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs:
+      - windows
+      - macos
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum atc-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(
+            "${GITHUB_REF_NAME}"
+            "--verify-tag"
+            "--generate-notes"
+          )
+
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            args+=("--prerelease" "--latest=false")
+          fi
+
+          gh release create \
+            "${args[@]}" \
+            dist/*
