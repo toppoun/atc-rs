@@ -2519,7 +2519,10 @@ mod tests {
 
     #[test]
     fn editor_target_modals_render_states_actions_and_fixed_template_rows() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(".atc-editor-modal-")
+            .tempdir_in(".")
+            .unwrap();
         let config_file = temp.path().join("config.toml");
         let templates_dir = temp.path().join("templates");
         fs::write(&config_file, [0xff, 0xfe]).unwrap();

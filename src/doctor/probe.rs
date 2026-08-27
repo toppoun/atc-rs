@@ -1097,6 +1097,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[ignore = "launched in a child process by root_exit_does_not_wait_for_a_detached_pipe_holder"]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the detached pipe holder must outlive this root helper so the probe cannot wait for its inherited pipe EOF"
+    )]
     fn spawn_detached_pipe_holder_and_exit_helper() {
         let marker = PathBuf::from("detached-probe-ready");
         let child = Command::new(std::env::current_exe().expect("current test executable"))

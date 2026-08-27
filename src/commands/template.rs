@@ -688,7 +688,7 @@ mod tests {
         fs::create_dir(&templates_dir).unwrap();
         let cpp = templates_dir.join("cpp.cpp");
         fs::write(&cpp, b"preserve me").unwrap();
-        fs::set_permissions(&cpp, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&cpp, fs::Permissions::from_mode(0o0)).unwrap();
         let permissions_are_enforced = fs::read(&cpp).is_err();
 
         let result = initialize(&templates_dir, &[Language::Cpp]);

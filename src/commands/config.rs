@@ -623,7 +623,7 @@ mod tests {
         let config_file = temp.path().join("config.toml");
         let contents = b"runner.timeout_seconds = 3.0\n";
         fs::write(&config_file, contents).unwrap();
-        fs::set_permissions(&config_file, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&config_file, fs::Permissions::from_mode(0o0)).unwrap();
         let permissions_are_enforced = fs::read(&config_file).is_err();
 
         let result = initialize(&config_file);
