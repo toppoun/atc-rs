@@ -79,6 +79,7 @@ pub enum TestsHealth {
 #[serde(deny_unknown_fields)]
 struct WorkspaceConfigFile {
     version: u32,
+    #[serde(default)]
     paths: Vec<WorkspacePathRuleFile>,
 }
 
@@ -2024,6 +2025,26 @@ mod tests {
         assert!(
             resolve_contest_path(temp.path(), "abc466").is_err(),
             "multiple matching rules remain ambiguous even when their paths are equal"
+        );
+    }
+
+    #[test]
+    fn workspace_parser_treats_omitted_paths_as_an_empty_rule_list() {
+        let path = Path::new(WORKSPACE_CONFIG_FILE);
+
+        let config = parse_workspace_config(path, "version = 1\n").unwrap();
+
+        assert!(config.paths.is_empty());
+    }
+
+    #[test]
+    fn contest_resolver_places_contest_at_root_when_paths_are_omitted() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_config(temp.path(), "version = 1\n");
+
+        assert_eq!(
+            resolve_contest_path(temp.path(), "abc466").unwrap(),
+            temp.path().join("abc466")
         );
     }
 
