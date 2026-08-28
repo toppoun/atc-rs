@@ -530,7 +530,7 @@ impl<'a> DetailDocument<'a> {
         content: &'a Arc<String>,
         folds: DetailFoldState,
     ) {
-        self.push_static("\n\n");
+        self.push_semantic_section_gap();
         debug_assert!(
             !self
                 .section_anchors
@@ -557,6 +557,21 @@ impl<'a> DetailDocument<'a> {
             self.push_static("(empty)");
         } else {
             self.push_shared(content);
+        }
+    }
+
+    fn push_semantic_section_gap(&mut self) {
+        // A trailing line feed already terminates the preceding body line, so only one more
+        // is needed to render the single blank row between semantic sections. The shared body
+        // segment itself remains untouched.
+        if self
+            .segments
+            .last()
+            .is_some_and(|segment| segment.text().ends_with('\n'))
+        {
+            self.push_static("\n");
+        } else {
+            self.push_static("\n\n");
         }
     }
 
@@ -912,8 +927,8 @@ mod tests {
                 "A - Problem A\n\n",
                 "sample 1 / 1   WA   1.0 ms",
                 "\n\n▼ Expected\n  58\n\n日本語 e\u{301} 👩‍💻\n",
-                "\n\n▼ Actual\n58 \n",
-                "\n\n▼ Stderr\n debug \n\n",
+                "\n▼ Actual\n58 \n",
+                "\n▼ Stderr\n debug \n\n",
             )
         );
         assert_snapshot_matches(&document);
@@ -1131,9 +1146,9 @@ mod tests {
                 "A - Problem A\n\n",
                 "sample 1 / 1   AC   4.0 ms",
                 "\n\n▼ Input\nsample input\n",
-                "\n\n▼ Expected\nexpected\n",
-                "\n\n▼ Actual\nactual\n",
-                "\n\n▼ Stderr\ndebug output\n",
+                "\n▼ Expected\nexpected\n",
+                "\n▼ Actual\nactual\n",
+                "\n▼ Stderr\ndebug output\n",
             )
         );
         assert!(!text.contains("\n\nAccepted"));
@@ -1226,6 +1241,66 @@ mod tests {
     }
 
     #[test]
+    fn semantic_section_gaps_preserve_internal_lines_and_add_no_trailing_separator() {
+        let expected = Arc::new("a\n\nb\n".to_string());
+        let actual = Arc::new("No\n".to_string());
+        let stderr = Arc::new("diagnostic".to_string());
+        let mut document = DetailDocument::default();
+        document.push_static("header");
+        for (kind, label, body) in [
+            (DetailSectionKind::Expected, "Expected", &expected),
+            (DetailSectionKind::Actual, "Actual", &actual),
+            (DetailSectionKind::Stderr, "Stderr", &stderr),
+        ] {
+            document.push_semantic_shared_section(kind, label, body, DetailFoldState::default());
+        }
+
+        assert_eq!(
+            document_text(&document),
+            concat!(
+                "header",
+                "\n\n▼ Expected\na\n\nb\n",
+                "\n▼ Actual\nNo\n",
+                "\n▼ Stderr\ndiagnostic",
+            )
+        );
+        assert_eq!(expected.as_str(), "a\n\nb\n");
+        assert_eq!(actual.as_str(), "No\n");
+        assert_eq!(stderr.as_str(), "diagnostic");
+        assert_snapshot_matches(&document);
+    }
+
+    #[test]
+    fn folded_semantic_sections_keep_one_blank_line_between_headers() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        app.toggle_detail_section(DetailSectionKind::Expected);
+        app.toggle_detail_section(DetailSectionKind::Stderr);
+        let expected = Arc::new("hidden expected\n".to_string());
+        let actual = Arc::new("No\n".to_string());
+        let stderr = Arc::new("hidden stderr\n".to_string());
+        let mut document = DetailDocument::default();
+        document.push_static("header");
+        for (kind, label, body) in [
+            (DetailSectionKind::Expected, "Expected", &expected),
+            (DetailSectionKind::Actual, "Actual", &actual),
+            (DetailSectionKind::Stderr, "Stderr", &stderr),
+        ] {
+            document.push_semantic_shared_section(kind, label, body, app.detail_fold_state());
+        }
+
+        assert_eq!(
+            document_text(&document),
+            concat!(
+                "header",
+                "\n\n▶ Expected",
+                "\n\n▼ Actual\nNo\n",
+                "\n▶ Stderr",
+            )
+        );
+        assert_snapshot_matches(&document);
+    }
+
+    #[test]
     fn live_stress_failure_records_all_semantic_sections_in_render_order() {
         let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
         app.source_changed(0, PathBuf::from("A.py"), Language::Python);
@@ -1247,9 +1322,9 @@ mod tests {
                 case_number: 1,
                 base_seed: 123,
                 seed: 456,
-                input: String::new(),
-                expected: "expected value".to_string(),
-                actual: "actual value".to_string(),
+                input: "stress input\n".to_string(),
+                expected: "No\n".to_string(),
+                actual: "No\n".to_string(),
                 stderr: "diagnostic".to_string(),
                 candidate_elapsed: Duration::from_millis(1),
                 elapsed: Duration::from_millis(2),
@@ -1270,7 +1345,12 @@ mod tests {
             assert_eq!(anchor.kind, kind);
             assert_eq!(anchor.raw_position, expected_anchor(&text, label));
         }
-        assert!(text.contains("▼ Input\n(empty)"));
+        assert!(text.contains(concat!(
+            "▼ Input\nstress input\n",
+            "\n▼ Expected\nNo\n",
+            "\n▼ Actual\nNo\n",
+            "\n▼ Stderr\ndiagnostic",
+        )));
         assert_snapshot_matches(&document);
     }
 
