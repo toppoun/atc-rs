@@ -71,6 +71,7 @@ pub enum TestEvent {
 
     TestCaseComparison {
         number: usize,
+        input: String,
         expected: String,
         actual: String,
     },

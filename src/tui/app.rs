@@ -208,6 +208,7 @@ pub enum CaseVerdict {
 pub struct CaseState {
     pub verdict: CaseVerdict,
     pub elapsed: Option<Duration>,
+    pub input: Option<Arc<String>>,
     pub expected: Option<Arc<String>>,
     pub actual: Option<Arc<String>>,
     pub stderr: Option<Arc<String>>,
@@ -218,6 +219,7 @@ impl Default for CaseState {
         Self {
             verdict: CaseVerdict::Pending,
             elapsed: None,
+            input: None,
             expected: None,
             actual: None,
             stderr: None,
@@ -230,6 +232,7 @@ pub struct RunState {
     pub id: Option<RunId>,
     pub phase: RunPhase,
     pub language: Option<Language>,
+    pub debug: bool,
     test_run_started: bool,
 
     pub accepted: usize,
@@ -244,6 +247,7 @@ impl Default for RunState {
             id: None,
             phase: RunPhase::Idle,
             language: None,
+            debug: false,
             test_run_started: false,
 
             accepted: 0,
@@ -740,6 +744,7 @@ impl WatchApp {
             id: Some(run_id),
             phase: RunPhase::Queued,
             language: Some(language),
+            debug,
             test_run_started: false,
             accepted: 0,
             total_cases,
@@ -1092,6 +1097,7 @@ impl WatchApp {
             }
             TestEvent::TestCaseComparison {
                 number,
+                input,
                 expected,
                 actual,
             } if run.phase == RunPhase::Running && run.test_run_started => {
@@ -1099,10 +1105,11 @@ impl WatchApp {
                     return false;
                 };
 
-                if case.expected.is_some() || case.actual.is_some() {
+                if case.input.is_some() || case.expected.is_some() || case.actual.is_some() {
                     return false;
                 }
 
+                case.input = Some(Arc::new(input));
                 case.expected = Some(Arc::new(expected));
                 case.actual = Some(Arc::new(actual));
 
@@ -1654,6 +1661,7 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "input".to_string(),
                 expected: "expected".to_string(),
                 actual: "actual".to_string(),
             },
@@ -1968,11 +1976,13 @@ mod tests {
 
         let cpp = app.queue_run(0).unwrap();
         assert!(cpp.debug);
+        assert!(app.current_problem().unwrap().run.debug);
 
         app.source_changed(0, PathBuf::from("A.py"), Language::Python);
 
         let python = app.queue_run(0).unwrap();
         assert!(!python.debug);
+        assert!(!app.current_problem().unwrap().run.debug);
     }
 
     #[test]
@@ -2178,6 +2188,7 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseComparison {
                 number: 2,
+                input: "1\n".to_owned(),
                 expected: "Yes\n".to_owned(),
                 actual: "No\n".to_owned(),
             },
@@ -2196,6 +2207,7 @@ mod tests {
 
         assert_eq!(case.verdict, CaseVerdict::WrongAnswer);
         assert_eq!(case.elapsed, Some(Duration::from_millis(6)));
+        assert_eq!(case.input.as_ref().map(|text| text.as_str()), Some("1\n"));
         assert_eq!(
             case.expected.as_ref().map(|text| text.as_str()),
             Some("Yes\n")
@@ -2222,6 +2234,8 @@ mod tests {
         let expected = "expected ".repeat(10_000);
         let actual = "actual ".repeat(10_000);
         let stderr = "stderr ".repeat(10_000);
+        let input = "input ".repeat(10_000);
+        let input_ptr = input.as_ptr();
         let expected_ptr = expected.as_ptr();
         let actual_ptr = actual.as_ptr();
         let stderr_ptr = stderr.as_ptr();
@@ -2239,6 +2253,7 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input,
                 expected,
                 actual,
             },
@@ -2250,9 +2265,11 @@ mod tests {
         ));
 
         let case = &app.current_problem().unwrap().run.cases[0];
+        let input: &Arc<String> = case.input.as_ref().unwrap();
         let expected: &Arc<String> = case.expected.as_ref().unwrap();
         let actual: &Arc<String> = case.actual.as_ref().unwrap();
         let stderr: &Arc<String> = case.stderr.as_ref().unwrap();
+        assert_eq!(input.as_ptr(), input_ptr);
         assert_eq!(expected.as_ptr(), expected_ptr);
         assert_eq!(actual.as_ptr(), actual_ptr);
         assert_eq!(stderr.as_ptr(), stderr_ptr);
@@ -2736,6 +2753,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 2,
+                input: "input".to_owned(),
                 expected: "...".to_owned(),
                 actual: "...".to_owned(),
             },
@@ -2766,6 +2784,7 @@ mod tests {
         assert!(run.cases.iter().all(|case| {
             case.verdict == CaseVerdict::Pending
                 && case.elapsed.is_none()
+                && case.input.is_none()
                 && case.expected.is_none()
                 && case.actual.is_none()
                 && case.stderr.is_none()
@@ -3180,6 +3199,7 @@ mod tests {
             request.run_id,
             TestEvent::TestCaseComparison {
                 number: 2,
+                input: "9\n".to_string(),
                 expected: "10\n".to_string(),
                 actual: "11\n".to_string(),
             },
@@ -3367,6 +3387,7 @@ mod tests {
             normal.run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "old input\n".to_string(),
                 expected: "old expected\n".to_string(),
                 actual: "old actual\n".to_string(),
             },

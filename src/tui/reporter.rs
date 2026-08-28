@@ -101,11 +101,13 @@ impl Reporter for ChannelReporter {
             }
             Event::TestCaseComparison {
                 number,
+                input,
                 expected,
                 actual,
             } => {
                 self.send(TestEvent::TestCaseComparison {
                     number,
+                    input: input.to_owned(),
                     expected: expected.to_owned(),
                     actual: actual.to_owned(),
                 });
@@ -277,6 +279,7 @@ mod tests {
 
         let mut reporter = ChannelReporter::new(3, 0, tx);
 
+        let input = String::from("1\n");
         let expected = String::from("Yes\n");
         let actual = String::from("No\n");
 
@@ -286,10 +289,12 @@ mod tests {
         });
         reporter.report(Event::TestCaseComparison {
             number: 2,
+            input: &input,
             expected: &expected,
             actual: &actual,
         });
 
+        drop(input);
         drop(expected);
         drop(actual);
 
@@ -314,12 +319,14 @@ mod tests {
                 event:
                     TestEvent::TestCaseComparison {
                         number,
+                        input,
                         expected,
                         actual,
                     },
                 ..
             } => {
                 assert_eq!(number, 2);
+                assert_eq!(input, "1\n");
                 assert_eq!(expected, "Yes\n");
                 assert_eq!(actual, "No\n");
             }

@@ -84,6 +84,7 @@ pub enum Event<'a> {
 
     TestCaseComparison {
         number: usize,
+        input: &'a str,
         expected: &'a str,
         actual: &'a str,
     },
@@ -345,6 +346,7 @@ impl Reporter for TerminalReporter {
                 number,
                 expected,
                 actual,
+                ..
             } => {
                 if let Some(test) = &mut self.current_test {
                     test.record_comparison(number, expected, actual);
@@ -847,6 +849,7 @@ mod tests {
         });
         reporter.report(Event::TestCaseComparison {
             number: 2,
+            input: "",
             expected: "",
             actual: "",
         });

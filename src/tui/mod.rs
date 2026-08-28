@@ -11125,6 +11125,7 @@ mod tests {
             initial.run_id,
             message::TestEvent::TestCaseComparison {
                 number: 1,
+                input: "input".to_string(),
                 expected: "expected".to_string(),
                 actual: "actual".to_string(),
             },

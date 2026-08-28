@@ -370,6 +370,7 @@ impl<'a> DetailDocument<'a> {
     }
 
     fn push_sample_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
+        let run = &problem.run;
         let total = problem.total_cases;
 
         if total == 0 {
@@ -405,9 +406,11 @@ impl<'a> DetailDocument<'a> {
                 return;
             }
 
-            CaseVerdict::Accepted => {
+            CaseVerdict::Accepted if !run.debug => {
                 self.push_static("\n\nAccepted");
             }
+
+            CaseVerdict::Accepted => {}
 
             CaseVerdict::WrongAnswer => {}
 
@@ -418,6 +421,15 @@ impl<'a> DetailDocument<'a> {
             CaseVerdict::TimedOut => {
                 self.push_static("\n\nTime Limit Exceeded");
             }
+        }
+
+        if run.debug {
+            self.push_optional_semantic_shared_section(
+                DetailSectionKind::Input,
+                "Input",
+                case.input.as_ref(),
+                app.detail_fold_state(),
+            );
         }
 
         self.push_optional_semantic_shared_section(
@@ -722,6 +734,23 @@ mod tests {
         (app, request.run_id)
     }
 
+    fn running_cpp_app(debug: bool) -> (WatchApp, u64) {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        if debug {
+            app.toggle_debug();
+        }
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert_eq!(request.debug, debug);
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        (app, request.run_id)
+    }
+
     fn compiling_app() -> (WatchApp, u64) {
         let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
         app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
@@ -861,6 +890,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "sample input\n".to_string(),
                 expected,
                 actual,
             },
@@ -985,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_error_and_accepted_stderr_documents_preserve_current_sections() {
+    fn compile_error_and_debug_off_accepted_stderr_preserve_current_sections() {
         let (mut compile_app, run_id) = compiling_app();
         assert!(compile_app.run_event(
             0,
@@ -1034,7 +1064,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let (mut accepted_app, run_id) = running_app();
+        let (mut accepted_app, run_id) = running_cpp_app(false);
         assert!(accepted_app.run_event(
             0,
             run_id,
@@ -1064,8 +1094,8 @@ mod tests {
     }
 
     #[test]
-    fn debug_accepted_detail_keeps_status_before_comparison_and_stderr() {
-        let (mut app, run_id) = running_app();
+    fn debug_accepted_detail_starts_with_input_and_omits_redundant_status() {
+        let (mut app, run_id) = running_cpp_app(true);
         assert!(app.run_event(
             0,
             run_id,
@@ -1079,6 +1109,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "sample input\n".to_string(),
                 expected: "expected\n".to_string(),
                 actual: "actual\n".to_string(),
             },
@@ -1092,16 +1123,32 @@ mod tests {
             },
         ));
 
+        let document = DetailDocument::from_app(&app);
+        let text = document_text(&document);
         assert_eq!(
-            document_text(&DetailDocument::from_app(&app)),
+            text,
             concat!(
                 "A - Problem A\n\n",
                 "sample 1 / 1   AC   4.0 ms",
-                "\n\nAccepted",
+                "\n\n▼ Input\nsample input\n",
                 "\n\n▼ Expected\nexpected\n",
                 "\n\n▼ Actual\nactual\n",
                 "\n\n▼ Stderr\ndebug output\n",
             )
+        );
+        assert!(!text.contains("\n\nAccepted"));
+        assert_eq!(
+            document
+                .section_anchors()
+                .iter()
+                .map(|anchor| anchor.kind)
+                .collect::<Vec<_>>(),
+            [
+                DetailSectionKind::Input,
+                DetailSectionKind::Expected,
+                DetailSectionKind::Actual,
+                DetailSectionKind::Stderr,
+            ]
         );
     }
 
@@ -1145,6 +1192,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: String::new(),
                 expected: String::new(),
                 actual: String::new(),
             },
@@ -1245,6 +1293,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "input\n".to_string(),
                 expected: "trusted\n".to_string(),
                 actual,
             },
@@ -1323,6 +1372,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "input\n".to_string(),
                 expected: "trusted\n".to_string(),
                 actual: "candidate\n".to_string(),
             },
@@ -1380,6 +1430,7 @@ mod tests {
             run_id,
             TestEvent::TestCaseComparison {
                 number: 1,
+                input: "input\n".to_string(),
                 expected,
                 actual,
             },

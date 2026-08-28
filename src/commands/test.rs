@@ -77,6 +77,7 @@ pub(super) fn report_case_result(
     if debug || matches!(verdict, CaseVerdict::WrongAnswer) {
         reporter.report(Event::TestCaseComparison {
             number,
+            input: &sample.input,
             expected: &sample.output,
             actual: &result.stdout,
         });
