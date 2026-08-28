@@ -48,7 +48,7 @@ const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const DETAIL_FOLD_ANIMATION_DURATION: Duration = Duration::from_millis(80);
+const DETAIL_FOLD_ANIMATION_DURATION: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrontendPreferences {
