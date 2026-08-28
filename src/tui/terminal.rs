@@ -136,7 +136,7 @@ enum LifecycleStep {
     AlternateScreen,
     SgrMouse,
     SgrPixelsMouseMayBeActive,
-    ButtonEventMouse,
+    AnyEventMouse,
     CursorHidden,
     PendingInput,
 }
@@ -147,12 +147,12 @@ const INITIALIZATION_STEPS: &[LifecycleStep] = &[
     LifecycleStep::PendingInput,
     LifecycleStep::AlternateScreen,
     LifecycleStep::SgrMouse,
-    LifecycleStep::ButtonEventMouse,
+    LifecycleStep::AnyEventMouse,
     LifecycleStep::CursorHidden,
 ];
 
 const CLEANUP_STEPS: &[LifecycleStep] = &[
-    LifecycleStep::ButtonEventMouse,
+    LifecycleStep::AnyEventMouse,
     LifecycleStep::SgrMouse,
     LifecycleStep::SgrPixelsMouseMayBeActive,
     LifecycleStep::PendingInput,
@@ -167,7 +167,7 @@ struct LifecycleState {
     alternate_screen: bool,
     sgr_mouse: bool,
     sgr_pixels_mouse_may_be_active: bool,
-    button_event_mouse: bool,
+    any_event_mouse: bool,
     cursor_hidden: bool,
     pending_input: bool,
 }
@@ -187,7 +187,7 @@ impl LifecycleState {
             LifecycleStep::AlternateScreen => self.alternate_screen,
             LifecycleStep::SgrMouse => self.sgr_mouse,
             LifecycleStep::SgrPixelsMouseMayBeActive => self.sgr_pixels_mouse_may_be_active,
-            LifecycleStep::ButtonEventMouse => self.button_event_mouse,
+            LifecycleStep::AnyEventMouse => self.any_event_mouse,
             LifecycleStep::CursorHidden => self.cursor_hidden,
             LifecycleStep::PendingInput => self.pending_input,
         }
@@ -199,7 +199,7 @@ impl LifecycleState {
             LifecycleStep::AlternateScreen => &mut self.alternate_screen,
             LifecycleStep::SgrMouse => &mut self.sgr_mouse,
             LifecycleStep::SgrPixelsMouseMayBeActive => &mut self.sgr_pixels_mouse_may_be_active,
-            LifecycleStep::ButtonEventMouse => &mut self.button_event_mouse,
+            LifecycleStep::AnyEventMouse => &mut self.any_event_mouse,
             LifecycleStep::CursorHidden => &mut self.cursor_hidden,
             LifecycleStep::PendingInput => &mut self.pending_input,
         }
@@ -234,10 +234,10 @@ fn cleanup_lifecycle(
 
         match cleanup_step(step) {
             Ok(()) => {
-                // A failed 1002 reset means the terminal can emit more reports after this drain.
-                // Keep the drain retryable until button-event tracking is confirmed disabled.
+                // A failed 1003 reset means the terminal can emit more reports after this drain.
+                // Keep the drain retryable until any-event tracking is confirmed disabled.
                 if step != LifecycleStep::PendingInput
-                    || !state.is_active(LifecycleStep::ButtonEventMouse)
+                    || !state.is_active(LifecycleStep::AnyEventMouse)
                 {
                     state.deactivate(step);
                 }
@@ -320,8 +320,8 @@ fn flush_terminal_input() -> io::Result<()> {
 
 fn restore_step(output: &mut PlatformTerminal, step: LifecycleStep) -> io::Result<()> {
     match step {
-        LifecycleStep::ButtonEventMouse => {
-            write_dec_private_mode(output, DecPrivateModeCode::ButtonEventMouse, false)
+        LifecycleStep::AnyEventMouse => {
+            write_dec_private_mode(output, DecPrivateModeCode::AnyEventMouse, false)
         }
         LifecycleStep::SgrMouse => {
             write_dec_private_mode(output, DecPrivateModeCode::SGRMouse, false)
@@ -555,7 +555,7 @@ impl Drop for ScopedPanicHook {
 
 fn panic_cleanup_sequence() -> String {
     [
-        dec_private_mode(DecPrivateModeCode::ButtonEventMouse, false),
+        dec_private_mode(DecPrivateModeCode::AnyEventMouse, false),
         dec_private_mode(DecPrivateModeCode::SGRMouse, false),
         dec_private_mode(DecPrivateModeCode::SGRPixelsMouse, false),
         dec_private_mode(DecPrivateModeCode::ShowCursor, true),
@@ -1209,8 +1209,8 @@ fn execute_transition(
     run_transition_plan(steps, |step| match step {
         MouseTransitionStep::DisableTracking => output
             .ensure_mode_disabled(
-                LifecycleStep::ButtonEventMouse,
-                DecPrivateModeCode::ButtonEventMouse,
+                LifecycleStep::AnyEventMouse,
+                DecPrivateModeCode::AnyEventMouse,
             )
             .map(|()| false),
         MouseTransitionStep::DisableCells => output
@@ -1241,8 +1241,8 @@ fn execute_transition(
             .map(|()| false),
         MouseTransitionStep::EnableTracking => output
             .change_mode(
-                LifecycleStep::ButtonEventMouse,
-                DecPrivateModeCode::ButtonEventMouse,
+                LifecycleStep::AnyEventMouse,
+                DecPrivateModeCode::AnyEventMouse,
                 true,
             )
             .map(|()| false),
@@ -1263,7 +1263,7 @@ fn transition_to_disabled(
     pending: &mut VecDeque<TerminalEvent>,
 ) -> io::Result<()> {
     // Tracking is off, so the parser is normally dormant. The pixel configuration is intentional
-    // for the permanently-active-1016 case: even if a terminal also violates the 1002 reset, any
+    // for the permanently-active-1016 case: even if a terminal also violates the 1003 reset, any
     // report is decoded without truncation and rejected while `MouseMode::Disabled`.
     execute_transition(DISABLED_TRANSITION, output, reader, pending).map(|_| ())
 }
@@ -1286,8 +1286,8 @@ fn normalize_for_deferred_pixel_retry(
 
 fn finish_transition_to_pixels(output: &mut SessionTerminal) -> io::Result<()> {
     output.change_mode(
-        LifecycleStep::ButtonEventMouse,
-        DecPrivateModeCode::ButtonEventMouse,
+        LifecycleStep::AnyEventMouse,
+        DecPrivateModeCode::AnyEventMouse,
         true,
     )
 }
@@ -1519,8 +1519,8 @@ impl TerminaSession {
         // Negotiate from a mouse-disabled baseline. Since 1006 and 1016 have the same wire
         // grammar, no tracking is enabled until the parser and coordinate mode agree.
         output.ensure_mode_disabled(
-            LifecycleStep::ButtonEventMouse,
-            DecPrivateModeCode::ButtonEventMouse,
+            LifecycleStep::AnyEventMouse,
+            DecPrivateModeCode::AnyEventMouse,
         )?;
         output.ensure_mode_disabled(LifecycleStep::SgrMouse, DecPrivateModeCode::SGRMouse)?;
         output.ensure_mode_disabled(
@@ -2006,8 +2006,8 @@ impl TerminaSession {
                 .expect("live TUI session must own terminal resources");
             let output = resources.terminal.backend_mut().terminal_mut();
             output.ensure_mode_disabled(
-                LifecycleStep::ButtonEventMouse,
-                DecPrivateModeCode::ButtonEventMouse,
+                LifecycleStep::AnyEventMouse,
+                DecPrivateModeCode::AnyEventMouse,
             )?;
             let resize_seen =
                 drain_transition_mouse_input(&resources.reader, &mut self.pending_events)?;
@@ -2898,7 +2898,7 @@ mod lifecycle_tests {
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         struct ProtocolState {
-            tracking_1002: bool,
+            tracking_1003: bool,
             cells_1006: bool,
             pixels_1016: bool,
             parser: ParserMode,
@@ -2907,7 +2907,7 @@ mod lifecycle_tests {
         impl ProtocolState {
             fn apply(&mut self, step: MouseTransitionStep) {
                 match step {
-                    MouseTransitionStep::DisableTracking => self.tracking_1002 = false,
+                    MouseTransitionStep::DisableTracking => self.tracking_1003 = false,
                     MouseTransitionStep::DisableCells => self.cells_1006 = false,
                     MouseTransitionStep::DisablePixels => self.pixels_1016 = false,
                     MouseTransitionStep::DrainInput => {}
@@ -2915,7 +2915,7 @@ mod lifecycle_tests {
                     MouseTransitionStep::ParserPixels => self.parser = ParserMode::Pixels,
                     MouseTransitionStep::EnableCells => self.cells_1006 = true,
                     MouseTransitionStep::EnablePixels => self.pixels_1016 = true,
-                    MouseTransitionStep::EnableTracking => self.tracking_1002 = true,
+                    MouseTransitionStep::EnableTracking => self.tracking_1003 = true,
                 }
                 assert!(!(self.cells_1006 && self.pixels_1016));
             }
@@ -2928,7 +2928,7 @@ mod lifecycle_tests {
         }
 
         let waiting = ProtocolState {
-            tracking_1002: true,
+            tracking_1003: true,
             cells_1006: true,
             pixels_1016: false,
             parser: ParserMode::Cells,
@@ -2939,7 +2939,7 @@ mod lifecycle_tests {
         assert_eq!(
             successful,
             ProtocolState {
-                tracking_1002: false,
+                tracking_1003: false,
                 cells_1006: false,
                 pixels_1016: false,
                 parser: ParserMode::Cells,
@@ -2950,7 +2950,7 @@ mod lifecycle_tests {
         assert_eq!(
             successful,
             ProtocolState {
-                tracking_1002: true,
+                tracking_1003: true,
                 cells_1006: false,
                 pixels_1016: true,
                 parser: ParserMode::Pixels,
@@ -3164,14 +3164,14 @@ mod lifecycle_tests {
     #[test]
     fn input_drain_retries_after_tracking_reset_failure() {
         let mut state = LifecycleState::default();
-        state.activate(LifecycleStep::ButtonEventMouse);
+        state.activate(LifecycleStep::AnyEventMouse);
         state.activate(LifecycleStep::PendingInput);
         let mut first_pass = Vec::new();
 
         cleanup_lifecycle(&mut state, |step| {
             first_pass.push(step);
-            if step == LifecycleStep::ButtonEventMouse {
-                Err(io::Error::other("1002 reset failed"))
+            if step == LifecycleStep::AnyEventMouse {
+                Err(io::Error::other("1003 reset failed"))
             } else {
                 Ok(())
             }
@@ -3180,9 +3180,9 @@ mod lifecycle_tests {
 
         assert_eq!(
             first_pass,
-            [LifecycleStep::ButtonEventMouse, LifecycleStep::PendingInput]
+            [LifecycleStep::AnyEventMouse, LifecycleStep::PendingInput]
         );
-        assert!(state.is_active(LifecycleStep::ButtonEventMouse));
+        assert!(state.is_active(LifecycleStep::AnyEventMouse));
         assert!(state.is_active(LifecycleStep::PendingInput));
 
         let mut retry = Vec::new();
@@ -3194,7 +3194,7 @@ mod lifecycle_tests {
 
         assert_eq!(
             retry,
-            [LifecycleStep::ButtonEventMouse, LifecycleStep::PendingInput]
+            [LifecycleStep::AnyEventMouse, LifecycleStep::PendingInput]
         );
     }
 
@@ -3299,6 +3299,8 @@ mod lifecycle_tests {
     fn panic_cleanup_resets_pixel_mode_without_ever_enabling_it() {
         let cleanup = panic_cleanup_sequence();
 
+        assert!(cleanup.contains("\u{1b}[?1003l"));
+        assert!(!cleanup.contains("\u{1b}[?1003h"));
         assert!(cleanup.contains("\u{1b}[?1016l"));
         assert!(!cleanup.contains("\u{1b}[?1016h"));
     }

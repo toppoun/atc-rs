@@ -2159,11 +2159,34 @@ enum DragCoordinate {
 #[derive(Debug, Default)]
 struct DetailScrollbarDragState {
     active: Option<DetailScrollbarDrag>,
+    hover_position: Option<(u16, u16)>,
 }
 
 impl DetailScrollbarDragState {
     fn cancel(&mut self) {
         self.active = None;
+    }
+
+    fn clear_hover(&mut self) {
+        self.hover_position = None;
+    }
+
+    fn update_hover(
+        &mut self,
+        pointer: PointerEvent,
+        render_info: &view::RenderInfo,
+        mouse_mode: MouseMode,
+        detail_revision: u64,
+    ) -> bool {
+        let Some(position) = project_pointer_to_cells(pointer, mouse_mode) else {
+            return false;
+        };
+        let previous = self.hover_position.and_then(|(column, row)| {
+            render_info.detail_section_header_at(detail_revision, column, row)
+        });
+        let next = render_info.detail_section_header_at(detail_revision, position.0, position.1);
+        self.hover_position = Some(position);
+        previous.map(|header| header.kind) != next.map(|header| header.kind)
     }
 
     fn reconcile_render_info(&mut self, render_info: &view::RenderInfo) {
@@ -2517,6 +2540,7 @@ where
 
         if take_leading_resizes(&mut terminal_events) {
             detail_scrollbar_drag.cancel();
+            detail_scrollbar_drag.clear_hover();
             discard_stale_pixel_events(&mut terminal_events);
             terminal.note_resize_dispatched();
             dirty = true;
@@ -2573,6 +2597,7 @@ where
 
         if take_leading_resizes(&mut terminal_events) {
             detail_scrollbar_drag.cancel();
+            detail_scrollbar_drag.clear_hover();
             discard_stale_pixel_events(&mut terminal_events);
             terminal.note_resize_dispatched();
             dirty = true;
@@ -2583,11 +2608,12 @@ where
             let render_mouse_mode = terminal.mouse_mode();
 
             terminal.draw(|frame| {
-                next_render_info = view::render_frontend_with_mouse_mode(
+                next_render_info = view::render_frontend_with_pointer(
                     frame,
                     &app,
                     &mut detail_layout,
                     render_mouse_mode,
+                    detail_scrollbar_drag.hover_position,
                     contest_switch.workspace_available,
                     view::FrontendOverlays {
                         switch_modal: contest_switch.modal(),
@@ -2972,6 +2998,7 @@ fn handle_terminal_events_with_mouse_mode(
             .expect("front terminal event must still exist");
         if matches!(terminal_event, TerminalEvent::Resize(_)) {
             detail_scrollbar_drag.cancel();
+            detail_scrollbar_drag.clear_hover();
             changed = true;
 
             // 連続resizeは1回の再描画へまとめる。後続mouseは新しいRectが
@@ -3192,17 +3219,27 @@ fn handle_terminal_event_with_mouse_mode(
             Ok(changed)
         }
 
-        TerminalEvent::Pointer(pointer) => Ok(handle_pointer_event_with_mouse_mode(
-            app,
-            detail_layout,
-            detail_scrollbar_drag,
-            pointer,
-            render_info,
-            mouse_mode,
-        )),
+        TerminalEvent::Pointer(pointer) => {
+            let hover_changed = detail_scrollbar_drag.update_hover(
+                pointer,
+                render_info,
+                mouse_mode,
+                app.detail_revision(),
+            );
+            Ok(hover_changed
+                | handle_pointer_event_with_mouse_mode(
+                    app,
+                    detail_layout,
+                    detail_scrollbar_drag,
+                    pointer,
+                    render_info,
+                    mouse_mode,
+                ))
+        }
 
         TerminalEvent::Resize(_) => {
             detail_scrollbar_drag.cancel();
+            detail_scrollbar_drag.clear_hover();
             Ok(true)
         }
 
@@ -3588,9 +3625,8 @@ fn handle_pointer_event_with_mouse_mode(
     }
 
     if let PointerKind::Down(PointerButton::Left) = pointer.kind
-        && let Some(header) = render_info.detail_section_headers.iter().find(|header| {
-            header.detail_revision == app.detail_revision() && contains(header.area, column, row)
-        })
+        && let Some(header) =
+            render_info.detail_section_header_at(app.detail_revision(), column, row)
     {
         app.toggle_detail_section(header.kind);
         return true;
@@ -9133,6 +9169,147 @@ mod tests {
     }
 
     #[test]
+    fn pointer_move_enters_and_leaves_semantic_header_hover() {
+        let mut app = foldable_app("actual body".to_string());
+        let info = rendered_fold_info(&app, 100, 40);
+        let target = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Expected)
+            .unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut pointer_state = DetailScrollbarDragState::default();
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        let mut enter = VecDeque::from([TerminalEvent::Pointer(pointer(
+            PointerKind::Move,
+            target.area.x,
+            target.area.y,
+        ))]);
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut pointer_state,
+                &info,
+                &mut enter,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            pointer_state.hover_position,
+            Some((target.area.x, target.area.y))
+        );
+
+        let mut within = VecDeque::from([TerminalEvent::Pointer(pointer(
+            PointerKind::Move,
+            target.area.right().saturating_sub(1),
+            target.area.y,
+        ))]);
+        assert!(
+            !super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut pointer_state,
+                &info,
+                &mut within,
+                &run_tx,
+            )
+            .unwrap()
+        );
+
+        let mut leave = VecDeque::from([TerminalEvent::Pointer(pointer(
+            PointerKind::Move,
+            target.area.x,
+            target.area.y.saturating_add(1),
+        ))]);
+        assert!(
+            super::handle_terminal_events(
+                &mut app,
+                &mut layout,
+                &mut pointer_state,
+                &info,
+                &mut leave,
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            info.detail_section_header_at(
+                app.detail_revision(),
+                target.area.x,
+                target.area.y.saturating_add(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_header_hitbox_boundaries_are_shared_by_hover_and_click() {
+        for edge in [0, 1] {
+            let mut app = foldable_app("actual body".to_string());
+            let info = rendered_fold_info(&app, 100, 40);
+            let target = *info
+                .detail_section_headers
+                .iter()
+                .find(|target| target.kind == detail::DetailSectionKind::Actual)
+                .unwrap();
+            let column = if edge == 0 {
+                target.area.x
+            } else {
+                target.area.right().saturating_sub(1)
+            };
+            assert_eq!(
+                info.detail_section_header_at(app.detail_revision(), column, target.area.y),
+                Some(target)
+            );
+            assert!(dispatch_mouse(
+                &mut app,
+                &mut detail_layout::DetailLayout::default(),
+                &mut DetailScrollbarDragState::default(),
+                &info,
+                PointerKind::Down(PointerButton::Left),
+                column,
+                target.area.y,
+            ));
+            assert!(
+                app.detail_fold_state()
+                    .is_collapsed(detail::DetailSectionKind::Actual)
+            );
+        }
+
+        let mut app = foldable_app("actual body".to_string());
+        let info = rendered_fold_info(&app, 100, 40);
+        let target = *info
+            .detail_section_headers
+            .iter()
+            .find(|target| target.kind == detail::DetailSectionKind::Actual)
+            .unwrap();
+        assert!(
+            info.detail_section_header_at(
+                app.detail_revision(),
+                target.area.right(),
+                target.area.y,
+            )
+            .is_none()
+        );
+        assert!(!dispatch_mouse(
+            &mut app,
+            &mut detail_layout::DetailLayout::default(),
+            &mut DetailScrollbarDragState::default(),
+            &info,
+            PointerKind::Down(PointerButton::Left),
+            target.area.right(),
+            target.area.y,
+        ));
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Actual)
+        );
+    }
+
+    #[test]
     fn body_non_left_and_wheel_events_do_not_toggle_fold_headers() {
         let mut app = foldable_app("actual body".to_string());
         let info = rendered_fold_info(&app, 100, 40);
@@ -9233,6 +9410,11 @@ mod tests {
                 .unwrap();
             let scrollbar = info.detail_scrollbar.as_ref().unwrap();
             let gutter = scrollbar.geometry.gutter.x;
+            assert_eq!(target.area.right(), gutter);
+            assert!(
+                info.detail_section_header_at(app.detail_revision(), gutter, target.area.y)
+                    .is_none()
+            );
             assert!(scrollbar.geometry.hit_test(gutter, target.area.y).is_some());
             let mut layout = detail_layout::DetailLayout::default();
             let mut drag = DetailScrollbarDragState::default();

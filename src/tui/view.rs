@@ -216,6 +216,23 @@ pub struct RenderInfo {
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
 }
 
+impl RenderInfo {
+    pub(super) fn detail_section_header_at(
+        &self,
+        detail_revision: u64,
+        column: u16,
+        row: u16,
+    ) -> Option<DetailSectionHeaderTarget> {
+        self.detail_section_headers.iter().copied().find(|header| {
+            header.detail_revision == detail_revision
+                && column >= header.area.x
+                && column < header.area.x.saturating_add(header.area.width)
+                && row >= header.area.y
+                && row < header.area.y.saturating_add(header.area.height)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FrontendOverlays<'a> {
     pub(super) switch_modal: Option<&'a SwitchContestModal>,
@@ -251,11 +268,32 @@ pub(super) fn render_with_mouse_mode(
     )
 }
 
+#[cfg(test)]
 pub(super) fn render_frontend_with_mouse_mode(
     frame: &mut Frame,
     app: &WatchApp,
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
+    workspace_available: bool,
+    overlays: FrontendOverlays<'_>,
+) -> RenderInfo {
+    render_frontend_with_pointer(
+        frame,
+        app,
+        detail_layout,
+        mouse_mode,
+        None,
+        workspace_available,
+        overlays,
+    )
+}
+
+pub(super) fn render_frontend_with_pointer(
+    frame: &mut Frame,
+    app: &WatchApp,
+    detail_layout: &mut DetailLayout,
+    mouse_mode: MouseMode,
+    detail_pointer: Option<(u16, u16)>,
     workspace_available: bool,
     overlays: FrontendOverlays<'_>,
 ) -> RenderInfo {
@@ -360,7 +398,7 @@ pub(super) fn render_frontend_with_mouse_mode(
         app.detail_scroll(),
     );
     detail_layout.stage_analysis_command(&detail_document);
-    let detail_section_headers = detail_viewport
+    let mut detail_section_headers: Vec<DetailSectionHeaderTarget> = detail_viewport
         .visible_section_headers
         .iter()
         .filter_map(|header| {
@@ -411,6 +449,35 @@ pub(super) fn render_frontend_with_mouse_mode(
         }
     }
 
+    if let Some(scrollbar) = detail_scrollbar.as_ref() {
+        for header in &mut detail_section_headers {
+            header.area.width = scrollbar.geometry.gutter.x.saturating_sub(header.area.x);
+        }
+    }
+
+    let render_info = RenderInfo {
+        max_detail_scroll: detail_viewport.max_scroll,
+        samples_area,
+        detail_area,
+        detail_scrollbar,
+        detail_section_headers,
+    };
+    let overlay_active = overlays.switch_modal.is_some()
+        || overlays.refresh_modal.is_some()
+        || overlays.source_modal.is_some()
+        || overlays.editor_target_modal.is_some()
+        || overlays.command_palette.is_some();
+    if !overlay_active
+        && !matches!(mouse_mode, MouseMode::Disabled)
+        && let Some((column, row)) = detail_pointer
+        && let Some(header) =
+            render_info.detail_section_header_at(app.detail_revision(), column, row)
+    {
+        frame
+            .buffer_mut()
+            .set_style(header.area, Style::default().bg(Color::DarkGray));
+    }
+
     let footer_base = if current_problem
         .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
     {
@@ -439,13 +506,7 @@ pub(super) fn render_frontend_with_mouse_mode(
         render_command_palette(frame, app, command_palette, workspace_available);
     }
 
-    RenderInfo {
-        max_detail_scroll: detail_viewport.max_scroll,
-        samples_area,
-        detail_area,
-        detail_scrollbar,
-        detail_section_headers,
-    }
+    render_info
 }
 
 fn editor_modal_geometry(frame_area: Rect, desired_height: u16) -> (Rect, usize) {
@@ -1393,6 +1454,34 @@ mod tests {
         info
     }
 
+    fn render_with_pointer_position(
+        app: &WatchApp,
+        pointer: Option<(u16, u16)>,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, RenderInfo) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut info = RenderInfo::default();
+        let mut detail_layout = DetailLayout::default();
+
+        terminal
+            .draw(|frame| {
+                info = render_frontend_with_pointer(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    pointer,
+                    false,
+                    FrontendOverlays::default(),
+                );
+            })
+            .unwrap();
+
+        (terminal.backend().buffer().clone(), info)
+    }
+
     fn rendered_buffer_text(app: &WatchApp, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1748,6 +1837,49 @@ mod tests {
             TestEvent::TestRunFinished {
                 accepted: usize::from(accepted),
                 total_cases: 1,
+            },
+        ));
+        app
+    }
+
+    fn semantic_sample_app(debug: bool) -> WatchApp {
+        let mut app = app();
+        if debug {
+            app.toggle_debug();
+        }
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert_eq!(request.debug, debug);
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                input: "sample input\n".to_string(),
+                expected: "expected\n".to_string(),
+                actual: "actual\n".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseStderr {
+                number: 1,
+                stderr: "stderr\n".to_string(),
             },
         ));
         app
@@ -2829,6 +2961,93 @@ mod tests {
             .unwrap();
         assert!(info.max_detail_scroll.is_some());
         assert!(info.detail_scrollbar.is_some());
+    }
+
+    #[test]
+    fn semantic_header_hover_highlights_only_the_shared_interactive_row() {
+        let app = foldable_app("actual body".to_string());
+        let (_, initial) = render_with_pointer_position(&app, None, 100, 40);
+        let target = *initial
+            .detail_section_headers
+            .iter()
+            .find(|header| header.kind == DetailSectionKind::Expected)
+            .unwrap();
+        let pointer = (target.area.right().saturating_sub(1), target.area.y);
+
+        assert_eq!(
+            initial.detail_section_header_at(app.detail_revision(), pointer.0, pointer.1),
+            Some(target)
+        );
+        assert!(
+            initial
+                .detail_section_header_at(app.detail_revision(), target.area.right(), target.area.y)
+                .is_none()
+        );
+
+        let (hovered, hovered_info) = render_with_pointer_position(&app, Some(pointer), 100, 40);
+        let hovered_target = hovered_info
+            .detail_section_header_at(app.detail_revision(), pointer.0, pointer.1)
+            .unwrap();
+        assert_eq!(hovered_target, target);
+        assert!(
+            (hovered_target.area.x..hovered_target.area.right()).all(|column| {
+                hovered.cell((column, hovered_target.area.y)).unwrap().bg == Color::DarkGray
+            })
+        );
+
+        let (outside, _) =
+            render_with_pointer_position(&app, Some((target.area.right(), target.area.y)), 100, 40);
+        assert!((target.area.x..target.area.right()).all(|column| {
+            outside.cell((column, target.area.y)).unwrap().bg != Color::DarkGray
+        }));
+    }
+
+    #[test]
+    fn semantic_header_hover_survives_folding_at_the_same_pointer_row() {
+        let mut app = foldable_app("actual body".to_string());
+        let (_, expanded) = render_with_pointer_position(&app, None, 100, 40);
+        let expanded_input = *expanded
+            .detail_section_headers
+            .iter()
+            .find(|header| header.kind == DetailSectionKind::Input)
+            .unwrap();
+        let pointer = (
+            expanded_input.area.x.saturating_add(1),
+            expanded_input.area.y,
+        );
+        let (expanded_hover, _) = render_with_pointer_position(&app, Some(pointer), 100, 40);
+        assert_eq!(expanded_hover.cell(pointer).unwrap().bg, Color::DarkGray);
+
+        app.toggle_detail_section(DetailSectionKind::Input);
+        let (folded_hover, folded) = render_with_pointer_position(&app, Some(pointer), 100, 40);
+        let folded_input = folded
+            .detail_section_header_at(app.detail_revision(), pointer.0, pointer.1)
+            .unwrap();
+        assert_eq!(folded_input.kind, DetailSectionKind::Input);
+        assert_eq!(folded_input.area.y, expanded_input.area.y);
+        assert_eq!(folded_hover.cell(pointer).unwrap().bg, Color::DarkGray);
+        assert_eq!(
+            folded_hover
+                .cell((folded_input.area.x, folded_input.area.y))
+                .unwrap()
+                .symbol(),
+            "▶"
+        );
+    }
+
+    #[test]
+    fn semantic_header_hover_is_shared_by_normal_debug_and_stress_details() {
+        for app in [
+            semantic_sample_app(false),
+            semantic_sample_app(true),
+            foldable_app("actual body".to_string()),
+        ] {
+            let (_, initial) = render_with_pointer_position(&app, None, 100, 40);
+            let target = initial.detail_section_headers[0];
+            let pointer = (target.area.x, target.area.y);
+            let (hovered, _) = render_with_pointer_position(&app, Some(pointer), 100, 40);
+            assert_eq!(hovered.cell(pointer).unwrap().bg, Color::DarkGray);
+        }
     }
 
     #[test]
