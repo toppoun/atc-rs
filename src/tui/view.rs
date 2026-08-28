@@ -13,8 +13,10 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{
     CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
 };
-use super::detail::{DetailDocument, DetailSectionKind};
-use super::detail_layout::DetailLayout;
+use super::detail::{
+    DetailDocument, DetailFoldAnimationFrame, DetailSectionClip, DetailSectionKind,
+};
+use super::detail_layout::{DetailLayout, animated_body_clip};
 use super::detail_scrollbar::{
     DetailScrollbarGeometry, DetailScrollbarInteraction, DetailScrollbarPixelGeometry,
     VerticalScrollbarGeometry, render_detail_scrollbar,
@@ -283,6 +285,7 @@ pub(super) fn render_frontend_with_mouse_mode(
         detail_layout,
         mouse_mode,
         None,
+        None,
         workspace_available,
         overlays,
     )
@@ -294,6 +297,7 @@ pub(super) fn render_frontend_with_pointer(
     detail_layout: &mut DetailLayout,
     mouse_mode: MouseMode,
     detail_pointer: Option<(u16, u16)>,
+    fold_animation: Option<DetailFoldAnimationFrame>,
     workspace_available: bool,
     overlays: FrontendOverlays<'_>,
 ) -> RenderInfo {
@@ -388,15 +392,40 @@ pub(super) fn render_frontend_with_pointer(
         frame.render_widget(samples, samples_area);
     }
 
-    let detail_document = DetailDocument::from_app(app);
+    let full_detail_document = DetailDocument::from_app(app);
+    let mut animation_wrap_width = detail_area.width;
+    let section_clip = fold_animation.and_then(|animation| {
+        animated_section_clip(&full_detail_document, animation, animation_wrap_width)
+    });
+    let mut detail_document = if section_clip.is_some() {
+        DetailDocument::from_app_with_clip(app, section_clip)
+    } else {
+        full_detail_document
+    };
     let viewport_height = usize::from(detail_area.height);
-    let detail_viewport = detail_layout.viewport(
+    let mut detail_viewport = detail_layout.viewport(
         &detail_document,
         app.detail_revision(),
         detail_area.width,
         viewport_height,
         app.detail_scroll(),
     );
+    if let Some(animation) = fold_animation {
+        let actual_wrap_width = detail_layout.current_wrap_width();
+        if actual_wrap_width != animation_wrap_width {
+            animation_wrap_width = actual_wrap_width;
+            let section_clip =
+                animated_section_clip(&detail_document, animation, animation_wrap_width);
+            detail_document = DetailDocument::from_app_with_clip(app, section_clip);
+            detail_viewport = detail_layout.viewport(
+                &detail_document,
+                app.detail_revision(),
+                detail_area.width,
+                viewport_height,
+                app.detail_scroll(),
+            );
+        }
+    }
     detail_layout.stage_analysis_command(&detail_document);
     let mut detail_section_headers: Vec<DetailSectionHeaderTarget> = detail_viewport
         .visible_section_headers
@@ -507,6 +536,19 @@ pub(super) fn render_frontend_with_pointer(
     }
 
     render_info
+}
+
+fn animated_section_clip(
+    document: &DetailDocument<'_>,
+    animation: DetailFoldAnimationFrame,
+    wrap_width: u16,
+) -> Option<DetailSectionClip> {
+    let body = document.section_body(animation.kind)?;
+    let clip = animated_body_clip(body, wrap_width, animation.expanded_fraction);
+    Some(DetailSectionClip {
+        kind: animation.kind,
+        prefix_len: clip.prefix_len,
+    })
 }
 
 fn editor_modal_geometry(frame_area: Rect, desired_height: u16) -> (Rect, usize) {
@@ -1460,6 +1502,16 @@ mod tests {
         width: u16,
         height: u16,
     ) -> (ratatui::buffer::Buffer, RenderInfo) {
+        render_with_pointer_and_animation(app, pointer, None, width, height)
+    }
+
+    fn render_with_pointer_and_animation(
+        app: &WatchApp,
+        pointer: Option<(u16, u16)>,
+        animation: Option<DetailFoldAnimationFrame>,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, RenderInfo) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut info = RenderInfo::default();
@@ -1473,6 +1525,7 @@ mod tests {
                     &mut detail_layout,
                     MouseMode::Cells,
                     pointer,
+                    animation,
                     false,
                     FrontendOverlays::default(),
                 );
@@ -1480,6 +1533,10 @@ mod tests {
             .unwrap();
 
         (terminal.backend().buffer().clone(), info)
+    }
+
+    fn buffer_symbols(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
     }
 
     fn rendered_buffer_text(app: &WatchApp, width: u16, height: u16) -> String {
@@ -3047,6 +3104,121 @@ mod tests {
             let pointer = (target.area.x, target.area.y);
             let (hovered, _) = render_with_pointer_position(&app, Some(pointer), 100, 40);
             assert_eq!(hovered.cell(pointer).unwrap().bg, Color::DarkGray);
+        }
+    }
+
+    #[test]
+    fn fold_animation_clips_the_same_semantic_bodies_for_normal_debug_and_stress_details() {
+        for (app, kind, body) in [
+            (
+                semantic_sample_app(false),
+                DetailSectionKind::Expected,
+                "expected",
+            ),
+            (
+                semantic_sample_app(true),
+                DetailSectionKind::Input,
+                "sample input",
+            ),
+            (
+                foldable_app("actual body".to_string()),
+                DetailSectionKind::Input,
+                "input body",
+            ),
+        ] {
+            let hidden_frame = DetailFoldAnimationFrame {
+                kind,
+                expanded_fraction: 0.0,
+            };
+            let (hidden, hidden_info) =
+                render_with_pointer_and_animation(&app, None, Some(hidden_frame), 100, 40);
+            assert!(
+                hidden_info
+                    .detail_section_headers
+                    .iter()
+                    .any(|header| header.kind == kind)
+            );
+            assert!(!buffer_symbols(&hidden).contains(body));
+
+            let shown_frame = DetailFoldAnimationFrame {
+                kind,
+                expanded_fraction: 1.0,
+            };
+            let (shown, _) =
+                render_with_pointer_and_animation(&app, None, Some(shown_frame), 100, 40);
+            assert!(buffer_symbols(&shown).contains(body));
+        }
+    }
+
+    #[test]
+    fn fold_animation_keeps_hover_on_the_current_header_layout() {
+        let app = foldable_app("actual body\nsecond row\nthird row".to_string());
+        let frame = DetailFoldAnimationFrame {
+            kind: DetailSectionKind::Actual,
+            expanded_fraction: 0.5,
+        };
+        let (_, initial) = render_with_pointer_and_animation(&app, None, Some(frame), 100, 40);
+        let target = *initial
+            .detail_section_headers
+            .iter()
+            .find(|header| header.kind == DetailSectionKind::Actual)
+            .unwrap();
+        let pointer = (target.area.right().saturating_sub(1), target.area.y);
+
+        let (hovered, hovered_info) =
+            render_with_pointer_and_animation(&app, Some(pointer), Some(frame), 100, 40);
+
+        assert_eq!(
+            hovered_info.detail_section_header_at(app.detail_revision(), pointer.0, pointer.1),
+            Some(target)
+        );
+        assert_eq!(hovered.cell(pointer).unwrap().bg, Color::DarkGray);
+    }
+
+    #[test]
+    fn fold_animation_uses_the_same_wrap_width_as_the_rendered_detail() {
+        // A 100-column terminal leaves a 98-column detail pane inside the outer border.
+        // With no scrollbar this body is one visual row, so a 50% frame rounds to the
+        // complete row rather than clipping its final column.
+        let body = "x".repeat(98);
+        let app = foldable_app(body.clone());
+        let frame = DetailFoldAnimationFrame {
+            kind: DetailSectionKind::Actual,
+            expanded_fraction: 0.5,
+        };
+
+        let (rendered, info) = render_with_pointer_and_animation(&app, None, Some(frame), 100, 40);
+
+        assert!(info.detail_scrollbar.is_none());
+        assert!(buffer_symbols(&rendered).contains(&body));
+    }
+
+    #[test]
+    fn long_fold_animation_limits_scroll_range_and_is_resize_safe() {
+        let mut app = foldable_app("actual body\n".repeat(1_000));
+        let expanded = render_info(&app, 80, 20).max_detail_scroll.unwrap();
+        assert!(expanded > 900);
+
+        let frame = DetailFoldAnimationFrame {
+            kind: DetailSectionKind::Actual,
+            expanded_fraction: 1.0,
+        };
+        let (_, animated) = render_with_pointer_and_animation(&app, None, Some(frame), 80, 20);
+        let animated_max = animated.max_detail_scroll.unwrap();
+        assert!(animated_max < expanded);
+
+        app.scroll_detail_down(usize::MAX);
+        for (width, height) in [(1, 1), (2, 3), (20, 5), (100, 40)] {
+            let _ = render_with_pointer_and_animation(
+                &app,
+                None,
+                Some(DetailFoldAnimationFrame {
+                    kind: DetailSectionKind::Actual,
+                    expanded_fraction: 0.5,
+                }),
+                width,
+                height,
+            );
         }
     }
 

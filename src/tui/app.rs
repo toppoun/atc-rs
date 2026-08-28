@@ -386,6 +386,10 @@ impl WatchApp {
         self.invalidate_detail();
     }
 
+    pub(super) fn invalidate_detail_animation(&mut self) {
+        self.invalidate_detail();
+    }
+
     #[cfg(test)]
     pub fn scroll_detail_up(&mut self, lines: usize) -> bool {
         let previous = self.detail_scroll;

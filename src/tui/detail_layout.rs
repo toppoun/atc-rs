@@ -27,6 +27,7 @@ const GIANT_LINE_PAGE_CACHE_SIZE: usize = 3;
 const GIANT_LINE_WINDOW_MIN_BYTES: usize = 4 * 1024;
 const LAZY_DETAIL_BYTE_THRESHOLD: usize = 64 * 1024;
 const LAZY_DETAIL_LINE_THRESHOLD: usize = 2048;
+pub(super) const DETAIL_FOLD_ANIMATION_MAX_ROWS: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
@@ -1076,6 +1077,17 @@ impl DetailLayout {
                 self.eager_viewport(document, detail_width, viewport_height, requested_scroll)
             }
             LayoutMode::Lazy => self.lazy_viewport(document, viewport_height, requested_scroll),
+        }
+    }
+
+    pub(super) fn current_wrap_width(&self) -> u16 {
+        match self.mode {
+            Some(LayoutMode::Eager) => self
+                .materialized_eager_width
+                .and_then(|width| u16::try_from(width).ok())
+                .unwrap_or(self.detail_width),
+            Some(LayoutMode::Lazy) => self.detail_width.saturating_sub(1),
+            None => self.detail_width,
         }
     }
 
@@ -2685,6 +2697,102 @@ fn wrap_normal_block_at(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AnimatedBodyClip {
+    pub(super) prefix_len: usize,
+    pub(super) visible_rows: usize,
+    pub(super) animated_rows: usize,
+    pub(super) has_more_rows: bool,
+}
+
+pub(super) fn animated_body_clip(
+    content: &str,
+    width: u16,
+    expanded_fraction: f64,
+) -> AnimatedBodyClip {
+    if content.is_empty() {
+        return AnimatedBodyClip {
+            prefix_len: 0,
+            visible_rows: 0,
+            animated_rows: 0,
+            has_more_rows: false,
+        };
+    }
+
+    let probe_rows = DETAIL_FOLD_ANIMATION_MAX_ROWS.saturating_add(1);
+    let mut sink = AnimatedBodyClipSink::new(content);
+    let mut line_start = 0usize;
+    let mut fully_wrapped = true;
+
+    while line_start < content.len() && sink.row_ends.len() < probe_rows {
+        // A section can contain a single enormous logical line. Bound the newline
+        // search as well as wrapping so an animation frame never scans the body in
+        // proportion to its total size.
+        let mut probe_end = line_start
+            .saturating_add(GIANT_LOGICAL_LINE_BYTE_THRESHOLD)
+            .min(content.len());
+        while probe_end > line_start && !content.is_char_boundary(probe_end) {
+            probe_end = probe_end.saturating_sub(1);
+        }
+        let probe = &content[line_start..probe_end];
+        let newline = probe.find('\n');
+        let (logical_line, next_line_start, truncated_line) = match newline {
+            Some(relative) => (
+                &probe[..relative],
+                line_start.saturating_add(relative).saturating_add(1),
+                false,
+            ),
+            None => (probe, probe_end, probe_end < content.len()),
+        };
+
+        let remaining_rows = probe_rows.saturating_sub(sink.row_ends.len());
+        let Some(progress) = wrap_logical_line_window(
+            logical_line,
+            usize::from(width),
+            line_start,
+            &mut sink,
+            &mut || false,
+            remaining_rows,
+            true,
+        ) else {
+            fully_wrapped = false;
+            break;
+        };
+
+        line_start = next_line_start;
+        if truncated_line || !progress.finished {
+            fully_wrapped = false;
+            break;
+        }
+    }
+
+    if sink.row_ends.len() >= probe_rows || line_start < content.len() {
+        fully_wrapped = false;
+    }
+
+    let detected_rows = sink.row_ends.len();
+    let animated_rows = detected_rows.min(DETAIL_FOLD_ANIMATION_MAX_ROWS);
+    let has_more_rows = !fully_wrapped || detected_rows > DETAIL_FOLD_ANIMATION_MAX_ROWS;
+    let fraction = if expanded_fraction.is_finite() {
+        expanded_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let visible_rows = ((animated_rows as f64 * fraction).round() as usize).min(animated_rows);
+    let prefix_len = match visible_rows {
+        0 => 0,
+        visible if visible == animated_rows && !has_more_rows => content.len(),
+        visible => sink.row_ends[visible - 1],
+    };
+
+    AnimatedBodyClip {
+        prefix_len,
+        visible_rows,
+        animated_rows,
+        has_more_rows,
+    }
+}
+
 #[cfg(test)]
 pub(super) fn wrap_detail_document(document: &impl DetailTextSource, width: u16) -> Text<'static> {
     let width = usize::from(width);
@@ -3294,6 +3402,45 @@ trait WrapSink {
     fn discard_current(&mut self);
 }
 
+struct AnimatedBodyClipSink<'a> {
+    content: &'a str,
+    has_content: bool,
+    row_ends: Vec<usize>,
+}
+
+impl<'a> AnimatedBodyClipSink<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            content,
+            has_content: false,
+            row_ends: Vec::new(),
+        }
+    }
+}
+
+impl WrapSink for AnimatedBodyClipSink<'_> {
+    fn has_content(&self) -> bool {
+        self.has_content
+    }
+
+    fn push(&mut self, text: &str) {
+        self.has_content |= !text.is_empty();
+    }
+
+    fn emit(&mut self, raw_range: Range<usize>) {
+        let mut prefix_end = raw_range.end;
+        if self.content.as_bytes().get(prefix_end) == Some(&b'\n') {
+            prefix_end = prefix_end.saturating_add(1);
+        }
+        self.row_ends.push(prefix_end.min(self.content.len()));
+        self.has_content = false;
+    }
+
+    fn discard_current(&mut self) {
+        self.has_content = false;
+    }
+}
+
 #[cfg(test)]
 struct MaterializeSink<'a> {
     current: String,
@@ -3729,6 +3876,80 @@ mod tests {
 
     fn make_document<'a>(segments: &'a [&'a str]) -> DetailDocument<'a> {
         DetailDocument::from_borrowed_segments(segments)
+    }
+
+    #[test]
+    fn fold_animation_clips_short_bodies_by_visual_row_without_changing_the_body() {
+        let body = "one\ntwo\nthree\nfour\nfive\n";
+
+        let collapsed = animated_body_clip(body, 80, 0.0);
+        assert_eq!(collapsed.visible_rows, 0);
+        assert_eq!(collapsed.prefix_len, 0);
+        assert_eq!(collapsed.animated_rows, 5);
+        assert!(!collapsed.has_more_rows);
+
+        let midpoint = animated_body_clip(body, 80, 0.5);
+        assert_eq!(midpoint.visible_rows, 3);
+        assert_eq!(&body[..midpoint.prefix_len], "one\ntwo\nthree\n");
+
+        let expanded = animated_body_clip(body, 80, 1.0);
+        assert_eq!(expanded.visible_rows, 5);
+        assert_eq!(expanded.prefix_len, body.len());
+        assert_eq!(&body[..expanded.prefix_len], body);
+    }
+
+    #[test]
+    fn fold_animation_limits_long_bodies_to_the_first_fifteen_visual_rows() {
+        let body = (0..40)
+            .map(|row| format!("row-{row:02}\n"))
+            .collect::<String>();
+        let first_fifteen = (0..15)
+            .map(|row| format!("row-{row:02}\n"))
+            .collect::<String>();
+
+        let full_animation_height = animated_body_clip(&body, 80, 1.0);
+        assert_eq!(
+            full_animation_height.animated_rows,
+            DETAIL_FOLD_ANIMATION_MAX_ROWS
+        );
+        assert_eq!(
+            full_animation_height.visible_rows,
+            DETAIL_FOLD_ANIMATION_MAX_ROWS
+        );
+        assert!(full_animation_height.has_more_rows);
+        assert_eq!(&body[..full_animation_height.prefix_len], first_fifteen);
+
+        let midpoint = animated_body_clip(&body, 80, 0.5);
+        assert_eq!(midpoint.visible_rows, 8);
+        assert!(midpoint.prefix_len < full_animation_height.prefix_len);
+
+        let collapsed = animated_body_clip(&body, 80, 0.0);
+        assert_eq!(collapsed.visible_rows, 0);
+        assert_eq!(collapsed.prefix_len, 0);
+    }
+
+    #[test]
+    fn fold_animation_probe_is_bounded_for_a_giant_single_line() {
+        let body = "x".repeat(GIANT_LOGICAL_LINE_BYTE_THRESHOLD * 8);
+
+        let clip = animated_body_clip(&body, 10, 1.0);
+
+        assert_eq!(clip.animated_rows, DETAIL_FOLD_ANIMATION_MAX_ROWS);
+        assert!(clip.has_more_rows);
+        assert_eq!(clip.prefix_len, DETAIL_FOLD_ANIMATION_MAX_ROWS * 10);
+        assert!(clip.prefix_len < GIANT_LOGICAL_LINE_BYTE_THRESHOLD);
+    }
+
+    #[test]
+    fn fold_animation_counts_wrapped_rows_and_keeps_utf8_prefixes_valid() {
+        let body = "あいうえお\nかきくけこ\n";
+
+        let clip = animated_body_clip(body, 4, 0.5);
+
+        assert_eq!(clip.animated_rows, 6);
+        assert_eq!(clip.visible_rows, 3);
+        assert!(body.is_char_boundary(clip.prefix_len));
+        assert_eq!(&body[..clip.prefix_len], "あいうえお\n");
     }
 
     fn completed_structure(layout: &DetailLayout) -> &Arc<DetailDocumentStructure> {

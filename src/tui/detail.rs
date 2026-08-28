@@ -19,6 +19,18 @@ pub(super) enum DetailSectionKind {
     Stderr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DetailFoldAnimationFrame {
+    pub(super) kind: DetailSectionKind,
+    pub(super) expanded_fraction: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailSectionClip {
+    pub(super) kind: DetailSectionKind,
+    pub(super) prefix_len: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DetailSectionAnchor {
     pub(super) kind: DetailSectionKind,
@@ -35,6 +47,7 @@ enum DetailSegmentText<'a> {
     Static(&'static str),
     Owned(String),
     Shared(&'a Arc<String>),
+    SharedSlice(&'a str),
     #[cfg(test)]
     SharedOwned(Arc<String>),
 }
@@ -45,6 +58,7 @@ impl DetailSegmentText<'_> {
             Self::Static(text) => text,
             Self::Owned(text) => text,
             Self::Shared(text) => text.as_str(),
+            Self::SharedSlice(text) => text,
             #[cfg(test)]
             Self::SharedOwned(text) => text.as_str(),
         }
@@ -116,12 +130,24 @@ impl DetailSnapshot {
 pub(super) struct DetailDocument<'a> {
     segments: Vec<DetailSegment<'a>>,
     section_anchors: Vec<DetailSectionAnchor>,
+    section_bodies: Vec<(DetailSectionKind, &'a str)>,
+    section_clip: Option<DetailSectionClip>,
     raw_len: usize,
 }
 
 impl<'a> DetailDocument<'a> {
     pub(super) fn from_app(app: &'a WatchApp) -> Self {
-        let mut document = Self::default();
+        Self::from_app_with_clip(app, None)
+    }
+
+    pub(super) fn from_app_with_clip(
+        app: &'a WatchApp,
+        section_clip: Option<DetailSectionClip>,
+    ) -> Self {
+        let mut document = Self {
+            section_clip,
+            ..Self::default()
+        };
 
         let Some(problem) = app.current_problem() else {
             document.push_static("No problems");
@@ -131,6 +157,12 @@ impl<'a> DetailDocument<'a> {
         document.push_owned(format!("{} - {}\n\n", problem.index, problem.title));
         document.push_problem_detail(app, problem);
         document
+    }
+
+    pub(super) fn section_body(&self, kind: DetailSectionKind) -> Option<&str> {
+        self.section_bodies
+            .iter()
+            .find_map(|(body_kind, content)| (*body_kind == kind).then_some(*content))
     }
 
     #[cfg(test)]
@@ -149,6 +181,9 @@ impl<'a> DetailDocument<'a> {
                     DetailSegmentText::Owned(text) => DetailSnapshotSegment::Owned(text.clone()),
                     DetailSegmentText::Shared(text) => {
                         DetailSnapshotSegment::Shared(Arc::clone(text))
+                    }
+                    DetailSegmentText::SharedSlice(text) => {
+                        DetailSnapshotSegment::Owned((*text).to_string())
                     }
                     #[cfg(test)]
                     DetailSegmentText::SharedOwned(text) => {
@@ -548,15 +583,33 @@ impl<'a> DetailDocument<'a> {
             self.push_static("▼ ");
         }
         self.push_static(label);
+        let displayed_content = if content.is_empty() {
+            "(empty)"
+        } else {
+            content.as_str()
+        };
+        self.section_bodies.push((kind, displayed_content));
         if folds.is_collapsed(kind) {
+            return;
+        }
+
+        let prefix_len = self
+            .section_clip
+            .filter(|clip| clip.kind == kind)
+            .map_or(displayed_content.len(), |clip| {
+                clip.prefix_len.min(displayed_content.len())
+            });
+        if prefix_len == 0 {
             return;
         }
 
         self.push_static("\n");
         if content.is_empty() {
-            self.push_static("(empty)");
-        } else {
+            self.push_static_prefix("(empty)", prefix_len);
+        } else if prefix_len == content.len() {
             self.push_shared(content);
+        } else {
+            self.push_shared_slice(&content[..prefix_len]);
         }
     }
 
@@ -607,6 +660,20 @@ impl<'a> DetailDocument<'a> {
         });
     }
 
+    fn push_shared_slice(&mut self, text: &'a str) {
+        self.raw_len = self
+            .raw_len
+            .checked_add(text.len())
+            .expect("detail document byte length must fit in usize");
+        self.segments.push(DetailSegment {
+            text: DetailSegmentText::SharedSlice(text),
+        });
+    }
+
+    fn push_static_prefix(&mut self, text: &'static str, prefix_len: usize) {
+        self.push_static(&text[..prefix_len.min(text.len())]);
+    }
+
     fn push_owned(&mut self, text: String) {
         self.raw_len = self
             .raw_len
@@ -631,6 +698,8 @@ impl<'a> DetailDocument<'a> {
                 })
                 .collect(),
             section_anchors: Vec::new(),
+            section_bodies: Vec::new(),
+            section_clip: None,
             raw_len,
         }
     }
@@ -669,6 +738,8 @@ impl<'a> DetailDocument<'a> {
                 })
                 .collect(),
             section_anchors: Vec::new(),
+            section_bodies: Vec::new(),
+            section_clip: None,
             raw_len,
         }
     }
@@ -1433,6 +1504,57 @@ mod tests {
             restored
                 .segments()
                 .any(|segment| segment.text().as_ptr() == actual_pointer)
+        );
+    }
+
+    #[test]
+    fn animation_clip_borrows_a_prefix_without_modifying_the_stored_section_body() {
+        let (mut app, run_id) = running_app();
+        let actual = "first\nsecond\nthird\n";
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            run_id,
+            TestEvent::TestCaseComparison {
+                number: 1,
+                input: "input\n".to_string(),
+                expected: "expected\n".to_string(),
+                actual: actual.to_string(),
+            },
+        ));
+
+        let clipped = DetailDocument::from_app_with_clip(
+            &app,
+            Some(DetailSectionClip {
+                kind: DetailSectionKind::Actual,
+                prefix_len: "first\n".len(),
+            }),
+        );
+        let clipped_text = document_text(&clipped);
+        assert!(clipped_text.contains("▼ Actual\nfirst\n"));
+        assert!(!clipped_text.contains("second"));
+        assert_eq!(
+            clipped.section_body(DetailSectionKind::Actual),
+            Some(actual)
+        );
+        assert_eq!(
+            app.current_problem().unwrap().run.cases[0]
+                .actual
+                .as_ref()
+                .map(|body| body.as_str()),
+            Some(actual)
+        );
+        assert!(
+            clipped
+                .segments()
+                .any(|segment| matches!(segment.text, DetailSegmentText::SharedSlice("first\n")))
         );
     }
 

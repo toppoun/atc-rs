@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_context::AppContext;
@@ -48,6 +48,7 @@ const MAX_DETAIL_ANALYSIS_RESULTS_PER_TICK: usize = 64;
 const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DETAIL_FOLD_ANIMATION_DURATION: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrontendPreferences {
@@ -2156,10 +2157,71 @@ enum DragCoordinate {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailFoldAnimationTarget {
+    Expanded,
+    Collapsed,
+}
+
+impl DetailFoldAnimationTarget {
+    fn expanded_fraction(self) -> f64 {
+        match self {
+            Self::Expanded => 1.0,
+            Self::Collapsed => 0.0,
+        }
+    }
+
+    fn reversed(self) -> Self {
+        match self {
+            Self::Expanded => Self::Collapsed,
+            Self::Collapsed => Self::Expanded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DetailFoldAnimation {
+    kind: detail::DetailSectionKind,
+    target: DetailFoldAnimationTarget,
+    started_at: Instant,
+    start_fraction: f64,
+    detail_revision: u64,
+}
+
+impl DetailFoldAnimation {
+    fn new(
+        kind: detail::DetailSectionKind,
+        target: DetailFoldAnimationTarget,
+        started_at: Instant,
+        start_fraction: f64,
+        detail_revision: u64,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            started_at,
+            start_fraction,
+            detail_revision,
+        }
+    }
+
+    fn expanded_fraction(self, now: Instant) -> f64 {
+        let progress = now.saturating_duration_since(self.started_at).as_secs_f64()
+            / DETAIL_FOLD_ANIMATION_DURATION.as_secs_f64();
+        let progress = progress.clamp(0.0, 1.0);
+        self.start_fraction + (self.target.expanded_fraction() - self.start_fraction) * progress
+    }
+
+    fn is_finished(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= DETAIL_FOLD_ANIMATION_DURATION
+    }
+}
+
 #[derive(Debug, Default)]
 struct DetailScrollbarDragState {
     active: Option<DetailScrollbarDrag>,
     hover_position: Option<(u16, u16)>,
+    fold_animation: Option<DetailFoldAnimation>,
 }
 
 impl DetailScrollbarDragState {
@@ -2187,6 +2249,87 @@ impl DetailScrollbarDragState {
         let next = render_info.detail_section_header_at(detail_revision, position.0, position.1);
         self.hover_position = Some(position);
         previous.map(|header| header.kind) != next.map(|header| header.kind)
+    }
+
+    fn toggle_fold_animation(
+        &mut self,
+        app: &mut WatchApp,
+        kind: detail::DetailSectionKind,
+        now: Instant,
+    ) {
+        if let Some(animation) = self
+            .fold_animation
+            .filter(|animation| animation.kind == kind)
+        {
+            let start_fraction = animation.expanded_fraction(now);
+            let target = animation.target.reversed();
+            app.invalidate_detail_animation();
+            self.fold_animation = Some(DetailFoldAnimation::new(
+                kind,
+                target,
+                now,
+                start_fraction,
+                app.detail_revision(),
+            ));
+            return;
+        }
+
+        self.finish_fold_animation(app);
+        let collapsed = app.detail_fold_state().is_collapsed(kind);
+        let (start_fraction, target) = if collapsed {
+            app.toggle_detail_section(kind);
+            (0.0, DetailFoldAnimationTarget::Expanded)
+        } else {
+            app.invalidate_detail_animation();
+            (1.0, DetailFoldAnimationTarget::Collapsed)
+        };
+        self.fold_animation = Some(DetailFoldAnimation::new(
+            kind,
+            target,
+            now,
+            start_fraction,
+            app.detail_revision(),
+        ));
+    }
+
+    fn fold_animation_frame(
+        &self,
+        app: &WatchApp,
+        now: Instant,
+    ) -> Option<detail::DetailFoldAnimationFrame> {
+        self.fold_animation
+            .filter(|animation| animation.detail_revision == app.detail_revision())
+            .map(|animation| detail::DetailFoldAnimationFrame {
+                kind: animation.kind,
+                expanded_fraction: animation.expanded_fraction(now),
+            })
+    }
+
+    fn advance_fold_animation(&mut self, app: &mut WatchApp, now: Instant) -> bool {
+        let Some(animation) = self.fold_animation else {
+            return false;
+        };
+        if animation.detail_revision != app.detail_revision() {
+            self.fold_animation = None;
+            return false;
+        }
+        if !animation.is_finished(now) {
+            return true;
+        }
+
+        self.finish_fold_animation(app);
+        true
+    }
+
+    fn finish_fold_animation(&mut self, app: &mut WatchApp) -> bool {
+        let Some(animation) = self.fold_animation.take() else {
+            return false;
+        };
+        let should_be_collapsed = animation.target == DetailFoldAnimationTarget::Collapsed;
+        if app.detail_fold_state().is_collapsed(animation.kind) != should_be_collapsed {
+            app.toggle_detail_section(animation.kind);
+        }
+        true
     }
 
     fn reconcile_render_info(&mut self, render_info: &view::RenderInfo) {
@@ -2521,6 +2664,10 @@ where
     let mut terminal_events = VecDeque::new();
 
     while !app.should_quit() {
+        if detail_scrollbar_drag.advance_fold_animation(&mut app, Instant::now()) {
+            dirty = true;
+        }
+
         if terminal_events.is_empty() {
             terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
         }
@@ -2606,6 +2753,7 @@ where
         if dirty {
             let mut next_render_info = view::RenderInfo::default();
             let render_mouse_mode = terminal.mouse_mode();
+            let fold_animation = detail_scrollbar_drag.fold_animation_frame(&app, Instant::now());
 
             terminal.draw(|frame| {
                 next_render_info = view::render_frontend_with_pointer(
@@ -2614,6 +2762,7 @@ where
                     &mut detail_layout,
                     render_mouse_mode,
                     detail_scrollbar_drag.hover_position,
+                    fold_animation,
                     contest_switch.workspace_available,
                     view::FrontendOverlays {
                         switch_modal: contest_switch.modal(),
@@ -3628,7 +3777,7 @@ fn handle_pointer_event_with_mouse_mode(
         && let Some(header) =
             render_info.detail_section_header_at(app.detail_revision(), column, row)
     {
-        app.toggle_detail_section(header.kind);
+        detail_scrollbar_drag.toggle_fold_animation(app, header.kind, Instant::now());
         return true;
     }
 
@@ -9101,6 +9250,84 @@ mod tests {
         super::handle_pointer_event(app, layout, drag, pointer(kind, column, row), info)
     }
 
+    fn complete_fold_animation(app: &mut WatchApp, state: &mut DetailScrollbarDragState) {
+        let animation = state.fold_animation.expect("fold animation must be active");
+        assert!(state.advance_fold_animation(
+            app,
+            animation.started_at + DETAIL_FOLD_ANIMATION_DURATION,
+        ));
+        assert!(state.fold_animation.is_none());
+        assert!(!state.advance_fold_animation(
+            app,
+            animation.started_at + DETAIL_FOLD_ANIMATION_DURATION + Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn fold_animation_uses_100ms_linear_progress_and_stops_redrawing_when_complete() {
+        let mut app = foldable_app("actual body".to_string());
+        let mut state = DetailScrollbarDragState::default();
+        let kind = detail::DetailSectionKind::Actual;
+        let collapse_started = Instant::now();
+
+        state.toggle_fold_animation(&mut app, kind, collapse_started);
+        assert!(!app.detail_fold_state().is_collapsed(kind));
+        assert_eq!(
+            state
+                .fold_animation_frame(&app, collapse_started)
+                .unwrap()
+                .expanded_fraction,
+            1.0
+        );
+        let collapse_midpoint = state
+            .fold_animation_frame(&app, collapse_started + Duration::from_millis(50))
+            .unwrap()
+            .expanded_fraction;
+        assert!((collapse_midpoint - 0.5).abs() < f64::EPSILON);
+        assert!(
+            state.advance_fold_animation(&mut app, collapse_started + Duration::from_millis(99))
+        );
+        assert!(!app.detail_fold_state().is_collapsed(kind));
+        complete_fold_animation(&mut app, &mut state);
+        assert!(app.detail_fold_state().is_collapsed(kind));
+
+        let expand_started = collapse_started + Duration::from_secs(1);
+        state.toggle_fold_animation(&mut app, kind, expand_started);
+        assert!(!app.detail_fold_state().is_collapsed(kind));
+        assert_eq!(
+            state
+                .fold_animation_frame(&app, expand_started)
+                .unwrap()
+                .expanded_fraction,
+            0.0
+        );
+        let expand_midpoint = state
+            .fold_animation_frame(&app, expand_started + Duration::from_millis(50))
+            .unwrap()
+            .expanded_fraction;
+        assert!((expand_midpoint - 0.5).abs() < f64::EPSILON);
+        complete_fold_animation(&mut app, &mut state);
+        assert!(!app.detail_fold_state().is_collapsed(kind));
+    }
+
+    #[test]
+    fn repeated_header_click_reverses_from_the_current_animation_height() {
+        let mut app = foldable_app("actual body".to_string());
+        let mut state = DetailScrollbarDragState::default();
+        let kind = detail::DetailSectionKind::Actual;
+        let started = Instant::now();
+
+        state.toggle_fold_animation(&mut app, kind, started);
+        state.toggle_fold_animation(&mut app, kind, started + Duration::from_millis(40));
+        let reversed = state
+            .fold_animation_frame(&app, started + Duration::from_millis(40))
+            .unwrap();
+        assert!((reversed.expanded_fraction - 0.6).abs() < f64::EPSILON);
+
+        complete_fold_animation(&mut app, &mut state);
+        assert!(!app.detail_fold_state().is_collapsed(kind));
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "test call sites name every raw pixel input needed by each scenario"
@@ -9153,7 +9380,8 @@ mod tests {
                 target.area.x.saturating_add(1),
                 target.area.y,
             ));
-            assert!(app.detail_fold_state().is_collapsed(kind));
+            assert!(!app.detail_fold_state().is_collapsed(kind));
+            assert_eq!(drag.fold_animation.unwrap().kind, kind);
 
             assert!(!dispatch_mouse(
                 &mut app,
@@ -9164,6 +9392,7 @@ mod tests {
                 target.area.x.saturating_add(1),
                 target.area.y,
             ));
+            complete_fold_animation(&mut app, &mut drag);
             assert!(app.detail_fold_state().is_collapsed(kind));
         }
     }
@@ -9264,15 +9493,21 @@ mod tests {
                 info.detail_section_header_at(app.detail_revision(), column, target.area.y),
                 Some(target)
             );
+            let mut drag = DetailScrollbarDragState::default();
             assert!(dispatch_mouse(
                 &mut app,
                 &mut detail_layout::DetailLayout::default(),
-                &mut DetailScrollbarDragState::default(),
+                &mut drag,
                 &info,
                 PointerKind::Down(PointerButton::Left),
                 column,
                 target.area.y,
             ));
+            assert!(
+                !app.detail_fold_state()
+                    .is_collapsed(detail::DetailSectionKind::Actual)
+            );
+            complete_fold_animation(&mut app, &mut drag);
             assert!(
                 app.detail_fold_state()
                     .is_collapsed(detail::DetailSectionKind::Actual)
@@ -9388,6 +9623,8 @@ mod tests {
             expected.area.x.saturating_add(1),
             expected.area.y,
         ));
+        assert!(drag.fold_animation.is_some());
+        complete_fold_animation(&mut app, &mut drag);
         assert!(
             app.detail_fold_state()
                 .is_collapsed(detail::DetailSectionKind::Actual)
@@ -9479,6 +9716,11 @@ mod tests {
                     target.area.y,
                 ));
             }
+            assert!(
+                !app.detail_fold_state()
+                    .is_collapsed(detail::DetailSectionKind::Actual)
+            );
+            complete_fold_animation(&mut app, &mut drag);
             assert!(
                 app.detail_fold_state()
                     .is_collapsed(detail::DetailSectionKind::Actual)
