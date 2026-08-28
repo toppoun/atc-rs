@@ -2038,6 +2038,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_parser_rejects_unknown_fields() {
+        let path = Path::new(WORKSPACE_CONFIG_FILE);
+
+        for content in [
+            concat!("version = 1\n", "unexpected = true\n",),
+            concat!(
+                "version = 1\n",
+                "[[paths]]\n",
+                "pattern = \"^abc[0-9]+$\"\n",
+                "path = \"ABC\"\n",
+                "unexpected = true\n",
+            ),
+        ] {
+            let error = match parse_workspace_config(path, content) {
+                Ok(_) => panic!("unknown workspace config fields must be rejected"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
     fn contest_resolver_places_contest_at_root_when_paths_are_omitted() {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_config(temp.path(), "version = 1\n");
