@@ -537,7 +537,7 @@ Factual prerequisites for a future Quick Start are:
   is WA; generator/reference truncation is an error.
 - Refresh owns only its documented `tests/<INDEX>/sample-N.in|out` namespace;
   user material inside `tests/` must be moved elsewhere before refresh.
-- The repository's `docs/SPEC.md` is historical migration/design material and
+- The repository's `docs/internal/SPEC.md` is historical migration/design material and
   is not an authoritative description of the current CLI.
 
 ### Non-blocking implementation concern
@@ -602,6 +602,6 @@ Factual prerequisites for a future Quick Start are:
   execution resumes.
 - Request pacing is measured between AtCoder request starts, HTTP 429 responses
   have three retries, and `Retry-After` waits are capped at 60 seconds.
-- `docs/SPEC.md` records migration history and stale design possibilities,
+- `docs/internal/SPEC.md` records migration history and stale design possibilities,
   including state concepts absent from the current product. Current code, help,
   tests, and observed release behavior are authoritative for documentation.
