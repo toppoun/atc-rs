@@ -17,6 +17,7 @@ use super::app::{
 use super::detail::{
     DetailDocument, DetailFoldAnimationFrame, DetailSectionClip, DetailSectionKind,
 };
+use super::detail_layout::DetailViewport;
 use super::detail_layout::{DetailLayout, animated_body_clip};
 use super::detail_scrollbar::{
     DetailScrollbarGeometry, DetailScrollbarInteraction, DetailScrollbarPixelGeometry,
@@ -210,13 +211,31 @@ pub(super) struct DetailSectionHeaderTarget {
     pub(super) detail_revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserInputDetailAction {
+    Edit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UserInputDetailActionTarget {
+    pub(super) action: UserInputDetailAction,
+    pub(super) area: Rect,
+    pub(super) detail_revision: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderInfo {
     pub max_detail_scroll: Option<usize>,
     pub samples_area: Option<Rect>,
+    pub(super) samples_body_area: Option<Rect>,
+    pub(super) new_input_area: Option<Rect>,
     pub detail_area: Rect,
     pub(super) detail_scrollbar: Option<DetailScrollbarInteraction>,
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
+    pub(super) user_input_detail_action: Option<UserInputDetailActionTarget>,
+    pub(super) editor_cursor: Option<(u16, u16)>,
+    pub(super) editor_scroll_reconciliation: Option<usize>,
 }
 
 impl RenderInfo {
@@ -233,6 +252,37 @@ impl RenderInfo {
                 && row >= header.area.y
                 && row < header.area.y.saturating_add(header.area.height)
         })
+    }
+
+    pub(super) fn user_input_detail_action_at(
+        &self,
+        detail_revision: u64,
+        column: u16,
+        row: u16,
+    ) -> Option<UserInputDetailActionTarget> {
+        self.user_input_detail_action.filter(|target| {
+            target.detail_revision == detail_revision
+                && column >= target.area.x
+                && column < target.area.right()
+                && row >= target.area.y
+                && row < target.area.bottom()
+        })
+    }
+}
+
+fn cases_pane_areas(area: Rect) -> (Rect, Rect, Option<Rect>) {
+    let content_width = area.width.saturating_sub(1);
+    if area.height >= 2 {
+        let separator = Rect::new(area.x, area.bottom().saturating_sub(2), content_width, 1);
+        let action = Rect::new(area.x, area.bottom().saturating_sub(1), content_width, 1);
+        let body = Rect::new(area.x, area.y, content_width, area.height.saturating_sub(2));
+        (body, action, Some(separator))
+    } else {
+        (
+            Rect::new(area.x, area.y, content_width, 0),
+            Rect::new(area.x, area.y, content_width, area.height.min(1)),
+            None,
+        )
     }
 }
 
@@ -372,7 +422,7 @@ pub(super) fn render_frontend_with_pointer(
 
     // 選択中sample / compile error等の詳細
     let show_samples = app.samples_pane_enabled()
-        && current_problem.is_some_and(ProblemState::has_case_pane_content)
+        && current_problem.is_some()
         && rows[1].width >= MIN_SAMPLES_LAYOUT_WIDTH;
 
     let (samples_area, detail_area) = if show_samples {
@@ -386,12 +436,18 @@ pub(super) fn render_frontend_with_pointer(
         (None, rows[1])
     };
 
-    if let Some(samples_area) = samples_area {
-        let samples = Paragraph::new(samples_text(app, samples_area.height))
-            .block(Block::default().borders(Borders::RIGHT));
-
-        frame.render_widget(samples, samples_area);
-    }
+    let (samples_body_area, new_input_area) = if let Some(samples_area) = samples_area {
+        frame.render_widget(Block::default().borders(Borders::RIGHT), samples_area);
+        let (body, action, separator) = cases_pane_areas(samples_area);
+        frame.render_widget(Paragraph::new(samples_text(app, body.height)), body);
+        if let Some(separator) = separator {
+            frame.render_widget(Block::default().borders(Borders::TOP), separator);
+        }
+        frame.render_widget(Paragraph::new("+ New Input"), action);
+        (Some(body), (action.height > 0).then_some(action))
+    } else {
+        (None, None)
+    };
 
     let full_detail_document = DetailDocument::from_app(app);
     let mut animation_wrap_width = detail_area.width;
@@ -445,9 +501,18 @@ pub(super) fn render_frontend_with_pointer(
             })
         })
         .collect();
+    let editor_cursor = editor_cursor_cell(app, &detail_document, &detail_viewport, detail_area);
+    let editor_scroll_reconciliation =
+        editor_scroll_reconciliation(app, &detail_viewport, viewport_height);
     let detail = Paragraph::new(detail_viewport.text);
 
     frame.render_widget(detail, detail_area);
+
+    if let Some((column, row)) = editor_cursor
+        && let Some(cell) = frame.buffer_mut().cell_mut((column, row))
+    {
+        cell.modifier.insert(Modifier::REVERSED);
+    }
 
     let mut detail_scrollbar = None;
     if let Some(max_detail_scroll) = detail_viewport.max_scroll
@@ -485,12 +550,27 @@ pub(super) fn render_frontend_with_pointer(
         }
     }
 
+    let user_input_detail_action =
+        user_input_detail_action_target(app, &mut detail_section_headers, app.detail_revision());
+    if let Some(target) = user_input_detail_action {
+        let label = match target.action {
+            UserInputDetailAction::Edit => "[Edit]",
+            UserInputDetailAction::Cancel => "[Cancel]",
+        };
+        frame.render_widget(Paragraph::new(label), target.area);
+    }
+
     let render_info = RenderInfo {
         max_detail_scroll: detail_viewport.max_scroll,
         samples_area,
+        samples_body_area,
+        new_input_area,
         detail_area,
         detail_scrollbar,
         detail_section_headers,
+        user_input_detail_action,
+        editor_cursor,
+        editor_scroll_reconciliation,
     };
     let overlay_active = overlays.switch_modal.is_some()
         || overlays.refresh_modal.is_some()
@@ -500,12 +580,27 @@ pub(super) fn render_frontend_with_pointer(
     if !overlay_active
         && !matches!(mouse_mode, MouseMode::Disabled)
         && let Some((column, row)) = detail_pointer
-        && let Some(header) =
-            render_info.detail_section_header_at(app.detail_revision(), column, row)
     {
-        frame
-            .buffer_mut()
-            .set_style(header.area, Style::default().bg(Color::DarkGray));
+        if let Some(action) =
+            render_info.user_input_detail_action_at(app.detail_revision(), column, row)
+        {
+            frame
+                .buffer_mut()
+                .set_style(action.area, Style::default().bg(Color::DarkGray));
+        } else if let Some(header) =
+            render_info.detail_section_header_at(app.detail_revision(), column, row)
+        {
+            frame
+                .buffer_mut()
+                .set_style(header.area, Style::default().bg(Color::DarkGray));
+        } else if let Some(action) = render_info
+            .new_input_area
+            .filter(|area| contains_rect(*area, column, row))
+        {
+            frame
+                .buffer_mut()
+                .set_style(action, Style::default().bg(Color::DarkGray));
+        }
     }
 
     let footer_base = if current_problem
@@ -537,6 +632,108 @@ pub(super) fn render_frontend_with_pointer(
     }
 
     render_info
+}
+
+fn contains_rect(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn user_input_detail_action_target(
+    app: &WatchApp,
+    headers: &mut Vec<DetailSectionHeaderTarget>,
+    detail_revision: u64,
+) -> Option<UserInputDetailActionTarget> {
+    let action = if app.user_input_editor_active() {
+        Some(UserInputDetailAction::Cancel)
+    } else if matches!(
+        app.selected_user_input(),
+        Some(UserInputSelection::Persisted(_))
+    ) {
+        Some(UserInputDetailAction::Edit)
+    } else {
+        None
+    }?;
+    let index = headers
+        .iter()
+        .position(|header| header.kind == DetailSectionKind::Input)?;
+    let mut header = headers[index];
+    if action == UserInputDetailAction::Cancel {
+        headers.remove(index);
+    }
+
+    let width: u16 = match action {
+        UserInputDetailAction::Edit => 6,
+        UserInputDetailAction::Cancel => 8,
+    };
+    if header.area.width < width.saturating_add(4) {
+        return None;
+    }
+    let area = Rect::new(
+        header.area.right().saturating_sub(width),
+        header.area.y,
+        width,
+        1,
+    );
+    if action == UserInputDetailAction::Edit {
+        header.area.width = area.x.saturating_sub(header.area.x);
+        headers[index] = header;
+    }
+    Some(UserInputDetailActionTarget {
+        action,
+        area,
+        detail_revision,
+    })
+}
+
+fn editor_cursor_cell(
+    app: &WatchApp,
+    document: &DetailDocument<'_>,
+    viewport: &DetailViewport,
+    area: Rect,
+) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let cursor = document.editor_cursor()?;
+    let edit = app.selected_user_input_edit()?;
+    let visual = viewport.editor_cursor?;
+    let viewport_row = visual.visual_row.checked_sub(viewport.effective_scroll)?;
+    if viewport_row >= usize::from(area.height) {
+        return None;
+    }
+    let local_cursor = cursor.raw_position.0.checked_sub(cursor.content_start.0)?;
+    let local_start = visual
+        .raw_row_start
+        .0
+        .saturating_sub(cursor.content_start.0)
+        .min(edit.buffer().len());
+    let prefix = edit.buffer().get(local_start..local_cursor)?;
+    let column = u16::try_from(UnicodeWidthStr::width(prefix)).ok()?;
+    let column = area.x.checked_add(column)?;
+    let row = area.y.checked_add(u16::try_from(viewport_row).ok()?)?;
+    (column < area.right() && row < area.bottom()).then_some((column, row))
+}
+
+fn editor_scroll_reconciliation(
+    app: &WatchApp,
+    viewport: &DetailViewport,
+    viewport_height: usize,
+) -> Option<usize> {
+    if viewport_height == 0 {
+        return None;
+    }
+    let cursor_row = viewport.editor_cursor?.visual_row;
+    let top = viewport.effective_scroll;
+    let bottom = top.saturating_add(viewport_height);
+    let target = if cursor_row < top {
+        cursor_row
+    } else if cursor_row >= bottom {
+        cursor_row.saturating_sub(viewport_height.saturating_sub(1))
+    } else {
+        return None;
+    };
+    let target = target.min(viewport.max_scroll?);
+    (target != app.detail_scroll()).then_some(target)
 }
 
 fn animated_section_clip(
@@ -3825,6 +4022,338 @@ mod tests {
     }
 
     #[test]
+    fn new_input_footer_is_fixed_outside_the_case_window_and_uses_disjoint_hitboxes() {
+        let mut app = app_with_user_inputs(30, UserInputState::default());
+        app.toggle_samples_pane();
+        for _ in 0..25 {
+            assert!(app.next_case());
+        }
+
+        let (buffer, info) = render_with_pointer_position(&app, None, 80, 14);
+        let pane = info.samples_area.expect("Cases pane must be visible");
+        let body = info
+            .samples_body_area
+            .expect("Cases body must be published");
+        let action = info
+            .new_input_area
+            .expect("New Input action must be published");
+        assert_eq!(action.y, pane.bottom().saturating_sub(1));
+        assert!(body.bottom() <= action.y);
+        assert_eq!(action.right(), pane.right().saturating_sub(1));
+        assert!(!contains_rect(body, action.x, action.y));
+        assert!(!contains_rect(
+            action,
+            pane.right().saturating_sub(1),
+            action.y
+        ));
+        assert!(
+            buffer_row_text(&buffer, action.x, action.y, usize::from(action.width))
+                .starts_with("+ New Input")
+        );
+        assert_eq!(sample_rows(app.current_problem().unwrap()).len(), 30);
+        assert_eq!(
+            sample_window(30, 25, usize::from(body.height)).len(),
+            usize::from(body.height)
+        );
+    }
+
+    #[test]
+    fn new_input_footer_hover_matches_its_click_area_only() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.toggle_samples_pane();
+        let (_, initial) = render_with_pointer_position(&app, None, 80, 12);
+        let action = initial.new_input_area.unwrap();
+        let pointer = (action.x, action.y);
+        let (hovered, hovered_info) = render_with_pointer_position(&app, Some(pointer), 80, 12);
+        assert_eq!(hovered.cell(pointer).unwrap().bg, Color::DarkGray);
+        assert_eq!(hovered_info.new_input_area, Some(action));
+
+        if action.y > 0 {
+            let separator = (action.x, action.y - 1);
+            let (not_hovered, _) = render_with_pointer_position(&app, Some(separator), 80, 12);
+            assert_ne!(not_hovered.cell(separator).unwrap().bg, Color::DarkGray);
+        }
+    }
+
+    #[test]
+    fn no_cases_still_shows_new_input_and_tiny_case_heights_are_safe() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.toggle_samples_pane();
+
+        let normal = render_info(&app, 52, 12);
+        assert!(normal.samples_area.is_some());
+        assert!(normal.new_input_area.is_some());
+        assert_eq!(sample_rows(app.current_problem().unwrap()), []);
+
+        for height in 0..=7 {
+            let (_, info) = render_with_pointer_position(&app, None, 52, height);
+            if let Some(action) = info.new_input_area {
+                assert!(action.height <= 1);
+                assert!(action.bottom() <= info.samples_area.unwrap().bottom());
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_edit_and_editing_cancel_actions_are_separate_from_fold_headers() {
+        let mut app = user_input_detail_app();
+        let (_, read_only) = render_with_pointer_position(&app, None, 100, 30);
+        let edit = read_only.user_input_detail_action.unwrap();
+        assert_eq!(edit.action, UserInputDetailAction::Edit);
+        let input_header = read_only
+            .detail_section_headers
+            .iter()
+            .find(|header| header.kind == DetailSectionKind::Input)
+            .unwrap();
+        assert!(input_header.area.right() <= edit.area.x);
+        let (edit_hover, _) =
+            render_with_pointer_position(&app, Some((edit.area.x, edit.area.y)), 100, 30);
+        assert_eq!(
+            edit_hover.cell((edit.area.x, edit.area.y)).unwrap().bg,
+            Color::DarkGray
+        );
+
+        app.begin_selected_user_input_edit().unwrap();
+        let (buffer, editing) = render_with_pointer_position(&app, None, 100, 30);
+        let cancel = editing.user_input_detail_action.unwrap();
+        assert_eq!(cancel.action, UserInputDetailAction::Cancel);
+        assert!(
+            editing
+                .detail_section_headers
+                .iter()
+                .all(|header| header.kind != DetailSectionKind::Input)
+        );
+        assert!(buffer_symbols(&buffer).contains("Input — Editing"));
+        assert!(buffer_symbols(&buffer).contains("[Cancel]"));
+        let (cancel_hover, _) =
+            render_with_pointer_position(&app, Some((cancel.area.x, cancel.area.y)), 100, 30);
+        assert_eq!(
+            cancel_hover
+                .cell((cancel.area.x, cancel.area.y))
+                .unwrap()
+                .bg,
+            Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn editor_renders_visible_cursor_for_empty_and_exact_multiline_buffers() {
+        let mut empty = app_with_user_inputs(0, UserInputState::default());
+        empty.begin_new_user_input().unwrap();
+        let (empty_buffer, empty_info) = render_with_pointer_position(&empty, None, 80, 20);
+        let empty_cursor = empty_info
+            .editor_cursor
+            .expect("empty editor needs a cursor");
+        assert!(
+            empty_buffer
+                .cell(empty_cursor)
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(empty.selected_user_input_edit().unwrap().buffer(), "");
+
+        assert!(empty.edit_user_input_insert("a\r\n\n界\n"));
+        let (text_buffer, text_info) = render_with_pointer_position(&empty, None, 80, 20);
+        let cursor = text_info
+            .editor_cursor
+            .expect("trailing line needs a cursor");
+        assert!(
+            text_buffer
+                .cell(cursor)
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(
+            empty.selected_user_input_edit().unwrap().buffer(),
+            "a\r\n\n界\n"
+        );
+    }
+
+    #[test]
+    fn editor_cursor_requests_vertical_scroll_until_it_is_visible() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        let text = (0..80)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        assert!(app.edit_user_input_insert(&text));
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+        let mut cursor = None;
+        for _ in 0..8 {
+            let mut info = RenderInfo::default();
+            terminal
+                .draw(|frame| info = render(frame, &app, &mut layout))
+                .unwrap();
+            cursor = info.editor_cursor;
+            let Some(target) = info.editor_scroll_reconciliation else {
+                break;
+            };
+            assert!(app.reconcile_detail_scroll(target));
+        }
+        assert!(cursor.is_some());
+        assert!(app.detail_scroll() > 0);
+    }
+
+    fn settle_editor_cursor_scroll(
+        app: &mut WatchApp,
+        terminal: &mut Terminal<TestBackend>,
+        layout: &mut DetailLayout,
+    ) -> RenderInfo {
+        for _ in 0..8 {
+            let info = render_with_layout(terminal, app, layout);
+            let Some(target) = info.editor_scroll_reconciliation else {
+                assert!(info.editor_cursor.is_some());
+                return info;
+            };
+            assert!(app.reconcile_detail_scroll(target));
+        }
+        panic!("editor cursor scroll did not converge");
+    }
+
+    #[test]
+    fn unicode_soft_wrap_cursor_scroll_converges_and_remains_stable() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert(&"😀".repeat(400)));
+
+        let backend = TestBackend::new(34, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+
+        let eof = settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        let eof_scroll = app.detail_scroll();
+        assert!(eof_scroll > 0);
+        assert!(eof.editor_cursor.is_some());
+        for _ in 0..3 {
+            let stable = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(stable.editor_scroll_reconciliation, None);
+            assert_eq!(app.detail_scroll(), eof_scroll);
+            assert!(stable.editor_cursor.is_some());
+        }
+
+        assert!(app.edit_user_input_home());
+        settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        let beginning_scroll = app.detail_scroll();
+        assert!(beginning_scroll < eof_scroll);
+
+        for _ in 0..200 {
+            assert!(app.edit_user_input_right());
+        }
+        settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        let middle_scroll = app.detail_scroll();
+        assert!(middle_scroll > beginning_scroll && middle_scroll < eof_scroll);
+        for _ in 0..3 {
+            let stable = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(stable.editor_scroll_reconciliation, None);
+            assert_eq!(app.detail_scroll(), middle_scroll);
+        }
+    }
+
+    #[test]
+    fn lazy_unicode_cursor_uses_exact_count_provenance() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert(&"😀".repeat(17_000)));
+
+        let backend = TestBackend::new(34, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+        render_with_layout(&mut terminal, &app, &mut layout);
+        let document = DetailDocument::from_app(&app);
+        apply_ready_count(&mut layout, &document);
+
+        settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        let stable_scroll = app.detail_scroll();
+        assert!(stable_scroll > 0);
+        for _ in 0..3 {
+            let stable = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(stable.editor_scroll_reconciliation, None);
+            assert_eq!(app.detail_scroll(), stable_scroll);
+            assert!(stable.editor_cursor.is_some());
+        }
+    }
+
+    #[test]
+    fn ascii_soft_wrap_cursor_scroll_still_converges() {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert(&"x".repeat(1_200)));
+        let backend = TestBackend::new(34, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+
+        settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        let stable_scroll = app.detail_scroll();
+        for _ in 0..3 {
+            let stable = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(stable.editor_scroll_reconciliation, None);
+            assert_eq!(app.detail_scroll(), stable_scroll);
+        }
+    }
+
+    fn rendered_editor_cursor_for(content: &str, width: u16) -> (RenderInfo, usize) {
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert(content));
+        let info = render_info(&app, width.saturating_add(2), 20);
+        let wrap_width = usize::from(info.detail_area.width);
+        (info, wrap_width)
+    }
+
+    #[test]
+    fn eof_cursor_uses_the_visual_insertion_point_at_wrap_boundaries() {
+        let width = 20u16;
+        for (content, expected_row_offset, expected_column_offset) in [
+            ("x".repeat(usize::from(width.saturating_sub(1))), 0, 19),
+            ("x".repeat(usize::from(width)), 1, 0),
+            ("x".repeat(usize::from(width.saturating_add(1))), 1, 1),
+            (format!("{}\n", "x".repeat(usize::from(width))), 1, 0),
+        ] {
+            let (info, actual_width) = rendered_editor_cursor_for(&content, width);
+            assert_eq!(actual_width, usize::from(width));
+            let cursor = info.editor_cursor.unwrap();
+            let content_row = info
+                .detail_section_headers
+                .iter()
+                .find(|header| header.kind == DetailSectionKind::Input)
+                .map(|header| header.area.y.saturating_add(1))
+                .unwrap_or(info.detail_area.y.saturating_add(4));
+            assert_eq!(
+                cursor.0.saturating_sub(info.detail_area.x),
+                expected_column_offset
+            );
+            assert_eq!(
+                cursor.1.saturating_sub(content_row),
+                expected_row_offset,
+                "content={content:?}, cursor={cursor:?}, detail={:?}",
+                info.detail_area
+            );
+        }
+
+        let unicode = "界".repeat(usize::from(width / 2));
+        let (info, actual_width) = rendered_editor_cursor_for(&unicode, width);
+        assert_eq!(actual_width, usize::from(width));
+        let cursor = info.editor_cursor.unwrap();
+        assert_eq!(cursor.0, info.detail_area.x);
+        assert_eq!(cursor.1, info.detail_area.y.saturating_add(5));
+
+        let mut app = app_with_user_inputs(0, UserInputState::default());
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert(&"x".repeat(usize::from(width.saturating_sub(1)))));
+        let backend = TestBackend::new(width.saturating_add(2), 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+        let settled = settle_editor_cursor_scroll(&mut app, &mut terminal, &mut layout);
+        assert_eq!(settled.editor_cursor.unwrap().0, settled.detail_area.x);
+        assert_eq!(settled.editor_scroll_reconciliation, None);
+    }
+
+    #[test]
     fn draft_only_problem_renders_the_cases_pane_selection_and_input_detail() {
         let draft = "draft first line\r\n\r\ndraft last line\r\n";
         let mut ready = UserInputReadyState::default();
@@ -3876,6 +4405,26 @@ mod tests {
         assert_eq!(sample_window(1, 0, 1), 0..1);
         assert_eq!(sample_window(3, 0, 10), 0..3);
         assert_eq!(sample_window(3, 2, 10), 0..3);
+    }
+
+    #[test]
+    fn cases_pane_geometry_is_saturating_at_heights_zero_one_and_two() {
+        let area = |height| Rect::new(5, 7, 20, height);
+
+        let (body, footer, separator) = cases_pane_areas(area(0));
+        assert_eq!(body, Rect::new(5, 7, 19, 0));
+        assert_eq!(footer, Rect::new(5, 7, 19, 0));
+        assert_eq!(separator, None);
+
+        let (body, footer, separator) = cases_pane_areas(area(1));
+        assert_eq!(body, Rect::new(5, 7, 19, 0));
+        assert_eq!(footer, Rect::new(5, 7, 19, 1));
+        assert_eq!(separator, None);
+
+        let (body, footer, separator) = cases_pane_areas(area(2));
+        assert_eq!(body, Rect::new(5, 7, 19, 0));
+        assert_eq!(footer, Rect::new(5, 8, 19, 1));
+        assert_eq!(separator, Some(Rect::new(5, 7, 19, 1)));
     }
 
     #[test]

@@ -8,7 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub(super) use super::detail::RawOffset;
-use super::detail::{DetailDocument, DetailSectionKind, DetailSnapshot, DetailTextSource};
+use super::detail::{
+    DetailDocument, DetailEditorCursor, DetailSectionKind, DetailSnapshot, DetailTextSource,
+};
 
 pub(super) const DETAIL_CHUNK_LINES: usize = 256;
 const MATERIALIZED_CHUNK_CACHE_SIZE: usize = 3;
@@ -820,6 +822,11 @@ pub(super) struct VisibleDetailSectionHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VisibleDetailRow {
+    pub(super) raw_range: Range<RawOffset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExactLayoutIndex {
     pub(super) total_visual_rows: usize,
     pub(super) unit_visual_lines: Vec<usize>,
@@ -1049,8 +1056,17 @@ pub(super) struct DetailViewport {
     pub(super) max_scroll: Option<usize>,
     pub(super) effective_scroll: usize,
     pub(super) visible_section_headers: Vec<VisibleDetailSectionHeader>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) visible_rows: Vec<VisibleDetailRow>,
     pub(super) exact_section_visual_rows: Option<Vec<DetailSectionVisualRow>>,
     pub(super) exact_layout_identity: Option<DetailExactLayoutIdentity>,
+    pub(super) editor_cursor: Option<DetailEditorCursorVisualPosition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailEditorCursorVisualPosition {
+    pub(super) visual_row: usize,
+    pub(super) raw_row_start: RawOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1597,9 +1613,17 @@ impl DetailLayout {
         requested_scroll: usize,
     ) -> DetailViewport {
         let mut structural_budget = FOREGROUND_STRUCTURE_SCAN_BUDGET;
+        let exact_editor_cursor = document
+            .editor_cursor()
+            .and_then(|cursor| self.exact_editor_cursor_visual_position(document, cursor));
         if viewport_height == 0 {
             let max_scroll = self
                 .exact_total_height()
+                .map(|height| {
+                    exact_editor_cursor.map_or(height, |cursor| {
+                        height.max(cursor.visual_row.saturating_add(1))
+                    })
+                })
                 .map(|height| max_scroll(height, viewport_height));
             let effective_scroll = max_scroll
                 .map(|max| requested_scroll.min(max))
@@ -1610,8 +1634,10 @@ impl DetailLayout {
                 max_scroll,
                 effective_scroll,
                 visible_section_headers: Vec::new(),
+                visible_rows: Vec::new(),
                 exact_section_visual_rows: self.exact_section_visual_rows(),
                 exact_layout_identity: self.exact_layout_identity(),
+                editor_cursor: exact_editor_cursor,
             };
         }
 
@@ -1629,6 +1655,29 @@ impl DetailLayout {
                 self.last_top_anchor = Some(top_anchor);
             }
             let visible_section_headers = visible_section_headers(document, &materialized.rows);
+            let editor_cursor = exact_editor_cursor.or_else(|| {
+                document.editor_cursor().and_then(|cursor| {
+                    editor_cursor_in_materialized_rows(
+                        &materialized.rows,
+                        cursor.raw_position,
+                        self.lazy_layout_width(),
+                        cursor.raw_position == self.structure().raw_map.total_len(),
+                    )
+                    .map(|(viewport_row, raw_row_start)| {
+                        DetailEditorCursorVisualPosition {
+                            visual_row: requested_scroll.saturating_add(viewport_row),
+                            raw_row_start,
+                        }
+                    })
+                })
+            });
+            let visible_rows = materialized
+                .rows
+                .iter()
+                .map(|row| VisibleDetailRow {
+                    raw_range: row.raw_range.clone(),
+                })
+                .collect();
             return DetailViewport {
                 text: Text::from(
                     materialized
@@ -1640,8 +1689,10 @@ impl DetailLayout {
                 max_scroll: None,
                 effective_scroll: requested_scroll,
                 visible_section_headers,
+                visible_rows,
                 exact_section_visual_rows: None,
                 exact_layout_identity: None,
+                editor_cursor,
             };
         }
 
@@ -1655,6 +1706,11 @@ impl DetailLayout {
 
         let mut exact_max = self
             .exact_total_height()
+            .map(|height| {
+                exact_editor_cursor.map_or(height, |cursor| {
+                    height.max(cursor.visual_row.saturating_add(1))
+                })
+            })
             .map(|height| max_scroll(height, viewport_height));
 
         if let Some(max) = exact_max {
@@ -1669,6 +1725,11 @@ impl DetailLayout {
                 );
                 exact_max = self
                     .exact_total_height()
+                    .map(|height| {
+                        exact_editor_cursor.map_or(height, |cursor| {
+                            height.max(cursor.visual_row.saturating_add(1))
+                        })
+                    })
                     .map(|height| max_scroll(height, viewport_height));
             }
         }
@@ -1677,6 +1738,29 @@ impl DetailLayout {
             self.last_top_anchor = Some(top_anchor);
         }
         let visible_section_headers = visible_section_headers(document, &materialized.rows);
+        let editor_cursor = exact_editor_cursor.or_else(|| {
+            document.editor_cursor().and_then(|cursor| {
+                editor_cursor_in_materialized_rows(
+                    &materialized.rows,
+                    cursor.raw_position,
+                    self.lazy_layout_width(),
+                    cursor.raw_position == self.structure().raw_map.total_len(),
+                )
+                .map(|(viewport_row, raw_row_start)| {
+                    DetailEditorCursorVisualPosition {
+                        visual_row: effective_scroll.saturating_add(viewport_row),
+                        raw_row_start,
+                    }
+                })
+            })
+        });
+        let visible_rows = materialized
+            .rows
+            .iter()
+            .map(|row| VisibleDetailRow {
+                raw_range: row.raw_range.clone(),
+            })
+            .collect();
 
         DetailViewport {
             text: Text::from(
@@ -1689,8 +1773,10 @@ impl DetailLayout {
             max_scroll: exact_max,
             effective_scroll,
             visible_section_headers,
+            visible_rows,
             exact_section_visual_rows: self.exact_section_visual_rows(),
             exact_layout_identity: self.exact_layout_identity(),
+            editor_cursor,
         }
     }
 
@@ -1732,7 +1818,27 @@ impl DetailLayout {
             self.materialized_eager_viewport_height = Some(viewport_height);
         }
 
-        let exact_max = max_scroll(self.materialized_eager_rows.len(), viewport_height);
+        let editor_cursor = document.editor_cursor().and_then(|cursor| {
+            let wrap_width = self.materialized_eager_width.unwrap_or_default();
+            editor_cursor_in_materialized_rows(
+                &self.materialized_eager_rows,
+                cursor.raw_position,
+                wrap_width,
+                cursor.raw_position == self.structure().raw_map.total_len(),
+            )
+            .map(
+                |(visual_row, raw_row_start)| DetailEditorCursorVisualPosition {
+                    visual_row,
+                    raw_row_start,
+                },
+            )
+        });
+        let content_height = editor_cursor.map_or(self.materialized_eager_rows.len(), |cursor| {
+            self.materialized_eager_rows
+                .len()
+                .max(cursor.visual_row.saturating_add(1))
+        });
+        let exact_max = max_scroll(content_height, viewport_height);
 
         let effective_scroll = requested_scroll.min(exact_max);
         let pending = self
@@ -1776,6 +1882,12 @@ impl DetailLayout {
             .cloned()
             .collect::<Vec<_>>();
         let visible_section_headers = visible_section_headers(document, &visible_rows);
+        let visible_row_ranges = visible_rows
+            .iter()
+            .map(|row| VisibleDetailRow {
+                raw_range: row.raw_range.clone(),
+            })
+            .collect();
         let text = Text::from(
             visible_rows
                 .into_iter()
@@ -1791,8 +1903,10 @@ impl DetailLayout {
             max_scroll: Some(exact_max),
             effective_scroll,
             visible_section_headers,
+            visible_rows: visible_row_ranges,
             exact_section_visual_rows: self.exact_section_visual_rows(),
             exact_layout_identity: self.exact_layout_identity(),
+            editor_cursor,
         }
     }
 
@@ -2320,6 +2434,82 @@ impl DetailLayout {
         self.structure().unit_index_for_raw_position(raw_position)
     }
 
+    fn exact_editor_cursor_visual_position(
+        &mut self,
+        document: &impl DetailTextSource,
+        cursor: DetailEditorCursor,
+    ) -> Option<DetailEditorCursorVisualPosition> {
+        let unit_index = self
+            .structure()
+            .unit_index_for_raw_position(cursor.raw_position)?;
+        let chunk_index = self
+            .chunks
+            .iter()
+            .position(|chunk| chunk.unit_index == unit_index)?;
+        let index = self.exact_layout_index.as_ref()?;
+        let visual_prefix = *index.unit_visual_prefixes.get(chunk_index)?;
+        let unit_visual_lines = *index.unit_visual_lines.get(chunk_index)?;
+        let checkpoints = index.giant_checkpoints.get(chunk_index)?.clone();
+        let unit = self.structure().units.get(unit_index)?.clone();
+        let wrap_width = self.lazy_layout_width();
+        let document_end = self.structure().raw_map.total_len();
+
+        let local = match unit {
+            StructuralUnit::Normal(_) => {
+                self.ensure_chunk_materialized(document, chunk_index);
+                let rows = &self
+                    .materialized_chunks
+                    .iter()
+                    .find(|chunk| chunk.index == chunk_index)?
+                    .rows;
+                editor_cursor_in_materialized_rows(
+                    rows,
+                    cursor.raw_position,
+                    wrap_width,
+                    cursor.raw_position == document_end,
+                )?
+            }
+            StructuralUnit::Giant(line) => {
+                let checkpoint = checkpoints
+                    .iter()
+                    .copied()
+                    .take_while(|checkpoint| checkpoint.raw_position <= cursor.raw_position)
+                    .last()?;
+                let remaining_rows = unit_visual_lines
+                    .saturating_sub(checkpoint.visual_row)
+                    .max(1);
+                let source = DocumentGiantSource {
+                    document,
+                    raw_map: &self.structure().raw_map,
+                    raw_start: line.raw_start,
+                    known_end: line.raw_end,
+                };
+                let mut sink = CountSink::for_cursor(cursor.raw_position);
+                let progress = wrap_document_giant_line_page(
+                    &source,
+                    checkpoint.raw_position,
+                    wrap_width,
+                    remaining_rows,
+                    &mut sink,
+                    &mut || false,
+                )?;
+                let resolved = sink.target_resolutions[0].or_else(|| {
+                    (progress.finished && cursor.raw_position == document_end)
+                        .then(|| {
+                            editor_cursor_at_counted_eof(&sink, cursor.raw_position, wrap_width)
+                        })
+                        .flatten()
+                })?;
+                (checkpoint.visual_row.saturating_add(resolved.0), resolved.1)
+            }
+        };
+
+        Some(DetailEditorCursorVisualPosition {
+            visual_row: visual_prefix.saturating_add(local.0),
+            raw_row_start: local.1,
+        })
+    }
+
     fn resolve_eager_anchor(
         &self,
         rows: &[MaterializedRow],
@@ -2426,6 +2616,52 @@ impl DetailLayout {
 fn row_matches_anchor(row: &MaterializedRow, raw_position: RawOffset) -> bool {
     row.raw_range.start == raw_position
         || (row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+}
+
+fn editor_cursor_in_materialized_rows(
+    rows: &[MaterializedRow],
+    raw_position: RawOffset,
+    wrap_width: usize,
+    at_document_end: bool,
+) -> Option<(usize, RawOffset)> {
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.raw_range.start == raw_position)
+    {
+        return Some((index, rows[index].raw_range.start));
+    }
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.raw_range.start < raw_position && raw_position < row.raw_range.end)
+    {
+        return Some((index, rows[index].raw_range.start));
+    }
+
+    let index = rows
+        .iter()
+        .rposition(|row| row.raw_range.end == raw_position)?;
+    let row = &rows[index];
+    if at_document_end && wrap_width > 0 && row.line.width() == wrap_width {
+        Some((rows.len(), raw_position))
+    } else {
+        Some((index, row.raw_range.start))
+    }
+}
+
+fn editor_cursor_at_counted_eof(
+    sink: &CountSink,
+    raw_position: RawOffset,
+    wrap_width: usize,
+) -> Option<(usize, RawOffset)> {
+    let row = sink.last_row?;
+    if row.raw_end != raw_position {
+        return None;
+    }
+    if wrap_width > 0 && row.width == wrap_width {
+        Some((sink.lines, raw_position))
+    } else {
+        Some((sink.lines.saturating_sub(1), row.raw_start))
+    }
 }
 
 fn visible_section_headers(
@@ -3515,11 +3751,20 @@ impl WrapSink for ProvenanceMaterializeSink<'_> {
 
 struct CountSink {
     has_content: bool,
+    current_width: Option<usize>,
     lines: usize,
     target_positions: Vec<RawOffset>,
     target_resolutions: Vec<Option<(usize, RawOffset)>>,
     checkpoint_stride: Option<usize>,
     checkpoints: Vec<WrapCheckpoint>,
+    last_row: Option<CountedRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CountedRow {
+    raw_start: RawOffset,
+    raw_end: RawOffset,
+    width: usize,
 }
 
 struct UnitVisualCount {
@@ -3537,12 +3782,20 @@ impl CountSink {
         let target_resolutions = vec![None; target_positions.len()];
         Self {
             has_content: false,
+            current_width: None,
             lines: 0,
             target_positions,
             target_resolutions,
             checkpoint_stride,
             checkpoints: Vec::new(),
+            last_row: None,
         }
+    }
+
+    fn for_cursor(raw_position: RawOffset) -> Self {
+        let mut sink = Self::with_targets(vec![raw_position], None);
+        sink.current_width = Some(0);
+        sink
     }
 
     fn into_unit_count(self) -> UnitVisualCount {
@@ -3567,6 +3820,9 @@ impl WrapSink for CountSink {
 
     fn push(&mut self, text: &str) {
         self.has_content |= !text.is_empty();
+        if let Some(current_width) = &mut self.current_width {
+            *current_width = current_width.saturating_add(UnicodeWidthStr::width(text));
+        }
     }
 
     fn emit(&mut self, raw_range: Range<usize>) {
@@ -3594,15 +3850,26 @@ impl WrapSink for CountSink {
                 raw_position: RawOffset(raw_range.start),
             });
         }
+        self.last_row = Some(CountedRow {
+            raw_start: RawOffset(raw_range.start),
+            raw_end: RawOffset(raw_range.end),
+            width: self.current_width.unwrap_or_default(),
+        });
         self.lines = self
             .lines
             .checked_add(1)
             .expect("detail visual row count must fit in usize");
         self.has_content = false;
+        if let Some(current_width) = &mut self.current_width {
+            *current_width = 0;
+        }
     }
 
     fn discard_current(&mut self) {
         self.has_content = false;
+        if let Some(current_width) = &mut self.current_width {
+            *current_width = 0;
+        }
     }
 }
 
@@ -4710,6 +4977,68 @@ mod tests {
                 RawOffset(1)..RawOffset(1),
                 RawOffset(2)..RawOffset(2),
             ]
+        );
+    }
+
+    #[test]
+    fn visible_row_ranges_map_crlf_unicode_wrap_blank_lines_and_eof() {
+        let raw = "a\r\n界界界\n\nz\n";
+        let segments = [raw];
+        let document = make_document(&segments);
+        let mut layout = DetailLayout::default();
+
+        let viewport = layout.viewport(&document, 1, 4, 20, 0);
+        assert_eq!(
+            viewport
+                .visible_rows
+                .iter()
+                .map(|row| row.raw_range.clone())
+                .collect::<Vec<_>>(),
+            [
+                RawOffset(0)..RawOffset(2),
+                RawOffset(3)..RawOffset(9),
+                RawOffset(9)..RawOffset(12),
+                RawOffset(13)..RawOffset(13),
+                RawOffset(14)..RawOffset(15),
+                RawOffset(16)..RawOffset(16),
+            ]
+        );
+        for row in &viewport.visible_rows {
+            assert!(raw.is_char_boundary(row.raw_range.start.0));
+            assert!(raw.is_char_boundary(row.raw_range.end.0));
+        }
+
+        let rows = &layout.materialized_eager_rows;
+        assert_eq!(
+            editor_cursor_in_materialized_rows(rows, RawOffset(1), 4, false),
+            Some((0, RawOffset(0)))
+        );
+        assert_eq!(
+            editor_cursor_in_materialized_rows(rows, RawOffset(3), 4, false),
+            Some((1, RawOffset(3)))
+        );
+        assert_eq!(
+            editor_cursor_in_materialized_rows(rows, RawOffset(9), 4, false),
+            Some((2, RawOffset(9)))
+        );
+        assert_eq!(
+            editor_cursor_in_materialized_rows(rows, RawOffset(13), 4, false),
+            Some((3, RawOffset(13)))
+        );
+        assert_eq!(
+            editor_cursor_in_materialized_rows(rows, RawOffset(raw.len()), 4, true),
+            Some((5, RawOffset(raw.len())))
+        );
+
+        let mut clipped_layout = DetailLayout::default();
+        let clipped = clipped_layout.viewport(&document, 1, 5, 2, 2);
+        assert_eq!(
+            clipped
+                .visible_rows
+                .iter()
+                .map(|row| row.raw_range.clone())
+                .collect::<Vec<_>>(),
+            [RawOffset(9)..RawOffset(12), RawOffset(13)..RawOffset(13)]
         );
     }
 

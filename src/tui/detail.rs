@@ -37,6 +37,12 @@ pub(super) struct DetailSectionAnchor {
     pub(super) raw_position: RawOffset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetailEditorCursor {
+    pub(super) raw_position: RawOffset,
+    pub(super) content_start: RawOffset,
+}
+
 #[derive(Debug)]
 pub(super) struct DetailSegment<'a> {
     text: DetailSegmentText<'a>,
@@ -90,6 +96,10 @@ pub(super) trait DetailTextSource {
     fn segment_count(&self) -> usize;
     fn segment_text(&self, index: usize) -> Option<&str>;
     fn section_anchors(&self) -> &[DetailSectionAnchor];
+
+    fn editor_cursor(&self) -> Option<DetailEditorCursor> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -147,6 +157,7 @@ pub(super) struct DetailDocument<'a> {
     section_anchors: Vec<DetailSectionAnchor>,
     section_bodies: Vec<(DetailSectionKind, &'a str)>,
     section_clip: Option<DetailSectionClip>,
+    editor_cursor: Option<DetailEditorCursor>,
     raw_len: usize,
 }
 
@@ -178,6 +189,10 @@ impl<'a> DetailDocument<'a> {
         self.section_bodies
             .iter()
             .find_map(|(body_kind, content)| (*body_kind == kind).then_some(*content))
+    }
+
+    pub(super) fn editor_cursor(&self) -> Option<DetailEditorCursor> {
+        self.editor_cursor
     }
 
     #[cfg(test)]
@@ -581,28 +596,41 @@ impl<'a> DetailDocument<'a> {
             self.push_static("User Input unavailable");
             return;
         };
-        let content = match selection {
-            UserInputSelection::Persisted(id) => ready
-                .persisted()
-                .iter()
-                .find(|input| input.id == id)
-                .map(|input| input.content.as_str()),
-            UserInputSelection::Draft => ready
-                .edit()
-                .filter(|edit| edit.target() == UserInputEditTarget::Draft)
-                .map(|edit| edit.buffer()),
-        };
+        let selected_edit = ready
+            .edit()
+            .filter(|edit| match (selection, edit.target()) {
+                (UserInputSelection::Draft, UserInputEditTarget::Draft) => true,
+                (
+                    UserInputSelection::Persisted(selected),
+                    UserInputEditTarget::Persisted(target),
+                ) => selected == target,
+                _ => false,
+            });
+        let content = selected_edit
+            .map(|edit| edit.buffer())
+            .or_else(|| match selection {
+                UserInputSelection::Persisted(id) => ready
+                    .persisted()
+                    .iter()
+                    .find(|input| input.id == id)
+                    .map(|input| input.content.as_str()),
+                UserInputSelection::Draft => None,
+            });
         let Some(content) = content else {
             self.push_static("User Input unavailable");
             return;
         };
 
-        self.push_semantic_slice_section(
-            DetailSectionKind::Input,
-            "Input",
-            content,
-            app.detail_fold_state(),
-        );
+        if let Some(edit) = selected_edit {
+            self.push_semantic_editor_section(content, edit.cursor());
+        } else {
+            self.push_semantic_slice_section(
+                DetailSectionKind::Input,
+                "Input",
+                content,
+                app.detail_fold_state(),
+            );
+        }
     }
 
     fn push_optional_semantic_shared_section(
@@ -644,6 +672,28 @@ impl<'a> DetailDocument<'a> {
         content: SemanticSectionContent<'a>,
         folds: DetailFoldState,
     ) {
+        self.push_semantic_section_with_editor(kind, label, content, folds, None);
+    }
+
+    fn push_semantic_editor_section(&mut self, content: &'a str, cursor: usize) {
+        debug_assert!(content.is_char_boundary(cursor));
+        self.push_semantic_section_with_editor(
+            DetailSectionKind::Input,
+            "Input — Editing",
+            SemanticSectionContent::Slice(content),
+            DetailFoldState::default(),
+            Some(cursor),
+        );
+    }
+
+    fn push_semantic_section_with_editor(
+        &mut self,
+        kind: DetailSectionKind,
+        label: &'static str,
+        content: SemanticSectionContent<'a>,
+        folds: DetailFoldState,
+        editor_cursor: Option<usize>,
+    ) {
         self.push_semantic_section_gap();
         debug_assert!(
             !self
@@ -656,20 +706,20 @@ impl<'a> DetailDocument<'a> {
             kind,
             raw_position: RawOffset(self.raw_len),
         });
-        if folds.is_collapsed(kind) {
+        if editor_cursor.is_none() && folds.is_collapsed(kind) {
             self.push_static("▶ ");
         } else {
             self.push_static("▼ ");
         }
         self.push_static(label);
         let content_text = content.text();
-        let displayed_content = if content_text.is_empty() {
+        let displayed_content = if content_text.is_empty() && editor_cursor.is_none() {
             "(empty)"
         } else {
             content_text
         };
         self.section_bodies.push((kind, displayed_content));
-        if folds.is_collapsed(kind) {
+        if editor_cursor.is_none() && folds.is_collapsed(kind) {
             return;
         }
 
@@ -679,12 +729,20 @@ impl<'a> DetailDocument<'a> {
             .map_or(displayed_content.len(), |clip| {
                 clip.prefix_len.min(displayed_content.len())
             });
+        if let Some(cursor) = editor_cursor {
+            self.push_static("\n");
+            let content_start = RawOffset(self.raw_len);
+            self.editor_cursor = Some(DetailEditorCursor {
+                raw_position: RawOffset(self.raw_len.saturating_add(cursor)),
+                content_start,
+            });
+        } else if prefix_len > 0 {
+            self.push_static("\n");
+        }
         if prefix_len == 0 {
             return;
         }
-
-        self.push_static("\n");
-        if content_text.is_empty() {
+        if content_text.is_empty() && editor_cursor.is_none() {
             self.push_static_prefix("(empty)", prefix_len);
         } else if prefix_len == content_text.len() {
             match content {
@@ -783,6 +841,7 @@ impl<'a> DetailDocument<'a> {
             section_anchors: Vec::new(),
             section_bodies: Vec::new(),
             section_clip: None,
+            editor_cursor: None,
             raw_len,
         }
     }
@@ -823,6 +882,7 @@ impl<'a> DetailDocument<'a> {
             section_anchors: Vec::new(),
             section_bodies: Vec::new(),
             section_clip: None,
+            editor_cursor: None,
             raw_len,
         }
     }
@@ -839,6 +899,10 @@ impl DetailTextSource for DetailDocument<'_> {
 
     fn section_anchors(&self) -> &[DetailSectionAnchor] {
         &self.section_anchors
+    }
+
+    fn editor_cursor(&self) -> Option<DetailEditorCursor> {
+        self.editor_cursor
     }
 }
 
@@ -971,6 +1035,35 @@ mod tests {
 
         assert_eq!(shared.as_ptr(), state.as_ptr());
         assert_eq!(Arc::strong_count(state), owners + 1);
+    }
+
+    #[test]
+    fn editing_document_keeps_buffer_exact_and_tracks_cursor_outside_the_text_state() {
+        let mut app = WatchApp::new(&contest(), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        let empty = DetailDocument::from_app(&app);
+        assert!(document_text(&empty).ends_with("▼ Input — Editing\n"));
+        assert_eq!(empty.section_body(DetailSectionKind::Input), Some(""));
+        assert_eq!(
+            empty.editor_cursor().unwrap().raw_position,
+            empty.editor_cursor().unwrap().content_start
+        );
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "");
+
+        assert!(app.edit_user_input_insert("a\r\n\n界\n"));
+        assert!(app.edit_user_input_left());
+        let document = DetailDocument::from_app(&app);
+        let edit = app.selected_user_input_edit().unwrap();
+        let cursor = document.editor_cursor().unwrap();
+        assert_eq!(
+            document.section_body(DetailSectionKind::Input),
+            Some(edit.buffer())
+        );
+        assert_eq!(
+            cursor.raw_position.0.saturating_sub(cursor.content_start.0),
+            edit.cursor()
+        );
+        assert_eq!(edit.buffer(), "a\r\n\n界\n");
     }
 
     #[test]

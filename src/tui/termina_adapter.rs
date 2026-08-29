@@ -39,12 +39,10 @@ pub(super) fn translate(event: Event) -> TerminalEvent {
             modifiers: translate_modifiers(modifiers),
             pixel_generation: None,
         }),
-        Event::FocusIn
-        | Event::FocusOut
-        | Event::Paste(_)
-        | Event::Csi(_)
-        | Event::Osc(_)
-        | Event::Dcs(_) => TerminalEvent::Ignored,
+        Event::Paste(text) => TerminalEvent::Paste(text),
+        Event::FocusIn | Event::FocusOut | Event::Csi(_) | Event::Osc(_) | Event::Dcs(_) => {
+            TerminalEvent::Ignored
+        }
     }
 }
 
@@ -74,6 +72,10 @@ fn translate_key(event: event::KeyEvent) -> Option<KeyEvent> {
             event::KeyCode::Enter => KeyCode::Enter,
             event::KeyCode::Escape => KeyCode::Escape,
             event::KeyCode::Backspace => KeyCode::Backspace,
+            event::KeyCode::Delete => KeyCode::Delete,
+            event::KeyCode::Home => KeyCode::Home,
+            event::KeyCode::End => KeyCode::End,
+            event::KeyCode::Tab => KeyCode::Tab,
             event::KeyCode::Left => KeyCode::Left,
             event::KeyCode::Right => KeyCode::Right,
             event::KeyCode::Up => KeyCode::Up,
@@ -267,6 +269,10 @@ mod tests {
             (TerminaKeyCode::Enter, KeyCode::Enter),
             (TerminaKeyCode::Escape, KeyCode::Escape),
             (TerminaKeyCode::Backspace, KeyCode::Backspace),
+            (TerminaKeyCode::Delete, KeyCode::Delete),
+            (TerminaKeyCode::Home, KeyCode::Home),
+            (TerminaKeyCode::End, KeyCode::End),
+            (TerminaKeyCode::Tab, KeyCode::Tab),
             (TerminaKeyCode::Left, KeyCode::Left),
             (TerminaKeyCode::Right, KeyCode::Right),
             (TerminaKeyCode::Up, KeyCode::Up),
@@ -442,20 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn intentionally_ignores_unused_events_unsupported_keys_and_csi_responses() {
+    fn translates_exact_paste_and_ignores_unused_events_and_csi_responses() {
         assert_eq!(translate(Event::FocusIn), TerminalEvent::Ignored);
         assert_eq!(translate(Event::FocusOut), TerminalEvent::Ignored);
         assert_eq!(
-            translate(Event::Paste("pasted".to_string())),
-            TerminalEvent::Ignored
-        );
-        assert_eq!(
-            translate(key(
-                TerminaKeyCode::Tab,
-                TerminaKeyEventKind::Press,
-                TerminaModifiers::NONE,
-            )),
-            TerminalEvent::Ignored
+            translate(Event::Paste("a\r\n\n  b\n".to_string())),
+            TerminalEvent::Paste("a\r\n\n  b\n".to_string())
         );
         assert_eq!(
             translate(Event::Csi(

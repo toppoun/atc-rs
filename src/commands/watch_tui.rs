@@ -1525,16 +1525,19 @@ mod tests {
             files
         };
         let before = snapshot();
-        let mut prepared = PreparedWatchInput::load(temp.path(), Some("abc123")).unwrap();
+        let prepared = PreparedWatchInput::load(temp.path(), Some("abc123")).unwrap();
+        let mut app = crate::tui::app::WatchApp::new_with_session_data(
+            &prepared.contest,
+            prepared.sample_counts,
+            prepared.stress_cases,
+            prepared.user_inputs,
+        )
+        .unwrap();
 
-        prepared.user_inputs[0]
-            .ready_mut()
-            .unwrap()
-            .begin_draft()
-            .unwrap();
+        app.begin_new_user_input().unwrap();
 
         assert_eq!(snapshot(), before);
-        let ready = prepared.user_inputs[0].ready().unwrap();
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
         assert_eq!(
             ready.edit().unwrap().target(),
             crate::tui::app::UserInputEditTarget::Draft

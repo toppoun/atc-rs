@@ -57,10 +57,21 @@ pub enum CaseSelection {
     UserInput(UserInputSelection),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DraftReturnSelection {
+    #[default]
+    None,
+    Sample(usize),
+    SavedStress,
+    PersistedUserInput(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInputEditState {
     target: UserInputEditTarget,
     buffer: String,
+    cursor: usize,
+    preferred_column: Option<usize>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -73,9 +84,216 @@ impl UserInputEditState {
         &self.buffer
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn replace_buffer(&mut self, buffer: String) {
         self.buffer = buffer;
+        self.cursor = self.buffer.len();
+        self.preferred_column = None;
     }
+
+    pub fn insert(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor = self.cursor.saturating_add(text.len());
+        if self.cursor > 0
+            && self.buffer.as_bytes().get(self.cursor - 1) == Some(&b'\r')
+            && self.buffer.as_bytes().get(self.cursor) == Some(&b'\n')
+        {
+            self.cursor = self.cursor.saturating_add(1);
+        }
+        self.preferred_column = None;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        true
+    }
+
+    pub fn move_left(&mut self) -> bool {
+        if self
+            .buffer
+            .as_bytes()
+            .get(self.cursor.saturating_sub(2)..self.cursor)
+            == Some(b"\r\n".as_slice())
+        {
+            self.cursor = self.cursor.saturating_sub(2);
+            self.preferred_column = None;
+            debug_assert!(self.buffer.is_char_boundary(self.cursor));
+            return true;
+        }
+        let Some((previous, _)) = self.buffer[..self.cursor].char_indices().next_back() else {
+            return false;
+        };
+        self.cursor = previous;
+        self.preferred_column = None;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        true
+    }
+
+    pub fn move_right(&mut self) -> bool {
+        if self
+            .buffer
+            .as_bytes()
+            .get(self.cursor..self.cursor.saturating_add(2))
+            == Some(b"\r\n".as_slice())
+        {
+            self.cursor = self.cursor.saturating_add(2);
+            self.preferred_column = None;
+            debug_assert!(self.buffer.is_char_boundary(self.cursor));
+            return true;
+        }
+        let Some(character) = self.buffer[self.cursor..].chars().next() else {
+            return false;
+        };
+        self.cursor = self.cursor.saturating_add(character.len_utf8());
+        self.preferred_column = None;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        true
+    }
+
+    pub fn move_home(&mut self) -> bool {
+        let start = logical_line_start(&self.buffer, self.cursor);
+        if start == self.cursor {
+            return false;
+        }
+        self.cursor = start;
+        self.preferred_column = None;
+        true
+    }
+
+    pub fn move_end(&mut self) -> bool {
+        let end = logical_line_end(&self.buffer, self.cursor);
+        if end == self.cursor {
+            return false;
+        }
+        self.cursor = end;
+        self.preferred_column = None;
+        true
+    }
+
+    pub fn move_up(&mut self) -> bool {
+        let current_start = logical_line_start(&self.buffer, self.cursor);
+        if current_start == 0 {
+            return false;
+        }
+        let column = self
+            .preferred_column
+            .unwrap_or_else(|| self.buffer[current_start..self.cursor].chars().count());
+        let previous_newline = current_start.saturating_sub(1);
+        let previous_end = previous_newline.saturating_sub(usize::from(
+            previous_newline > 0
+                && self.buffer.as_bytes().get(previous_newline - 1) == Some(&b'\r'),
+        ));
+        let previous_start = logical_line_start(&self.buffer, previous_end);
+        self.cursor = byte_at_scalar_column(&self.buffer, previous_start, previous_end, column);
+        self.preferred_column = Some(column);
+        true
+    }
+
+    pub fn move_down(&mut self) -> bool {
+        let Some(next_newline) = self.buffer[self.cursor..].find('\n') else {
+            return false;
+        };
+        let current_start = logical_line_start(&self.buffer, self.cursor);
+        let column = self
+            .preferred_column
+            .unwrap_or_else(|| self.buffer[current_start..self.cursor].chars().count());
+        let next_start = self.cursor.saturating_add(next_newline).saturating_add(1);
+        let next_end = logical_line_end(&self.buffer, next_start);
+        self.cursor = byte_at_scalar_column(&self.buffer, next_start, next_end, column);
+        self.preferred_column = Some(column);
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if self
+            .buffer
+            .as_bytes()
+            .get(self.cursor.saturating_sub(2)..self.cursor)
+            == Some(b"\r\n".as_slice())
+        {
+            let start = self.cursor.saturating_sub(2);
+            self.buffer.drain(start..self.cursor);
+            self.cursor = start;
+            self.preferred_column = None;
+            debug_assert!(self.buffer.is_char_boundary(self.cursor));
+            return true;
+        }
+        let Some((previous, _)) = self.buffer[..self.cursor].char_indices().next_back() else {
+            return false;
+        };
+        self.buffer.drain(previous..self.cursor);
+        self.cursor = previous;
+        self.move_before_crlf_if_between();
+        self.preferred_column = None;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        true
+    }
+
+    pub fn delete(&mut self) -> bool {
+        if self
+            .buffer
+            .as_bytes()
+            .get(self.cursor..self.cursor.saturating_add(2))
+            == Some(b"\r\n".as_slice())
+        {
+            let end = self.cursor.saturating_add(2);
+            self.buffer.drain(self.cursor..end);
+            self.preferred_column = None;
+            debug_assert!(self.buffer.is_char_boundary(self.cursor));
+            return true;
+        }
+        let Some(character) = self.buffer[self.cursor..].chars().next() else {
+            return false;
+        };
+        let end = self.cursor.saturating_add(character.len_utf8());
+        self.buffer.drain(self.cursor..end);
+        self.move_before_crlf_if_between();
+        self.preferred_column = None;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+        true
+    }
+
+    fn move_before_crlf_if_between(&mut self) {
+        if self.cursor > 0
+            && self.buffer.as_bytes().get(self.cursor - 1) == Some(&b'\r')
+            && self.buffer.as_bytes().get(self.cursor) == Some(&b'\n')
+        {
+            self.cursor -= 1;
+        }
+    }
+}
+
+fn logical_line_start(buffer: &str, cursor: usize) -> usize {
+    debug_assert!(buffer.is_char_boundary(cursor));
+    buffer[..cursor]
+        .rfind('\n')
+        .map_or(0, |newline| newline.saturating_add(1))
+}
+
+fn logical_line_end(buffer: &str, cursor: usize) -> usize {
+    debug_assert!(buffer.is_char_boundary(cursor));
+    let newline = buffer[cursor..]
+        .find('\n')
+        .map_or(buffer.len(), |newline| cursor.saturating_add(newline));
+    if newline > cursor && buffer.as_bytes().get(newline - 1) == Some(&b'\r') {
+        newline - 1
+    } else {
+        newline
+    }
+}
+
+fn byte_at_scalar_column(buffer: &str, start: usize, end: usize, column: usize) -> usize {
+    debug_assert!(start <= end);
+    debug_assert!(buffer.is_char_boundary(start));
+    debug_assert!(buffer.is_char_boundary(end));
+    buffer[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(offset, _)| start.saturating_add(offset))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -83,6 +301,7 @@ impl UserInputEditState {
 pub enum UserInputEditStartError {
     AlreadyEditing,
     PersistedInputNotFound(u64),
+    Unavailable,
 }
 
 impl fmt::Display for UserInputEditStartError {
@@ -92,6 +311,7 @@ impl fmt::Display for UserInputEditStartError {
             Self::PersistedInputNotFound(id) => {
                 write!(formatter, "persisted user input {id} was not found")
             }
+            Self::Unavailable => formatter.write_str("User Inputs are unavailable"),
         }
     }
 }
@@ -133,6 +353,8 @@ impl UserInputReadyState {
         self.edit = Some(UserInputEditState {
             target: UserInputEditTarget::Draft,
             buffer: String::new(),
+            cursor: 0,
+            preferred_column: None,
         });
         Ok(())
     }
@@ -149,7 +371,9 @@ impl UserInputReadyState {
             .ok_or(UserInputEditStartError::PersistedInputNotFound(id))?;
         self.edit = Some(UserInputEditState {
             target: UserInputEditTarget::Persisted(id),
+            cursor: content.len(),
             buffer: content,
+            preferred_column: None,
         });
         Ok(())
     }
@@ -233,6 +457,7 @@ pub struct ProblemState {
     pub stress_setup: StressSetupState,
     #[cfg_attr(not(test), allow(dead_code))]
     pub user_inputs: UserInputState,
+    selection_before_draft: DraftReturnSelection,
     pub detail_mode: DetailMode,
 }
 
@@ -277,10 +502,53 @@ impl ProblemState {
         }
     }
 
-    pub fn has_case_pane_content(&self) -> bool {
-        self.total_cases > 0
-            || self.user_inputs.error_message().is_some()
-            || self.user_input_selections().next().is_some()
+    fn draft_return_selection(&self, selection: Option<CaseSelection>) -> DraftReturnSelection {
+        match selection {
+            Some(CaseSelection::Test(index)) if index < self.sample_cases => {
+                DraftReturnSelection::Sample(index)
+            }
+            Some(CaseSelection::Test(index))
+                if self.saved_stress_case.is_some() && index == self.sample_cases =>
+            {
+                DraftReturnSelection::SavedStress
+            }
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)))
+                if self.contains_case_selection(CaseSelection::UserInput(
+                    UserInputSelection::Persisted(id),
+                )) =>
+            {
+                DraftReturnSelection::PersistedUserInput(id)
+            }
+            Some(CaseSelection::Test(_))
+            | Some(CaseSelection::UserInput(UserInputSelection::Draft))
+            | Some(CaseSelection::UserInput(UserInputSelection::Persisted(_)))
+            | None => DraftReturnSelection::None,
+        }
+    }
+
+    fn resolve_draft_return_selection(
+        &self,
+        selection: DraftReturnSelection,
+    ) -> Option<CaseSelection> {
+        match selection {
+            DraftReturnSelection::Sample(index) if index < self.sample_cases => {
+                Some(CaseSelection::Test(index))
+            }
+            DraftReturnSelection::SavedStress if self.saved_stress_case.is_some() => {
+                Some(CaseSelection::Test(self.sample_cases))
+            }
+            DraftReturnSelection::PersistedUserInput(id)
+                if self.contains_case_selection(CaseSelection::UserInput(
+                    UserInputSelection::Persisted(id),
+                )) =>
+            {
+                Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)))
+            }
+            DraftReturnSelection::None
+            | DraftReturnSelection::Sample(_)
+            | DraftReturnSelection::SavedStress
+            | DraftReturnSelection::PersistedUserInput(_) => None,
+        }
     }
 }
 
@@ -329,6 +597,15 @@ impl DetailFoldState {
             DetailSectionKind::Stderr => &mut self.stderr_collapsed,
         };
         *collapsed = !*collapsed;
+    }
+
+    fn expand(&mut self, kind: DetailSectionKind) {
+        match kind {
+            DetailSectionKind::Input => self.input_collapsed = false,
+            DetailSectionKind::Expected => self.expected_collapsed = false,
+            DetailSectionKind::Actual => self.actual_collapsed = false,
+            DetailSectionKind::Stderr => self.stderr_collapsed = false,
+        }
     }
 }
 
@@ -582,6 +859,7 @@ impl WatchApp {
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
                     user_inputs,
+                    selection_before_draft: DraftReturnSelection::None,
                     detail_mode: DetailMode::Samples,
                 }
             })
@@ -646,6 +924,205 @@ impl WatchApp {
         }
     }
 
+    pub fn active_user_input_edit(&self) -> Option<&UserInputEditState> {
+        self.current_problem()?.user_inputs.ready()?.edit()
+    }
+
+    pub fn selected_user_input_edit(&self) -> Option<&UserInputEditState> {
+        let selection = self.selected_user_input()?;
+        let edit = self.active_user_input_edit()?;
+        let matches_selection = matches!(
+            (selection, edit.target()),
+            (UserInputSelection::Draft, UserInputEditTarget::Draft)
+                | (
+                    UserInputSelection::Persisted(_),
+                    UserInputEditTarget::Persisted(_)
+                )
+        ) && match (selection, edit.target()) {
+            (UserInputSelection::Persisted(selected), UserInputEditTarget::Persisted(target)) => {
+                selected == target
+            }
+            _ => true,
+        };
+        (self
+            .current_problem()
+            .is_some_and(|problem| problem.detail_mode == DetailMode::Samples)
+            && matches_selection)
+            .then_some(edit)
+    }
+
+    pub fn user_input_editor_active(&self) -> bool {
+        self.selected_user_input_edit().is_some()
+    }
+
+    pub fn begin_new_user_input(&mut self) -> Result<bool, UserInputEditStartError> {
+        let problem_index = self
+            .selected_problem()
+            .ok_or(UserInputEditStartError::Unavailable)?;
+        let existing_target = self.problems[problem_index]
+            .user_inputs
+            .ready()
+            .ok_or(UserInputEditStartError::Unavailable)?
+            .edit()
+            .map(UserInputEditState::target);
+
+        match existing_target {
+            Some(UserInputEditTarget::Persisted(_)) => {
+                return Err(UserInputEditStartError::AlreadyEditing);
+            }
+            Some(UserInputEditTarget::Draft) => {}
+            None => {
+                let selection_before_draft =
+                    self.problems[problem_index].draft_return_selection(self.case_selection);
+                self.problems[problem_index]
+                    .user_inputs
+                    .ready_mut()
+                    .expect("checked ready User Input state must remain ready")
+                    .begin_draft()?;
+                self.problems[problem_index].selection_before_draft = selection_before_draft;
+            }
+        }
+
+        let draft = CaseSelection::UserInput(UserInputSelection::Draft);
+        let mode_changed = self.problems[problem_index].detail_mode != DetailMode::Samples;
+        if self.case_selection == Some(draft) && !mode_changed {
+            self.detail_folds.expand(DetailSectionKind::Input);
+            return Ok(existing_target.is_none());
+        }
+
+        let previous = self.displayed_detail_case();
+        self.problems[problem_index].detail_mode = DetailMode::Samples;
+        self.case_selection = Some(draft);
+        self.reset_folds_if_displayed_case_changed(previous);
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.reset_detail_scroll();
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub fn begin_selected_user_input_edit(&mut self) -> Result<bool, UserInputEditStartError> {
+        let UserInputSelection::Persisted(id) = self
+            .selected_user_input()
+            .ok_or(UserInputEditStartError::Unavailable)?
+        else {
+            return Err(UserInputEditStartError::Unavailable);
+        };
+        let problem_index = self
+            .selected_problem()
+            .ok_or(UserInputEditStartError::Unavailable)?;
+        self.problems[problem_index]
+            .user_inputs
+            .ready_mut()
+            .ok_or(UserInputEditStartError::Unavailable)?
+            .begin_persisted_edit(id)?;
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub fn cancel_user_input_edit(&mut self) -> bool {
+        let Some(problem_index) = self.selected_problem() else {
+            return false;
+        };
+        let Some(target) = self.problems[problem_index]
+            .user_inputs
+            .ready()
+            .and_then(UserInputReadyState::edit)
+            .map(UserInputEditState::target)
+        else {
+            return false;
+        };
+        let previous = self.displayed_detail_case();
+        let cancelled = self.problems[problem_index]
+            .user_inputs
+            .ready_mut()
+            .is_some_and(UserInputReadyState::cancel_edit);
+        if !cancelled {
+            return false;
+        }
+
+        if target == UserInputEditTarget::Draft {
+            let return_selection =
+                std::mem::take(&mut self.problems[problem_index].selection_before_draft);
+            self.case_selection =
+                self.problems[problem_index].resolve_draft_return_selection(return_selection);
+            self.reconcile_case_selection(problem_index);
+            self.reset_folds_if_displayed_case_changed(previous);
+            self.reset_detail_scroll();
+        }
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        true
+    }
+
+    pub fn edit_user_input_insert(&mut self, text: &str) -> bool {
+        let changed = self
+            .selected_user_input_edit_mut()
+            .is_some_and(|edit| edit.insert(text));
+        if changed {
+            self.invalidate_detail();
+        }
+        changed
+    }
+
+    pub fn edit_user_input_backspace(&mut self) -> bool {
+        let changed = self
+            .selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::backspace);
+        if changed {
+            self.invalidate_detail();
+        }
+        changed
+    }
+
+    pub fn edit_user_input_delete(&mut self) -> bool {
+        let changed = self
+            .selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::delete);
+        if changed {
+            self.invalidate_detail();
+        }
+        changed
+    }
+
+    pub fn edit_user_input_left(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_left)
+    }
+
+    pub fn edit_user_input_right(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_right)
+    }
+
+    pub fn edit_user_input_up(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_up)
+    }
+
+    pub fn edit_user_input_down(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_down)
+    }
+
+    pub fn edit_user_input_home(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_home)
+    }
+
+    pub fn edit_user_input_end(&mut self) -> bool {
+        self.selected_user_input_edit_mut()
+            .is_some_and(UserInputEditState::move_end)
+    }
+
+    fn selected_user_input_edit_mut(&mut self) -> Option<&mut UserInputEditState> {
+        if !self.user_input_editor_active() {
+            return None;
+        }
+        let problem = self.problems.get_mut(self.selected_problem)?;
+        problem.user_inputs.ready_mut()?.edit_mut()
+    }
+
     #[cfg(test)]
     pub fn selected_case(&self) -> usize {
         self.selected_test_case().unwrap_or(0)
@@ -672,6 +1149,9 @@ impl WatchApp {
     }
 
     pub(super) fn toggle_detail_section(&mut self, kind: DetailSectionKind) {
+        if kind == DetailSectionKind::Input && self.user_input_editor_active() {
+            return;
+        }
         self.detail_folds.toggle(kind);
         self.invalidate_detail();
     }
@@ -2013,6 +2493,576 @@ mod tests {
 
         assert!(state.cancel_edit());
         assert_eq!(state.persisted()[0].content, original);
+    }
+
+    #[test]
+    fn editor_insert_delete_and_horizontal_movement_are_utf8_safe() {
+        let mut state = UserInputReadyState::default();
+        state.begin_draft().unwrap();
+        let edit = state.edit_mut().unwrap();
+
+        assert!(edit.insert("a界🙂"));
+        assert_eq!(edit.buffer(), "a界🙂");
+        assert_eq!(edit.cursor(), "a界🙂".len());
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), "a界".len());
+        assert!(edit.backspace());
+        assert_eq!(edit.buffer(), "a🙂");
+        assert_eq!(edit.cursor(), 1);
+        assert!(edit.delete());
+        assert_eq!(edit.buffer(), "a");
+        assert_eq!(edit.cursor(), 1);
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), 0);
+        assert!(edit.move_right());
+        assert_eq!(edit.cursor(), 1);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+    }
+
+    #[test]
+    fn editor_horizontal_movement_never_enters_a_crlf_pair() {
+        let mut state = UserInputReadyState::default();
+        state.begin_draft().unwrap();
+        let edit = state.edit_mut().unwrap();
+        assert!(edit.insert("a\r\nb\r\n"));
+
+        for expected in [4, 3, 1, 0] {
+            assert!(edit.move_left());
+            assert_eq!(edit.cursor(), expected);
+            assert!(edit.buffer().is_char_boundary(edit.cursor()));
+            assert!(!matches!(
+                edit.buffer().as_bytes().get(edit.cursor()),
+                Some(b'\n')
+            ));
+        }
+        assert!(!edit.move_left());
+
+        for expected in [1, 3, 4, 6] {
+            assert!(edit.move_right());
+            assert_eq!(edit.cursor(), expected);
+            assert!(edit.buffer().is_char_boundary(edit.cursor()));
+            assert!(!matches!(
+                edit.buffer().as_bytes().get(edit.cursor()),
+                Some(b'\n')
+            ));
+        }
+        assert!(!edit.move_right());
+        assert_eq!(edit.buffer(), "a\r\nb\r\n");
+
+        edit.replace_buffer("界\r\n🙂\r\n".to_string());
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), "界\r\n🙂".len());
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), "界\r\n".len());
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), "界".len());
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+        assert!(edit.move_right());
+        assert_eq!(edit.cursor(), "界\r\n".len());
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+    }
+
+    #[test]
+    fn editor_backspace_and_delete_remove_crlf_as_one_logical_newline() {
+        let mut edit = UserInputEditState {
+            target: UserInputEditTarget::Draft,
+            buffer: "a\r\nb\r\n".to_string(),
+            cursor: "a\r\n".len(),
+            preferred_column: None,
+        };
+        assert!(edit.backspace());
+        assert_eq!(edit.buffer(), "ab\r\n");
+        assert_eq!(edit.cursor(), 1);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+        edit.replace_buffer("a\r\nb\r\n".to_string());
+        edit.cursor = 1;
+        assert!(edit.delete());
+        assert_eq!(edit.buffer(), "ab\r\n");
+        assert_eq!(edit.cursor(), 1);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+        edit.replace_buffer("界\r\n🙂".to_string());
+        edit.cursor = "界\r\n".len();
+        assert!(edit.backspace());
+        assert_eq!(edit.buffer(), "界🙂");
+        assert_eq!(edit.cursor(), "界".len());
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+        edit.replace_buffer("界\r\n🙂".to_string());
+        edit.cursor = "界".len();
+        assert!(edit.delete());
+        assert_eq!(edit.buffer(), "界🙂");
+        assert_eq!(edit.cursor(), "界".len());
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+    }
+
+    #[test]
+    fn editor_leaves_lone_carriage_return_and_line_feed_independent() {
+        for newline in ['\r', '\n'] {
+            let mut edit = UserInputEditState {
+                target: UserInputEditTarget::Draft,
+                buffer: format!("a{newline}b"),
+                cursor: 1,
+                preferred_column: None,
+            };
+            assert!(edit.move_right());
+            assert_eq!(edit.cursor(), 2);
+            assert!(edit.buffer().is_char_boundary(edit.cursor()));
+            assert!(edit.move_left());
+            assert_eq!(edit.cursor(), 1);
+            assert!(edit.delete());
+            assert_eq!(edit.buffer(), "ab");
+            assert_eq!(edit.cursor(), 1);
+            assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+            edit.replace_buffer(format!("a{newline}b"));
+            edit.cursor = 2;
+            assert!(edit.backspace());
+            assert_eq!(edit.buffer(), "ab");
+            assert_eq!(edit.cursor(), 1);
+            assert!(edit.buffer().is_char_boundary(edit.cursor()));
+        }
+    }
+
+    #[test]
+    fn editor_mutations_that_form_crlf_do_not_leave_the_cursor_between_the_pair() {
+        let mut edit = UserInputEditState {
+            target: UserInputEditTarget::Draft,
+            buffer: "\n".to_string(),
+            cursor: 0,
+            preferred_column: None,
+        };
+        assert!(edit.insert("\r"));
+        assert_eq!(edit.buffer(), "\r\n");
+        assert_eq!(edit.cursor(), 2);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+        edit.replace_buffer("\rX\n".to_string());
+        edit.cursor = 2;
+        assert!(edit.backspace());
+        assert_eq!(edit.buffer(), "\r\n");
+        assert_eq!(edit.cursor(), 0);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+
+        edit.replace_buffer("\rX\n".to_string());
+        edit.cursor = 1;
+        assert!(edit.delete());
+        assert_eq!(edit.buffer(), "\r\n");
+        assert_eq!(edit.cursor(), 0);
+        assert!(edit.buffer().is_char_boundary(edit.cursor()));
+    }
+
+    #[test]
+    fn editor_enter_home_end_and_vertical_movement_preserve_blank_and_trailing_lines() {
+        let mut state = UserInputReadyState::default();
+        state.begin_draft().unwrap();
+        let edit = state.edit_mut().unwrap();
+        assert!(edit.insert("abc\n界\n\nxyz\n"));
+        assert_eq!(edit.cursor(), edit.buffer().len());
+
+        assert!(edit.move_left());
+        assert_eq!(edit.cursor(), "abc\n界\n\nxyz".len());
+        assert!(edit.move_up());
+        assert_eq!(edit.cursor(), "abc\n界\n".len());
+        assert!(edit.move_up());
+        assert_eq!(edit.cursor(), "abc\n界".len());
+        assert!(edit.move_home());
+        assert_eq!(edit.cursor(), "abc\n".len());
+        assert!(edit.move_end());
+        assert_eq!(edit.cursor(), "abc\n界".len());
+        assert!(edit.move_down());
+        assert_eq!(edit.cursor(), "abc\n界\n".len());
+        assert_eq!(edit.buffer(), "abc\n界\n\nxyz\n");
+    }
+
+    #[test]
+    fn editor_exact_insert_never_normalizes_existing_or_pasted_crlf() {
+        let original = "a\r\nb\r\n";
+        let mut state = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 7,
+            content: original.to_string(),
+        }]);
+        state.begin_persisted_edit(7).unwrap();
+        let edit = state.edit_mut().unwrap();
+        assert!(edit.insert(" \r\n\n  tail\r\n"));
+        assert_eq!(edit.buffer(), "a\r\nb\r\n \r\n\n  tail\r\n");
+        assert_eq!(state.persisted()[0].content, original);
+    }
+
+    #[test]
+    fn editor_line_movement_treats_crlf_as_one_logical_line_break() {
+        let mut state = UserInputReadyState::default();
+        state.begin_draft().unwrap();
+        let edit = state.edit_mut().unwrap();
+        assert!(edit.insert("ab\r\n界x\r\n"));
+
+        assert!(edit.move_up());
+        assert_eq!(edit.cursor(), "ab\r\n".len());
+        assert!(edit.move_end());
+        assert_eq!(edit.cursor(), "ab\r\n界x".len());
+        assert!(edit.move_up());
+        assert_eq!(edit.cursor(), "ab".len());
+        assert!(edit.move_down());
+        assert_eq!(edit.cursor(), "ab\r\n界x".len());
+        assert_eq!(edit.buffer(), "ab\r\n界x\r\n");
+    }
+
+    #[test]
+    fn new_user_input_creates_selects_and_edits_one_memory_only_draft() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![2],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "persisted\n")])],
+        )
+        .unwrap();
+        let total_cases = app.current_problem().unwrap().total_cases;
+        let run_cases = app.current_problem().unwrap().run.cases.len();
+
+        assert!(app.begin_new_user_input().unwrap());
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Draft))
+        );
+        assert!(app.user_input_editor_active());
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "");
+        assert_eq!(app.selected_user_input_edit().unwrap().cursor(), 0);
+        assert_eq!(app.current_problem().unwrap().total_cases, total_cases);
+        assert_eq!(app.current_problem().unwrap().run.cases.len(), run_cases);
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_input_selections()
+                .filter(|selection| {
+                    *selection == CaseSelection::UserInput(UserInputSelection::Draft)
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reopening_an_existing_draft_preserves_buffer_cursor_and_single_edit_invariant() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![None],
+            vec![loaded_user_inputs(&[])],
+        )
+        .unwrap();
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert("123\n456"));
+        assert!(app.edit_user_input_left());
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+        assert!(
+            app.next_case(),
+            "navigation may leave an active edit selected elsewhere"
+        );
+        assert!(!app.user_input_editor_active());
+
+        assert!(app.begin_new_user_input().unwrap());
+        let edit = app.selected_user_input_edit().unwrap();
+        assert_eq!(edit.buffer(), "123\n456");
+        assert_eq!(edit.cursor(), cursor);
+        assert_eq!(edit.target(), UserInputEditTarget::Draft);
+    }
+
+    #[test]
+    fn new_user_input_never_silently_discards_a_persisted_edit() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "original\r\n")])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(app.edit_user_input_insert("edited"));
+        let buffer = app.selected_user_input_edit().unwrap().buffer().to_string();
+
+        assert_eq!(
+            app.begin_new_user_input(),
+            Err(UserInputEditStartError::AlreadyEditing)
+        );
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), buffer);
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            UserInputEditTarget::Persisted(3)
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "original\r\n"
+        );
+    }
+
+    #[test]
+    fn draft_cancel_restores_valid_selection_and_reconciles_a_removed_target() {
+        let mut app = WatchApp::new(&contest(1), vec![2]).unwrap();
+        assert!(app.next_case());
+        assert_eq!(app.case_selection(), Some(CaseSelection::Test(1)));
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert("discard me"));
+        assert!(app.cancel_user_input_edit());
+        assert_eq!(app.case_selection(), Some(CaseSelection::Test(1)));
+        assert!(app.active_user_input_edit().is_none());
+
+        app.begin_new_user_input().unwrap();
+        app.problems[0].sample_cases = 1;
+        app.problems[0].total_cases = 1;
+        assert!(app.cancel_user_input_edit());
+        assert_eq!(app.case_selection(), Some(CaseSelection::Test(0)));
+        assert_selection_invariant(&app);
+    }
+
+    #[test]
+    fn draft_cancel_restores_sample_saved_stress_persisted_and_none_semantically() {
+        let stress = || Sample {
+            input: "stress input\n".to_string(),
+            output: "stress output\n".to_string(),
+        };
+
+        let mut sample = WatchApp::new(&contest(1), vec![2]).unwrap();
+        assert!(sample.next_case());
+        sample.begin_new_user_input().unwrap();
+        assert!(sample.cancel_user_input_edit());
+        assert_case_selection(&sample, Some(CaseSelection::Test(1)));
+
+        let mut saved = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![2],
+            vec![Some(stress())],
+            vec![loaded_user_inputs(&[])],
+        )
+        .unwrap();
+        assert!(saved.next_case());
+        assert!(saved.next_case());
+        saved.begin_new_user_input().unwrap();
+        assert!(saved.cancel_user_input_edit());
+        assert_case_selection(&saved, Some(CaseSelection::Test(2)));
+
+        let mut persisted = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(41, "input\n")])],
+        )
+        .unwrap();
+        persisted.begin_new_user_input().unwrap();
+        assert!(persisted.cancel_user_input_edit());
+        assert_case_selection(
+            &persisted,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(41))),
+        );
+
+        let mut none = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[])],
+        )
+        .unwrap();
+        assert_case_selection(&none, None);
+        none.begin_new_user_input().unwrap();
+        assert!(none.cancel_user_input_edit());
+        assert_case_selection(&none, None);
+    }
+
+    #[test]
+    fn draft_cancel_re_resolves_saved_stress_after_sample_count_changes() {
+        let stress = || SavedStressCaseState {
+            input: Arc::new("stress input\n".to_string()),
+            expected: Arc::new("stress output\n".to_string()),
+        };
+
+        for (initial_samples, changed_samples) in [(2, 3), (3, 1)] {
+            let mut app = WatchApp::new_with_session_data(
+                &contest(1),
+                vec![initial_samples],
+                vec![Some(Sample {
+                    input: "stress input\n".to_string(),
+                    output: "stress output\n".to_string(),
+                })],
+                vec![loaded_user_inputs(&[])],
+            )
+            .unwrap();
+            app.case_selection = Some(CaseSelection::Test(initial_samples));
+            app.begin_new_user_input().unwrap();
+
+            app.problems[0].sample_cases = changed_samples;
+            app.problems[0].total_cases = changed_samples + 1;
+            app.problems[0].saved_stress_case = Some(stress());
+
+            assert!(app.cancel_user_input_edit());
+            assert_case_selection(&app, Some(CaseSelection::Test(changed_samples)));
+        }
+    }
+
+    #[test]
+    fn draft_cancel_falls_back_instead_of_aliasing_a_disappeared_semantic_target() {
+        let mut sample = WatchApp::new(&contest(1), vec![2]).unwrap();
+        sample.case_selection = Some(CaseSelection::Test(1));
+        sample.begin_new_user_input().unwrap();
+        sample.problems[0].sample_cases = 1;
+        sample.problems[0].total_cases = 1;
+        assert!(sample.cancel_user_input_edit());
+        assert_case_selection(&sample, Some(CaseSelection::Test(0)));
+
+        let mut saved = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![Some(Sample {
+                input: "stress input\n".to_string(),
+                output: "stress output\n".to_string(),
+            })],
+            vec![loaded_user_inputs(&[])],
+        )
+        .unwrap();
+        saved.case_selection = Some(CaseSelection::Test(1));
+        saved.begin_new_user_input().unwrap();
+        saved.problems[0].saved_stress_case = None;
+        saved.problems[0].total_cases = 1;
+        assert!(saved.cancel_user_input_edit());
+        assert_case_selection(&saved, Some(CaseSelection::Test(0)));
+
+        let mut persisted = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![None],
+            vec![loaded_user_inputs(&[(73, "input\n")])],
+        )
+        .unwrap();
+        persisted.case_selection =
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(73)));
+        persisted.begin_new_user_input().unwrap();
+        persisted.problems[0]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .persisted
+            .clear();
+        assert!(persisted.cancel_user_input_edit());
+        assert_case_selection(&persisted, Some(CaseSelection::Test(0)));
+    }
+
+    #[test]
+    fn persisted_cancel_keeps_selection_and_exact_backend_loaded_content() {
+        let original = "4\r\n1 2 3 4\r\n";
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(9, original)])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), original);
+        assert!(app.edit_user_input_insert("x"));
+        assert!(app.cancel_user_input_edit());
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(9)))
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            original
+        );
+    }
+
+    #[test]
+    fn edit_state_is_problem_local_and_survives_navigation_and_run_events() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(2),
+            vec![1, 0],
+            vec![None, None],
+            vec![
+                loaded_user_inputs(&[(3, "A original\n")]),
+                loaded_user_inputs(&[(8, "B original\n")]),
+            ],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let request = app.queue_run(0).unwrap();
+        assert!(app.next_case());
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(app.edit_user_input_insert("A edit\n"));
+        assert!(app.edit_user_input_left());
+        let selection = app.case_selection();
+        let buffer = app.selected_user_input_edit().unwrap().buffer().to_string();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_requeued(0, request.run_id));
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_completed(0, request.run_id));
+        assert_eq!(app.case_selection(), selection);
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), buffer);
+        assert_eq!(app.selected_user_input_edit().unwrap().cursor(), cursor);
+
+        let failed_request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, failed_request.run_id));
+        assert!(app.run_failed(0, failed_request.run_id, "runner failed".to_string()));
+        assert_eq!(app.case_selection(), selection);
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), buffer);
+        assert_eq!(app.selected_user_input_edit().unwrap().cursor(), cursor);
+
+        assert!(app.next_problem());
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(app.edit_user_input_insert("B edit"));
+        assert!(app.previous_problem());
+        assert_eq!(app.active_user_input_edit().unwrap().buffer(), buffer);
+        assert_eq!(app.active_user_input_edit().unwrap().cursor(), cursor);
+        assert_eq!(
+            app.problems[1]
+                .user_inputs
+                .ready()
+                .unwrap()
+                .edit()
+                .unwrap()
+                .buffer(),
+            "B original\nB edit"
+        );
+    }
+
+    #[test]
+    fn edit_content_mutation_keeps_detail_identity_scroll_and_non_input_folds() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "original")])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        app.detail_folds.expected_collapsed = true;
+        assert!(app.scroll_detail_down(17));
+        let identity = app.displayed_detail_case();
+        let revision = app.detail_revision();
+
+        assert!(app.edit_user_input_insert(" changed"));
+        assert_eq!(app.displayed_detail_case(), identity);
+        assert_eq!(app.detail_scroll(), 17);
+        assert!(app.detail_folds.expected_collapsed);
+        assert!(!app.detail_folds.input_collapsed);
+        assert_ne!(app.detail_revision(), revision);
+        app.toggle_detail_section(DetailSectionKind::Input);
+        assert!(
+            !app.detail_folds.input_collapsed,
+            "editing Input stays expanded"
+        );
     }
 
     #[test]

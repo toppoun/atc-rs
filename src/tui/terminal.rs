@@ -134,6 +134,7 @@ impl PixelRefresh {
 enum LifecycleStep {
     RawMode,
     AlternateScreen,
+    BracketedPaste,
     SgrMouse,
     SgrPixelsMouseMayBeActive,
     AnyEventMouse,
@@ -146,6 +147,7 @@ const INITIALIZATION_STEPS: &[LifecycleStep] = &[
     LifecycleStep::RawMode,
     LifecycleStep::PendingInput,
     LifecycleStep::AlternateScreen,
+    LifecycleStep::BracketedPaste,
     LifecycleStep::SgrMouse,
     LifecycleStep::AnyEventMouse,
     LifecycleStep::CursorHidden,
@@ -155,6 +157,7 @@ const CLEANUP_STEPS: &[LifecycleStep] = &[
     LifecycleStep::AnyEventMouse,
     LifecycleStep::SgrMouse,
     LifecycleStep::SgrPixelsMouseMayBeActive,
+    LifecycleStep::BracketedPaste,
     LifecycleStep::PendingInput,
     LifecycleStep::CursorHidden,
     LifecycleStep::AlternateScreen,
@@ -165,6 +168,7 @@ const CLEANUP_STEPS: &[LifecycleStep] = &[
 struct LifecycleState {
     raw_mode: bool,
     alternate_screen: bool,
+    bracketed_paste: bool,
     sgr_mouse: bool,
     sgr_pixels_mouse_may_be_active: bool,
     any_event_mouse: bool,
@@ -185,6 +189,7 @@ impl LifecycleState {
         match step {
             LifecycleStep::RawMode => self.raw_mode,
             LifecycleStep::AlternateScreen => self.alternate_screen,
+            LifecycleStep::BracketedPaste => self.bracketed_paste,
             LifecycleStep::SgrMouse => self.sgr_mouse,
             LifecycleStep::SgrPixelsMouseMayBeActive => self.sgr_pixels_mouse_may_be_active,
             LifecycleStep::AnyEventMouse => self.any_event_mouse,
@@ -197,6 +202,7 @@ impl LifecycleState {
         match step {
             LifecycleStep::RawMode => &mut self.raw_mode,
             LifecycleStep::AlternateScreen => &mut self.alternate_screen,
+            LifecycleStep::BracketedPaste => &mut self.bracketed_paste,
             LifecycleStep::SgrMouse => &mut self.sgr_mouse,
             LifecycleStep::SgrPixelsMouseMayBeActive => &mut self.sgr_pixels_mouse_may_be_active,
             LifecycleStep::AnyEventMouse => &mut self.any_event_mouse,
@@ -328,6 +334,9 @@ fn restore_step(output: &mut PlatformTerminal, step: LifecycleStep) -> io::Resul
         }
         LifecycleStep::SgrPixelsMouseMayBeActive => {
             write_dec_private_mode(output, DecPrivateModeCode::SGRPixelsMouse, false)
+        }
+        LifecycleStep::BracketedPaste => {
+            write_dec_private_mode(output, DecPrivateModeCode::BracketedPaste, false)
         }
         LifecycleStep::CursorHidden => {
             write_dec_private_mode(output, DecPrivateModeCode::ShowCursor, true)
@@ -558,6 +567,7 @@ fn panic_cleanup_sequence() -> String {
         dec_private_mode(DecPrivateModeCode::AnyEventMouse, false),
         dec_private_mode(DecPrivateModeCode::SGRMouse, false),
         dec_private_mode(DecPrivateModeCode::SGRPixelsMouse, false),
+        dec_private_mode(DecPrivateModeCode::BracketedPaste, false),
         dec_private_mode(DecPrivateModeCode::ShowCursor, true),
         dec_private_mode(DecPrivateModeCode::ClearAndEnableAlternateScreen, false),
     ]
@@ -1515,6 +1525,11 @@ impl TerminaSession {
             DecPrivateModeCode::ClearAndEnableAlternateScreen,
             true,
         )?;
+        output.change_mode(
+            LifecycleStep::BracketedPaste,
+            DecPrivateModeCode::BracketedPaste,
+            true,
+        )?;
 
         // Negotiate from a mouse-disabled baseline. Since 1006 and 1016 have the same wire
         // grammar, no tracking is enabled until the parser and coordinate mode agree.
@@ -2163,9 +2178,10 @@ impl Drop for TerminaSession {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalEvent {
     Key(KeyEvent),
+    Paste(String),
     Pointer(PointerEvent),
     Resize(TerminalSize),
     Ignored,
@@ -2190,6 +2206,10 @@ pub(super) enum KeyCode {
     Enter,
     Escape,
     Backspace,
+    Delete,
+    Home,
+    End,
+    Tab,
     Left,
     Right,
     Up,
@@ -3296,12 +3316,24 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn panic_cleanup_resets_pixel_mode_without_ever_enabling_it() {
+    fn panic_cleanup_resets_pixel_and_bracketed_paste_modes_without_enabling_them() {
         let cleanup = panic_cleanup_sequence();
 
         assert!(cleanup.contains("\u{1b}[?1003l"));
         assert!(!cleanup.contains("\u{1b}[?1003h"));
         assert!(cleanup.contains("\u{1b}[?1016l"));
         assert!(!cleanup.contains("\u{1b}[?1016h"));
+        assert!(cleanup.contains("\u{1b}[?2004l"));
+        assert!(!cleanup.contains("\u{1b}[?2004h"));
+        assert!(
+            CLEANUP_STEPS
+                .iter()
+                .position(|step| *step == LifecycleStep::BracketedPaste)
+                .unwrap()
+                < CLEANUP_STEPS
+                    .iter()
+                    .position(|step| *step == LifecycleStep::PendingInput)
+                    .unwrap()
+        );
     }
 }

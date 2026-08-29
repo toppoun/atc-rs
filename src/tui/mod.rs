@@ -2246,12 +2246,22 @@ impl DetailScrollbarDragState {
         let Some(position) = project_pointer_to_cells(pointer, mouse_mode) else {
             return false;
         };
-        let previous = self.hover_position.and_then(|(column, row)| {
-            render_info.detail_section_header_at(detail_revision, column, row)
-        });
-        let next = render_info.detail_section_header_at(detail_revision, position.0, position.1);
+        let hover_target = |position: (u16, u16)| {
+            let action = render_info
+                .user_input_detail_action_at(detail_revision, position.0, position.1)
+                .map(|target| target.action);
+            let header = render_info
+                .detail_section_header_at(detail_revision, position.0, position.1)
+                .map(|header| header.kind);
+            let new_input = render_info
+                .new_input_area
+                .is_some_and(|area| contains(area, position.0, position.1));
+            (action, header, new_input)
+        };
+        let previous = self.hover_position.map(hover_target);
+        let next = hover_target(position);
         self.hover_position = Some(position);
-        previous.map(|header| header.kind) != next.map(|header| header.kind)
+        previous != Some(next)
     }
 
     fn toggle_fold_animation(
@@ -2786,6 +2796,9 @@ where
             detail_scrollbar_drag.reconcile_render_info(&render_info);
 
             apply_detail_scroll_reconciliation(&mut app, &mut detail_layout);
+            let editor_scroll_changed = render_info
+                .editor_scroll_reconciliation
+                .is_some_and(|target| app.reconcile_detail_scroll(target));
 
             if let Some(max_detail_scroll) = render_info.max_detail_scroll {
                 app.clamp_detail_scroll(max_detail_scroll);
@@ -2800,6 +2813,10 @@ where
             let resize_pending = resize_event_count(&terminal_events) != 0;
             terminal.refresh_mouse_after_redraw(resize_pending)?;
             terminal.retry_high_res_after_redraw(resize_pending)?;
+            if editor_scroll_changed {
+                dirty = true;
+                continue;
+            }
             if terminal.mouse_mode() != render_mouse_mode {
                 // Pixel metrics become authoritative only after the settled resize/redraw
                 // boundary. Draw once more so the published thumb geometry uses that mode.
@@ -2970,8 +2987,14 @@ fn contains_global_quit_event(
     let mut source_modal_active = open_source.modal_active();
     let mut editor_target_modal_active = editor_target_modal_active;
     let mut command_palette = command_palette.clone();
+    let mut user_input_editor_active = app.user_input_editor_active();
+    let mut pointer_seen = false;
 
     for event in events {
+        if matches!(event, TerminalEvent::Pointer(_)) {
+            pointer_seen = true;
+            continue;
+        }
         let TerminalEvent::Key(key) = event else {
             continue;
         };
@@ -3043,6 +3066,13 @@ fn contains_global_quit_event(
             continue;
         }
 
+        if user_input_editor_active {
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
+                user_input_editor_active = false;
+            }
+            continue;
+        }
+
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -3060,7 +3090,7 @@ fn contains_global_quit_event(
         }
 
         if is_quit_event(event) {
-            return true;
+            return !pointer_seen;
         }
     }
 
@@ -3376,6 +3406,8 @@ fn handle_terminal_event_with_mouse_mode(
             Ok(changed)
         }
 
+        TerminalEvent::Paste(text) => Ok(app.edit_user_input_insert(&text)),
+
         TerminalEvent::Pointer(pointer) => {
             let hover_changed = detail_scrollbar_drag.update_hover(
                 pointer,
@@ -3444,6 +3476,10 @@ fn handle_key_event_with_frontend_context(
         return Ok(false);
     }
 
+    if app.user_input_editor_active() {
+        return Ok(handle_user_input_editor_key(app, key));
+    }
+
     if key.code == KeyCode::Char('q') && key.kind == KeyEventKind::Press {
         app.quit();
         return Ok(true);
@@ -3478,6 +3514,33 @@ fn handle_key_event_with_frontend_context(
         KeyCode::Char('j') | KeyCode::Down => Ok(app.next_case()),
         KeyCode::Char('k') | KeyCode::Up => Ok(app.previous_case()),
         _ => Ok(false),
+    }
+}
+
+fn handle_user_input_editor_key(app: &mut WatchApp, key: KeyEvent) -> bool {
+    if key.code == KeyCode::Escape {
+        return app.cancel_user_input_edit();
+    }
+    if key.modifiers.control || key.modifiers.alt || key.modifiers.super_key {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char(character) => {
+            let mut encoded = [0; 4];
+            app.edit_user_input_insert(character.encode_utf8(&mut encoded))
+        }
+        KeyCode::Enter => app.edit_user_input_insert("\n"),
+        KeyCode::Tab => app.edit_user_input_insert("\t"),
+        KeyCode::Backspace => app.edit_user_input_backspace(),
+        KeyCode::Delete => app.edit_user_input_delete(),
+        KeyCode::Left => app.edit_user_input_left(),
+        KeyCode::Right => app.edit_user_input_right(),
+        KeyCode::Up => app.edit_user_input_up(),
+        KeyCode::Down => app.edit_user_input_down(),
+        KeyCode::Home => app.edit_user_input_home(),
+        KeyCode::End => app.edit_user_input_end(),
+        KeyCode::Escape => unreachable!("Escape is handled before modifier filtering"),
     }
 }
 
@@ -3707,8 +3770,17 @@ fn handle_pointer_event_with_mouse_mode(
         );
     }
 
-    if let Some(samples_area) = render_info.samples_area
-        && contains(samples_area, column, row)
+    if let Some(new_input_area) = render_info.new_input_area
+        && contains(new_input_area, column, row)
+    {
+        return match pointer.kind {
+            PointerKind::Down(PointerButton::Left) => app.begin_new_user_input().unwrap_or(false),
+            _ => false,
+        };
+    }
+
+    if let Some(samples_body_area) = render_info.samples_body_area.or(render_info.samples_area)
+        && contains(samples_body_area, column, row)
     {
         return match pointer.kind {
             PointerKind::ScrollUp => app.previous_case(),
@@ -3716,6 +3788,18 @@ fn handle_pointer_event_with_mouse_mode(
             PointerKind::ScrollDown => app.next_case(),
 
             _ => false,
+        };
+    }
+
+    if let PointerKind::Down(PointerButton::Left) = pointer.kind
+        && let Some(target) =
+            render_info.user_input_detail_action_at(app.detail_revision(), column, row)
+    {
+        return match target.action {
+            view::UserInputDetailAction::Edit => {
+                app.begin_selected_user_input_edit().unwrap_or(false)
+            }
+            view::UserInputDetailAction::Cancel => app.cancel_user_input_edit(),
         };
     }
 
@@ -5125,6 +5209,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
         let mut pointers = VecDeque::from([
             TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, 5, 5)),
@@ -5826,6 +5911,7 @@ mod tests {
                 detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
                 detail_scrollbar: None,
                 detail_section_headers: Vec::new(),
+                ..view::RenderInfo::default()
             };
             let mut suppressed = VecDeque::from([
                 TerminalEvent::Key(key(KeyCode::Char('r'), KeyEventKind::Press)),
@@ -6355,6 +6441,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
         let mut events = VecDeque::from([TerminalEvent::Pointer(pointer(
             PointerKind::ScrollDown,
@@ -8536,7 +8623,7 @@ mod tests {
     fn ignored_events_preserve_the_raw_event_batch_cap_before_quit() {
         let quit = TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press));
         let mut source = vec![TerminalEvent::Ignored; MAX_TERMINAL_EVENTS_PER_TICK];
-        source.push(quit);
+        source.push(quit.clone());
         let events = RefCell::new(VecDeque::from(source));
 
         let queued = read_terminal_events_with(
@@ -8617,6 +8704,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         let mut events = VecDeque::from([
@@ -8635,6 +8723,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 100, 40),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(handle_terminal_events(&mut app, &new_info, &mut events, &run_tx,).unwrap());
@@ -8951,6 +9040,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 70, 20),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
         assert!(super::handle_pointer_event(
             &mut app,
@@ -9243,6 +9333,7 @@ mod tests {
             detail_area,
             detail_scrollbar: Some(interaction),
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         }
     }
 
@@ -9788,6 +9879,359 @@ mod tests {
             anchor_row_raw_start: count.anchor_row_raw_start,
         }
     }
+
+    fn user_input_app(content: &str) -> WatchApp {
+        WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(vec![
+                app::PersistedUserInputState {
+                    id: 3,
+                    content: content.to_string(),
+                },
+            ])],
+        )
+        .unwrap()
+    }
+
+    fn contains_plain_global_quit_event(events: &VecDeque<TerminalEvent>, app: &WatchApp) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let context = workspace_context(root.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".into());
+        let contest_switch = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let open_source = OpenSourceController::new(root.path(), Language::Cpp);
+
+        contains_global_quit_event(
+            events,
+            app,
+            &contest_switch,
+            None,
+            &CommandPalette::default(),
+            &open_source,
+            false,
+        )
+    }
+
+    #[test]
+    fn new_input_pointer_then_q_same_batch_defers_quit_and_inserts_q() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::default()],
+        )
+        .unwrap();
+        app.toggle_samples_pane();
+        let info = rendered_fold_info(&app, 80, 16);
+        let new_input = info.new_input_area.unwrap();
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                new_input.x,
+                new_input.y,
+            )),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(app.user_input_editor_active());
+
+        let updated = rendered_fold_info(&app, 80, 16);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        assert!(handle_terminal_events(&mut app, &updated, &mut events, &run_tx).unwrap());
+
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+        assert!(app.user_input_editor_active());
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "q");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn edit_pointer_then_q_same_batch_defers_quit_and_preserves_original() {
+        let original = "original\r\n";
+        let mut app = user_input_app(original);
+        let info = rendered_fold_info(&app, 100, 30);
+        let edit = info.user_input_detail_action.unwrap();
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                edit.area.x,
+                edit.area.y,
+            )),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(app.user_input_editor_active());
+
+        let updated = rendered_fold_info(&app, 100, 30);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        assert!(handle_terminal_events(&mut app, &updated, &mut events, &run_tx).unwrap());
+
+        assert!(app.user_input_editor_active());
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "original\r\nq"
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            original
+        );
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn focus_away_pointer_then_q_same_batch_uses_ordered_global_quit() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[1]),
+            vec![1],
+            vec![None],
+            vec![app::UserInputState::default()],
+        )
+        .unwrap();
+        app.begin_new_user_input().unwrap();
+        assert!(app.edit_user_input_insert("kept"));
+        app.toggle_samples_pane();
+        let info = rendered_fold_info(&app, 80, 16);
+        let body = info.samples_body_area.unwrap();
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(PointerKind::ScrollDown, body.x, body.y)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(!app.user_input_editor_active());
+        assert!(contains_plain_global_quit_event(&events, &app));
+        app.quit();
+
+        assert_eq!(app.case_selection(), Some(app::CaseSelection::Test(0)));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(app.active_user_input_edit().unwrap().buffer(), "kept");
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn q_only_batch_keeps_the_global_quit_preflight() {
+        let app = app();
+        let events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('q'),
+            KeyEventKind::Press,
+        ))]);
+
+        assert!(contains_plain_global_quit_event(&events, &app));
+        let resize_then_q = VecDeque::from([
+            resize(100, 30),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(contains_plain_global_quit_event(&resize_then_q, &app));
+        let paste_then_q = VecDeque::from([
+            TerminalEvent::Paste("literal paste".to_string()),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(contains_plain_global_quit_event(&paste_then_q, &app));
+    }
+
+    #[test]
+    fn active_user_input_editor_captures_chars_tabs_and_escape_before_global_keys() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[1]),
+            vec![1],
+            vec![None],
+            vec![app::UserInputState::default()],
+        )
+        .unwrap();
+        app.begin_new_user_input().unwrap();
+
+        assert!(handle_key(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyEventKind::Press
+        ));
+        assert!(handle_key(&mut app, KeyCode::Tab, KeyEventKind::Press));
+        assert!(!app.should_quit());
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "q\t");
+
+        let (run_tx, _run_rx) = mpsc::channel();
+        let modified = KeyEvent {
+            code: KeyCode::Char('x'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        };
+        assert!(!handle_key_event(&mut app, modified, &run_tx).unwrap());
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "q\t");
+
+        assert!(handle_key(&mut app, KeyCode::Escape, KeyEventKind::Press));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(app.case_selection(), Some(app::CaseSelection::Test(0)));
+        assert!(handle_key(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyEventKind::Press
+        ));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn multiline_paste_is_inserted_exactly_only_into_the_active_editor() {
+        let mut app = user_input_app("original\r\n");
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(app.edit_user_input_up());
+        let pasted = "  first\r\n\nsecond  \n";
+        let mut events = VecDeque::from([TerminalEvent::Paste(pasted.to_string())]);
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert!(
+            handle_terminal_events(&mut app, &view::RenderInfo::default(), &mut events, &run_tx,)
+                .unwrap()
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "  first\r\n\nsecond  \noriginal\r\n"
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "original\r\n"
+        );
+    }
+
+    #[test]
+    fn new_input_footer_click_is_not_a_case_or_wheel_target() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[2]),
+            vec![2],
+            vec![None],
+            vec![app::UserInputState::default()],
+        )
+        .unwrap();
+        app.toggle_samples_pane();
+        let info = rendered_fold_info(&app, 80, 16);
+        let action = info.new_input_area.unwrap();
+        let selection_before = app.case_selection();
+        assert!(!handle_pointer_event(
+            &mut app,
+            pointer(PointerKind::ScrollDown, action.x, action.y),
+            &info,
+        ));
+        assert_eq!(app.case_selection(), selection_before);
+
+        assert!(handle_pointer_event(
+            &mut app,
+            pointer(PointerKind::Down(PointerButton::Left), action.x, action.y,),
+            &info,
+        ));
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+        assert_eq!(app.current_problem().unwrap().total_cases, 2);
+        assert!(app.current_problem().unwrap().run.cases.is_empty());
+        assert!(app.edit_user_input_insert("kept buffer"));
+        let edited_buffer = app.selected_user_input_edit().unwrap().buffer().to_string();
+        let updated = rendered_fold_info(&app, 80, 16);
+        let body = updated.samples_body_area.unwrap();
+        assert!(handle_pointer_event(
+            &mut app,
+            pointer(PointerKind::ScrollDown, body.x, body.y),
+            &updated,
+        ));
+        assert_eq!(app.case_selection(), Some(app::CaseSelection::Test(0)));
+        assert_eq!(
+            app.active_user_input_edit().unwrap().buffer(),
+            edited_buffer
+        );
+    }
+
+    #[test]
+    fn edit_and_cancel_pointer_actions_do_not_also_toggle_input_fold() {
+        let mut app = user_input_app("exact\r\ncontent\r\n");
+        app.toggle_detail_section(detail::DetailSectionKind::Input);
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Input)
+        );
+        let read_only = rendered_fold_info(&app, 100, 30);
+        let edit = read_only.user_input_detail_action.unwrap();
+        assert!(handle_pointer_event(
+            &mut app,
+            pointer(
+                PointerKind::Down(PointerButton::Left),
+                edit.area.x,
+                edit.area.y,
+            ),
+            &read_only,
+        ));
+        assert!(app.user_input_editor_active());
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Input)
+        );
+        assert!(app.edit_user_input_insert("changed"));
+
+        let editing = rendered_fold_info(&app, 100, 30);
+        let cancel = editing.user_input_detail_action.unwrap();
+        assert!(handle_pointer_event(
+            &mut app,
+            pointer(
+                PointerKind::Down(PointerButton::Left),
+                cancel.area.x,
+                cancel.area.y,
+            ),
+            &editing,
+        ));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "exact\r\ncontent\r\n"
+        );
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(detail::DetailSectionKind::Input)
+        );
+    }
+
     #[test]
     fn mouse_wheel_over_samples_changes_sample() {
         let mut app = app();
@@ -9800,6 +10244,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(handle_pointer_event(
@@ -9836,6 +10281,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         for expected in [
@@ -9873,6 +10319,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(handle_pointer_event(
@@ -9894,6 +10341,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(handle_pointer_event(
@@ -9915,6 +10363,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(!handle_pointer_event(
@@ -9936,6 +10385,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(0, 0, 60, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(!handle_pointer_event(
@@ -9955,6 +10405,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         let mut samples_app = app();
@@ -9985,6 +10436,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(!handle_pointer_event(
@@ -10004,6 +10456,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 5, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
 
         assert!(!handle_pointer_event(
@@ -10025,6 +10478,7 @@ mod tests {
             detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
             detail_scrollbar: None,
             detail_section_headers: Vec::new(),
+            ..view::RenderInfo::default()
         };
         let pointer = PointerEvent {
             kind: PointerKind::ScrollDown,
