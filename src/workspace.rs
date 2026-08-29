@@ -1225,6 +1225,225 @@ pub fn validate_workspace_marker(destination: &Path) -> io::Result<()> {
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhysicalDirectoryIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u32,
+        file_index: u64,
+    },
+    #[cfg(not(any(unix, windows)))]
+    Other { canonical_path: PathBuf },
+}
+
+#[cfg(unix)]
+fn open_contest_destination_nofollow(destination: &Path) -> io::Result<CapDir> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(destination)?;
+    if !file.metadata()?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest directory is not a real directory: {}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(CapDir::from_std_file(file))
+}
+
+#[cfg(windows)]
+fn open_contest_destination_nofollow(destination: &Path) -> io::Result<CapDir> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(destination)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest directory is a reparse point: {}",
+                destination.display()
+            ),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest directory is not a real directory: {}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(CapDir::from_std_file(file))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_contest_destination_nofollow(destination: &Path) -> io::Result<CapDir> {
+    let directory = CapDir::open_ambient_dir(destination, ambient_authority())?;
+    if !directory.dir_metadata()?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "contest directory is not a real directory: {}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn opened_directory_identity(
+    directory: &CapDir,
+    _destination: &Path,
+) -> io::Result<PhysicalDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory.try_clone()?.into_std_file().metadata()?;
+    Ok(PhysicalDirectoryIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn opened_directory_identity(
+    directory: &CapDir,
+    _destination: &Path,
+) -> io::Result<PhysicalDirectoryIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = directory.try_clone()?.into_std_file();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` keeps the handle valid for the call and `information` points to writable
+    // storage of the exact structure required by Win32.
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::from_mut(&mut information))
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(PhysicalDirectoryIdentity::Windows {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_directory_identity(
+    _directory: &CapDir,
+    destination: &Path,
+) -> io::Result<PhysicalDirectoryIdentity> {
+    Ok(PhysicalDirectoryIdentity::Other {
+        canonical_path: fs::canonicalize(destination)?,
+    })
+}
+
+fn changed_contest_destination_error(destination: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!(
+            "contest destination changed while opening workspace state: {}",
+            destination.display()
+        ),
+    )
+}
+
+fn validate_workspace_marker_in_opened_directory(
+    destination: &Path,
+    directory: &CapDir,
+) -> io::Result<()> {
+    let marker_path = destination.join(".atc");
+    let metadata = match directory.symlink_metadata(".atc") {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("workspace marker not found: {}", marker_path.display()),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace marker is a reparse point: {}",
+                marker_path.display()
+            ),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace marker is not a real directory: {}",
+                marker_path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn open_validated_contest_destination_with_hook(
+    destination: &Path,
+    after_validation: impl FnOnce() -> io::Result<()>,
+) -> io::Result<CapDir> {
+    // Open the boundary first so marker validation is relative to a pinned physical directory,
+    // rather than validating one path target and opening another. If opening fails, retain the
+    // existing contest-directory error policy where it can provide the more specific error.
+    let expected_directory = match open_contest_destination_nofollow(destination) {
+        Ok(directory) => directory,
+        Err(open_error) => match validate_contest_directory(destination) {
+            Ok(()) => return Err(open_error),
+            Err(validation_error) => return Err(validation_error),
+        },
+    };
+    let expected_identity = opened_directory_identity(&expected_directory, destination)?;
+    validate_workspace_marker_in_opened_directory(destination, &expected_directory)?;
+    drop(expected_directory);
+
+    after_validation()?;
+
+    // Reopen the path and compare the physical directory, so only the directory whose marker was
+    // validated can become the capability used by the caller.
+    let opened_directory = open_contest_destination_nofollow(destination)?;
+    if opened_directory_identity(&opened_directory, destination)? != expected_identity {
+        return Err(changed_contest_destination_error(destination));
+    }
+    Ok(opened_directory)
+}
+
+pub(crate) fn open_validated_contest_destination_after(
+    destination: &Path,
+    after_validation: impl FnOnce() -> io::Result<()>,
+) -> io::Result<CapDir> {
+    open_validated_contest_destination_with_hook(destination, after_validation)
+}
+
 pub fn validate_refresh_destination(
     cwd: &Path,
     contest_id: &str,

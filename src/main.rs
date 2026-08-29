@@ -27,6 +27,9 @@ mod template;
 mod tui;
 mod ui;
 mod user_config_fs;
+// Phase 1 establishes persistence for a later TUI feature; no production caller exists yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod user_input;
 mod watcher;
 mod workspace;
 use crate::error::AppError;
