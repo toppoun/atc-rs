@@ -15,6 +15,7 @@ use std::time::Duration;
 use super::contest::{ContestTargetHealth, inspect_contest_target};
 use super::refresh::PreparedRefresh;
 use super::watch_worker::RunWorker;
+use crate::tui::app::{PersistedUserInputState, UserInputState};
 use crate::tui::detail_analysis::DetailAnalysisWorker;
 use crate::tui::message::Message;
 use crate::ui::Reporter;
@@ -634,6 +635,7 @@ struct PreparedWatchInput {
     contest: Contest,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
+    user_inputs: Vec<UserInputState>,
 }
 
 enum SwitchTargetPreparation {
@@ -650,13 +652,14 @@ struct SwitchPreparationError {
 
 impl PreparedWatchInput {
     fn load(destination: &Path, expected_contest_id: Option<&str>) -> Result<Self, AppError> {
-        let (contest, sample_counts, stress_cases) =
+        let (contest, sample_counts, stress_cases, user_inputs) =
             load_watch_input(destination, expected_contest_id)?;
         Ok(Self {
             destination: destination.to_path_buf(),
             contest,
             sample_counts,
             stress_cases,
+            user_inputs,
         })
     }
 
@@ -729,7 +732,7 @@ impl PreparedWatchInput {
             }
         }
 
-        let (contest, sample_counts, stress_cases) =
+        let (contest, sample_counts, stress_cases, user_inputs) =
             load_watch_input(&destination, Some(contest_id)).map_err(|error| {
                 SwitchPreparationError {
                     destination: Some(destination.clone()),
@@ -742,6 +745,7 @@ impl PreparedWatchInput {
             contest,
             sample_counts,
             stress_cases,
+            user_inputs,
         }))
     }
 }
@@ -1126,6 +1130,7 @@ impl ContestSession {
     {
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
+        let user_inputs = std::mem::take(&mut self.input.user_inputs);
         let channels = self.channels();
         let runtime = crate::tui::SessionRuntime::new(
             &self.input.destination,
@@ -1133,6 +1138,7 @@ impl ContestSession {
             &self.input.contest,
             sample_counts,
             stress_cases,
+            user_inputs,
             channels,
         );
         crate::tui::run(terminal, app_context, preferences, runtime, frontend)
@@ -1185,7 +1191,17 @@ impl Drop for ContestSession {
     }
 }
 
-type LoadedWatchInput = (Contest, Vec<usize>, Vec<Option<crate::model::Sample>>);
+type LoadedWatchInput = (
+    Contest,
+    Vec<usize>,
+    Vec<Option<crate::model::Sample>>,
+    Vec<UserInputState>,
+);
+type LoadedWatchData = (
+    Vec<usize>,
+    Vec<Option<crate::model::Sample>>,
+    Vec<UserInputState>,
+);
 
 fn load_watch_input(
     destination: &Path,
@@ -1199,15 +1215,12 @@ fn load_watch_input(
         workspace::validate_contest_identity(&contest, contest_id)?;
     }
 
-    let (sample_counts, stress_cases) = load_watch_data(destination, &contest)?;
+    let (sample_counts, stress_cases, user_inputs) = load_watch_data(destination, &contest)?;
 
-    Ok((contest, sample_counts, stress_cases))
+    Ok((contest, sample_counts, stress_cases, user_inputs))
 }
 
-fn load_watch_data(
-    destination: &Path,
-    contest: &Contest,
-) -> io::Result<(Vec<usize>, Vec<Option<crate::model::Sample>>)> {
+fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWatchData> {
     let sample_counts = contest
         .problems
         .iter()
@@ -1232,8 +1245,29 @@ fn load_watch_data(
             crate::stress::load_saved_case(destination, &contest.contest_id, &problem.index)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let user_inputs = contest
+        .problems
+        .iter()
+        .map(
+            |problem| match crate::user_input::load_user_inputs(destination, &problem.index) {
+                Ok(inputs) => UserInputState::loaded(
+                    inputs
+                        .into_iter()
+                        .map(|input| PersistedUserInputState {
+                            id: input.id,
+                            content: input.content,
+                        })
+                        .collect(),
+                ),
+                Err(error) => UserInputState::load_error(format!(
+                    "failed to load User Inputs for problem {}: {error}",
+                    problem.index
+                )),
+            },
+        )
+        .collect();
 
-    Ok((sample_counts, stress_cases))
+    Ok((sample_counts, stress_cases, user_inputs))
 }
 
 #[cfg(test)]
@@ -1341,7 +1375,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded_contest, sample_counts, stress_cases) =
+        let (loaded_contest, sample_counts, stress_cases, user_inputs) =
             load_watch_input(temp.path(), None).unwrap();
 
         assert_eq!(loaded_contest.contest_id, "contest");
@@ -1364,6 +1398,182 @@ mod tests {
                 None,
                 None,
             ]
+        );
+        assert!(user_inputs.iter().all(|state| {
+            state
+                .ready()
+                .is_some_and(|ready| ready.persisted().is_empty())
+        }));
+    }
+
+    #[test]
+    fn missing_user_input_directories_prepare_problem_local_ready_empty_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A"), problem("B")],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+
+        let prepared = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap();
+
+        assert_eq!(prepared.user_inputs.len(), 2);
+        for state in &prepared.user_inputs {
+            let ready = state.ready().expect("missing storage is Ready, not Error");
+            assert!(ready.persisted().is_empty());
+            assert!(ready.edit().is_none());
+        }
+    }
+
+    #[test]
+    fn persisted_user_inputs_load_in_id_order_with_exact_problem_local_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A"), problem("B")],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+        assert_eq!(
+            crate::user_input::create_user_input(temp.path(), "A", "one\r\n\r\n").unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::user_input::create_user_input(temp.path(), "A", "deleted").unwrap(),
+            2
+        );
+        assert_eq!(
+            crate::user_input::create_user_input(temp.path(), "A", "three\n\n").unwrap(),
+            3
+        );
+        crate::user_input::delete_user_input(temp.path(), "A", 2).unwrap();
+        assert_eq!(
+            crate::user_input::create_user_input(temp.path(), "B", "B only\n").unwrap(),
+            1
+        );
+
+        let prepared = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap();
+        let a = prepared.user_inputs[0].ready().unwrap().persisted();
+        let b = prepared.user_inputs[1].ready().unwrap().persisted();
+
+        assert_eq!(a.iter().map(|input| input.id).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(a[0].content, "one\r\n\r\n");
+        assert_eq!(a[1].content, "three\n\n");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].id, 1);
+        assert_eq!(b[0].content, "B only\n");
+    }
+
+    #[test]
+    fn one_problem_user_input_load_error_does_not_abort_the_contest_session_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A"), problem("B")],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+        let invalid_problem = temp.path().join(".atc/user-inputs/A");
+        std::fs::create_dir_all(&invalid_problem).unwrap();
+        std::fs::write(invalid_problem.join("1.in"), [0xff, 0xfe]).unwrap();
+        crate::user_input::create_user_input(temp.path(), "B", "healthy\r\n").unwrap();
+
+        let prepared = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap();
+
+        let error = prepared.user_inputs[0]
+            .error_message()
+            .expect("invalid UTF-8 must remain an explicit problem-local error");
+        assert!(error.contains("problem A"));
+        assert!(error.contains("UTF-8"));
+        assert!(prepared.user_inputs[0].ready().is_none());
+        assert_eq!(
+            prepared.user_inputs[1].ready().unwrap().persisted(),
+            [PersistedUserInputState {
+                id: 1,
+                content: "healthy\r\n".to_string(),
+            }]
+        );
+
+        let app = crate::tui::app::WatchApp::new_with_session_data(
+            &prepared.contest,
+            prepared.sample_counts.clone(),
+            prepared.stress_cases.clone(),
+            prepared.user_inputs.clone(),
+        )
+        .expect("a local User Input error must not prevent WatchApp construction");
+        assert_eq!(app.problems().len(), 2);
+        assert!(app.problems()[0].user_inputs.error_message().is_some());
+        assert!(app.problems()[1].user_inputs.ready().is_some());
+    }
+
+    #[test]
+    fn beginning_a_user_input_draft_does_not_mutate_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        save_healthy_contest(temp.path(), "abc123");
+        crate::user_input::create_user_input(temp.path(), "A", "persisted\r\n").unwrap();
+        let problem_directory = temp.path().join(".atc/user-inputs/A");
+        let snapshot = || {
+            let mut files = std::fs::read_dir(&problem_directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        };
+        let before = snapshot();
+        let mut prepared = PreparedWatchInput::load(temp.path(), Some("abc123")).unwrap();
+
+        prepared.user_inputs[0]
+            .ready_mut()
+            .unwrap()
+            .begin_draft()
+            .unwrap();
+
+        assert_eq!(snapshot(), before);
+        let ready = prepared.user_inputs[0].ready().unwrap();
+        assert_eq!(
+            ready.edit().unwrap().target(),
+            crate::tui::app::UserInputEditTarget::Draft
+        );
+        assert_eq!(ready.edit().unwrap().buffer(), "");
+    }
+
+    #[test]
+    fn fresh_prepared_contest_state_reloads_inputs_without_old_draft_or_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_destination = temp.path().join("old");
+        let new_destination = temp.path().join("new");
+        save_healthy_contest(&old_destination, "abc123");
+        save_healthy_contest(&new_destination, "abc467");
+        crate::user_input::create_user_input(&old_destination, "A", "old\n").unwrap();
+        crate::user_input::create_user_input(&new_destination, "A", "new\r\n").unwrap();
+        let mut old = PreparedWatchInput::load(&old_destination, Some("abc123")).unwrap();
+        old.user_inputs[0]
+            .ready_mut()
+            .unwrap()
+            .begin_persisted_edit(1)
+            .unwrap();
+        old.user_inputs[0]
+            .ready_mut()
+            .unwrap()
+            .edit_mut()
+            .unwrap()
+            .replace_buffer("unsaved old edit\n".to_string());
+
+        let fresh = PreparedWatchInput::load(&new_destination, Some("abc467")).unwrap();
+
+        let ready = fresh.user_inputs[0].ready().unwrap();
+        assert!(ready.edit().is_none());
+        assert_eq!(
+            ready.persisted(),
+            [PersistedUserInputState {
+                id: 1,
+                content: "new\r\n".to_string(),
+            }]
         );
     }
 

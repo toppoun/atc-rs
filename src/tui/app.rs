@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +32,182 @@ impl From<Sample> for SavedStressCaseState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedUserInputState {
+    pub id: u64,
+    pub content: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputEditTarget {
+    Draft,
+    Persisted(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputEditState {
+    target: UserInputEditTarget,
+    buffer: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl UserInputEditState {
+    pub fn target(&self) -> UserInputEditTarget {
+        self.target
+    }
+
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn replace_buffer(&mut self, buffer: String) {
+        self.buffer = buffer;
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputEditStartError {
+    AlreadyEditing,
+    PersistedInputNotFound(u64),
+}
+
+impl fmt::Display for UserInputEditStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyEditing => formatter.write_str("a user input edit is already active"),
+            Self::PersistedInputNotFound(id) => {
+                write!(formatter, "persisted user input {id} was not found")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UserInputEditStartError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserInputReadyState {
+    persisted: Vec<PersistedUserInputState>,
+    edit: Option<UserInputEditState>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl UserInputReadyState {
+    pub(crate) fn new(mut persisted: Vec<PersistedUserInputState>) -> Self {
+        persisted.sort_by_key(|input| input.id);
+        Self {
+            persisted,
+            edit: None,
+        }
+    }
+
+    pub fn persisted(&self) -> &[PersistedUserInputState] {
+        &self.persisted
+    }
+
+    pub fn edit(&self) -> Option<&UserInputEditState> {
+        self.edit.as_ref()
+    }
+
+    pub fn edit_mut(&mut self) -> Option<&mut UserInputEditState> {
+        self.edit.as_mut()
+    }
+
+    pub fn begin_draft(&mut self) -> Result<(), UserInputEditStartError> {
+        if self.edit.is_some() {
+            return Err(UserInputEditStartError::AlreadyEditing);
+        }
+        self.edit = Some(UserInputEditState {
+            target: UserInputEditTarget::Draft,
+            buffer: String::new(),
+        });
+        Ok(())
+    }
+
+    pub fn begin_persisted_edit(&mut self, id: u64) -> Result<(), UserInputEditStartError> {
+        if self.edit.is_some() {
+            return Err(UserInputEditStartError::AlreadyEditing);
+        }
+        let content = self
+            .persisted
+            .iter()
+            .find(|input| input.id == id)
+            .map(|input| input.content.clone())
+            .ok_or(UserInputEditStartError::PersistedInputNotFound(id))?;
+        self.edit = Some(UserInputEditState {
+            target: UserInputEditTarget::Persisted(id),
+            buffer: content,
+        });
+        Ok(())
+    }
+
+    pub fn edit_is_dirty(&self) -> Option<bool> {
+        let edit = self.edit.as_ref()?;
+        Some(match edit.target {
+            UserInputEditTarget::Draft => true,
+            UserInputEditTarget::Persisted(id) => {
+                let persisted = self
+                    .persisted
+                    .iter()
+                    .find(|input| input.id == id)
+                    .expect("an active persisted User Input edit must retain its target");
+                edit.buffer != persisted.content
+            }
+        })
+    }
+
+    pub fn cancel_edit(&mut self) -> bool {
+        self.edit.take().is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserInputState {
+    Ready(UserInputReadyState),
+    Error { message: Arc<String> },
+}
+
+impl Default for UserInputState {
+    fn default() -> Self {
+        Self::Ready(UserInputReadyState::default())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl UserInputState {
+    pub(crate) fn loaded(persisted: Vec<PersistedUserInputState>) -> Self {
+        Self::Ready(UserInputReadyState::new(persisted))
+    }
+
+    pub(crate) fn load_error(message: String) -> Self {
+        Self::Error {
+            message: Arc::new(message),
+        }
+    }
+
+    pub fn ready(&self) -> Option<&UserInputReadyState> {
+        match self {
+            Self::Ready(state) => Some(state),
+            Self::Error { .. } => None,
+        }
+    }
+
+    pub fn ready_mut(&mut self) -> Option<&mut UserInputReadyState> {
+        match self {
+            Self::Ready(state) => Some(state),
+            Self::Error { .. } => None,
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Error { message } => Some(message),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProblemState {
     pub index: String,
@@ -42,6 +219,8 @@ pub struct ProblemState {
     pub run: RunState,
     pub stress: StressState,
     pub stress_setup: StressSetupState,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub user_inputs: UserInputState,
     pub detail_mode: DetailMode,
 }
 
@@ -271,10 +450,21 @@ impl WatchApp {
         Self::new_with_stress_cases(contest, sample_counts, stress_cases)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_with_stress_cases(
         contest: &Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<Sample>>,
+    ) -> io::Result<Self> {
+        let user_inputs = vec![UserInputState::default(); contest.problems.len()];
+        Self::new_with_session_data(contest, sample_counts, stress_cases, user_inputs)
+    }
+
+    pub(crate) fn new_with_session_data(
+        contest: &Contest,
+        sample_counts: Vec<usize>,
+        stress_cases: Vec<Option<Sample>>,
+        user_inputs: Vec<UserInputState>,
     ) -> io::Result<Self> {
         if contest.problems.len() != sample_counts.len() {
             return Err(io::Error::new(
@@ -296,13 +486,24 @@ impl WatchApp {
                 ),
             ));
         }
+        if contest.problems.len() != user_inputs.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "problem and user input state lengths differ: {} problems, {} user input states",
+                    contest.problems.len(),
+                    user_inputs.len()
+                ),
+            ));
+        }
 
         let problems = contest
             .problems
             .iter()
             .zip(sample_counts)
             .zip(stress_cases)
-            .map(|((problem, sample_cases), stress_case)| {
+            .zip(user_inputs)
+            .map(|(((problem, sample_cases), stress_case), user_inputs)| {
                 let saved_stress_case = stress_case.map(SavedStressCaseState::from);
                 ProblemState {
                     index: problem.index.clone(),
@@ -314,6 +515,7 @@ impl WatchApp {
                     run: RunState::default(),
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
+                    user_inputs,
                     detail_mode: DetailMode::Samples,
                 }
             })
@@ -1586,6 +1788,220 @@ mod tests {
         ] {
             assert!(!app.detail_fold_state().is_collapsed(kind), "{kind:?}");
         }
+    }
+
+    fn loaded_user_inputs(inputs: &[(u64, &str)]) -> UserInputState {
+        UserInputState::loaded(
+            inputs
+                .iter()
+                .map(|(id, content)| PersistedUserInputState {
+                    id: *id,
+                    content: (*content).to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn user_input_draft_is_one_unsaved_empty_edit_and_cancel_discards_it() {
+        let mut state = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 1,
+            content: "persisted\n".to_string(),
+        }]);
+
+        state.begin_draft().unwrap();
+
+        let edit = state.edit().unwrap();
+        assert_eq!(edit.target(), UserInputEditTarget::Draft);
+        assert_eq!(edit.buffer(), "");
+        assert_eq!(state.edit_is_dirty(), Some(true));
+        assert_eq!(
+            state.begin_draft(),
+            Err(UserInputEditStartError::AlreadyEditing)
+        );
+        assert_eq!(state.persisted()[0].content, "persisted\n");
+
+        assert!(state.cancel_edit());
+        assert!(state.edit().is_none());
+        assert_eq!(state.edit_is_dirty(), None);
+        assert!(!state.cancel_edit());
+    }
+
+    #[test]
+    fn persisted_user_input_edit_is_exact_derived_and_cancel_preserves_content() {
+        let original = "alpha\r\n\r\nomega\r\n";
+        let mut state = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 3,
+            content: original.to_string(),
+        }]);
+
+        state.begin_persisted_edit(3).unwrap();
+        assert_eq!(
+            state.edit().unwrap().target(),
+            UserInputEditTarget::Persisted(3)
+        );
+        assert_eq!(state.edit().unwrap().buffer(), original);
+        assert_eq!(state.edit_is_dirty(), Some(false));
+
+        state
+            .edit_mut()
+            .unwrap()
+            .replace_buffer("alpha\r\n\r\nomega\n".to_string());
+        assert_eq!(state.edit_is_dirty(), Some(true));
+
+        state
+            .edit_mut()
+            .unwrap()
+            .replace_buffer(original.to_string());
+        assert_eq!(state.edit_is_dirty(), Some(false));
+
+        assert!(state.cancel_edit());
+        assert_eq!(state.persisted()[0].content, original);
+    }
+
+    #[test]
+    fn missing_persisted_user_input_edit_has_an_explicit_result() {
+        let mut state = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 1,
+            content: "one".to_string(),
+        }]);
+
+        assert_eq!(
+            state.begin_persisted_edit(3),
+            Err(UserInputEditStartError::PersistedInputNotFound(3))
+        );
+        assert!(state.edit().is_none());
+    }
+
+    #[test]
+    fn user_input_runtime_state_is_problem_local() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(2),
+            vec![0, 0],
+            vec![None, None],
+            vec![
+                loaded_user_inputs(&[(1, "A persisted\n")]),
+                loaded_user_inputs(&[(3, "B persisted\r\n")]),
+            ],
+        )
+        .unwrap();
+
+        app.problems[0]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .begin_draft()
+            .unwrap();
+        app.problems[1]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .begin_persisted_edit(3)
+            .unwrap();
+        app.problems[1]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .edit_mut()
+            .unwrap()
+            .replace_buffer("B edited\r\n".to_string());
+
+        let a = app.problems[0].user_inputs.ready().unwrap();
+        assert_eq!(a.edit().unwrap().target(), UserInputEditTarget::Draft);
+        assert_eq!(a.persisted()[0].content, "A persisted\n");
+        let b = app.problems[1].user_inputs.ready().unwrap();
+        assert_eq!(
+            b.edit().unwrap().target(),
+            UserInputEditTarget::Persisted(3)
+        );
+        assert_eq!(b.persisted()[0].content, "B persisted\r\n");
+        assert_eq!(b.edit_is_dirty(), Some(true));
+    }
+
+    #[test]
+    fn fresh_watch_app_does_not_retain_user_input_draft_or_edit_state() {
+        let contest = contest(2);
+        let session_inputs = || {
+            vec![
+                loaded_user_inputs(&[(1, "A persisted\n")]),
+                loaded_user_inputs(&[(3, "B persisted\r\n")]),
+            ]
+        };
+        let mut old = WatchApp::new_with_session_data(
+            &contest,
+            vec![0, 0],
+            vec![None, None],
+            session_inputs(),
+        )
+        .unwrap();
+        old.problems[0]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .begin_draft()
+            .unwrap();
+        old.problems[1]
+            .user_inputs
+            .ready_mut()
+            .unwrap()
+            .begin_persisted_edit(3)
+            .unwrap();
+
+        let fresh = WatchApp::new_with_session_data(
+            &contest,
+            vec![0, 0],
+            vec![None, None],
+            session_inputs(),
+        )
+        .unwrap();
+
+        assert!(
+            fresh.problems.iter().all(|problem| problem
+                .user_inputs
+                .ready()
+                .unwrap()
+                .edit()
+                .is_none())
+        );
+        assert_eq!(
+            fresh.problems[0].user_inputs.ready().unwrap().persisted()[0].content,
+            "A persisted\n"
+        );
+        assert_eq!(
+            fresh.problems[1].user_inputs.ready().unwrap().persisted()[0].content,
+            "B persisted\r\n"
+        );
+    }
+
+    #[test]
+    fn user_inputs_do_not_join_case_navigation_or_change_detail_modes() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![2],
+            vec![Some(Sample {
+                input: "stress input\n".to_string(),
+                output: "stress output\n".to_string(),
+            })],
+            vec![loaded_user_inputs(&[(1, "one\n"), (3, "three\n")])],
+        )
+        .unwrap();
+
+        assert_eq!(app.problems[0].total_cases, 3);
+        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
+
+        assert!(app.previous_case());
+        assert_eq!(app.selected_case(), 2, "saved Stress remains the last case");
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
+        assert!(app.next_case());
+        assert_eq!(app.selected_case(), 0);
+
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(app.queue_stress(0, 1).is_some());
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Stress);
+        assert!(app.next_case());
+        assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
+        assert_eq!(app.selected_case(), 1);
     }
 
     #[test]

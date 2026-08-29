@@ -2045,6 +2045,7 @@ pub(crate) struct SessionRuntime<'a> {
     stress_setup: StressSetupContext<'a>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
+    user_inputs: Vec<app::UserInputState>,
     channels: SessionChannels<'a>,
 }
 
@@ -2081,6 +2082,7 @@ impl<'a> SessionRuntime<'a> {
         contest: &'a Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
+        user_inputs: Vec<app::UserInputState>,
         channels: SessionChannels<'a>,
     ) -> Self {
         Self {
@@ -2089,6 +2091,7 @@ impl<'a> SessionRuntime<'a> {
             stress_setup: StressSetupContext::new(current_destination, contest),
             sample_counts,
             stress_cases,
+            user_inputs,
             channels,
         }
     }
@@ -2617,6 +2620,7 @@ where
         stress_setup,
         sample_counts,
         stress_cases,
+        user_inputs,
         channels:
             SessionChannels {
                 message_rx,
@@ -2625,8 +2629,12 @@ where
                 detail_analysis_rx,
             },
     } = runtime;
-    let mut app =
-        WatchApp::new_with_stress_cases(stress_setup.contest, sample_counts, stress_cases)?;
+    let mut app = WatchApp::new_with_session_data(
+        stress_setup.contest,
+        sample_counts,
+        stress_cases,
+        user_inputs,
+    )?;
     preferences.apply(&mut app);
     let initial_refresh_error = refresh_frontend_state
         .as_ref()
