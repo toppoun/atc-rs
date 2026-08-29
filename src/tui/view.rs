@@ -11,7 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{
-    CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState, WatchApp,
+    CaseSelection, CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState,
+    UserInputEditTarget, UserInputSelection, WatchApp,
 };
 use super::detail::{
     DetailDocument, DetailFoldAnimationFrame, DetailSectionClip, DetailSectionKind,
@@ -371,7 +372,7 @@ pub(super) fn render_frontend_with_pointer(
 
     // 選択中sample / compile error等の詳細
     let show_samples = app.samples_pane_enabled()
-        && current_problem.is_some_and(|problem| problem.total_cases > 0)
+        && current_problem.is_some_and(ProblemState::has_case_pane_content)
         && rows[1].width >= MIN_SAMPLES_LAYOUT_WIDTH;
 
     let (samples_area, detail_area) = if show_samples {
@@ -1318,6 +1319,27 @@ enum SampleRow {
     Blank,
     StressHeader,
     Stress { flat_index: usize },
+    UserInputsHeader,
+    UserInput { id: u64 },
+    Draft,
+    UserInputError,
+}
+
+impl SampleRow {
+    fn selection(self) -> Option<CaseSelection> {
+        match self {
+            Self::Sample { flat_index, .. } | Self::Stress { flat_index } => {
+                Some(CaseSelection::Test(flat_index))
+            }
+            Self::UserInput { id } => {
+                Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)))
+            }
+            Self::Draft => Some(CaseSelection::UserInput(UserInputSelection::Draft)),
+            Self::Blank | Self::StressHeader | Self::UserInputsHeader | Self::UserInputError => {
+                None
+            }
+        }
+    }
 }
 
 fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
@@ -1338,6 +1360,36 @@ fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
         });
     }
 
+    match &problem.user_inputs {
+        super::app::UserInputState::Ready(ready) => {
+            let has_draft = ready
+                .edit()
+                .is_some_and(|edit| edit.target() == UserInputEditTarget::Draft);
+            if !ready.persisted().is_empty() || has_draft {
+                if !rows.is_empty() {
+                    rows.push(SampleRow::Blank);
+                }
+                rows.push(SampleRow::UserInputsHeader);
+                rows.extend(
+                    ready
+                        .persisted()
+                        .iter()
+                        .map(|input| SampleRow::UserInput { id: input.id }),
+                );
+                if has_draft {
+                    rows.push(SampleRow::Draft);
+                }
+            }
+        }
+        super::app::UserInputState::Error { .. } => {
+            if !rows.is_empty() {
+                rows.push(SampleRow::Blank);
+            }
+            rows.push(SampleRow::UserInputsHeader);
+            rows.push(SampleRow::UserInputError);
+        }
+    }
+
     rows
 }
 
@@ -1346,30 +1398,34 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
         return Text::default();
     };
 
-    let mut lines = vec![
-        Line::styled("Samples", Style::default().add_modifier(Modifier::BOLD)),
-        Line::from(""),
-    ];
+    let mut lines = if problem.sample_cases > 0 {
+        vec![
+            Line::styled("Samples", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(""),
+        ]
+    } else {
+        Vec::new()
+    };
 
     let rows = sample_rows(problem);
-    let visible = usize::from(height.saturating_sub(2));
-    let selected_case = app.selected_case();
+    let visible = usize::from(height).saturating_sub(lines.len());
+    let selection = (problem.detail_mode == DetailMode::Samples)
+        .then(|| app.case_selection())
+        .flatten();
     let selected_row = rows
         .iter()
-        .position(|row| match row {
-            SampleRow::Sample { flat_index, .. } | SampleRow::Stress { flat_index } => {
-                *flat_index == selected_case
-            }
-            SampleRow::Blank | SampleRow::StressHeader => false,
-        })
+        .position(|row| row.selection() == selection && row.selection().is_some())
         .unwrap_or(0);
     let range = sample_window(rows.len(), selected_row, visible);
-    let selected = (problem.detail_mode == DetailMode::Samples).then_some(selected_case);
+    let selected_test = selection.and_then(|selection| match selection {
+        CaseSelection::Test(index) => Some(index),
+        CaseSelection::UserInput(_) => None,
+    });
 
     for row in &rows[range] {
         match *row {
             SampleRow::Sample { flat_index, number } => {
-                lines.push(sample_line(problem, flat_index, number, selected));
+                lines.push(sample_line(problem, flat_index, number, selected_test));
             }
             SampleRow::Blank => lines.push(Line::from("")),
             SampleRow::StressHeader => lines.push(Line::styled(
@@ -1377,12 +1433,38 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             SampleRow::Stress { flat_index } => {
-                lines.push(sample_line(problem, flat_index, 1, selected));
+                lines.push(sample_line(problem, flat_index, 1, selected_test));
             }
+            SampleRow::UserInputsHeader => lines.push(Line::styled(
+                "User Inputs",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            SampleRow::UserInput { id } => lines.push(user_input_line(
+                &format!("Input {id}"),
+                selection == Some(CaseSelection::UserInput(UserInputSelection::Persisted(id))),
+            )),
+            SampleRow::Draft => lines.push(user_input_line(
+                "Draft",
+                selection == Some(CaseSelection::UserInput(UserInputSelection::Draft)),
+            )),
+            SampleRow::UserInputError => lines.push(Line::styled(
+                "  ! Failed to load",
+                Style::default().fg(Color::Red),
+            )),
         }
     }
 
     Text::from(lines)
+}
+
+fn user_input_line(label: &str, selected: bool) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::styled(format!("{marker} {label}"), style)
 }
 
 fn sample_window(total: usize, selected: usize, visible: usize) -> std::ops::Range<usize> {
@@ -1457,6 +1539,7 @@ mod tests {
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;
+    use crate::tui::app::{PersistedUserInputState, UserInputReadyState, UserInputState};
     use crate::tui::detail_layout::{max_scroll, viewport_text, wrap_detail_document};
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
@@ -1479,6 +1562,35 @@ mod tests {
             vec![1],
         )
         .unwrap()
+    }
+
+    fn app_with_user_inputs(sample_count: usize, user_inputs: UserInputState) -> WatchApp {
+        WatchApp::new_with_session_data(
+            &Contest {
+                contest_id: "abc123".to_string(),
+                problems: vec![Problem {
+                    index: "A".to_string(),
+                    title: "Problem A".to_string(),
+                    task_id: "abc123_a".to_string(),
+                    url: "https://example.invalid/a".to_string(),
+                    sample_count,
+                }],
+            },
+            vec![sample_count],
+            vec![None],
+            vec![user_inputs],
+        )
+        .unwrap()
+    }
+
+    fn user_input_detail_app() -> WatchApp {
+        app_with_user_inputs(
+            0,
+            UserInputState::loaded(vec![PersistedUserInputState {
+                id: 3,
+                content: "user input body".to_string(),
+            }]),
+        )
     }
 
     fn render_info(app: &WatchApp, width: u16, height: u16) -> RenderInfo {
@@ -3098,6 +3210,7 @@ mod tests {
             semantic_sample_app(false),
             semantic_sample_app(true),
             foldable_app("actual body".to_string()),
+            user_input_detail_app(),
         ] {
             let (_, initial) = render_with_pointer_position(&app, None, 100, 40);
             let target = initial.detail_section_headers[0];
@@ -3108,7 +3221,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_animation_clips_the_same_semantic_bodies_for_normal_debug_and_stress_details() {
+    fn fold_animation_clips_the_same_semantic_bodies_for_test_stress_and_user_input_details() {
         for (app, kind, body) in [
             (
                 semantic_sample_app(false),
@@ -3124,6 +3237,11 @@ mod tests {
                 foldable_app("actual body".to_string()),
                 DetailSectionKind::Input,
                 "input body",
+            ),
+            (
+                user_input_detail_app(),
+                DetailSectionKind::Input,
+                "user input body",
             ),
         ] {
             let hidden_frame = DetailFoldAnimationFrame {
@@ -3606,6 +3724,139 @@ mod tests {
             ]
         );
         assert_eq!(sample_window(5, 4, 2), 3..5);
+    }
+
+    #[test]
+    fn user_input_rows_are_sorted_selected_and_rendered_without_test_results() {
+        let mut app = app_with_user_inputs(
+            1,
+            UserInputState::loaded(vec![
+                PersistedUserInputState {
+                    id: 8,
+                    content: "eight".to_string(),
+                },
+                PersistedUserInputState {
+                    id: 1,
+                    content: "one".to_string(),
+                },
+                PersistedUserInputState {
+                    id: 3,
+                    content: "three".to_string(),
+                },
+            ]),
+        );
+
+        assert_eq!(
+            sample_rows(app.current_problem().unwrap()),
+            vec![
+                SampleRow::Sample {
+                    flat_index: 0,
+                    number: 1,
+                },
+                SampleRow::Blank,
+                SampleRow::UserInputsHeader,
+                SampleRow::UserInput { id: 1 },
+                SampleRow::UserInput { id: 3 },
+                SampleRow::UserInput { id: 8 },
+            ]
+        );
+        assert!(app.next_case());
+        let text = samples_text(&app, 20);
+        let lines = text_lines(&text);
+        assert!(lines.iter().any(|line| line == "> Input 1"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("AC") || line.contains("ms"))
+        );
+        let selected = text
+            .lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    == "> Input 1"
+            })
+            .unwrap();
+        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn user_input_load_error_is_a_visible_non_selectable_section() {
+        let mut app = app_with_user_inputs(
+            0,
+            UserInputState::load_error(
+                "permission denied: full detail stays out of pane".to_string(),
+            ),
+        );
+        app.toggle_samples_pane();
+
+        assert_eq!(
+            sample_rows(app.current_problem().unwrap()),
+            vec![SampleRow::UserInputsHeader, SampleRow::UserInputError]
+        );
+        assert_eq!(
+            text_lines(&samples_text(&app, 10)),
+            ["User Inputs", "  ! Failed to load"]
+        );
+        assert_eq!(app.case_selection(), None);
+        assert!(render_info(&app, 52, 12).samples_area.is_some());
+    }
+
+    #[test]
+    fn user_input_only_problem_can_show_the_cases_pane() {
+        let mut app = app_with_user_inputs(
+            0,
+            UserInputState::loaded(vec![PersistedUserInputState {
+                id: 3,
+                content: "only input".to_string(),
+            }]),
+        );
+        app.toggle_samples_pane();
+
+        let info = render_info(&app, 52, 12);
+        assert!(info.samples_area.is_some());
+        assert_eq!(
+            text_lines(&samples_text(&app, 10)),
+            ["User Inputs", "> Input 3"]
+        );
+    }
+
+    #[test]
+    fn draft_only_problem_renders_the_cases_pane_selection_and_input_detail() {
+        let draft = "draft first line\r\n\r\ndraft last line\r\n";
+        let mut ready = UserInputReadyState::default();
+        ready.begin_draft().unwrap();
+        ready.edit_mut().unwrap().replace_buffer(draft.to_string());
+        let mut app = app_with_user_inputs(0, UserInputState::Ready(ready));
+
+        assert_eq!(app.current_problem().unwrap().sample_cases, 0);
+        assert!(app.current_problem().unwrap().saved_stress_case.is_none());
+        assert_eq!(app.current_problem().unwrap().total_cases, 0);
+        assert!(app.current_problem().unwrap().run.cases.is_empty());
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Draft))
+        );
+        assert_eq!(
+            text_lines(&samples_text(&app, 10)),
+            ["User Inputs", "> Draft"]
+        );
+
+        app.toggle_samples_pane();
+        assert!(render_info(&app, 80, 16).samples_area.is_some());
+        let rendered = rendered_buffer_text(&app, 80, 16);
+        assert!(rendered.contains("User Inputs"));
+        assert!(rendered.contains("> Draft"));
+        assert!(rendered.contains("▼ Input"));
+        assert!(rendered.contains("draft first line"));
+        assert!(rendered.contains("draft last line"));
+        assert_eq!(
+            DetailDocument::from_app(&app).section_body(DetailSectionKind::Input),
+            Some(draft)
+        );
     }
 
     #[test]

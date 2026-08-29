@@ -9811,6 +9811,58 @@ mod tests {
         assert_eq!(app.selected_case(), 1);
         assert_eq!(app.detail_scroll(), 0);
     }
+
+    #[test]
+    fn mouse_wheel_over_cases_navigates_into_user_inputs_and_wraps() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[1]),
+            vec![1],
+            vec![None],
+            vec![app::UserInputState::loaded(vec![
+                app::PersistedUserInputState {
+                    id: 1,
+                    content: "one".to_string(),
+                },
+                app::PersistedUserInputState {
+                    id: 3,
+                    content: "three".to_string(),
+                },
+            ])],
+        )
+        .unwrap();
+        let info = view::RenderInfo {
+            max_detail_scroll: Some(20),
+            samples_area: Some(ratatui::layout::Rect::new(0, 0, 20, 10)),
+            detail_area: ratatui::layout::Rect::new(20, 0, 40, 10),
+            detail_scrollbar: None,
+            detail_section_headers: Vec::new(),
+        };
+
+        for expected in [
+            app::CaseSelection::UserInput(app::UserInputSelection::Persisted(1)),
+            app::CaseSelection::UserInput(app::UserInputSelection::Persisted(3)),
+            app::CaseSelection::Test(0),
+        ] {
+            assert!(handle_pointer_event(
+                &mut app,
+                pointer(PointerKind::ScrollDown, 5, 5),
+                &info,
+            ));
+            assert_eq!(app.case_selection(), Some(expected));
+        }
+
+        assert!(handle_pointer_event(
+            &mut app,
+            pointer(PointerKind::ScrollUp, 5, 5),
+            &info,
+        ));
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(3)
+            ))
+        );
+    }
     #[test]
     fn mouse_wheel_over_detail_scrolls_detail() {
         let mut app = app();

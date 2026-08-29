@@ -45,6 +45,18 @@ pub enum UserInputEditTarget {
     Persisted(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputSelection {
+    Persisted(u64),
+    Draft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseSelection {
+    Test(usize),
+    UserInput(UserInputSelection),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInputEditState {
     target: UserInputEditTarget,
@@ -224,6 +236,54 @@ pub struct ProblemState {
     pub detail_mode: DetailMode,
 }
 
+impl ProblemState {
+    fn user_input_selections(&self) -> impl Iterator<Item = CaseSelection> + '_ {
+        let ready = self.user_inputs.ready();
+        let persisted = ready.into_iter().flat_map(|ready| {
+            ready
+                .persisted()
+                .iter()
+                .map(|input| CaseSelection::UserInput(UserInputSelection::Persisted(input.id)))
+        });
+        let draft = ready
+            .and_then(UserInputReadyState::edit)
+            .filter(|edit| edit.target() == UserInputEditTarget::Draft)
+            .map(|_| CaseSelection::UserInput(UserInputSelection::Draft));
+
+        persisted.chain(draft)
+    }
+
+    fn case_selections(&self) -> Vec<CaseSelection> {
+        (0..self.total_cases)
+            .map(CaseSelection::Test)
+            .chain(self.user_input_selections())
+            .collect()
+    }
+
+    fn first_case_selection(&self) -> Option<CaseSelection> {
+        if self.total_cases > 0 {
+            Some(CaseSelection::Test(0))
+        } else {
+            self.user_input_selections().next()
+        }
+    }
+
+    fn contains_case_selection(&self, selection: CaseSelection) -> bool {
+        match selection {
+            CaseSelection::Test(index) => index < self.total_cases,
+            CaseSelection::UserInput(_) => {
+                self.user_input_selections().any(|item| item == selection)
+            }
+        }
+    }
+
+    pub fn has_case_pane_content(&self) -> bool {
+        self.total_cases > 0
+            || self.user_inputs.error_message().is_some()
+            || self.user_input_selections().next().is_some()
+    }
+}
+
 #[derive(Debug)]
 pub struct WatchApp {
     should_quit: bool,
@@ -234,7 +294,7 @@ pub struct WatchApp {
     problems: Vec<ProblemState>,
 
     selected_problem: usize,
-    selected_case: usize,
+    case_selection: Option<CaseSelection>,
 
     detail_scroll: usize,
     detail_revision: u64,
@@ -276,8 +336,14 @@ impl DetailFoldState {
 struct DisplayedDetailCase {
     problem: usize,
     mode: DetailMode,
-    sample_case: Option<usize>,
-    persisted_stress_case: bool,
+    case: Option<DisplayedNormalCase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayedNormalCase {
+    Sample(usize),
+    SavedStress,
+    UserInput(UserInputSelection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,7 +585,10 @@ impl WatchApp {
                     detail_mode: DetailMode::Samples,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let case_selection = problems
+            .first()
+            .and_then(ProblemState::first_case_selection);
 
         Ok(Self {
             should_quit: false,
@@ -528,7 +597,7 @@ impl WatchApp {
             contest_id: contest.contest_id.clone(),
             problems,
             selected_problem: 0,
-            selected_case: 0,
+            case_selection,
             detail_scroll: 0,
             detail_revision: 0,
             detail_folds: DetailFoldState::default(),
@@ -559,8 +628,27 @@ impl WatchApp {
         self.problems.get(self.selected_problem)
     }
 
+    pub fn case_selection(&self) -> Option<CaseSelection> {
+        self.case_selection
+    }
+
+    pub fn selected_test_case(&self) -> Option<usize> {
+        match self.case_selection {
+            Some(CaseSelection::Test(index)) => Some(index),
+            Some(CaseSelection::UserInput(_)) | None => None,
+        }
+    }
+
+    pub fn selected_user_input(&self) -> Option<UserInputSelection> {
+        match self.case_selection {
+            Some(CaseSelection::UserInput(selection)) => Some(selection),
+            Some(CaseSelection::Test(_)) | None => None,
+        }
+    }
+
+    #[cfg(test)]
     pub fn selected_case(&self) -> usize {
-        self.selected_case
+        self.selected_test_case().unwrap_or(0)
     }
 
     pub fn selected_problem(&self) -> Option<usize> {
@@ -636,15 +724,28 @@ impl WatchApp {
 
     fn displayed_detail_case(&self) -> Option<DisplayedDetailCase> {
         let problem = self.current_problem()?;
-        let sample_case =
-            (problem.detail_mode == DetailMode::Samples).then_some(self.selected_case);
+        let case = if problem.detail_mode == DetailMode::Samples {
+            match self.case_selection {
+                Some(CaseSelection::Test(index)) if index < problem.sample_cases => {
+                    Some(DisplayedNormalCase::Sample(index))
+                }
+                Some(CaseSelection::Test(index))
+                    if problem.saved_stress_case.is_some() && index == problem.sample_cases =>
+                {
+                    Some(DisplayedNormalCase::SavedStress)
+                }
+                Some(CaseSelection::UserInput(selection)) => {
+                    Some(DisplayedNormalCase::UserInput(selection))
+                }
+                Some(CaseSelection::Test(_)) | None => None,
+            }
+        } else {
+            None
+        };
         Some(DisplayedDetailCase {
             problem: self.selected_problem,
             mode: problem.detail_mode,
-            sample_case,
-            persisted_stress_case: problem.detail_mode == DetailMode::Samples
-                && problem.saved_stress_case.is_some()
-                && self.selected_case >= problem.sample_cases,
+            case,
         })
     }
 
@@ -658,10 +759,40 @@ impl WatchApp {
         }
     }
 
-    fn current_case_count(&self) -> usize {
-        self.current_problem()
-            .map(|problem| problem.total_cases)
-            .unwrap_or(0)
+    fn selected_test_detail_for(&self, problem: usize) -> Option<usize> {
+        (self.selected_problem == problem
+            && self
+                .problems
+                .get(problem)
+                .is_some_and(|problem| problem.detail_mode == DetailMode::Samples))
+        .then(|| self.selected_test_case())
+        .flatten()
+    }
+
+    fn displays_attempt_detail(&self, problem: usize, mode: DetailMode) -> bool {
+        self.selected_problem == problem
+            && self
+                .problems
+                .get(problem)
+                .is_some_and(|state| state.detail_mode == mode)
+            && (mode == DetailMode::Stress || self.selected_user_input().is_none())
+    }
+
+    fn reconcile_case_selection(&mut self, problem: usize) {
+        if self.selected_problem != problem {
+            return;
+        }
+        let Some(problem) = self.problems.get(problem) else {
+            self.case_selection = None;
+            return;
+        };
+        if self
+            .case_selection
+            .is_some_and(|selection| problem.contains_case_selection(selection))
+        {
+            return;
+        }
+        self.case_selection = problem.first_case_selection();
     }
 
     pub fn quit(&mut self) {
@@ -757,7 +888,7 @@ impl WatchApp {
 
         let previous_detail_case = self.displayed_detail_case();
         self.selected_problem = index;
-        self.selected_case = 0;
+        self.case_selection = self.problems[index].first_case_selection();
         self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -767,7 +898,7 @@ impl WatchApp {
     pub fn next_problem(&mut self) -> bool {
         if self.problems.is_empty() {
             self.selected_problem = 0;
-            self.selected_case = 0;
+            self.case_selection = None;
             return false;
         }
 
@@ -778,7 +909,7 @@ impl WatchApp {
     pub fn previous_problem(&mut self) -> bool {
         if self.problems.is_empty() {
             self.selected_problem = 0;
-            self.selected_case = 0;
+            self.case_selection = None;
             return false;
         }
 
@@ -791,21 +922,27 @@ impl WatchApp {
     }
 
     pub fn next_case(&mut self) -> bool {
-        let count = self.current_case_count();
-
-        if count == 0 {
-            self.selected_case = 0;
+        let Some(problem) = self.current_problem() else {
+            self.case_selection = None;
             return false;
-        }
-
-        let next = (self.selected_case + 1) % count;
+        };
+        let selections = problem.case_selections();
+        let Some(next) = self
+            .case_selection
+            .and_then(|selected| selections.iter().position(|item| *item == selected))
+            .map(|index| selections[(index + 1) % selections.len()])
+            .or_else(|| selections.first().copied())
+        else {
+            self.case_selection = None;
+            return false;
+        };
         let mode_changed = self.problems[self.selected_problem].detail_mode != DetailMode::Samples;
-        if next == self.selected_case && !mode_changed {
+        if Some(next) == self.case_selection && !mode_changed {
             return false;
         }
         let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
-        self.selected_case = next;
+        self.case_selection = Some(next);
         self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -813,25 +950,27 @@ impl WatchApp {
     }
 
     pub fn previous_case(&mut self) -> bool {
-        let count = self.current_case_count();
-
-        if count == 0 {
-            self.selected_case = 0;
+        let Some(problem) = self.current_problem() else {
+            self.case_selection = None;
             return false;
-        }
-
-        let previous = if self.selected_case == 0 {
-            count - 1
-        } else {
-            self.selected_case - 1
+        };
+        let selections = problem.case_selections();
+        let Some(previous) = self
+            .case_selection
+            .and_then(|selected| selections.iter().position(|item| *item == selected))
+            .map(|index| selections[(index + selections.len() - 1) % selections.len()])
+            .or_else(|| selections.last().copied())
+        else {
+            self.case_selection = None;
+            return false;
         };
         let mode_changed = self.problems[self.selected_problem].detail_mode != DetailMode::Samples;
-        if previous == self.selected_case && !mode_changed {
+        if Some(previous) == self.case_selection && !mode_changed {
             return false;
         }
         let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
-        self.selected_case = previous;
+        self.case_selection = Some(previous);
         self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -851,7 +990,7 @@ impl WatchApp {
         self.problems[problem].source = Some(source);
         self.problems[problem].detail_mode = DetailMode::Samples;
         self.selected_problem = problem;
-        self.selected_case = 0;
+        self.case_selection = self.problems[problem].first_case_selection();
         self.reset_folds_if_displayed_case_changed(previous_detail_case);
         self.reset_detail_scroll();
         self.invalidate_detail();
@@ -936,6 +1075,7 @@ impl WatchApp {
         let run_id = self.next_run_id;
         self.next_run_id += 1;
 
+        let previous_detail_case = self.displayed_detail_case();
         self.problems[problem].detail_mode = DetailMode::Samples;
         if self.problems[problem].stress.id.is_some()
             && matches!(
@@ -957,10 +1097,16 @@ impl WatchApp {
             error: None,
             cases: vec![CaseState::default(); total_cases],
         };
-        self.reset_detail_scroll();
         if self.selected_problem == problem {
-            self.reset_detail_folds();
-            self.invalidate_detail();
+            let displayed_case_changed = self.displayed_detail_case() != previous_detail_case;
+            if displayed_case_changed || self.selected_user_input().is_none() {
+                self.reset_detail_scroll();
+                self.reset_folds_if_displayed_case_changed(previous_detail_case);
+                if !displayed_case_changed {
+                    self.reset_detail_folds();
+                }
+                self.invalidate_detail();
+            }
         }
 
         Some(RunRequest {
@@ -1057,10 +1203,10 @@ impl WatchApp {
     }
 
     pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
-        let affects_current_detail = self.selected_problem == problem;
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
         };
+        let affects_current_detail = self.displays_attempt_detail(problem, mode);
 
         let changed = match mode {
             DetailMode::Samples => {
@@ -1104,7 +1250,7 @@ impl WatchApp {
         changed
     }
     pub fn run_requeued(&mut self, problem: usize, run_id: RunId) -> bool {
-        let affects_current_detail = self.selected_problem == problem;
+        let affects_current_detail = self.displays_attempt_detail(problem, DetailMode::Samples);
         let Some(total_cases) = self
             .problems
             .get(problem)
@@ -1129,10 +1275,10 @@ impl WatchApp {
         run.error = None;
         run.cases = vec![CaseState::default(); total_cases];
 
+        if self.selected_problem == problem {
+            self.reconcile_case_selection(problem);
+        }
         if affects_current_detail {
-            if total_cases == 0 || self.selected_case >= total_cases {
-                self.selected_case = 0;
-            }
             self.reset_detail_scroll();
             self.reset_detail_folds();
             self.invalidate_detail();
@@ -1148,7 +1294,7 @@ impl WatchApp {
         stress_case: Option<Sample>,
     ) -> bool {
         let previous_detail_case = self.displayed_detail_case();
-        let affects_current_detail = self.selected_problem == problem;
+        let affects_current_detail = self.displays_attempt_detail(problem, DetailMode::Samples);
         let Some(problem_state) = self.problems.get_mut(problem) else {
             return false;
         };
@@ -1174,10 +1320,10 @@ impl WatchApp {
         problem_state.run.total_cases = total_cases;
         problem_state.run.cases = vec![CaseState::default(); total_cases];
 
+        if self.selected_problem == problem {
+            self.reconcile_case_selection(problem);
+        }
         if affects_current_detail {
-            if total_cases == 0 || self.selected_case >= total_cases {
-                self.selected_case = 0;
-            }
             self.reset_detail_scroll();
             self.reset_folds_if_displayed_case_changed(previous_detail_case);
             self.invalidate_detail();
@@ -1197,18 +1343,17 @@ impl WatchApp {
             event => event,
         };
 
-        let affects_current_detail = self.selected_problem == problem
-            && match &event {
-                TestEvent::TestCaseAccepted { number, .. }
-                | TestEvent::TestCaseComparison { number, .. }
-                | TestEvent::TestCaseWrongAnswer { number, .. }
-                | TestEvent::TestCaseRuntimeError { number, .. }
-                | TestEvent::TestCaseTimedOut { number, .. }
-                | TestEvent::TestCaseStderr { number, .. } => {
-                    number.checked_sub(1) == Some(self.selected_case)
-                }
-                _ => true,
-            };
+        let affects_current_detail = match &event {
+            TestEvent::TestCaseAccepted { number, .. }
+            | TestEvent::TestCaseComparison { number, .. }
+            | TestEvent::TestCaseWrongAnswer { number, .. }
+            | TestEvent::TestCaseRuntimeError { number, .. }
+            | TestEvent::TestCaseTimedOut { number, .. }
+            | TestEvent::TestCaseStderr { number, .. } => {
+                number.checked_sub(1) == self.selected_test_detail_for(problem)
+            }
+            _ => self.displays_attempt_detail(problem, DetailMode::Samples),
+        };
 
         let updated_total_cases = match &event {
             TestEvent::TestRunStarted { total_cases } => Some(*total_cases),
@@ -1378,16 +1523,19 @@ impl WatchApp {
                 self.problems[problem].sample_cases = 0;
                 self.problems[problem].saved_stress_case = None;
             }
-            if self.selected_problem == problem
-                && (total_cases == 0 || self.selected_case >= total_cases)
-            {
-                self.selected_case = 0;
+            if self.selected_problem == problem {
+                self.reconcile_case_selection(problem);
+                let displayed_case_changed = self.displayed_detail_case() != previous_detail_case;
+                if affects_current_detail || displayed_case_changed {
+                    self.reset_folds_if_displayed_case_changed(previous_detail_case);
+                    self.reset_detail_scroll();
+                }
             }
-            self.reset_folds_if_displayed_case_changed(previous_detail_case);
-            self.reset_detail_scroll();
         }
 
-        if changed && affects_current_detail {
+        if changed
+            && (affects_current_detail || self.displayed_detail_case() != previous_detail_case)
+        {
             self.invalidate_detail();
         }
 
@@ -1410,11 +1558,13 @@ impl WatchApp {
         elapsed: Duration,
         saved_to: PathBuf,
     ) -> bool {
+        let previous_detail_case = self.displayed_detail_case();
         let affects_current_detail = self.selected_problem == problem
-            && self.problems.get(problem).is_some_and(|problem| {
-                problem.detail_mode == DetailMode::Stress
-                    || (problem.detail_mode == DetailMode::Samples
-                        && self.selected_case >= problem.sample_cases)
+            && self.problems.get(problem).is_some_and(|state| {
+                state.detail_mode == DetailMode::Stress
+                    || (state.detail_mode == DetailMode::Samples
+                        && state.saved_stress_case.is_some()
+                        && self.selected_test_case() == Some(state.sample_cases))
             });
         let Some(problem_state) = self.problems.get_mut(problem) else {
             return false;
@@ -1483,8 +1633,15 @@ impl WatchApp {
             case.stderr = (!stderr.is_empty()).then_some(stderr);
         }
 
-        if affects_current_detail {
+        if self.selected_problem == problem {
+            self.reconcile_case_selection(problem);
+        }
+        let displayed_case_changed = self.displayed_detail_case() != previous_detail_case;
+        if affects_current_detail || displayed_case_changed {
             self.reset_detail_folds();
+            if displayed_case_changed {
+                self.reset_detail_scroll();
+            }
             self.invalidate_detail();
         }
 
@@ -1608,14 +1765,10 @@ impl WatchApp {
     }
 
     pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
-        let detail_mode = self
-            .problems
-            .get(problem)
-            .map(|problem| problem.detail_mode);
-        let affects_current_detail = self.selected_problem == problem;
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
         };
+        let affects_current_detail = self.displays_attempt_detail(problem, mode);
 
         let changed = match mode {
             DetailMode::Samples => {
@@ -1658,7 +1811,7 @@ impl WatchApp {
             self.problems[problem].stress_setup = StressSetupState::None;
         }
 
-        if changed && affects_current_detail && detail_mode == Some(mode) {
+        if changed && affects_current_detail {
             self.invalidate_detail();
         }
 
@@ -1666,14 +1819,10 @@ impl WatchApp {
     }
 
     pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
-        let detail_mode = self
-            .problems
-            .get(problem)
-            .map(|problem| problem.detail_mode);
-        let affects_current_detail = self.selected_problem == problem;
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
         };
+        let affects_current_detail = self.displays_attempt_detail(problem, mode);
 
         let changed = match mode {
             DetailMode::Samples => {
@@ -1712,7 +1861,7 @@ impl WatchApp {
             self.problems[problem].stress_setup = StressSetupState::None;
         }
 
-        if changed && affects_current_detail && detail_mode == Some(mode) {
+        if changed && affects_current_detail {
             self.invalidate_detail();
         }
 
@@ -1724,7 +1873,10 @@ impl WatchApp {
     }
 
     pub fn selected_case_state(&self) -> Option<&CaseState> {
-        self.current_problem()?.run.cases.get(self.selected_case)
+        self.current_problem()?
+            .run
+            .cases
+            .get(self.selected_test_case()?)
     }
 }
 
@@ -1752,16 +1904,15 @@ mod tests {
     fn assert_selection_invariant(app: &WatchApp) {
         if app.problems.is_empty() {
             assert_eq!(app.selected_problem, 0);
-            assert_eq!(app.selected_case, 0);
+            assert_eq!(app.case_selection, None);
             return;
         }
 
         assert!(app.selected_problem < app.problems.len());
-        let total_cases = app.current_case_count();
-        if total_cases == 0 {
-            assert_eq!(app.selected_case, 0);
-        } else {
-            assert!(app.selected_case < total_cases);
+        let problem = app.current_problem().unwrap();
+        match app.case_selection {
+            Some(selection) => assert!(problem.contains_case_selection(selection)),
+            None => assert!(problem.first_case_selection().is_none()),
         }
     }
 
@@ -1800,6 +1951,11 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn assert_case_selection(app: &WatchApp, expected: Option<CaseSelection>) {
+        assert_eq!(app.case_selection(), expected);
+        assert_selection_invariant(app);
     }
 
     #[test]
@@ -1974,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn user_inputs_do_not_join_case_navigation_or_change_detail_modes() {
+    fn samples_stress_and_user_inputs_share_semantic_navigation_without_changing_test_counts() {
         let mut app = WatchApp::new_with_session_data(
             &contest(1),
             vec![2],
@@ -1987,21 +2143,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.problems[0].total_cases, 3);
-        assert_eq!(app.selected_case(), 0);
+        assert_eq!(app.problems[0].run.cases.len(), 0);
+        assert_case_selection(&app, Some(CaseSelection::Test(0)));
         assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
 
-        assert!(app.previous_case());
-        assert_eq!(app.selected_case(), 2, "saved Stress remains the last case");
-        assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
         assert!(app.next_case());
-        assert_eq!(app.selected_case(), 0);
+        assert_case_selection(&app, Some(CaseSelection::Test(1)));
+        assert!(app.next_case());
+        assert_case_selection(&app, Some(CaseSelection::Test(2)));
+        assert!(app.next_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(1))),
+        );
+        assert!(app.next_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(3))),
+        );
+        assert!(app.next_case());
+        assert_case_selection(&app, Some(CaseSelection::Test(0)));
+
+        assert!(app.previous_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(3))),
+        );
+        assert_eq!(app.problems[0].total_cases, 3);
+        assert!(app.problems[0].run.cases.is_empty());
 
         assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
         assert!(app.queue_stress(0, 1).is_some());
         assert_eq!(app.problems[0].detail_mode, DetailMode::Stress);
         assert!(app.next_case());
         assert_eq!(app.problems[0].detail_mode, DetailMode::Samples);
-        assert_eq!(app.selected_case(), 1);
+        assert_case_selection(&app, Some(CaseSelection::Test(1)));
     }
 
     #[test]
@@ -2214,6 +2390,118 @@ mod tests {
         assert_eq!(app.selected_case(), 2);
         app.next_case();
         assert_eq!(app.selected_case(), 0);
+    }
+
+    #[test]
+    fn samples_and_non_contiguous_user_input_ids_navigate_in_both_directions() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![None],
+            vec![loaded_user_inputs(&[
+                (8, "eight"),
+                (1, "one"),
+                (3, "three"),
+            ])],
+        )
+        .unwrap();
+
+        for expected in [
+            CaseSelection::UserInput(UserInputSelection::Persisted(1)),
+            CaseSelection::UserInput(UserInputSelection::Persisted(3)),
+            CaseSelection::UserInput(UserInputSelection::Persisted(8)),
+            CaseSelection::Test(0),
+        ] {
+            assert!(app.next_case());
+            assert_case_selection(&app, Some(expected));
+        }
+
+        for expected in [
+            CaseSelection::UserInput(UserInputSelection::Persisted(8)),
+            CaseSelection::UserInput(UserInputSelection::Persisted(3)),
+            CaseSelection::UserInput(UserInputSelection::Persisted(1)),
+            CaseSelection::Test(0),
+        ] {
+            assert!(app.previous_case());
+            assert_case_selection(&app, Some(expected));
+        }
+    }
+
+    #[test]
+    fn zero_samples_selects_user_input_and_no_selectable_cases_selects_nothing() {
+        let mut user_input_only = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "three")])],
+        )
+        .unwrap();
+        assert_case_selection(
+            &user_input_only,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(3))),
+        );
+        assert!(!user_input_only.next_case());
+        assert!(!user_input_only.previous_case());
+
+        let mut empty = WatchApp::new(&contest(1), vec![0]).unwrap();
+        assert_case_selection(&empty, None);
+        assert!(!empty.next_case());
+        assert!(!empty.previous_case());
+        assert_case_selection(&empty, None);
+    }
+
+    #[test]
+    fn draft_is_the_last_semantic_item_without_becoming_a_test_case() {
+        let mut ready = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 3,
+            content: "three".to_string(),
+        }]);
+        ready.begin_draft().unwrap();
+        ready
+            .edit_mut()
+            .unwrap()
+            .replace_buffer("draft\r\nbody\r\n".to_string());
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![None],
+            vec![UserInputState::Ready(ready)],
+        )
+        .unwrap();
+
+        assert!(app.previous_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Draft)),
+        );
+        assert_eq!(app.current_problem().unwrap().total_cases, 1);
+        assert!(app.current_problem().unwrap().run.cases.is_empty());
+    }
+
+    #[test]
+    fn problem_switch_selects_the_destination_first_semantic_item() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(3),
+            vec![2, 0, 0],
+            vec![None, None, None],
+            vec![
+                UserInputState::default(),
+                loaded_user_inputs(&[(8, "eight")]),
+                UserInputState::default(),
+            ],
+        )
+        .unwrap();
+        assert!(app.next_case());
+
+        assert!(app.select_problem(1));
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8))),
+        );
+        assert!(app.select_problem(2));
+        assert_case_selection(&app, None);
+        assert!(app.select_problem(0));
+        assert_case_selection(&app, Some(CaseSelection::Test(0)));
     }
 
     #[test]
@@ -3918,11 +4206,241 @@ mod tests {
     }
 
     #[test]
+    fn test_layout_and_case_events_preserve_user_input_selection_and_detail_state() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![2],
+            vec![Some(Sample {
+                input: "old stress\n".to_string(),
+                output: "old expected\n".to_string(),
+            })],
+            vec![loaded_user_inputs(&[(3, "user\r\ninput\r\n")])],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.next_case());
+        assert!(app.next_case());
+        assert!(app.next_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(3))),
+        );
+        app.toggle_detail_section(DetailSectionKind::Input);
+        assert!(app.scroll_detail_down(27));
+        let revision = app.detail_revision();
+
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseLayout {
+                sample_cases: 1,
+                stress_case: None,
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(2),
+            },
+        ));
+
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(3))),
+        );
+        assert_eq!(app.current_problem().unwrap().sample_cases, 1);
+        assert!(app.current_problem().unwrap().saved_stress_case.is_none());
+        assert_eq!(app.current_problem().unwrap().total_cases, 1);
+        assert_eq!(app.current_problem().unwrap().run.cases.len(), 1);
+        assert_eq!(app.detail_scroll(), 27);
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Input)
+        );
+        assert_eq!(app.detail_revision(), revision);
+    }
+
+    #[test]
+    fn run_lifecycle_preserves_user_input_selection_fold_scroll_and_revision() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![1],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "user input\r\n")])],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        assert!(app.next_case());
+
+        let selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(3)));
+        assert_case_selection(&app, selection);
+        app.toggle_detail_section(DetailSectionKind::Input);
+        assert!(app.scroll_detail_down(27));
+        let folds = app.detail_fold_state();
+        let scroll = app.detail_scroll();
+        let revision = app.detail_revision();
+
+        let assert_preserved = |app: &WatchApp, operation: &str| {
+            assert_eq!(app.case_selection(), selection, "{operation}: selection");
+            assert_eq!(app.detail_fold_state(), folds, "{operation}: folds");
+            assert_eq!(app.detail_scroll(), scroll, "{operation}: scroll");
+            assert_eq!(app.detail_revision(), revision, "{operation}: revision");
+            assert_selection_invariant(app);
+        };
+
+        let first = app.queue_run(0).unwrap();
+        assert_preserved(&app, "queue_run");
+
+        assert!(app.run_started(0, first.run_id));
+        assert_preserved(&app, "run_started");
+
+        assert!(app.run_requeued(0, first.run_id));
+        assert_preserved(&app, "run_requeued");
+
+        assert!(app.run_started(0, first.run_id));
+        assert_preserved(&app, "run_started after requeue");
+
+        assert!(app.run_completed(0, first.run_id));
+        assert_preserved(&app, "run_completed");
+
+        let second = app.queue_run(0).unwrap();
+        assert_preserved(&app, "queue_run before failure");
+        assert!(app.run_started(0, second.run_id));
+        assert_preserved(&app, "run_started before failure");
+        assert!(app.run_failed(0, second.run_id, "runner failed".to_string()));
+        assert_preserved(&app, "run_failed");
+    }
+
+    #[test]
+    fn saved_stress_failure_does_not_replace_or_invalidate_user_input_detail() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(8, "kept user input\r\n")])],
+        )
+        .unwrap();
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        let request = app.queue_stress(0, 99).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Started {
+                base_seed: 99,
+                case_limit: None,
+            },
+        ));
+        assert!(app.next_case(), "case navigation exits live Stress mode");
+        assert_eq!(
+            app.current_problem().unwrap().detail_mode,
+            DetailMode::Samples
+        );
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8))),
+        );
+        app.toggle_detail_section(DetailSectionKind::Input);
+        assert!(app.scroll_detail_down(19));
+        let revision = app.detail_revision();
+
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Failed {
+                kind: CandidateFailureKind::WrongAnswer,
+                case_number: 4,
+                base_seed: 99,
+                seed: 102,
+                input: "saved stress input\n".to_string(),
+                expected: "expected\n".to_string(),
+                actual: "actual\n".to_string(),
+                stderr: String::new(),
+                candidate_elapsed: Duration::from_millis(3),
+                elapsed: Duration::from_millis(12),
+                saved_to: PathBuf::from(".atc/stress/A"),
+            },
+        ));
+
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8))),
+        );
+        assert_eq!(app.current_problem().unwrap().total_cases, 1);
+        assert_eq!(app.current_problem().unwrap().run.cases.len(), 1);
+        assert_eq!(app.detail_scroll(), 19);
+        assert!(
+            app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Input)
+        );
+        assert_eq!(app.detail_revision(), revision);
+        assert!(detail_text(&app).contains("▶ Input"));
+        assert!(!detail_text(&app).contains("saved stress input"));
+    }
+
+    #[test]
+    fn persisted_and_draft_user_input_details_preserve_exact_content_and_fold_identity() {
+        let persisted = "alpha\r\n\r\nomega\r\n";
+        let mut ready = UserInputReadyState::new(vec![PersistedUserInputState {
+            id: 3,
+            content: persisted.to_string(),
+        }]);
+        ready.begin_draft().unwrap();
+        let draft = "draft\r\n\r\nbody\n";
+        ready.edit_mut().unwrap().replace_buffer(draft.to_string());
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![UserInputState::Ready(ready)],
+        )
+        .unwrap();
+
+        let persisted_document = DetailDocument::from_app(&app);
+        assert_eq!(
+            persisted_document.section_body(DetailSectionKind::Input),
+            Some(persisted)
+        );
+        assert!(detail_text(&app).contains("▼ Input\nalpha\r\n\r\nomega\r\n"));
+
+        app.toggle_detail_section(DetailSectionKind::Input);
+        assert!(detail_text(&app).contains("▶ Input"));
+        assert_eq!(
+            DetailDocument::from_app(&app).section_body(DetailSectionKind::Input),
+            Some(persisted)
+        );
+
+        assert!(app.next_case());
+        assert_case_selection(
+            &app,
+            Some(CaseSelection::UserInput(UserInputSelection::Draft)),
+        );
+        assert!(
+            !app.detail_fold_state()
+                .is_collapsed(DetailSectionKind::Input),
+            "changing semantic detail identity resets folds"
+        );
+        assert_eq!(
+            DetailDocument::from_app(&app).section_body(DetailSectionKind::Input),
+            Some(draft)
+        );
+    }
+
+    #[test]
     fn selected_case_is_clamped_to_current_problem_sample_count_on_requeue() {
         let (mut app, run_id) = queued_cpp_app(3);
         assert!(app.run_started(0, run_id));
         assert!(app.run_event(0, run_id, TestEvent::TestRunStarted { total_cases: 3 },));
-        app.selected_case = 2;
+        app.case_selection = Some(CaseSelection::Test(2));
         app.problems[0].total_cases = 1;
 
         assert!(app.run_requeued(0, run_id));

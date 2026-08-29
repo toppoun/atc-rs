@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::app::{
     CaseVerdict, DetailFoldState, DetailMode, ProblemState, RunPhase, StressPhase,
-    StressSetupState, WatchApp,
+    StressSetupState, UserInputEditTarget, UserInputSelection, WatchApp,
 };
 
 // Byte position in the virtual concatenation of all detail segments. Segment
@@ -50,6 +50,21 @@ enum DetailSegmentText<'a> {
     SharedSlice(&'a str),
     #[cfg(test)]
     SharedOwned(Arc<String>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SemanticSectionContent<'a> {
+    Shared(&'a Arc<String>),
+    Slice(&'a str),
+}
+
+impl<'a> SemanticSectionContent<'a> {
+    fn text(self) -> &'a str {
+        match self {
+            Self::Shared(content) => content.as_str(),
+            Self::Slice(content) => content,
+        }
+    }
 }
 
 impl DetailSegmentText<'_> {
@@ -205,9 +220,14 @@ impl<'a> DetailDocument<'a> {
     fn push_sample_run_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
 
+        if let Some(selection) = app.selected_user_input() {
+            self.push_user_input_detail(app, problem, selection);
+            return;
+        }
+
         if run.id.is_none()
             && problem.saved_stress_case.is_some()
-            && app.selected_case() >= problem.sample_cases
+            && app.selected_test_case() == Some(problem.sample_cases)
         {
             self.push_saved_stress_case_detail(app, problem);
             return;
@@ -413,7 +433,12 @@ impl<'a> DetailDocument<'a> {
             return;
         }
 
-        if app.selected_case() >= problem.sample_cases {
+        let Some(selected_case) = app.selected_test_case() else {
+            self.push_static("Running samples...");
+            return;
+        };
+
+        if selected_case >= problem.sample_cases {
             self.push_saved_stress_case_detail(app, problem);
             return;
         }
@@ -421,7 +446,7 @@ impl<'a> DetailDocument<'a> {
         let Some(case) = app.selected_case_state() else {
             self.push_owned(format!(
                 "sample {} / {}\n\nPending...",
-                app.selected_case() + 1,
+                selected_case + 1,
                 problem.sample_cases,
             ));
             return;
@@ -429,7 +454,7 @@ impl<'a> DetailDocument<'a> {
 
         self.push_owned(format!(
             "sample {} / {}   {}{}",
-            app.selected_case() + 1,
+            selected_case + 1,
             problem.sample_cases,
             verdict_label(case.verdict),
             elapsed_label(case.elapsed),
@@ -546,6 +571,40 @@ impl<'a> DetailDocument<'a> {
         }
     }
 
+    fn push_user_input_detail(
+        &mut self,
+        app: &'a WatchApp,
+        problem: &'a ProblemState,
+        selection: UserInputSelection,
+    ) {
+        let Some(ready) = problem.user_inputs.ready() else {
+            self.push_static("User Input unavailable");
+            return;
+        };
+        let content = match selection {
+            UserInputSelection::Persisted(id) => ready
+                .persisted()
+                .iter()
+                .find(|input| input.id == id)
+                .map(|input| input.content.as_str()),
+            UserInputSelection::Draft => ready
+                .edit()
+                .filter(|edit| edit.target() == UserInputEditTarget::Draft)
+                .map(|edit| edit.buffer()),
+        };
+        let Some(content) = content else {
+            self.push_static("User Input unavailable");
+            return;
+        };
+
+        self.push_semantic_slice_section(
+            DetailSectionKind::Input,
+            "Input",
+            content,
+            app.detail_fold_state(),
+        );
+    }
+
     fn push_optional_semantic_shared_section(
         &mut self,
         kind: DetailSectionKind,
@@ -563,6 +622,26 @@ impl<'a> DetailDocument<'a> {
         kind: DetailSectionKind,
         label: &'static str,
         content: &'a Arc<String>,
+        folds: DetailFoldState,
+    ) {
+        self.push_semantic_section(kind, label, SemanticSectionContent::Shared(content), folds);
+    }
+
+    fn push_semantic_slice_section(
+        &mut self,
+        kind: DetailSectionKind,
+        label: &'static str,
+        content: &'a str,
+        folds: DetailFoldState,
+    ) {
+        self.push_semantic_section(kind, label, SemanticSectionContent::Slice(content), folds);
+    }
+
+    fn push_semantic_section(
+        &mut self,
+        kind: DetailSectionKind,
+        label: &'static str,
+        content: SemanticSectionContent<'a>,
         folds: DetailFoldState,
     ) {
         self.push_semantic_section_gap();
@@ -583,10 +662,11 @@ impl<'a> DetailDocument<'a> {
             self.push_static("▼ ");
         }
         self.push_static(label);
-        let displayed_content = if content.is_empty() {
+        let content_text = content.text();
+        let displayed_content = if content_text.is_empty() {
             "(empty)"
         } else {
-            content.as_str()
+            content_text
         };
         self.section_bodies.push((kind, displayed_content));
         if folds.is_collapsed(kind) {
@@ -604,12 +684,15 @@ impl<'a> DetailDocument<'a> {
         }
 
         self.push_static("\n");
-        if content.is_empty() {
+        if content_text.is_empty() {
             self.push_static_prefix("(empty)", prefix_len);
-        } else if prefix_len == content.len() {
-            self.push_shared(content);
+        } else if prefix_len == content_text.len() {
+            match content {
+                SemanticSectionContent::Shared(content) => self.push_shared(content),
+                SemanticSectionContent::Slice(content) => self.push_shared_slice(content),
+            }
         } else {
-            self.push_shared_slice(&content[..prefix_len]);
+            self.push_shared_slice(&content_text[..prefix_len]);
         }
     }
 
