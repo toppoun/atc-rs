@@ -395,7 +395,9 @@ impl OpenSourceController {
             target
         };
 
+        let previous_problem = app.selected_problem();
         app.source_changed(problem, target.clone(), language);
+        sync_user_inputs_on_problem_entry(app, previous_problem, Some(&self.destination));
         let launch = editor.launch(&resolved, &target);
         match launch {
             Ok(()) => self.close(),
@@ -2467,10 +2469,20 @@ fn initialize_problem_stress(
     }
 }
 
+#[cfg(test)]
 fn handle_messages(
     app: &mut WatchApp,
     message_rx: &Receiver<Message>,
     run_tx: &Sender<RunWorkerCommand>,
+) -> io::Result<bool> {
+    handle_messages_with_destination(app, message_rx, run_tx, None)
+}
+
+fn handle_messages_with_destination(
+    app: &mut WatchApp,
+    message_rx: &Receiver<Message>,
+    run_tx: &Sender<RunWorkerCommand>,
+    current_destination: Option<&Path>,
 ) -> io::Result<bool> {
     let mut changed = false;
 
@@ -2481,7 +2493,9 @@ fn handle_messages(
                 path,
                 language,
             }) => {
+                let previous_problem = app.selected_problem();
                 if app.source_changed(problem, path, language) {
+                    sync_user_inputs_on_problem_entry(app, previous_problem, current_destination);
                     changed = true;
                     queue_problem_run(app, problem, run_tx)?;
                 }
@@ -2714,7 +2728,12 @@ where
             dirty = true;
         }
 
-        if handle_messages(&mut app, message_rx, run_tx)? {
+        if handle_messages_with_destination(
+            &mut app,
+            message_rx,
+            run_tx,
+            Some(current_destination),
+        )? {
             dirty = true;
         }
 
@@ -2730,7 +2749,12 @@ where
         if contest_refresh.refresh_requested {
             // Capture the most recent canonical source transition possible before the
             // frontend yields to the outer shutdown/apply lifecycle.
-            handle_messages(&mut app, message_rx, run_tx)?;
+            handle_messages_with_destination(
+                &mut app,
+                message_rx,
+                run_tx,
+                Some(current_destination),
+            )?;
             break;
         }
 
@@ -3532,13 +3556,78 @@ fn handle_key_event_with_frontend_context(
         );
     }
 
-    match key.code {
-        KeyCode::Char('h') | KeyCode::Left => Ok(app.previous_problem()),
-        KeyCode::Char('l') | KeyCode::Right => Ok(app.next_problem()),
-        KeyCode::Char('j') | KeyCode::Down => Ok(app.next_case()),
-        KeyCode::Char('k') | KeyCode::Up => Ok(app.previous_case()),
-        _ => Ok(false),
+    let previous_problem = app.selected_problem();
+    let changed = match key.code {
+        KeyCode::Char('h') | KeyCode::Left => app.previous_problem(),
+        KeyCode::Char('l') | KeyCode::Right => app.next_problem(),
+        KeyCode::Char('j') | KeyCode::Down => app.next_case(),
+        KeyCode::Char('k') | KeyCode::Up => app.previous_case(),
+        _ => false,
+    };
+    sync_user_inputs_on_problem_entry(app, previous_problem, input.terminal.current_destination);
+    Ok(changed)
+}
+
+fn sync_user_inputs_on_problem_entry(
+    app: &mut WatchApp,
+    previous_problem: Option<usize>,
+    current_destination: Option<&Path>,
+) {
+    if app.selected_problem() != previous_problem
+        && let Some(problem) = app.selected_problem()
+    {
+        sync_user_inputs_for_problem(app, current_destination, problem);
     }
+}
+
+// Returns success, not UI dirtiness. Failed loads leave the cache intact and
+// must never authorize starting an edit from an unverified baseline.
+fn sync_user_inputs_for_problem(
+    app: &mut WatchApp,
+    current_destination: Option<&Path>,
+    problem: usize,
+) -> bool {
+    let Some(state) = app.problems().get(problem) else {
+        return false;
+    };
+    if state
+        .user_inputs
+        .ready()
+        .is_some_and(|ready| ready.edit().is_some())
+    {
+        return false;
+    }
+    let loaded = match current_destination {
+        Some(destination) => load_reconciled_user_inputs(destination, &state.index)
+            .map_err(|error| error.to_string()),
+        None => Err("current contest destination is unavailable".to_string()),
+    };
+    let succeeded = loaded.is_ok();
+    app.reconcile_user_input_sync(problem, loaded);
+    succeeded
+}
+
+fn sync_selected_user_input_before_edit(
+    app: &mut WatchApp,
+    current_destination: Option<&Path>,
+) -> bool {
+    let Some(problem) = app.selected_problem() else {
+        return false;
+    };
+    let Some(app::UserInputSelection::Persisted(id)) = app.selected_user_input() else {
+        return false;
+    };
+    if app.active_user_input_edit().is_some() {
+        return false;
+    }
+    // The synchronous load leaves the pre-sync list/ordinals available to the
+    // pure reconciliation. Keep the intended ID even if selection falls back.
+    if sync_user_inputs_for_problem(app, current_destination, problem)
+        && app.selected_user_input() == Some(app::UserInputSelection::Persisted(id))
+    {
+        app.begin_selected_user_input_edit().unwrap_or(false);
+    }
+    true
 }
 
 fn load_reconciled_user_inputs(
@@ -4081,7 +4170,7 @@ fn handle_pointer_event_with_mouse_mode(
     {
         return match target.action {
             view::UserInputDetailAction::Edit => {
-                app.begin_selected_user_input_edit().unwrap_or(false)
+                sync_selected_user_input_before_edit(app, current_destination)
             }
             view::UserInputDetailAction::Save => current_destination
                 .is_some_and(|destination| save_selected_user_input(app, destination)),
@@ -10235,6 +10324,700 @@ mod tests {
         }
     }
 
+    fn sync_test_app(destination: &Path, samples: &[usize]) -> WatchApp {
+        let contest = contest_with_problems(samples);
+        WatchApp::new_with_session_data(
+            &contest,
+            samples.to_vec(),
+            vec![None; samples.len()],
+            contest
+                .problems
+                .iter()
+                .map(|problem| {
+                    app::UserInputState::loaded(
+                        load_reconciled_user_inputs(destination, &problem.index).unwrap(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn write_sync_inputs(destination: &Path, problem: &str, inputs: &[(u64, &str)]) {
+        let directory = destination.join(".atc/user-inputs").join(problem);
+        fs::create_dir_all(&directory).unwrap();
+        for (id, content) in inputs {
+            fs::write(directory.join(format!("{id}.in")), content).unwrap();
+        }
+    }
+
+    fn select_sync_input(app: &mut WatchApp, id: u64) {
+        for _ in 0..20 {
+            if app.selected_user_input() == Some(app::UserInputSelection::Persisted(id)) {
+                return;
+            }
+            app.next_case();
+        }
+        panic!("input {id} was not selectable");
+    }
+
+    fn sync_notice(app: &WatchApp) -> Option<&str> {
+        app.current_problem()
+            .unwrap()
+            .user_input_sync_notice
+            .as_deref()
+            .map(String::as_str)
+    }
+
+    fn click_sync_edit(app: &mut WatchApp, destination: &Path) {
+        let info = rendered_fold_info(app, 120, 35);
+        let edit = info
+            .user_input_detail_actions
+            .iter()
+            .find(|target| target.action == view::UserInputDetailAction::Edit)
+            .unwrap();
+        assert!(super::handle_pointer_event_with_mouse_mode(
+            app,
+            &mut detail_layout::DetailLayout::default(),
+            &mut DetailScrollbarDragState::default(),
+            pointer(
+                PointerKind::Down(PointerButton::Left),
+                edit.area.x,
+                edit.area.y
+            ),
+            &info,
+            MouseMode::Cells,
+            Some(destination),
+        ));
+    }
+
+    fn dispatch_sync_events(
+        app: &mut WatchApp,
+        info: &view::RenderInfo,
+        events: &mut VecDeque<TerminalEvent>,
+        destination: &Path,
+    ) {
+        let (run_tx, run_rx) = mpsc::channel();
+        assert!(
+            super::handle_terminal_events_with_mouse_mode(
+                app,
+                &mut detail_layout::DetailLayout::default(),
+                &mut DetailScrollbarDragState::default(),
+                info,
+                events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, Some(destination), None),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(run_rx.try_recv().is_err());
+    }
+
+    fn switch_sync_problem(app: &mut WatchApp, destination: &Path, code: KeyCode) {
+        let (run_tx, run_rx) = mpsc::channel();
+        assert!(
+            handle_key_event_with_stress_context(
+                app,
+                key(code, KeyEventKind::Press),
+                &run_tx,
+                Some(destination),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(run_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn edit_sync_uses_latest_disk_content_as_clean_buffer_and_baseline() {
+        for latest in ["A\r\n", "B\n\t界\n"] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "A", &[(7, "A\r\n")]);
+            let mut app = loaded_user_input_app(&destination);
+            write_sync_inputs(&destination, "A", &[(7, latest)]);
+            click_sync_edit(&mut app, &destination);
+            let snapshot = app.user_input_save_snapshot().unwrap();
+            assert_eq!(snapshot.target, app::UserInputEditTarget::Persisted(7));
+            assert_eq!(snapshot.content, latest);
+            assert_eq!(snapshot.baseline.as_deref(), Some(latest));
+            assert!(!snapshot.dirty);
+            assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+            assert_eq!(sync_notice(&app), None);
+        }
+    }
+
+    #[test]
+    fn edit_sync_missing_target_falls_back_to_next_previous_sample_or_none() {
+        for (ids, selected, samples, expected) in [
+            (
+                vec![1, 3, 7],
+                3,
+                1,
+                Some(app::CaseSelection::UserInput(
+                    app::UserInputSelection::Persisted(7),
+                )),
+            ),
+            (
+                vec![1, 3],
+                3,
+                1,
+                Some(app::CaseSelection::UserInput(
+                    app::UserInputSelection::Persisted(1),
+                )),
+            ),
+            (vec![3], 3, 1, Some(app::CaseSelection::Test(0))),
+            (vec![3], 3, 0, None),
+        ] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(
+                &destination,
+                "A",
+                &ids.iter().map(|id| (*id, "content")).collect::<Vec<_>>(),
+            );
+            let mut app = sync_test_app(&destination, &[samples]);
+            select_sync_input(&mut app, selected);
+            let ordinal = ids.iter().position(|id| *id == selected).unwrap() + 1;
+            fs::remove_file(destination.join(format!(".atc/user-inputs/A/{selected}.in"))).unwrap();
+            click_sync_edit(&mut app, &destination);
+            assert_eq!(app.case_selection(), expected);
+            let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+            assert!(ready.edit().is_none());
+            assert!(!ready.persisted().iter().any(|input| input.id == selected));
+            let notice = format!("User Input {ordinal} was removed externally.");
+            assert_eq!(sync_notice(&app), Some(notice.as_str()));
+            assert!(
+                rendered_app_text(&app, 120, 35).contains(&format!("! Input {ordinal} removed"))
+            );
+        }
+    }
+
+    #[test]
+    fn edit_sync_unrelated_deletion_keeps_stable_id_and_packs_display_ordinal() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(1, "one"), (3, "three"), (7, "seven")]);
+        let mut app = loaded_user_input_app(&destination);
+        app.toggle_samples_pane();
+        select_sync_input(&mut app, 7);
+        fs::remove_file(destination.join(".atc/user-inputs/A/3.in")).unwrap();
+        click_sync_edit(&mut app, &destination);
+        assert_eq!(
+            app.selected_user_input(),
+            Some(app::UserInputSelection::Persisted(7))
+        );
+        assert_eq!(
+            app.user_input_save_snapshot().unwrap().baseline.as_deref(),
+            Some("seven")
+        );
+        assert_eq!(
+            sync_notice(&app),
+            Some("User Input 2 was removed externally.")
+        );
+        let rendered = rendered_app_text(&app, 120, 35);
+        assert!(rendered.contains("> Input 2"));
+        assert!(rendered.contains("! Input 2 removed"));
+        assert!(!rendered.contains("User Input 3 was removed"));
+        assert!(!rendered.contains("Input 7"));
+        assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+    }
+
+    #[test]
+    fn edit_sync_multiple_deletions_sort_and_reconcile_without_dangling_selection() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(
+            &destination,
+            "A",
+            &[(9, "nine"), (7, "seven"), (3, "three"), (1, "one")],
+        );
+        let mut app = loaded_user_input_app(&destination);
+        select_sync_input(&mut app, 7);
+        fs::remove_file(destination.join(".atc/user-inputs/A/3.in")).unwrap();
+        fs::remove_file(destination.join(".atc/user-inputs/A/7.in")).unwrap();
+        click_sync_edit(&mut app, &destination);
+        assert_eq!(
+            app.selected_user_input(),
+            Some(app::UserInputSelection::Persisted(9))
+        );
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert_eq!(
+            ready
+                .persisted()
+                .iter()
+                .map(|input| input.id)
+                .collect::<Vec<_>>(),
+            [1, 9]
+        );
+        assert!(ready.edit().is_none());
+        assert_eq!(
+            sync_notice(&app),
+            Some("2 User Inputs were removed externally.")
+        );
+    }
+
+    #[test]
+    fn edit_sync_removed_problem_directory_drops_all_rows_without_a_draft() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(1, "one"), (7, "seven")]);
+        let mut app = loaded_user_input_app(&destination);
+        fs::remove_dir_all(destination.join(".atc/user-inputs/A")).unwrap();
+        click_sync_edit(&mut app, &destination);
+        assert_eq!(app.case_selection(), None);
+        assert!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()
+                .is_empty()
+        );
+        assert!(app.active_user_input_edit().is_none());
+        assert_eq!(
+            sync_notice(&app),
+            Some("2 User Inputs were removed externally.")
+        );
+    }
+
+    #[test]
+    fn edit_sync_load_errors_keep_cache_selection_and_do_not_start_editor() {
+        for failure in ["utf8", "metadata", "workspace", "io"] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "A", &[(3, "cached"), (7, "other")]);
+            let mut app = loaded_user_input_app(&destination);
+            let cached = app.current_problem().unwrap().user_inputs.clone();
+            let selection = app.case_selection();
+            match failure {
+                "utf8" => fs::write(destination.join(".atc/user-inputs/A/7.in"), [0xff]).unwrap(),
+                "metadata" => {
+                    fs::write(destination.join(".atc/user-inputs/A/meta.toml"), "invalid").unwrap()
+                }
+                "workspace" => fs::remove_dir_all(destination.join(".atc")).unwrap(),
+                "io" => {
+                    fs::remove_dir_all(destination.join(".atc/user-inputs/A")).unwrap();
+                    fs::write(destination.join(".atc/user-inputs/A"), "not a directory").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = load_reconciled_user_inputs(&destination, "A")
+                .unwrap_err()
+                .to_string();
+            click_sync_edit(&mut app, &destination);
+            assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+            assert_eq!(app.case_selection(), selection);
+            assert!(app.active_user_input_edit().is_none());
+            assert_eq!(
+                sync_notice(&app),
+                Some(format!("Could not refresh User Inputs: {error}").as_str())
+            );
+            assert!(rendered_app_text(&app, 160, 40).contains("! Input sync failed"));
+        }
+    }
+
+    #[test]
+    fn edit_sync_without_current_destination_never_uses_cached_baseline() {
+        let mut app = user_input_app("cached");
+        let cached = app.current_problem().unwrap().user_inputs.clone();
+        assert!(sync_selected_user_input_before_edit(&mut app, None));
+        assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+        assert!(app.active_user_input_edit().is_none());
+        assert!(
+            sync_notice(&app)
+                .unwrap()
+                .contains("destination is unavailable")
+        );
+    }
+
+    #[test]
+    fn edit_sync_rejected_symlink_keeps_cache_and_external_content_untouched() {
+        let (temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(7, "cached")]);
+        let mut app = loaded_user_input_app(&destination);
+        let cached = app.current_problem().unwrap().user_inputs.clone();
+        let external = temp.path().join("external.in");
+        fs::write(&external, "external").unwrap();
+        let target = destination.join(".atc/user-inputs/A/7.in");
+        fs::remove_file(&target).unwrap();
+        if !create_file_symlink(&external, &target) {
+            return;
+        }
+        assert!(load_reconciled_user_inputs(&destination, "A").is_err());
+        click_sync_edit(&mut app, &destination);
+        assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+        assert!(app.active_user_input_edit().is_none());
+        assert!(
+            sync_notice(&app)
+                .unwrap()
+                .starts_with("Could not refresh User Inputs:")
+        );
+        assert_eq!(fs::read_to_string(&external).unwrap(), "external");
+    }
+
+    #[test]
+    fn same_problem_navigation_does_not_sync_or_clear_a_notice() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(7, "cached")]);
+        let mut app = sync_test_app(&destination, &[1]);
+        app.reconcile_user_input_sync(0, Err("previous sync failed".to_string()));
+        write_sync_inputs(&destination, "A", &[(7, "latest")]);
+        let (run_tx, _run_rx) = mpsc::channel();
+        for code in [KeyCode::Right, KeyCode::Down, KeyCode::Up] {
+            handle_key_event_with_stress_context(
+                &mut app,
+                key(code, KeyEventKind::Press),
+                &run_tx,
+                Some(&destination),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "cached"
+        );
+        assert_eq!(
+            sync_notice(&app),
+            Some("Could not refresh User Inputs: previous sync failed")
+        );
+    }
+
+    #[test]
+    fn problem_entry_sync_loads_additions_deletions_and_content_changes() {
+        for code in [
+            KeyCode::Char('l'),
+            KeyCode::Right,
+            KeyCode::Char('h'),
+            KeyCode::Left,
+        ] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "B", &[(1, "one"), (3, "three"), (7, "old")]);
+            let mut app = sync_test_app(&destination, &[1, 1]);
+            fs::remove_file(destination.join(".atc/user-inputs/B/3.in")).unwrap();
+            write_sync_inputs(&destination, "B", &[(7, "latest"), (9, "added")]);
+            switch_sync_problem(&mut app, &destination, code);
+            assert_eq!(app.selected_problem(), Some(1));
+            assert_eq!(
+                app.current_problem()
+                    .unwrap()
+                    .user_inputs
+                    .ready()
+                    .unwrap()
+                    .persisted(),
+                load_reconciled_user_inputs(&destination, "B").unwrap()
+            );
+            assert_eq!(
+                sync_notice(&app),
+                Some("User Input 2 was removed externally.")
+            );
+            assert_eq!(app.case_selection(), Some(app::CaseSelection::Test(0)));
+            assert_eq!(app.current_problem().unwrap().total_cases, 1);
+            assert!(app.current_problem().unwrap().run.cases.is_empty());
+        }
+    }
+
+    #[test]
+    fn problem_entry_sync_addition_and_modification_do_not_notify() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "B", &[(7, "old")]);
+        let mut app = sync_test_app(&destination, &[0, 0]);
+        write_sync_inputs(&destination, "B", &[(3, "new"), (7, "latest")]);
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(
+            app.selected_user_input(),
+            Some(app::UserInputSelection::Persisted(7))
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted(),
+            load_reconciled_user_inputs(&destination, "B").unwrap()
+        );
+        assert_eq!(sync_notice(&app), None);
+    }
+
+    #[test]
+    fn problem_entry_sync_skips_active_persisted_edit_and_preserves_checked_save() {
+        for mutation in ["modified", "deleted", "error"] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "B", &[(7, "baseline A")]);
+            let mut app = sync_test_app(&destination, &[1, 1]);
+            switch_sync_problem(&mut app, &destination, KeyCode::Right);
+            select_sync_input(&mut app, 7);
+            click_sync_edit(&mut app, &destination);
+            app.edit_user_input_insert(" buffer C");
+            app.edit_user_input_left();
+            let snapshot = app.user_input_save_snapshot().unwrap();
+            let cached = app.current_problem().unwrap().user_inputs.clone();
+            app.next_case(); // Leave the editor selected state, but retain the problem-local edit.
+            switch_sync_problem(&mut app, &destination, KeyCode::Left);
+            match mutation {
+                "modified" => write_sync_inputs(&destination, "B", &[(7, "disk B")]),
+                "deleted" => fs::remove_file(destination.join(".atc/user-inputs/B/7.in")).unwrap(),
+                "error" => fs::write(destination.join(".atc/user-inputs/B/7.in"), [0xff]).unwrap(),
+                _ => unreachable!(),
+            }
+            switch_sync_problem(&mut app, &destination, KeyCode::Right);
+            assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+            assert_eq!(sync_notice(&app), None); // Even invalid disk content must not be read.
+            select_sync_input(&mut app, 7);
+            assert_eq!(app.user_input_save_snapshot().unwrap(), snapshot);
+            save_user_input_by_key(&mut app, &destination);
+            let edit = app.selected_user_input_edit().unwrap();
+            assert_eq!(edit.buffer(), snapshot.content);
+            if mutation == "deleted" {
+                assert_eq!(edit.target(), app::UserInputEditTarget::Draft);
+                assert!(
+                    edit.save_error()
+                        .unwrap()
+                        .contains("Recovered as an unsaved Draft")
+                );
+                assert_eq!(app.user_input_save_snapshot().unwrap().baseline, None);
+            } else if mutation == "modified" {
+                assert_eq!(edit.target(), app::UserInputEditTarget::Persisted(7));
+                assert!(edit.save_error().unwrap().contains("conflict"));
+                assert_eq!(
+                    app.user_input_save_snapshot().unwrap().baseline.as_deref(),
+                    Some("disk B")
+                );
+                assert_eq!(
+                    fs::read_to_string(destination.join(".atc/user-inputs/B/7.in")).unwrap(),
+                    "disk B"
+                );
+            } else {
+                assert!(edit.save_error().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn problem_entry_sync_skips_active_draft_and_keeps_exact_editor_state() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = sync_test_app(&destination, &[1, 1]);
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("draft\r\n\t界");
+        app.edit_user_input_left();
+        let cached = app.current_problem().unwrap().user_inputs.clone();
+        app.next_case();
+        switch_sync_problem(&mut app, &destination, KeyCode::Left);
+        write_sync_inputs(&destination, "B", &[(7, "external addition")]);
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+        assert_eq!(sync_notice(&app), None);
+    }
+
+    #[test]
+    fn problem_entry_sync_failure_retains_cache_and_notice_clears_on_successful_return() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "B", &[(7, "cached")]);
+        let mut app = sync_test_app(&destination, &[0, 0]);
+        let cached = app.problems()[1].user_inputs.clone();
+        fs::write(destination.join(".atc/user-inputs/B/7.in"), [0xff]).unwrap();
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(app.current_problem().unwrap().user_inputs, cached);
+        assert!(
+            sync_notice(&app)
+                .unwrap()
+                .starts_with("Could not refresh User Inputs:")
+        );
+        switch_sync_problem(&mut app, &destination, KeyCode::Left);
+        assert!(!rendered_app_text(&app, 120, 35).contains("! Input sync failed"));
+        write_sync_inputs(&destination, "B", &[(7, "fixed")]);
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(sync_notice(&app), None);
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "fixed"
+        );
+    }
+
+    #[test]
+    fn sync_deletion_notice_survives_selection_changes_then_clears_on_successful_return() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "B", &[(1, "one"), (7, "seven")]);
+        let mut app = sync_test_app(&destination, &[1, 1]);
+        fs::remove_file(destination.join(".atc/user-inputs/B/7.in")).unwrap();
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        let notice = "User Input 2 was removed externally.";
+        let compact = "! Input 2 removed";
+        assert_eq!(sync_notice(&app), Some(notice));
+        assert!(rendered_app_text(&app, 120, 35).contains(compact));
+        select_sync_input(&mut app, 1);
+        assert_eq!(sync_notice(&app), Some(notice));
+        assert!(rendered_app_text(&app, 120, 35).contains(compact));
+        switch_sync_problem(&mut app, &destination, KeyCode::Left);
+        assert!(!rendered_app_text(&app, 120, 35).contains(compact));
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(sync_notice(&app), None);
+        assert!(!rendered_app_text(&app, 120, 35).contains(compact));
+    }
+
+    #[test]
+    fn sync_notice_is_separate_from_editor_save_error_and_clears_before_next_edit() {
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(3, "cached")]);
+        let mut app = loaded_user_input_app(&destination);
+        app.reconcile_user_input_sync(0, Err("sync error".to_string()));
+        app.begin_new_user_input().unwrap();
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        app.fail_user_input_save(&snapshot, "save error".to_string(), None)
+            .unwrap();
+        let text = rendered_app_text(&app, 120, 35);
+        assert!(text.contains("! Input sync failed"));
+        assert_eq!(
+            sync_notice(&app),
+            Some("Could not refresh User Inputs: sync error")
+        );
+        assert!(text.contains("Save failed: save error"));
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().save_error(),
+            Some("save error")
+        );
+        app.cancel_user_input_edit();
+        click_sync_edit(&mut app, &destination);
+        assert_eq!(sync_notice(&app), None);
+        assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+    }
+
+    #[test]
+    fn sync_pure_transition_rejects_snapshots_for_any_problem_with_active_edit() {
+        for draft in [false, true] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "B", &[(7, "baseline")]);
+            let mut app = sync_test_app(&destination, &[0, 0]);
+            app.select_problem(1);
+            if draft {
+                app.begin_new_user_input().unwrap();
+            } else {
+                app.begin_selected_user_input_edit().unwrap();
+            }
+            app.edit_user_input_insert("buffer");
+            let cached = app.current_problem().unwrap().user_inputs.clone();
+            app.select_problem(0);
+            assert!(!app.reconcile_user_input_sync(1, Ok(Vec::new())));
+            assert!(!app.reconcile_user_input_sync(1, Err("error".to_string())));
+            assert_eq!(app.problems()[1].user_inputs, cached);
+            assert!(app.problems()[1].user_input_sync_notice.is_none());
+        }
+    }
+
+    #[test]
+    fn problem_entry_sync_can_recover_an_initial_storage_error() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0, 0]),
+            vec![0, 0],
+            vec![None, None],
+            vec![
+                app::UserInputState::default(),
+                app::UserInputState::load_error("initial failure".to_string()),
+            ],
+        )
+        .unwrap();
+        write_sync_inputs(&destination, "B", &[(7, "recovered")]);
+        switch_sync_problem(&mut app, &destination, KeyCode::Right);
+        assert_eq!(
+            app.selected_user_input(),
+            Some(app::UserInputSelection::Persisted(7))
+        );
+        assert_eq!(sync_notice(&app), None);
+    }
+
+    #[test]
+    fn source_changed_problem_entry_sync_does_not_expand_runner_scope() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = sync_test_app(&destination, &[1, 1]);
+        write_sync_inputs(&destination, "B", &[(7, "added")]);
+        let (message_tx, message_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+        message_tx
+            .send(Message::SourceChanged {
+                problem: 1,
+                path: destination.join("B.py"),
+                language: Language::Python,
+            })
+            .unwrap();
+        assert!(
+            handle_messages_with_destination(&mut app, &message_rx, &run_tx, Some(&destination))
+                .unwrap()
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .id,
+            7
+        );
+        assert_eq!(app.current_problem().unwrap().total_cases, 1);
+        assert_eq!(app.current_problem().unwrap().run.cases.len(), 1);
+        assert!(matches!(
+            run_rx.try_recv().unwrap(),
+            RunWorkerCommand::Run(_)
+        ));
+        assert!(run_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn edit_sync_missing_or_load_error_then_q_uses_ordered_global_quit() {
+        for missing in [false, true] {
+            let (_temp, destination) = user_input_workspace();
+            write_sync_inputs(&destination, "A", &[(7, "cached")]);
+            let mut app = loaded_user_input_app(&destination);
+            let info = rendered_fold_info(&app, 120, 35);
+            let edit = info
+                .user_input_detail_actions
+                .iter()
+                .find(|target| target.action == view::UserInputDetailAction::Edit)
+                .unwrap();
+            if missing {
+                fs::remove_file(destination.join(".atc/user-inputs/A/7.in")).unwrap();
+            } else {
+                fs::write(destination.join(".atc/user-inputs/A/7.in"), [0xff]).unwrap();
+            }
+            let mut events = VecDeque::from([
+                TerminalEvent::Pointer(pointer(
+                    PointerKind::Down(PointerButton::Left),
+                    edit.area.x,
+                    edit.area.y,
+                )),
+                TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            ]);
+            assert!(!contains_plain_global_quit_event(&events, &app));
+            dispatch_sync_events(&mut app, &info, &mut events, &destination);
+            assert_eq!(events.len(), 1);
+            assert!(!app.user_input_editor_active());
+            assert!(!app.should_quit());
+            assert!(contains_plain_global_quit_event(&events, &app));
+            let updated = rendered_fold_info(&app, 120, 35);
+            dispatch_sync_events(&mut app, &updated, &mut events, &destination);
+            assert!(app.should_quit());
+        }
+    }
+
     fn save_user_input_by_key(app: &mut WatchApp, destination: &Path) {
         let (run_tx, _run_rx) = mpsc::channel();
         assert!(
@@ -10318,7 +11101,9 @@ mod tests {
     #[test]
     fn edit_pointer_then_q_same_batch_defers_quit_and_preserves_original() {
         let original = "original\r\n";
-        let mut app = user_input_app(original);
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(3, original)]);
+        let mut app = loaded_user_input_app(&destination);
         let info = rendered_fold_info(&app, 100, 30);
         let edit = info
             .user_input_detail_actions
@@ -10336,14 +11121,13 @@ mod tests {
         ]);
 
         assert!(!contains_plain_global_quit_event(&events, &app));
-        let (run_tx, _run_rx) = mpsc::channel();
-        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        dispatch_sync_events(&mut app, &info, &mut events, &destination);
         assert_eq!(events.len(), 1);
         assert!(app.user_input_editor_active());
 
         let updated = rendered_fold_info(&app, 100, 30);
         assert!(!contains_plain_global_quit_event(&events, &app));
-        assert!(handle_terminal_events(&mut app, &updated, &mut events, &run_tx).unwrap());
+        dispatch_sync_events(&mut app, &updated, &mut events, &destination);
 
         assert!(app.user_input_editor_active());
         assert_eq!(
@@ -11823,28 +12607,15 @@ mod tests {
 
     #[test]
     fn edit_and_cancel_pointer_actions_do_not_also_toggle_input_fold() {
-        let mut app = user_input_app("exact\r\ncontent\r\n");
+        let (_temp, destination) = user_input_workspace();
+        write_sync_inputs(&destination, "A", &[(3, "exact\r\ncontent\r\n")]);
+        let mut app = loaded_user_input_app(&destination);
         app.toggle_detail_section(detail::DetailSectionKind::Input);
         assert!(
             app.detail_fold_state()
                 .is_collapsed(detail::DetailSectionKind::Input)
         );
-        let read_only = rendered_fold_info(&app, 100, 30);
-        let edit = read_only
-            .user_input_detail_actions
-            .iter()
-            .copied()
-            .find(|target| target.action == view::UserInputDetailAction::Edit)
-            .unwrap();
-        assert!(handle_pointer_event(
-            &mut app,
-            pointer(
-                PointerKind::Down(PointerButton::Left),
-                edit.area.x,
-                edit.area.y,
-            ),
-            &read_only,
-        ));
+        click_sync_edit(&mut app, &destination);
         assert!(app.user_input_editor_active());
         assert!(
             !app.detail_fold_state()

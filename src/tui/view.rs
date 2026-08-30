@@ -419,10 +419,19 @@ pub(super) fn render_frontend_with_pointer(
         .split(inner);
 
     // A ✓   B ✗   C …   D ·
-    let problems =
-        Paragraph::new(problem_status_line(app)).block(Block::default().borders(Borders::BOTTOM));
+    let problem_line = problem_status_line(app);
+    let problem_line_width = problem_line.width();
+    let problem_block = Block::default().borders(Borders::BOTTOM);
+    let navigation_area = problem_block.inner(rows[0]);
+    let problems = Paragraph::new(problem_line).block(problem_block);
 
     frame.render_widget(problems, rows[0]);
+
+    if let Some(notice) =
+        current_problem.and_then(|problem| problem.user_input_sync_notice.as_deref())
+    {
+        render_problem_sync_notice(frame, navigation_area, problem_line_width, notice);
+    }
 
     // 選択中sample / compile error等の詳細
     let show_samples = app.samples_pane_enabled()
@@ -641,6 +650,46 @@ pub(super) fn render_frontend_with_pointer(
 
 fn contains_rect(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn render_problem_sync_notice(
+    frame: &mut Frame,
+    navigation_area: Rect,
+    navigation_width: usize,
+    notice: &str,
+) {
+    let compact = if let Some(ordinal) = notice
+        .strip_prefix("User Input ")
+        .and_then(|notice| notice.strip_suffix(" was removed externally."))
+        .and_then(|ordinal| ordinal.parse::<usize>().ok())
+    {
+        format!("! Input {ordinal} removed")
+    } else if let Some(count) = notice
+        .strip_suffix(" User Inputs were removed externally.")
+        .and_then(|count| count.parse::<usize>().ok())
+    {
+        format!("! {count} inputs removed")
+    } else {
+        "! Input sync failed".to_string()
+    };
+    let width = usize::from(navigation_area.width);
+    // Reuse the navigation row without moving or covering any problem spans.
+    // Paragraph clips the compact notice without wrapping or allocating another row.
+    let start = navigation_width
+        .saturating_add(2)
+        .max(width.saturating_sub(compact.width()));
+    if start >= width || navigation_area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(compact).style(Style::default().fg(Color::Yellow)),
+        Rect::new(
+            navigation_area.x.saturating_add(start as u16),
+            navigation_area.y,
+            (width - start) as u16,
+            1,
+        ),
+    );
 }
 
 fn user_input_detail_action_targets(
@@ -4091,6 +4140,278 @@ mod tests {
                 .iter()
                 .any(|line| line.contains('*'))
         );
+    }
+
+    fn navigation_test_app(problem_count: usize) -> WatchApp {
+        let contest = Contest {
+            contest_id: "abc123".to_string(),
+            problems: (0..problem_count)
+                .map(|offset| {
+                    let index = char::from(b'A' + offset as u8);
+                    Problem {
+                        index: index.to_string(),
+                        title: format!("Problem {index}"),
+                        task_id: format!("abc123_{index}"),
+                        url: format!("https://example.invalid/{index}"),
+                        sample_count: 1,
+                    }
+                })
+                .collect(),
+        };
+        WatchApp::new(&contest, vec![1; problem_count]).unwrap()
+    }
+
+    #[test]
+    fn sync_notice_renders_on_problem_navigation_without_changing_detail() {
+        for (loaded_ids, compact) in [
+            (Ok(vec![1, 7]), "! Input 2 removed"),
+            (Ok(vec![]), "! 3 inputs removed"),
+            (
+                Err("permission denied: storage path".to_string()),
+                "! Input sync failed",
+            ),
+            (
+                Err("3 User Inputs were removed externally.".to_string()),
+                "! Input sync failed",
+            ),
+        ] {
+            let persisted = [1, 3, 7]
+                .into_iter()
+                .map(|id| PersistedUserInputState {
+                    id,
+                    content: id.to_string(),
+                })
+                .collect::<Vec<_>>();
+            let mut app = app_with_user_inputs(1, UserInputState::loaded(persisted.clone()));
+            let document_before = DetailDocument::from_app(&app)
+                .segments()
+                .map(|segment| segment.text())
+                .collect::<String>();
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut layout = DetailLayout::default();
+            let before = render_with_layout(&mut terminal, &app, &mut layout);
+            let buffer_before = terminal.backend().buffer().clone();
+            let navigation_before = problem_status_line(&app);
+            assert_eq!(
+                buffer_row_text(
+                    &buffer_before,
+                    before.detail_area.x,
+                    before.detail_area.y,
+                    usize::from(before.detail_area.width),
+                )
+                .trim_end(),
+                "A - Problem A"
+            );
+
+            let loaded = loaded_ids.map(|ids| {
+                persisted
+                    .iter()
+                    .filter(|input| ids.contains(&input.id))
+                    .cloned()
+                    .collect()
+            });
+            assert!(app.reconcile_user_input_sync(0, loaded));
+            assert_eq!(
+                DetailDocument::from_app(&app)
+                    .segments()
+                    .map(|segment| segment.text())
+                    .collect::<String>(),
+                document_before
+            );
+            // Reuse the populated layout and terminal to cover notice-only redraws.
+            let after = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(after.detail_area, before.detail_area);
+            assert_eq!(after.max_detail_scroll, before.max_detail_scroll);
+            assert_eq!(problem_status_line(&app), navigation_before);
+            let buffer = terminal.backend().buffer();
+            let navigation = buffer_row_text(buffer, 1, 1, 98);
+            assert!(navigation.starts_with("A ·  "));
+            assert!(navigation.trim_end().ends_with(compact), "{navigation:?}");
+            for y in 0..12 {
+                if y != 1 {
+                    for x in 0..100 {
+                        assert_eq!(buffer.cell((x, y)), buffer_before.cell((x, y)));
+                    }
+                }
+            }
+
+            assert!(app.reconcile_user_input_sync(0, Ok(persisted)));
+            render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(terminal.backend().buffer(), &buffer_before);
+        }
+    }
+
+    #[test]
+    fn sync_notice_clips_without_overwriting_navigation_or_adding_rows_on_small_terminals() {
+        for width in [1, 2, 8, 16, 28, 50, 80] {
+            for height in [1, 2, 3, 5, 8, 12] {
+                for problem_count in [1, 4] {
+                    for samples_pane in [false, true] {
+                        let mut app = navigation_test_app(problem_count);
+                        if samples_pane {
+                            app.toggle_samples_pane();
+                        }
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        let mut layout = DetailLayout::default();
+                        let before = render_with_layout(&mut terminal, &app, &mut layout);
+                        let buffer_before = terminal.backend().buffer().clone();
+                        let protected_navigation_end = 1 + problem_status_line(&app).width() + 2;
+                        assert!(app.reconcile_user_input_sync(0, Err("read error".to_string())));
+                        let after = render_with_layout(&mut terminal, &app, &mut layout);
+                        assert_eq!(after.detail_area, before.detail_area);
+                        assert_eq!(after.max_detail_scroll, before.max_detail_scroll);
+                        let buffer = terminal.backend().buffer();
+                        for y in 0..height {
+                            for x in 0..width {
+                                let old = buffer_before.cell((x, y)).unwrap();
+                                if y != 1
+                                    || usize::from(x) < protected_navigation_end
+                                    || old.symbol() != " "
+                                {
+                                    assert_eq!(buffer.cell((x, y)), Some(old));
+                                }
+                            }
+                        }
+                        if width == 28 && height == 12 && problem_count == 4 {
+                            let navigation = buffer_row_text(buffer, 1, 1, 26);
+                            assert_eq!(navigation, "A ·   B ·   C ·   D ·  ! I");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_notice_navigation_is_problem_local_and_clears_after_success() {
+        let mut app = navigation_test_app(2);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut layout = DetailLayout::default();
+        assert!(app.reconcile_user_input_sync(0, Err("A storage error".to_string())));
+        for (problem, has_notice) in [(0, true), (1, false), (0, true)] {
+            app.select_problem(problem);
+            render_with_layout(&mut terminal, &app, &mut layout);
+            let navigation = buffer_row_text(terminal.backend().buffer(), 1, 1, 98);
+            assert_eq!(navigation.contains("! Input sync failed"), has_notice);
+            assert!(app.problems()[0].user_input_sync_notice.is_some());
+        }
+        assert!(app.reconcile_user_input_sync(0, Ok(Vec::new())));
+        render_with_layout(&mut terminal, &app, &mut layout);
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), 1, 1, 98).trim_end(),
+            "A ·   B ·"
+        );
+    }
+
+    #[test]
+    fn sync_notice_stays_on_problem_navigation_when_detail_scrolls() {
+        let mut app = app_with_user_inputs(
+            0,
+            UserInputState::loaded(vec![PersistedUserInputState {
+                id: 7,
+                content: "input body\n".repeat(30),
+            }]),
+        );
+        assert!(app.reconcile_user_input_sync(0, Err("read error".to_string())));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut layout = DetailLayout::default();
+        render_with_layout(&mut terminal, &app, &mut layout);
+        let navigation_before = buffer_row_text(terminal.backend().buffer(), 1, 1, 78);
+        assert!(navigation_before.contains("! Input sync failed"));
+        assert!(app.scroll_detail_down(1));
+        let info = render_with_layout(&mut terminal, &app, &mut layout);
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), 1, 1, 78),
+            navigation_before
+        );
+        for y in info.detail_area.y..info.detail_area.bottom() {
+            let row = buffer_row_text(
+                terminal.backend().buffer(),
+                info.detail_area.x,
+                y,
+                usize::from(info.detail_area.width),
+            );
+            assert!(!row.contains("! Input sync failed"));
+        }
+        assert!(
+            app.current_problem()
+                .unwrap()
+                .user_input_sync_notice
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sync_notice_does_not_add_navigation_click_targets_or_change_existing_hitboxes() {
+        use crate::tui::terminal::{
+            Modifiers, PointerButton, PointerEvent, PointerKind, PointerPosition,
+        };
+        use crate::tui::{DetailScrollbarDragState, handle_pointer_event_with_mouse_mode};
+
+        let mut app = navigation_test_app(3);
+        app.reconcile_user_input_sync(
+            0,
+            Ok(vec![PersistedUserInputState {
+                id: 7,
+                content: "input".to_string(),
+            }]),
+        );
+        app.next_case();
+        app.toggle_samples_pane();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut layout = DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let before = render_with_layout(&mut terminal, &app, &mut layout);
+        assert!(!before.user_input_detail_actions.is_empty());
+        let target_geometry = |info: &RenderInfo| {
+            (
+                info.samples_area,
+                info.samples_body_area,
+                info.new_input_area,
+                info.detail_area,
+                info.detail_section_headers
+                    .iter()
+                    .map(|target| (target.kind, target.area))
+                    .collect::<Vec<_>>(),
+                info.user_input_detail_actions
+                    .iter()
+                    .map(|target| (target.action, target.area))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let selection = app.case_selection();
+        for has_notice in [false, true] {
+            if has_notice {
+                assert!(app.reconcile_user_input_sync(0, Err("read error".to_string())));
+            }
+            let info = render_with_layout(&mut terminal, &app, &mut layout);
+            assert_eq!(target_geometry(&info), target_geometry(&before));
+            assert_eq!(
+                buffer_row_text(terminal.backend().buffer(), 1, 1, 98)
+                    .contains("! Input sync failed"),
+                has_notice
+            );
+            // Navigation has no click targets today. Both its labels and the
+            // entire notice/gap region must remain inert in the production handler.
+            for column in 1..99 {
+                assert!(!handle_pointer_event_with_mouse_mode(
+                    &mut app,
+                    &mut layout,
+                    &mut drag,
+                    PointerEvent {
+                        kind: PointerKind::Down(PointerButton::Left),
+                        position: PointerPosition::Cells { column, row: 1 },
+                        modifiers: Modifiers::default(),
+                        pixel_generation: None,
+                    },
+                    &info,
+                    MouseMode::Cells,
+                    None,
+                ));
+                assert_eq!(app.selected_problem(), Some(0));
+                assert_eq!(app.case_selection(), selection);
+            }
+        }
     }
 
     #[test]

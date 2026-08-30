@@ -426,8 +426,8 @@ impl UserInputReadyState {
         })
     }
 
-    // Runtime persisted content is the edit baseline. Only explicit reconciliation
-    // advances it; the user's buffer/cursor are independent and remain untouched.
+    // Runtime persisted content is the edit baseline. While editing, only explicit
+    // Save reconciliation advances it; automatic sync must leave it untouched.
     fn edit_baseline(&self) -> Option<&str> {
         let UserInputEditTarget::Persisted(id) = self.edit.as_ref()?.target else {
             return None;
@@ -513,6 +513,7 @@ pub struct ProblemState {
     pub stress_setup: StressSetupState,
     #[cfg_attr(not(test), allow(dead_code))]
     pub user_inputs: UserInputState,
+    pub user_input_sync_notice: Option<Arc<String>>,
     selection_before_draft: DraftReturnSelection,
     pub detail_mode: DetailMode,
 }
@@ -915,6 +916,7 @@ impl WatchApp {
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
                     user_inputs,
+                    user_input_sync_notice: None,
                     selection_before_draft: DraftReturnSelection::None,
                     detail_mode: DetailMode::Samples,
                 }
@@ -1309,7 +1311,97 @@ impl WatchApp {
         Ok(true)
     }
 
-    pub fn begin_selected_user_input_edit(&mut self) -> Result<bool, UserInputEditStartError> {
+    // Automatic sync must never advance the persisted content used as an active
+    // edit's Save baseline, including when that edit is not currently selected.
+    pub(super) fn reconcile_user_input_sync(
+        &mut self,
+        problem: usize,
+        loaded: Result<Vec<PersistedUserInputState>, String>,
+    ) -> bool {
+        let previous = self.displayed_detail_case();
+        let Some(state) = self.problems.get_mut(problem) else {
+            return false;
+        };
+        if state
+            .user_inputs
+            .ready()
+            .is_some_and(|ready| ready.edit().is_some())
+        {
+            return false;
+        }
+
+        let mut fallback_position = None;
+        let mut cache_changed = false;
+        let notice = match loaded {
+            Ok(mut persisted) => {
+                persisted.sort_by_key(|input| input.id);
+                let old = state
+                    .user_inputs
+                    .ready()
+                    .map(|ready| ready.persisted())
+                    .unwrap_or(&[]);
+                // Capture packed ordinals from the pre-sync cache, never from IDs.
+                let removed: Vec<_> = old
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, input)| {
+                        persisted
+                            .binary_search_by_key(&input.id, |input| input.id)
+                            .is_err()
+                    })
+                    .map(|(position, _)| position)
+                    .collect();
+                if self.selected_problem == problem
+                    && let Some(CaseSelection::UserInput(UserInputSelection::Persisted(id))) =
+                        self.case_selection
+                    && persisted
+                        .binary_search_by_key(&id, |input| input.id)
+                        .is_err()
+                {
+                    fallback_position = old.iter().position(|input| input.id == id);
+                }
+                let notice = match removed.as_slice() {
+                    [] => None,
+                    [position] => Some(Arc::new(format!(
+                        "User Input {} was removed externally.",
+                        position + 1
+                    ))),
+                    _ => Some(Arc::new(format!(
+                        "{} User Inputs were removed externally.",
+                        removed.len()
+                    ))),
+                };
+                cache_changed = state.user_inputs.ready().is_none() || old != persisted;
+                if cache_changed {
+                    state.user_inputs = UserInputState::loaded(persisted);
+                }
+                notice
+            }
+            Err(error) => Some(Arc::new(format!("Could not refresh User Inputs: {error}"))),
+        };
+        if !cache_changed && state.user_input_sync_notice == notice {
+            return false;
+        }
+        state.user_input_sync_notice = notice;
+        if self.selected_problem == problem {
+            if let Some(position) = fallback_position {
+                let persisted = state.user_inputs.ready().unwrap().persisted();
+                self.case_selection = persisted
+                    .get(position.min(persisted.len().saturating_sub(1)))
+                    .map(|input| CaseSelection::UserInput(UserInputSelection::Persisted(input.id)));
+            }
+            self.reconcile_case_selection(problem);
+            self.reset_folds_if_displayed_case_changed(previous);
+            self.reset_detail_scroll();
+            self.invalidate_detail();
+        }
+        true
+    }
+
+    // Controller must successfully sync before calling this pure edit transition.
+    pub(super) fn begin_selected_user_input_edit(
+        &mut self,
+    ) -> Result<bool, UserInputEditStartError> {
         let UserInputSelection::Persisted(id) = self
             .selected_user_input()
             .ok_or(UserInputEditStartError::Unavailable)?
