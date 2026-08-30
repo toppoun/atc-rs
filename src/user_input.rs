@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace;
 
+#[cfg(windows)]
+mod windows_publish;
+
 const FORMAT_VERSION: u32 = 1;
 const USER_INPUTS_DIRECTORY: &str = "user-inputs";
 const METADATA_FILE: &str = "meta.toml";
@@ -19,10 +22,61 @@ const STAGING_PREFIX: &str = ".user-input-staging-";
 
 static NEXT_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn io_context(error: io::Error, context: impl Into<String>) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", context.into()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserInput {
     pub(crate) id: u64,
     pub(crate) content: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum UserInputCreateError {
+    // This attempt did not install its input. Directories, staging, and the
+    // metadata high-water reservation may already have changed; retry reads disk truth.
+    BeforeInstall(io::Error),
+    // The input was installed after its ID was reserved in metadata.
+    AfterInstall { id: u64, error: io::Error },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserInputSaveOutcome {
+    Saved,
+    Unchanged,
+    Conflict,
+    Missing,
+}
+
+impl UserInputCreateError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::BeforeInstall(error) | Self::AfterInstall { error, .. } => error,
+        }
+    }
+}
+
+impl std::fmt::Display for UserInputCreateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeInstall(error) => error.fmt(formatter),
+            Self::AfterInstall { id, error } => {
+                write!(
+                    formatter,
+                    "user input {id} was installed, but finalization failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UserInputCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeInstall(error) | Self::AfterInstall { error, .. } => Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -89,29 +143,22 @@ pub(crate) fn create_user_input(
     problem_index: &str,
     content: &str,
 ) -> io::Result<u64> {
-    create_user_input_with_hooks(
-        destination,
-        problem_index,
-        content,
-        || Ok(()),
-        || Ok(()),
-        || Ok(()),
-    )
+    create_user_input_with_outcome(destination, problem_index, content)
+        .map_err(UserInputCreateError::into_io_error)
 }
 
-fn create_user_input_with_hook(
+pub(crate) fn create_user_input_with_outcome(
     destination: &Path,
     problem_index: &str,
     content: &str,
-    after_input_install: impl FnOnce() -> io::Result<()>,
-) -> io::Result<u64> {
-    create_user_input_with_hooks(
+) -> Result<u64, UserInputCreateError> {
+    create_user_input_with_outcome_and_hooks(
         destination,
         problem_index,
         content,
         || Ok(()),
         || Ok(()),
-        after_input_install,
+        || Ok(()),
     )
 }
 
@@ -123,38 +170,193 @@ fn create_user_input_with_hooks(
     before_input_install: impl FnOnce() -> io::Result<()>,
     after_input_install: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<u64> {
-    validate_request(problem_index)?;
+    create_user_input_with_outcome_and_hooks(
+        destination,
+        problem_index,
+        content,
+        after_destination_validation,
+        before_input_install,
+        after_input_install,
+    )
+    .map_err(UserInputCreateError::into_io_error)
+}
 
-    let marker = open_workspace_marker_after(destination, after_destination_validation)?;
+fn create_user_input_with_outcome_and_hooks(
+    destination: &Path,
+    problem_index: &str,
+    content: &str,
+    after_destination_validation: impl FnOnce() -> io::Result<()>,
+    before_input_install: impl FnOnce() -> io::Result<()>,
+    after_input_install: impl FnOnce() -> io::Result<()>,
+) -> Result<u64, UserInputCreateError> {
+    create_user_input_with_reservation(
+        destination,
+        problem_index,
+        content,
+        after_destination_validation,
+        before_input_install,
+        after_input_install,
+        persist_metadata,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn create_user_input_with_after_install_hook(
+    destination: &Path,
+    problem_index: &str,
+    content: &str,
+    after_input_install: impl FnOnce() -> io::Result<()>,
+) -> Result<u64, UserInputCreateError> {
+    create_user_input_with_outcome_and_hooks(
+        destination,
+        problem_index,
+        content,
+        || Ok(()),
+        || Ok(()),
+        after_input_install,
+    )
+}
+
+fn create_user_input_with_reservation(
+    destination: &Path,
+    problem_index: &str,
+    content: &str,
+    after_destination_validation: impl FnOnce() -> io::Result<()>,
+    before_input_install: impl FnOnce() -> io::Result<()>,
+    after_input_install: impl FnOnce() -> io::Result<()>,
+    reserve: impl FnOnce(&CapDir, UserInputMetadata, bool) -> io::Result<()>,
+) -> Result<u64, UserInputCreateError> {
+    validate_request(problem_index).map_err(UserInputCreateError::BeforeInstall)?;
+
+    let marker = open_workspace_marker_after(destination, after_destination_validation)
+        .map_err(UserInputCreateError::BeforeInstall)?;
     let root =
-        ensure_real_child_directory(&marker, USER_INPUTS_DIRECTORY, "user input root directory")?;
-    let lock = open_problem_lock(&root, problem_index, true)?
+        ensure_real_child_directory(&marker, USER_INPUTS_DIRECTORY, "user input root directory")
+            .map_err(UserInputCreateError::BeforeInstall)?;
+    let lock = open_problem_lock(&root, problem_index, true)
+        .map_err(UserInputCreateError::BeforeInstall)?
         .expect("create was requested for the user input lock");
-    lock.lock()?;
+    lock.lock()
+        .map_err(|error| io_context(error, "failed to lock user input storage for create"))
+        .map_err(UserInputCreateError::BeforeInstall)?;
 
-    let problem =
-        ensure_real_child_directory(&root, problem_index, "user input problem directory")?;
-    let snapshot = scan_problem_directory(&problem, false)?;
-    let stored_metadata = read_metadata(&problem)?;
-    let next_id = effective_next_id(stored_metadata, snapshot.max_id)?;
-    let following_id = next_id.checked_add(1).ok_or_else(id_space_exhausted)?;
-    let input_name = input_file_name(next_id)?;
+    let problem = ensure_real_child_directory(&root, problem_index, "user input problem directory")
+        .map_err(UserInputCreateError::BeforeInstall)?;
+    let snapshot =
+        scan_problem_directory(&problem, false).map_err(UserInputCreateError::BeforeInstall)?;
+    let stored_metadata = read_metadata(&problem).map_err(UserInputCreateError::BeforeInstall)?;
+    let next_id = effective_next_id(stored_metadata, snapshot.max_id)
+        .map_err(UserInputCreateError::BeforeInstall)?;
+    let following_id = next_id
+        .checked_add(1)
+        .ok_or_else(id_space_exhausted)
+        .map_err(UserInputCreateError::BeforeInstall)?;
+    let input_name = input_file_name(next_id).map_err(UserInputCreateError::BeforeInstall)?;
 
-    let staged = StagedFile::new(&problem, "input", content.as_bytes())?;
-    before_input_install()?;
-    staged.install_noclobber(&input_name)?;
+    let staged = StagedFile::for_install(&problem, "input", content.as_bytes())
+        .map_err(UserInputCreateError::BeforeInstall)?;
 
-    after_input_install()?;
-
-    persist_metadata(
+    // Burn this ID before publishing the input. A later failed publish leaves a
+    // deliberate gap, and deleting an installed input can never erase this reservation.
+    // Even a reservation error may have advanced metadata before its sync failed.
+    reserve(
         &problem,
         UserInputMetadata {
             version: FORMAT_VERSION,
             next_id: following_id,
         },
         stored_metadata.is_some(),
-    )?;
+    )
+    .map_err(UserInputCreateError::BeforeInstall)?;
+    before_input_install().map_err(UserInputCreateError::BeforeInstall)?;
+    staged
+        .install_noclobber_with_outcome(&input_name)
+        .map_err(|error| match error {
+            StagedInstallError::BeforeInstall(error) => UserInputCreateError::BeforeInstall(error),
+            StagedInstallError::AfterInstall(error) => {
+                UserInputCreateError::AfterInstall { id: next_id, error }
+            }
+        })?;
+
+    let after_install = |error| UserInputCreateError::AfterInstall { id: next_id, error };
+    after_input_install().map_err(after_install)?;
     Ok(next_id)
+}
+
+/// Compare and (only on an exact match) replace under the same exclusive lock.
+/// Unchanged still verifies disk content, but never stages or writes input/metadata.
+/// This coordinates lock-respecting writers, not arbitrary lock-ignoring mutations.
+pub(crate) fn save_user_input_if_unchanged(
+    destination: &Path,
+    problem_index: &str,
+    id: u64,
+    expected_content: &str,
+    content: &str,
+) -> io::Result<UserInputSaveOutcome> {
+    save_user_input_if_unchanged_with_hooks(
+        destination,
+        problem_index,
+        id,
+        expected_content,
+        content,
+        || Ok(()),
+        || Ok(()),
+    )
+}
+
+fn save_user_input_if_unchanged_with_hooks(
+    destination: &Path,
+    problem_index: &str,
+    id: u64,
+    expected_content: &str,
+    content: &str,
+    before_lock: impl FnOnce() -> io::Result<()>,
+    before_replace: impl FnOnce() -> io::Result<()>,
+) -> io::Result<UserInputSaveOutcome> {
+    validate_request(problem_index)?;
+    let input_name = input_file_name(id)?;
+    let (root, problem) = match open_existing_problem(destination, problem_index, || Ok(())) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(UserInputSaveOutcome::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    drop(problem);
+    let lock = open_problem_lock(&root, problem_index, true)?
+        .expect("create was requested for the user input lock");
+    before_lock()?;
+    lock.lock()
+        .map_err(|error| io_context(error, "failed to lock user input storage for checked save"))?;
+
+    let problem = match reopen_existing_problem(&root, problem_index) {
+        Ok(problem) => problem,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(UserInputSaveOutcome::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(mut target) = open_regular_file(&problem, &input_name, "user input")? else {
+        return Ok(UserInputSaveOutcome::Missing);
+    };
+    let mut current = String::new();
+    target.read_to_string(&mut current).map_err(|error| {
+        io_context(
+            error,
+            format!("failed to read user input {id} as UTF-8 for checked save"),
+        )
+    })?;
+    drop(target);
+    if current != expected_content {
+        return Ok(UserInputSaveOutcome::Conflict);
+    }
+    if content == expected_content {
+        return Ok(UserInputSaveOutcome::Unchanged);
+    }
+
+    // `lock` remains live through comparison, metadata reconciliation and replacement.
+    replace_user_input(&problem, &input_name, content, before_replace, || Ok(()))?;
+    Ok(UserInputSaveOutcome::Saved)
 }
 
 pub(crate) fn save_user_input(
@@ -168,6 +370,7 @@ pub(crate) fn save_user_input(
         problem_index,
         id,
         content,
+        || Ok(()),
         || Ok(()),
         || Ok(()),
     )
@@ -187,6 +390,7 @@ fn save_user_input_with_hook(
         content,
         || Ok(()),
         before_replace,
+        || Ok(()),
     )
 }
 
@@ -197,6 +401,7 @@ fn save_user_input_with_hooks(
     content: &str,
     after_destination_validation: impl FnOnce() -> io::Result<()>,
     before_replace: impl FnOnce() -> io::Result<()>,
+    after_replace: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     validate_request(problem_index)?;
     let input_name = input_file_name(id)?;
@@ -205,17 +410,35 @@ fn save_user_input_with_hooks(
     drop(problem);
     let lock = open_problem_lock(&root, problem_index, true)?
         .expect("create was requested for the user input lock");
-    lock.lock()?;
+    lock.lock()
+        .map_err(|error| io_context(error, "failed to lock user input storage for save"))?;
 
     let problem = reopen_existing_problem(&root, problem_index)?;
     let target = open_regular_file(&problem, &input_name, "user input")?
         .ok_or_else(|| missing_input_error(problem_index, id))?;
     drop(target);
 
-    reconcile_metadata(&problem)?;
-    let staged = StagedFile::new(&problem, "input", content.as_bytes())?;
+    replace_user_input(
+        &problem,
+        &input_name,
+        content,
+        before_replace,
+        after_replace,
+    )
+}
+
+// Both save APIs call this only while retaining their exclusive problem lock.
+fn replace_user_input(
+    problem: &CapDir,
+    input_name: &OsStr,
+    content: &str,
+    before_replace: impl FnOnce() -> io::Result<()>,
+    after_replace: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    reconcile_metadata(problem)?;
+    let staged = StagedFile::new(problem, "input", content.as_bytes())?;
     before_replace()?;
-    staged.replace(&input_name)
+    staged.replace_with_hook(input_name, after_replace)
 }
 
 pub(crate) fn delete_user_input(
@@ -539,7 +762,11 @@ fn persist_metadata(
     replace_existing: bool,
 ) -> io::Result<()> {
     let content = toml::to_string_pretty(&metadata).map_err(io::Error::other)?;
-    let staged = StagedFile::new(problem, "metadata", content.as_bytes())?;
+    let staged = if replace_existing {
+        StagedFile::new(problem, "metadata", content.as_bytes())?
+    } else {
+        StagedFile::for_install(problem, "metadata", content.as_bytes())?
+    };
     if replace_existing {
         let existing =
             open_regular_file(problem, OsStr::new(METADATA_FILE), "user input metadata")?
@@ -559,11 +786,39 @@ fn persist_metadata(
 struct StagedFile {
     directory: CapDir,
     name: OsString,
+    // Only no-clobber publish retains the original DELETE-capable handle.
+    // Replacement staging keeps its existing write/sync/close sequence.
+    #[cfg(windows)]
+    publish_source: Option<fs::File>,
+}
+
+#[derive(Debug)]
+enum StagedInstallError {
+    BeforeInstall(io::Error),
+    AfterInstall(io::Error),
 }
 
 impl StagedFile {
     fn new(directory: &CapDir, purpose: &str, content: &[u8]) -> io::Result<Self> {
-        let directory = directory.try_clone()?;
+        Self::new_with_publish_handle(directory, purpose, content, false)
+    }
+
+    fn for_install(directory: &CapDir, purpose: &str, content: &[u8]) -> io::Result<Self> {
+        Self::new_with_publish_handle(directory, purpose, content, cfg!(windows))
+    }
+
+    fn new_with_publish_handle(
+        directory: &CapDir,
+        purpose: &str,
+        content: &[u8],
+        _retain_publish_handle: bool,
+    ) -> io::Result<Self> {
+        let directory = directory.try_clone().map_err(|error| {
+            io_context(
+                error,
+                format!("failed to clone directory handle for staged {purpose} file"),
+            )
+        })?;
         for _ in 0..128 {
             let sequence = NEXT_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let name = OsString::from(format!(
@@ -576,21 +831,72 @@ impl StagedFile {
                 .create_new(true)
                 .follow(FollowSymlinks::No)
                 .nonblock(true);
-            let mut file = match directory.open_with(&name, &options) {
-                Ok(file) => file.into_std(),
+            #[cfg(windows)]
+            if _retain_publish_handle {
+                windows_publish::configure_source(&mut options);
+            }
+            let file = match directory.open_with(&name, &options) {
+                Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(io_context(
+                        error,
+                        format!(
+                            "failed to create staged {purpose} file {}",
+                            name.to_string_lossy()
+                        ),
+                    ));
+                }
             };
-            let staged = Self { directory, name };
+            let staged = Self {
+                directory,
+                name,
+                #[cfg(windows)]
+                publish_source: None,
+            };
+            #[cfg(windows)]
+            if _retain_publish_handle {
+                let validated = file.metadata().and_then(|metadata| {
+                    validate_regular_file_metadata(&metadata, &staged.name, "staged publish source")
+                });
+                if let Err(error) = validated {
+                    drop(file);
+                    return Err(io_context(
+                        error,
+                        "failed to validate staged publish source",
+                    ));
+                }
+            }
+            let mut file = file.into_std();
             if let Err(error) = file.write_all(content) {
                 drop(file);
+                let error = io_context(
+                    error,
+                    format!(
+                        "failed to write staged {purpose} file {}",
+                        staged.name.to_string_lossy()
+                    ),
+                );
                 drop(staged);
                 return Err(error);
             }
             if let Err(error) = file.sync_all() {
                 drop(file);
+                let error = io_context(
+                    error,
+                    format!(
+                        "failed to sync staged {purpose} file {}",
+                        staged.name.to_string_lossy()
+                    ),
+                );
                 drop(staged);
                 return Err(error);
+            }
+            #[cfg(windows)]
+            if _retain_publish_handle {
+                let mut staged = staged;
+                staged.publish_source = Some(file);
+                return Ok(staged);
             }
             drop(file);
             return Ok(staged);
@@ -602,24 +908,131 @@ impl StagedFile {
         ))
     }
 
-    fn install_noclobber(mut self, destination: &OsStr) -> io::Result<()> {
-        self.directory
-            .hard_link(&self.name, &self.directory, destination)?;
-        self.directory.remove_file(&self.name)?;
-        self.name.clear();
-        sync_directory(&self.directory)
+    fn install_noclobber(self, destination: &OsStr) -> io::Result<()> {
+        self.install_noclobber_with_outcome(destination)
+            .map_err(|error| match error {
+                StagedInstallError::BeforeInstall(error)
+                | StagedInstallError::AfterInstall(error) => error,
+            })
     }
 
-    fn replace(mut self, destination: &OsStr) -> io::Result<()> {
-        self.directory
-            .rename(&self.name, &self.directory, destination)?;
+    fn install_noclobber_with_outcome(self, destination: &OsStr) -> Result<(), StagedInstallError> {
+        self.install_noclobber_with_sync(destination, sync_directory)
+    }
+
+    fn install_noclobber_with_sync(
+        mut self,
+        destination: &OsStr,
+        sync: impl FnOnce(&CapDir) -> io::Result<()>,
+    ) -> Result<(), StagedInstallError> {
+        #[cfg(windows)]
+        {
+            let source = self.publish_source.as_ref().ok_or_else(|| {
+                StagedInstallError::BeforeInstall(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no-clobber publish requires its original staging handle",
+                ))
+            })?;
+            windows_publish::publish(&self.directory, source, destination)
+                .map_err(|error| {
+                    io_context(
+                        error,
+                        format!(
+                            "failed to publish staged file {} as {} without replacement",
+                            self.name.to_string_lossy(),
+                            destination.to_string_lossy()
+                        ),
+                    )
+                })
+                .map_err(StagedInstallError::BeforeInstall)?;
+            // Native rename success is the commit point. It consumes the staging name;
+            // never unlink an alias or undo the published destination after this point.
+            self.name.clear();
+            drop(self.publish_source.take());
+        }
+        #[cfg(not(windows))]
+        {
+            self.directory
+                .hard_link(&self.name, &self.directory, destination)
+                .map_err(|error| {
+                    io_context(
+                        error,
+                        format!(
+                            "failed to hard-link staged file {} as {}",
+                            self.name.to_string_lossy(),
+                            destination.to_string_lossy()
+                        ),
+                    )
+                })
+                .map_err(StagedInstallError::BeforeInstall)?;
+            self.directory
+                .remove_file(&self.name)
+                .map_err(|error| {
+                    io_context(
+                        error,
+                        format!(
+                            "failed to remove staging file {} after installing {}",
+                            self.name.to_string_lossy(),
+                            destination.to_string_lossy()
+                        ),
+                    )
+                })
+                .map_err(StagedInstallError::AfterInstall)?;
+            self.name.clear();
+        }
+        sync(&self.directory)
+            .map_err(|error| {
+                io_context(
+                    error,
+                    format!(
+                        "failed to sync user input directory after installing {}",
+                        destination.to_string_lossy()
+                    ),
+                )
+            })
+            .map_err(StagedInstallError::AfterInstall)
+    }
+
+    fn replace(self, destination: &OsStr) -> io::Result<()> {
+        self.replace_with_hook(destination, || Ok(()))
+    }
+
+    fn replace_with_hook(
+        mut self,
+        destination: &OsStr,
+        after_replace: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let result = self
+            .directory
+            .rename(&self.name, &self.directory, destination);
+        result.map_err(|error| {
+            io_context(
+                error,
+                format!(
+                    "failed to replace {} with staged file {}",
+                    destination.to_string_lossy(),
+                    self.name.to_string_lossy()
+                ),
+            )
+        })?;
         self.name.clear();
-        sync_directory(&self.directory)
+        after_replace()?;
+        sync_directory(&self.directory).map_err(|error| {
+            io_context(
+                error,
+                format!(
+                    "failed to sync user input directory after replacing {}",
+                    destination.to_string_lossy()
+                ),
+            )
+        })
     }
 }
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        drop(self.publish_source.take());
         if !self.name.is_empty() {
             let _ = self.directory.remove_file(&self.name);
         }
@@ -855,6 +1268,242 @@ mod tests {
     }
 
     #[test]
+    fn checked_save_replaces_exact_content_while_holding_the_problem_lock() {
+        for (expected, new_content) in [("A\r\n\0", "C\n\n\t "), ("A", ""), ("", "C\r\n")] {
+            let workspace = TestWorkspace::new();
+            let id = create_user_input(&workspace.destination, "A", expected).unwrap();
+            let lock_path = workspace.destination.join(".atc/user-inputs/.A.lock");
+            let result = save_user_input_if_unchanged_with_hooks(
+                &workspace.destination,
+                "A",
+                id,
+                expected,
+                new_content,
+                || Ok(()),
+                || {
+                    let contender = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&lock_path)?;
+                    assert!(matches!(
+                        contender.try_lock(),
+                        Err(fs::TryLockError::WouldBlock)
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(result, UserInputSaveOutcome::Saved);
+            assert_eq!(
+                fs::read(workspace.problem_directory("A").join(format!("{id}.in"))).unwrap(),
+                new_content.as_bytes()
+            );
+            assert_eq!(
+                ids(&load_user_inputs(&workspace.destination, "A").unwrap()),
+                [id]
+            );
+        }
+    }
+
+    #[test]
+    fn checked_unchanged_save_verifies_disk_without_replacement_or_metadata_write() {
+        let workspace = TestWorkspace::new();
+        let content = "A\r\n\n\0\t ";
+        let id = create_user_input(&workspace.destination, "A", content).unwrap();
+        let directory = workspace.problem_directory("A");
+        // A stale but valid high-water mark would be rewritten by the write path.
+        let metadata = b"version = 1\nnext_id = 1\n";
+        fs::write(directory.join(METADATA_FILE), metadata).unwrap();
+        assert_eq!(
+            save_user_input_if_unchanged_with_hooks(
+                &workspace.destination,
+                "A",
+                id,
+                content,
+                content,
+                || Ok(()),
+                || panic!("Unchanged must not enter replacement"),
+            )
+            .unwrap(),
+            UserInputSaveOutcome::Unchanged
+        );
+        assert_eq!(fs::read(directory.join(METADATA_FILE)).unwrap(), metadata);
+        assert_eq!(
+            fs::read(directory.join(format!("{id}.in"))).unwrap(),
+            content.as_bytes()
+        );
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn checked_conflict_and_missing_never_enter_the_write_path() {
+        let workspace = TestWorkspace::new();
+        let id = create_user_input(&workspace.destination, "A", "A\r\n").unwrap();
+        save_user_input(&workspace.destination, "A", id, "B\n").unwrap();
+        let directory = workspace.problem_directory("A");
+        let metadata = fs::read(directory.join(METADATA_FILE)).unwrap();
+        // Even new == disk is Conflict when the edit baseline differs.
+        for new_content in ["C", "A\r\n", "B\n"] {
+            assert_eq!(
+                save_user_input_if_unchanged_with_hooks(
+                    &workspace.destination,
+                    "A",
+                    id,
+                    "A\r\n",
+                    new_content,
+                    || Ok(()),
+                    || panic!("Conflict must not enter replacement"),
+                )
+                .unwrap(),
+                UserInputSaveOutcome::Conflict
+            );
+            assert_eq!(
+                fs::read(directory.join(format!("{id}.in"))).unwrap(),
+                b"B\n"
+            );
+        }
+        fs::remove_file(directory.join(format!("{id}.in"))).unwrap();
+        assert_eq!(
+            save_user_input_if_unchanged_with_hooks(
+                &workspace.destination,
+                "A",
+                id,
+                "B\n",
+                "C",
+                || Ok(()),
+                || panic!("Missing must not enter replacement"),
+            )
+            .unwrap(),
+            UserInputSaveOutcome::Missing
+        );
+        assert!(!directory.join(format!("{id}.in")).exists());
+        assert_eq!(fs::read(directory.join(METADATA_FILE)).unwrap(), metadata);
+        assert_eq!(
+            save_user_input_if_unchanged(&workspace.destination, "B", id, "", "C",).unwrap(),
+            UserInputSaveOutcome::Missing
+        );
+        assert_eq!(
+            save_user_input_if_unchanged(&workspace.destination.join("absent"), "A", id, "", "C",)
+                .unwrap(),
+            UserInputSaveOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn checked_save_reads_after_a_cooperative_writer_wins_the_lock() {
+        let workspace = TestWorkspace::new();
+        let id = create_user_input(&workspace.destination, "A", "A").unwrap();
+        let destination = workspace.destination.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            done_tx
+                .send(save_user_input(&destination, "A", id, "B"))
+                .unwrap();
+        });
+        let outcome = save_user_input_if_unchanged_with_hooks(
+            &workspace.destination,
+            "A",
+            id,
+            "A",
+            "C",
+            || {
+                start_tx.send(()).unwrap();
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?
+            },
+            || panic!("the winning writer's content must not be replaced"),
+        );
+        writer.join().unwrap();
+        assert_eq!(outcome.unwrap(), UserInputSaveOutcome::Conflict);
+        assert_eq!(
+            load_user_inputs(&workspace.destination, "A").unwrap()[0].content,
+            "B"
+        );
+    }
+
+    #[test]
+    fn concurrent_checked_saves_of_one_baseline_have_only_one_winner() {
+        let workspace = Arc::new(TestWorkspace::new());
+        let id = create_user_input(&workspace.destination, "A", "A").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = ["B", "C"].map(|content| {
+            let workspace = Arc::clone(&workspace);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let outcome = save_user_input_if_unchanged_with_hooks(
+                    &workspace.destination,
+                    "A",
+                    id,
+                    "A",
+                    content,
+                    || {
+                        barrier.wait();
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+                (content, outcome)
+            })
+        });
+        barrier.wait();
+        let results = workers.map(|worker| worker.join().unwrap());
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, outcome)| *outcome == UserInputSaveOutcome::Saved)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, outcome)| *outcome == UserInputSaveOutcome::Conflict)
+                .count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find(|(_, outcome)| *outcome == UserInputSaveOutcome::Saved)
+            .unwrap()
+            .0;
+        assert_eq!(
+            load_user_inputs(&workspace.destination, "A").unwrap()[0].content,
+            winner
+        );
+    }
+
+    #[test]
+    fn checked_save_rejects_invalid_requests_and_unreadable_utf8_without_replacing() {
+        let workspace = TestWorkspace::new();
+        let id = create_user_input(&workspace.destination, "A", "A").unwrap();
+        for problem in ["../escape", "A\\B", "CON"] {
+            assert!(
+                save_user_input_if_unchanged(&workspace.destination, problem, id, "A", "C")
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            save_user_input_if_unchanged(&workspace.destination, "A", 0, "A", "C")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let path = workspace.problem_directory("A").join(format!("{id}.in"));
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            save_user_input_if_unchanged(&workspace.destination, "A", id, "A", "C")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
     fn delete_removes_only_the_requested_id_and_missing_is_an_error() {
         let workspace = TestWorkspace::new();
         for content in ["one", "two", "three"] {
@@ -1003,23 +1652,201 @@ mod tests {
     }
 
     #[test]
-    fn input_installed_before_metadata_failure_is_complete_and_never_reused() {
+    fn save_error_after_replacement_leaves_recoverable_new_content() {
         let workspace = TestWorkspace::new();
-        let error =
-            create_user_input_with_hook(&workspace.destination, "A", "complete first", || {
-                Err(io::Error::other("simulated interruption"))
-            })
-            .unwrap_err();
+        let id = create_user_input(&workspace.destination, "A", "previous").unwrap();
+
+        let error = save_user_input_with_hooks(
+            &workspace.destination,
+            "A",
+            id,
+            "replacement\r\n\r\n",
+            || Ok(()),
+            || Ok(()),
+            || Err(io::Error::other("simulated post-replacement sync failure")),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            load_user_inputs(&workspace.destination, "A").unwrap()[0].content,
+            "replacement\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn permission_denied_after_replacement_does_not_retry_rename_or_hook() {
+        let workspace = TestWorkspace::new();
+        let id = create_user_input(&workspace.destination, "A", "previous").unwrap();
+        let hook_calls = Cell::new(0);
+        let error = save_user_input_with_hooks(
+            &workspace.destination,
+            "A",
+            id,
+            "replacement\r\n",
+            || Ok(()),
+            || Ok(()),
+            || {
+                hook_calls.set(hook_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "post-replacement failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(hook_calls.get(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "post-replacement failure");
+        assert_eq!(
+            load_user_inputs(&workspace.destination, "A").unwrap()[0].content,
+            "replacement\r\n"
+        );
+    }
+
+    #[test]
+    fn create_outcome_reports_failure_before_install_without_an_id() {
+        let workspace = TestWorkspace::new();
+        let error = create_user_input_with_outcome_and_hooks(
+            &workspace.destination,
+            "A",
+            "not installed",
+            || Ok(()),
+            || Err(io::Error::other("simulated pre-install failure")),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, UserInputCreateError::BeforeInstall(_)));
+        assert!(
+            load_user_inputs(&workspace.destination, "A")
+                .unwrap()
+                .is_empty()
+        );
+        // BeforeInstall promises no installed input, not an untouched filesystem.
+        let problem = CapDir::open_ambient_dir(
+            workspace.problem_directory("A"),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        assert_eq!(read_metadata(&problem).unwrap().unwrap().next_id, 2);
+        assert_eq!(
+            create_user_input(&workspace.destination, "A", "retry").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn after_install_failure_has_reserved_metadata_and_never_reuses_a_deleted_id() {
+        let workspace = TestWorkspace::new();
+        let error = create_user_input_with_outcome_and_hooks(
+            &workspace.destination,
+            "A",
+            "complete first",
+            || Ok(()),
+            || Ok(()),
+            || Err(io::Error::other("simulated interruption")),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UserInputCreateError::AfterInstall { id: 1, .. }
+        ));
         assert_eq!(
             fs::read(workspace.problem_directory("A").join("1.in")).unwrap(),
             b"complete first"
         );
 
+        let problem = CapDir::open_ambient_dir(
+            workspace.problem_directory("A"),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        assert_eq!(read_metadata(&problem).unwrap().unwrap().next_id, 2);
+        fs::remove_file(workspace.problem_directory("A").join("1.in")).unwrap();
+
         assert_eq!(
             create_user_input(&workspace.destination, "A", "second").unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn metadata_reservation_precedes_input_publish_for_initial_and_existing_metadata() {
+        let workspace = TestWorkspace::new();
+        for id in 1..=2 {
+            let path = workspace.problem_directory("A");
+            assert_eq!(
+                create_user_input_with_outcome_and_hooks(
+                    &workspace.destination,
+                    "A",
+                    "complete",
+                    || Ok(()),
+                    || {
+                        let problem =
+                            CapDir::open_ambient_dir(&path, cap_std::ambient_authority())?;
+                        assert_eq!(read_metadata(&problem)?.unwrap().next_id, id + 1);
+                        assert!(!path.join(format!("{id}.in")).exists());
+                        Ok(())
+                    },
+                    || {
+                        let problem =
+                            CapDir::open_ambient_dir(&path, cap_std::ambient_authority())?;
+                        assert_eq!(read_metadata(&problem)?.unwrap().next_id, id + 1);
+                        assert_eq!(fs::read(path.join(format!("{id}.in")))?, b"complete");
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_errors_never_publish_and_retry_uses_actual_metadata() {
+        for existing_metadata in [false, true] {
+            for reservation_written in [false, true] {
+                let workspace = TestWorkspace::new();
+                if existing_metadata {
+                    create_user_input(&workspace.destination, "A", "retained").unwrap();
+                }
+                let reserved_id = if existing_metadata { 2 } else { 1 };
+                let outcome = create_user_input_with_reservation(
+                    &workspace.destination,
+                    "A",
+                    "not published",
+                    || Ok(()),
+                    || panic!("reservation failure must stop before input publish"),
+                    || panic!("input must not be installed"),
+                    |problem, metadata, replace| {
+                        if reservation_written {
+                            persist_metadata(problem, metadata, replace)?;
+                        }
+                        Err(io::Error::other(
+                            "injected metadata persistence/sync failure",
+                        ))
+                    },
+                );
+                assert!(matches!(
+                    outcome,
+                    Err(UserInputCreateError::BeforeInstall(_))
+                ));
+                let path = workspace.problem_directory("A");
+                assert!(!path.join(format!("{reserved_id}.in")).exists());
+                assert!(!fs::read_dir(&path).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(STAGING_PREFIX)
+                }));
+                let expected_id = reserved_id + u64::from(reservation_written);
+                assert_eq!(
+                    create_user_input(&workspace.destination, "A", "retry").unwrap(),
+                    expected_id
+                );
+            }
+        }
     }
 
     #[test]
@@ -1058,7 +1885,7 @@ mod tests {
         let workspace = TestWorkspace::new();
         let problem = workspace.problem_directory("A");
 
-        let error = create_user_input_with_hooks(
+        let error = create_user_input_with_outcome_and_hooks(
             &workspace.destination,
             "A",
             "ours",
@@ -1070,7 +1897,19 @@ mod tests {
             || Ok(()),
         )
         .unwrap_err();
+        let UserInputCreateError::BeforeInstall(error) = error else {
+            panic!("publish collision must be classified before install");
+        };
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        #[cfg(not(windows))]
+        assert!(
+            error
+                .to_string()
+                .contains("failed to hard-link staged file")
+        );
+        #[cfg(windows)]
+        assert!(error.to_string().contains("NTSTATUS 0xC0000035"));
+        assert!(error.to_string().contains("1.in"));
         assert_eq!(
             fs::read_to_string(problem.join("1.in")).unwrap(),
             "competitor"
@@ -1079,6 +1918,206 @@ mod tests {
             create_user_input(&workspace.destination, "A", "next").unwrap(),
             2
         );
+    }
+
+    fn staged_fixture() -> (tempfile::TempDir, CapDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned");
+        fs::create_dir(&path).unwrap();
+        let directory = CapDir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap();
+        (temp, directory)
+    }
+
+    #[test]
+    fn staged_publish_exact_content_consumes_source_and_stays_directory_relative() {
+        let (temp, directory) = staged_fixture();
+        for (name, bytes) in [
+            ("1.in", b"\r\n\t space\0\n".as_slice()),
+            ("2.in", b""),
+            (METADATA_FILE, b"version = 1\nnext_id = 3\n"),
+        ] {
+            fs::write(temp.path().join(name), "ambient sentinel").unwrap();
+            let staged = StagedFile::for_install(&directory, "test", bytes).unwrap();
+            let staging_name = staged.name.clone();
+            staged
+                .install_noclobber_with_outcome(OsStr::new(name))
+                .unwrap();
+            assert!(!temp.path().join("owned").join(staging_name).exists());
+            assert_eq!(directory.read(name).unwrap(), bytes);
+            assert_eq!(
+                fs::read(temp.path().join(name)).unwrap(),
+                b"ambient sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_publish_collision_preserves_competitor_and_cleans_staging() {
+        let (_temp, directory) = staged_fixture();
+        for name in ["1.in", METADATA_FILE] {
+            let staged = StagedFile::for_install(&directory, "test", b"ours").unwrap();
+            let staging_name = staged.name.clone();
+            // The competitor appears after staging is ready; no existence precheck
+            // can arbitrate this race. The publish primitive must do so atomically.
+            let mut options = CapOpenOptions::new();
+            options.write(true).create_new(true);
+            directory
+                .open_with(name, &options)
+                .unwrap()
+                .write_all(b"competitor")
+                .unwrap();
+            let sync_calls = Cell::new(0);
+            let error = staged
+                .install_noclobber_with_sync(OsStr::new(name), |_| {
+                    sync_calls.set(sync_calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, StagedInstallError::BeforeInstall(ref error) if error.kind() == io::ErrorKind::AlreadyExists)
+            );
+            assert_eq!(sync_calls.get(), 0);
+            assert_eq!(directory.read(name).unwrap(), b"competitor");
+            assert!(!directory.exists(staging_name));
+        }
+    }
+
+    #[test]
+    fn staged_publish_sync_failure_is_after_install_and_keeps_destination() {
+        let (_temp, directory) = staged_fixture();
+        for name in ["1.in", METADATA_FILE] {
+            let staged = StagedFile::for_install(&directory, "test", b"complete").unwrap();
+            let staging_name = staged.name.clone();
+            let sync_calls = Cell::new(0);
+            let error = staged
+                .install_noclobber_with_sync(OsStr::new(name), |_| {
+                    sync_calls.set(sync_calls.get() + 1);
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected directory sync failure",
+                    ))
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, StagedInstallError::AfterInstall(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+            );
+            assert_eq!(sync_calls.get(), 1);
+            assert_eq!(directory.read(name).unwrap(), b"complete");
+            assert!(!directory.exists(staging_name));
+        }
+    }
+
+    #[test]
+    fn dropping_unpublished_staging_closes_handle_and_removes_name() {
+        let (_temp, directory) = staged_fixture();
+        let staged = StagedFile::for_install(&directory, "test", b"not published").unwrap();
+        let name = staged.name.clone();
+        drop(staged);
+        assert!(!directory.exists(name));
+        assert!(directory.entries().unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_publish_failure_preserves_source_until_staging_cleanup() {
+        let (_temp, directory) = staged_fixture();
+        let staged = StagedFile::for_install(&directory, "test", b"ours").unwrap();
+        directory.write("1.in", b"competitor").unwrap();
+        let error = windows_publish::publish(
+            &directory,
+            staged.publish_source.as_ref().unwrap(),
+            OsStr::new("1.in"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(directory.read("1.in").unwrap(), b"competitor");
+        assert_eq!(directory.read(&staged.name).unwrap(), b"ours");
+        let name = staged.name.clone();
+        drop(staged);
+        assert!(!directory.exists(name));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_publish_same_file_alias_is_a_successful_install() {
+        let (_temp, directory) = staged_fixture();
+        let staged = StagedFile::for_install(&directory, "test", b"same object").unwrap();
+        let name = staged.name.clone();
+        directory.hard_link(&name, &directory, "1.in").unwrap();
+        staged
+            .install_noclobber_with_outcome(OsStr::new("1.in"))
+            .unwrap();
+        assert!(!directory.exists(name));
+        assert_eq!(directory.read("1.in").unwrap(), b"same object");
+        assert_eq!(directory.entries().unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_publish_uses_retained_source_handle_not_a_reopened_staging_path() {
+        let (_temp, directory) = staged_fixture();
+        let staged = StagedFile::for_install(&directory, "test", b"completed source").unwrap();
+        let name = staged.name.clone();
+        directory.rename(&name, &directory, "moved-source").unwrap();
+        directory.write(&name, b"different staging object").unwrap();
+
+        staged
+            .install_noclobber_with_outcome(OsStr::new("1.in"))
+            .unwrap();
+
+        assert_eq!(directory.read("1.in").unwrap(), b"completed source");
+        assert_eq!(directory.read(name).unwrap(), b"different staging object");
+        assert!(!directory.exists("moved-source"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_publish_rejects_invalid_destination_before_install_and_cleans_source() {
+        let (_temp, directory) = staged_fixture();
+        let staged = StagedFile::for_install(&directory, "test", b"ours").unwrap();
+        let name = staged.name.clone();
+        let error = staged
+            .install_noclobber_with_outcome(OsStr::new("../1.in"))
+            .unwrap_err();
+        assert!(
+            matches!(error, StagedInstallError::BeforeInstall(ref error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        assert!(!directory.exists(name));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_publish_does_not_replace_directory_or_follow_symlink() {
+        let (temp, directory) = staged_fixture();
+        directory.create_dir("1.in").unwrap();
+        let external = temp.path().join("external");
+        fs::write(&external, "external").unwrap();
+        let has_symlink = create_file_symlink(&external, &temp.path().join("owned/2.in"));
+        for name in ["1.in", "2.in"] {
+            if name == "2.in" && !has_symlink {
+                continue;
+            }
+            let staged = StagedFile::for_install(&directory, "test", b"ours").unwrap();
+            let staging_name = staged.name.clone();
+            let error = staged
+                .install_noclobber_with_outcome(OsStr::new(name))
+                .unwrap_err();
+            assert!(
+                matches!(error, StagedInstallError::BeforeInstall(ref error) if error.kind() == io::ErrorKind::AlreadyExists)
+            );
+            assert!(!directory.exists(staging_name));
+        }
+        assert!(directory.symlink_metadata("1.in").unwrap().is_dir());
+        if has_symlink {
+            assert!(
+                directory
+                    .symlink_metadata("2.in")
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(fs::read(external).unwrap(), b"external");
     }
 
     fn seed_external_workspace(workspace: &TestWorkspace) -> (PathBuf, PathBuf) {
@@ -1196,6 +2235,7 @@ mod tests {
                         replacement_setup_completed.set(true);
                         Ok(())
                     },
+                    || Ok(()),
                     || Ok(()),
                 ),
                 "delete" => delete_user_input_with_hook(&workspace.destination, "A", 1, || {
@@ -1455,6 +2495,10 @@ mod tests {
 
             assert!(create_user_input(&workspace.destination, "A", "outside").is_err());
             assert!(load_user_inputs(&workspace.destination, "A").is_err());
+            assert!(
+                save_user_input_if_unchanged(&workspace.destination, "A", 1, "", "outside")
+                    .is_err()
+            );
             assert!(fs::read_dir(&external).unwrap().next().is_none());
         }
     }
@@ -1472,6 +2516,10 @@ mod tests {
 
         assert!(load_user_inputs(&workspace.destination, "A").is_err());
         assert!(save_user_input(&workspace.destination, "A", 1, "changed").is_err());
+        assert!(
+            save_user_input_if_unchanged(&workspace.destination, "A", 1, "external", "changed")
+                .is_err()
+        );
         assert!(delete_user_input(&workspace.destination, "A", 1).is_err());
         assert_eq!(fs::read_to_string(external).unwrap(), "external");
         assert!(

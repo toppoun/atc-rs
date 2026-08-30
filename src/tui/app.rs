@@ -72,6 +72,8 @@ pub struct UserInputEditState {
     buffer: String,
     cursor: usize,
     preferred_column: Option<usize>,
+    save_error: Option<Arc<String>>,
+    installed_draft_id: Option<u64>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -88,10 +90,15 @@ impl UserInputEditState {
         self.cursor
     }
 
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref().map(String::as_str)
+    }
+
     pub fn replace_buffer(&mut self, buffer: String) {
         self.buffer = buffer;
         self.cursor = self.buffer.len();
         self.preferred_column = None;
+        self.save_error = None;
     }
 
     pub fn insert(&mut self, text: &str) -> bool {
@@ -108,6 +115,7 @@ impl UserInputEditState {
             self.cursor = self.cursor.saturating_add(1);
         }
         self.preferred_column = None;
+        self.save_error = None;
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
         true
     }
@@ -219,6 +227,7 @@ impl UserInputEditState {
             self.buffer.drain(start..self.cursor);
             self.cursor = start;
             self.preferred_column = None;
+            self.save_error = None;
             debug_assert!(self.buffer.is_char_boundary(self.cursor));
             return true;
         }
@@ -229,6 +238,7 @@ impl UserInputEditState {
         self.cursor = previous;
         self.move_before_crlf_if_between();
         self.preferred_column = None;
+        self.save_error = None;
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
         true
     }
@@ -243,6 +253,7 @@ impl UserInputEditState {
             let end = self.cursor.saturating_add(2);
             self.buffer.drain(self.cursor..end);
             self.preferred_column = None;
+            self.save_error = None;
             debug_assert!(self.buffer.is_char_boundary(self.cursor));
             return true;
         }
@@ -253,6 +264,7 @@ impl UserInputEditState {
         self.buffer.drain(self.cursor..end);
         self.move_before_crlf_if_between();
         self.preferred_column = None;
+        self.save_error = None;
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
         true
     }
@@ -302,6 +314,23 @@ pub enum UserInputEditStartError {
     AlreadyEditing,
     PersistedInputNotFound(u64),
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UserInputSaveSnapshot {
+    pub(super) problem: usize,
+    pub(super) problem_index: String,
+    pub(super) target: UserInputEditTarget,
+    pub(super) content: String,
+    pub(super) baseline: Option<String>,
+    pub(super) dirty: bool,
+    pub(super) installed_draft_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserInputSaveTransitionError {
+    StaleSnapshot,
+    InvalidPersistedSnapshot,
 }
 
 impl fmt::Display for UserInputEditStartError {
@@ -355,6 +384,8 @@ impl UserInputReadyState {
             buffer: String::new(),
             cursor: 0,
             preferred_column: None,
+            save_error: None,
+            installed_draft_id: None,
         });
         Ok(())
     }
@@ -374,6 +405,8 @@ impl UserInputReadyState {
             cursor: content.len(),
             buffer: content,
             preferred_column: None,
+            save_error: None,
+            installed_draft_id: None,
         });
         Ok(())
     }
@@ -391,6 +424,29 @@ impl UserInputReadyState {
                 edit.buffer != persisted.content
             }
         })
+    }
+
+    // Runtime persisted content is the edit baseline. Only explicit reconciliation
+    // advances it; the user's buffer/cursor are independent and remain untouched.
+    fn edit_baseline(&self) -> Option<&str> {
+        let UserInputEditTarget::Persisted(id) = self.edit.as_ref()?.target else {
+            return None;
+        };
+        self.persisted
+            .iter()
+            .find(|input| input.id == id)
+            .map(|input| input.content.as_str())
+    }
+
+    fn edit_matches(&self, target: UserInputEditTarget, content: &str) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|edit| edit.target == target && edit.buffer == content)
+    }
+
+    fn replace_persisted(&mut self, mut persisted: Vec<PersistedUserInputState>) {
+        persisted.sort_by_key(|input| input.id);
+        self.persisted = persisted;
     }
 
     pub fn cancel_edit(&mut self) -> bool {
@@ -953,6 +1009,259 @@ impl WatchApp {
 
     pub fn user_input_editor_active(&self) -> bool {
         self.selected_user_input_edit().is_some()
+    }
+
+    pub(super) fn user_input_save_snapshot(&self) -> Option<UserInputSaveSnapshot> {
+        let problem = self.selected_problem()?;
+        let problem_state = self.problems.get(problem)?;
+        let ready = problem_state.user_inputs.ready()?;
+        let edit = self.selected_user_input_edit()?;
+        Some(UserInputSaveSnapshot {
+            problem,
+            problem_index: problem_state.index.clone(),
+            target: edit.target,
+            content: edit.buffer.clone(),
+            baseline: ready.edit_baseline().map(str::to_owned),
+            dirty: ready
+                .edit_is_dirty()
+                .expect("a selected User Input edit must have dirty state"),
+            installed_draft_id: edit.installed_draft_id,
+        })
+    }
+
+    fn user_input_save_snapshot_matches(&self, snapshot: &UserInputSaveSnapshot) -> bool {
+        if self.selected_problem() != Some(snapshot.problem) {
+            return false;
+        }
+        let selection_matches = match snapshot.target {
+            UserInputEditTarget::Draft => {
+                self.selected_user_input() == Some(UserInputSelection::Draft)
+            }
+            UserInputEditTarget::Persisted(id) => {
+                self.selected_user_input() == Some(UserInputSelection::Persisted(id))
+            }
+        };
+        selection_matches
+            && self
+                .problems
+                .get(snapshot.problem)
+                .filter(|problem| problem.index == snapshot.problem_index)
+                .and_then(|problem| problem.user_inputs.ready())
+                .is_some_and(|ready| {
+                    ready.edit_matches(snapshot.target, &snapshot.content)
+                        && ready.edit_baseline() == snapshot.baseline.as_deref()
+                        && ready.edit_is_dirty() == Some(snapshot.dirty)
+                        && ready.edit().is_some_and(|edit| {
+                            edit.installed_draft_id == snapshot.installed_draft_id
+                        })
+                })
+    }
+
+    pub(super) fn complete_draft_user_input_save(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        id: u64,
+        reloaded: Option<Vec<PersistedUserInputState>>,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        if snapshot.target != UserInputEditTarget::Draft
+            || !self.user_input_save_snapshot_matches(snapshot)
+        {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+
+        let problem = &mut self.problems[snapshot.problem];
+        let ready = problem
+            .user_inputs
+            .ready_mut()
+            .expect("a matching User Input snapshot must retain ready state");
+        if let Some(reloaded) = reloaded {
+            if !reloaded
+                .iter()
+                .any(|input| input.id == id && input.content == snapshot.content)
+            {
+                return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+            }
+            ready.replace_persisted(reloaded);
+        } else {
+            if ready.persisted.iter().any(|input| input.id == id) {
+                return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+            }
+            ready.persisted.push(PersistedUserInputState {
+                id,
+                content: snapshot.content.clone(),
+            });
+            ready.persisted.sort_by_key(|input| input.id);
+        }
+        ready.edit = None;
+        problem.selection_before_draft = DraftReturnSelection::None;
+        self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)));
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub(super) fn complete_persisted_user_input_save(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        reloaded: Option<Vec<PersistedUserInputState>>,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        let UserInputEditTarget::Persisted(id) = snapshot.target else {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        };
+        if !self.user_input_save_snapshot_matches(snapshot) {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+
+        let ready = self.problems[snapshot.problem]
+            .user_inputs
+            .ready_mut()
+            .expect("a matching User Input snapshot must retain ready state");
+        if let Some(reloaded) = reloaded {
+            if !reloaded
+                .iter()
+                .any(|input| input.id == id && input.content == snapshot.content)
+            {
+                return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+            }
+            ready.replace_persisted(reloaded);
+        } else {
+            let persisted = ready
+                .persisted
+                .iter_mut()
+                .find(|input| input.id == id)
+                .ok_or(UserInputSaveTransitionError::InvalidPersistedSnapshot)?;
+            persisted.content.clone_from(&snapshot.content);
+        }
+        ready.edit = None;
+        self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)));
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub(super) fn fail_user_input_save(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        message: String,
+        installed_draft_id: Option<u64>,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        if !self.user_input_save_snapshot_matches(snapshot) {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+        let edit = self.problems[snapshot.problem]
+            .user_inputs
+            .ready_mut()
+            .and_then(UserInputReadyState::edit_mut)
+            .expect("a matching User Input snapshot must retain its editor");
+        edit.save_error = Some(Arc::new(message));
+        if snapshot.target == UserInputEditTarget::Draft
+            && let Some(id) = installed_draft_id
+        {
+            edit.installed_draft_id = Some(id);
+        }
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub(super) fn reconcile_draft_user_input_install_conflict(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        id: u64,
+        reloaded: Vec<PersistedUserInputState>,
+        message: String,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        if snapshot.target != UserInputEditTarget::Draft
+            || !self.user_input_save_snapshot_matches(snapshot)
+        {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+        if !reloaded.iter().any(|input| input.id == id) {
+            return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+        }
+
+        let problem = &mut self.problems[snapshot.problem];
+        let ready = problem
+            .user_inputs
+            .ready_mut()
+            .expect("a matching User Input snapshot must retain ready state");
+        ready.replace_persisted(reloaded);
+        let edit = ready
+            .edit_mut()
+            .expect("a matching User Input snapshot must retain its editor");
+        edit.target = UserInputEditTarget::Persisted(id);
+        edit.installed_draft_id = None;
+        edit.save_error = Some(Arc::new(message));
+        problem.selection_before_draft = DraftReturnSelection::None;
+        self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)));
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub(super) fn reconcile_persisted_user_input_save_failure(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        reloaded: Vec<PersistedUserInputState>,
+        message: String,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        let UserInputEditTarget::Persisted(id) = snapshot.target else {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        };
+        if !self.user_input_save_snapshot_matches(snapshot) {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+        if !reloaded.iter().any(|input| input.id == id) {
+            return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+        }
+
+        let ready = self.problems[snapshot.problem]
+            .user_inputs
+            .ready_mut()
+            .expect("a matching User Input snapshot must retain ready state");
+        ready.replace_persisted(reloaded);
+        ready
+            .edit_mut()
+            .expect("a matching User Input snapshot must retain its editor")
+            .save_error = Some(Arc::new(message));
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
+    }
+
+    pub(super) fn reconcile_missing_persisted_user_input_save_failure(
+        &mut self,
+        snapshot: &UserInputSaveSnapshot,
+        reloaded: Vec<PersistedUserInputState>,
+        message: String,
+    ) -> Result<bool, UserInputSaveTransitionError> {
+        let UserInputEditTarget::Persisted(id) = snapshot.target else {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        };
+        if !self.user_input_save_snapshot_matches(snapshot) {
+            return Err(UserInputSaveTransitionError::StaleSnapshot);
+        }
+        if reloaded.iter().any(|input| input.id == id) {
+            return Err(UserInputSaveTransitionError::InvalidPersistedSnapshot);
+        }
+
+        let problem = &mut self.problems[snapshot.problem];
+        let ready = problem
+            .user_inputs
+            .ready_mut()
+            .expect("a matching User Input snapshot must retain ready state");
+        ready.replace_persisted(reloaded);
+        let edit = ready
+            .edit_mut()
+            .expect("a matching User Input snapshot must retain its editor");
+        edit.target = UserInputEditTarget::Draft;
+        edit.installed_draft_id = None;
+        edit.save_error = Some(Arc::new(message));
+        problem.selection_before_draft = DraftReturnSelection::None;
+        self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Draft));
+        self.detail_folds.expand(DetailSectionKind::Input);
+        self.invalidate_detail();
+        Ok(true)
     }
 
     pub fn begin_new_user_input(&mut self) -> Result<bool, UserInputEditStartError> {
@@ -2570,6 +2879,8 @@ mod tests {
             buffer: "a\r\nb\r\n".to_string(),
             cursor: "a\r\n".len(),
             preferred_column: None,
+            save_error: None,
+            installed_draft_id: None,
         };
         assert!(edit.backspace());
         assert_eq!(edit.buffer(), "ab\r\n");
@@ -2606,6 +2917,8 @@ mod tests {
                 buffer: format!("a{newline}b"),
                 cursor: 1,
                 preferred_column: None,
+                save_error: None,
+                installed_draft_id: None,
             };
             assert!(edit.move_right());
             assert_eq!(edit.cursor(), 2);
@@ -2633,6 +2946,8 @@ mod tests {
             buffer: "\n".to_string(),
             cursor: 0,
             preferred_column: None,
+            save_error: None,
+            installed_draft_id: None,
         };
         assert!(edit.insert("\r"));
         assert_eq!(edit.buffer(), "\r\n");
@@ -3062,6 +3377,415 @@ mod tests {
         assert!(
             !app.detail_folds.input_collapsed,
             "editing Input stays expanded"
+        );
+    }
+
+    #[test]
+    fn draft_save_transition_persists_exact_content_without_changing_test_cases_or_scroll() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![2],
+            vec![None],
+            vec![loaded_user_inputs(&[(1, "one"), (3, "three")])],
+        )
+        .unwrap();
+        assert!(app.next_case());
+        assert!(app.begin_new_user_input().unwrap());
+        assert!(app.edit_user_input_insert("alpha\r\n\r\nomega\n"));
+        assert!(app.edit_user_input_left());
+        assert!(app.scroll_detail_down(19));
+        let total_cases = app.current_problem().unwrap().total_cases;
+        let run_cases = app.current_problem().unwrap().run.cases.len();
+        let snapshot = app.user_input_save_snapshot().unwrap();
+
+        assert!(snapshot.dirty);
+        assert_eq!(snapshot.target, UserInputEditTarget::Draft);
+        assert_eq!(snapshot.content, "alpha\r\n\r\nomega\n");
+        assert!(
+            app.complete_draft_user_input_save(&snapshot, 8, None)
+                .unwrap()
+        );
+
+        let problem = app.current_problem().unwrap();
+        let ready = problem.user_inputs.ready().unwrap();
+        assert_eq!(
+            ready
+                .persisted()
+                .iter()
+                .map(|input| (input.id, input.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "one"), (3, "three"), (8, "alpha\r\n\r\nomega\n")]
+        );
+        assert!(ready.edit().is_none());
+        assert_eq!(problem.selection_before_draft, DraftReturnSelection::None);
+        assert_eq!(problem.total_cases, total_cases);
+        assert_eq!(problem.run.cases.len(), run_cases);
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
+        );
+        assert_eq!(app.detail_scroll(), 19);
+        assert!(!app.detail_folds.input_collapsed);
+    }
+
+    #[test]
+    fn empty_draft_and_persisted_save_transitions_end_editing_with_stable_ids() {
+        let mut draft = WatchApp::new(&contest(1), vec![0]).unwrap();
+        draft.begin_new_user_input().unwrap();
+        let snapshot = draft.user_input_save_snapshot().unwrap();
+        assert!(snapshot.dirty);
+        assert!(snapshot.content.is_empty());
+        draft
+            .complete_draft_user_input_save(&snapshot, 41, None)
+            .unwrap();
+        assert_eq!(
+            draft
+                .current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted(),
+            &[PersistedUserInputState {
+                id: 41,
+                content: String::new(),
+            }]
+        );
+
+        let mut persisted = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(8, "original\r\n")])],
+        )
+        .unwrap();
+        persisted.begin_selected_user_input_edit().unwrap();
+        let unchanged = persisted.user_input_save_snapshot().unwrap();
+        assert!(!unchanged.dirty);
+        persisted
+            .complete_persisted_user_input_save(&unchanged, None)
+            .unwrap();
+        assert!(!persisted.user_input_editor_active());
+        assert_eq!(
+            persisted.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
+        );
+
+        persisted.begin_selected_user_input_edit().unwrap();
+        assert!(persisted.edit_user_input_insert("changed\n"));
+        let changed = persisted.user_input_save_snapshot().unwrap();
+        assert!(changed.dirty);
+        persisted
+            .complete_persisted_user_input_save(&changed, None)
+            .unwrap();
+        let ready = persisted
+            .current_problem()
+            .unwrap()
+            .user_inputs
+            .ready()
+            .unwrap();
+        assert_eq!(ready.persisted()[0].id, 8);
+        assert_eq!(ready.persisted()[0].content, "original\r\nchanged\n");
+        assert!(ready.edit().is_none());
+    }
+
+    #[test]
+    fn dirty_state_is_exact_and_save_error_lifecycle_distinguishes_content_from_cursor() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "same\r\n")])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .edit_is_dirty(),
+            Some(false)
+        );
+        assert!(app.edit_user_input_insert("x"));
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .edit_is_dirty(),
+            Some(true)
+        );
+        assert!(app.edit_user_input_backspace());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .edit_is_dirty(),
+            Some(false)
+        );
+
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        app.fail_user_input_save(&snapshot, "permission denied".to_string(), None)
+            .unwrap();
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().save_error(),
+            Some("permission denied")
+        );
+        assert!(app.edit_user_input_left());
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().save_error(),
+            Some("permission denied")
+        );
+        assert!(app.edit_user_input_insert("!"));
+        assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        app.fail_user_input_save(&snapshot, "again".to_string(), None)
+            .unwrap();
+        assert!(app.cancel_user_input_edit());
+        assert!(app.active_user_input_edit().is_none());
+    }
+
+    #[test]
+    fn reconcile_transitions_preserve_edit_buffer_cursor_and_prevent_draft_recreate() {
+        let mut draft = WatchApp::new(&contest(1), vec![0]).unwrap();
+        draft.begin_new_user_input().unwrap();
+        assert!(draft.edit_user_input_insert("snapshot\r\n"));
+        assert!(draft.edit_user_input_left());
+        let snapshot = draft.user_input_save_snapshot().unwrap();
+        let cursor = draft.selected_user_input_edit().unwrap().cursor();
+        draft
+            .reconcile_draft_user_input_install_conflict(
+                &snapshot,
+                8,
+                vec![PersistedUserInputState {
+                    id: 8,
+                    content: "different".to_string(),
+                }],
+                "installed content differs".to_string(),
+            )
+            .unwrap();
+        let edit = draft.selected_user_input_edit().unwrap();
+        assert_eq!(edit.target(), UserInputEditTarget::Persisted(8));
+        assert_eq!(edit.buffer(), "snapshot\r\n");
+        assert_eq!(edit.cursor(), cursor);
+        assert_eq!(edit.save_error(), Some("installed content differs"));
+        assert_eq!(
+            draft.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
+        );
+
+        let mut persisted = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "original")])],
+        )
+        .unwrap();
+        persisted.begin_selected_user_input_edit().unwrap();
+        persisted.edit_user_input_insert(" buffer\r\nsecond");
+        assert!(persisted.edit_user_input_up());
+        let snapshot = persisted.user_input_save_snapshot().unwrap();
+        let cursor = persisted.selected_user_input_edit().unwrap().cursor();
+        let preferred_column = persisted
+            .selected_user_input_edit()
+            .unwrap()
+            .preferred_column;
+        assert!(preferred_column.is_some());
+        persisted
+            .reconcile_persisted_user_input_save_failure(
+                &snapshot,
+                vec![PersistedUserInputState {
+                    id: 3,
+                    content: "disk changed".to_string(),
+                }],
+                "save failed".to_string(),
+            )
+            .unwrap();
+        let ready = persisted
+            .current_problem()
+            .unwrap()
+            .user_inputs
+            .ready()
+            .unwrap();
+        assert_eq!(ready.persisted()[0].content, "disk changed");
+        assert_eq!(ready.edit().unwrap().buffer(), "original buffer\r\nsecond");
+        assert_eq!(ready.edit().unwrap().cursor(), cursor);
+        assert_eq!(ready.edit().unwrap().preferred_column, preferred_column);
+        assert_eq!(ready.edit().unwrap().save_error(), Some("save failed"));
+    }
+
+    #[test]
+    fn missing_persisted_save_transition_reloads_disk_truth_and_recovers_as_draft() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(1, "runtime one"), (8, "target")])],
+        )
+        .unwrap();
+        assert!(app.next_case());
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert(" first\r\nsecond");
+        assert!(app.edit_user_input_up());
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        let edit = app.selected_user_input_edit().unwrap();
+        let buffer = edit.buffer().to_string();
+        let cursor = edit.cursor();
+        let preferred_column = edit.preferred_column;
+        let reloaded = vec![
+            PersistedUserInputState {
+                id: 1,
+                content: "disk one".to_string(),
+            },
+            PersistedUserInputState {
+                id: 12,
+                content: "disk twelve".to_string(),
+            },
+        ];
+
+        let mut stale = snapshot.clone();
+        stale.content.push('!');
+        assert_eq!(
+            app.reconcile_missing_persisted_user_input_save_failure(
+                &stale,
+                reloaded.clone(),
+                "must not apply".to_string(),
+            ),
+            Err(UserInputSaveTransitionError::StaleSnapshot)
+        );
+
+        assert_eq!(
+            app.reconcile_persisted_user_input_save_failure(
+                &snapshot,
+                reloaded.clone(),
+                "save failed".to_string(),
+            ),
+            Err(UserInputSaveTransitionError::InvalidPersistedSnapshot)
+        );
+        assert_eq!(
+            app.reconcile_missing_persisted_user_input_save_failure(
+                &snapshot,
+                reloaded,
+                "recovered as a draft".to_string(),
+            ),
+            Ok(true)
+        );
+
+        let problem = app.current_problem().unwrap();
+        let ready = problem.user_inputs.ready().unwrap();
+        assert_eq!(
+            ready
+                .persisted()
+                .iter()
+                .map(|input| (input.id, input.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "disk one"), (12, "disk twelve")]
+        );
+        let edit = ready.edit().unwrap();
+        assert_eq!(edit.target(), UserInputEditTarget::Draft);
+        assert_eq!(edit.buffer(), buffer);
+        assert_eq!(edit.cursor(), cursor);
+        assert_eq!(edit.preferred_column, preferred_column);
+        assert_eq!(edit.installed_draft_id, None);
+        assert_eq!(edit.save_error(), Some("recovered as a draft"));
+        assert_eq!(problem.selection_before_draft, DraftReturnSelection::None);
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Draft))
+        );
+        assert_eq!(ready.edit_is_dirty(), Some(true));
+    }
+
+    #[test]
+    fn save_completion_rejects_a_snapshot_after_the_edit_buffer_changes() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "original")])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        let stale = app.user_input_save_snapshot().unwrap();
+        assert!(app.edit_user_input_insert(" changed"));
+        assert_eq!(
+            app.complete_persisted_user_input_save(&stale, None),
+            Err(UserInputSaveTransitionError::StaleSnapshot)
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "original changed"
+        );
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "original"
+        );
+    }
+
+    #[test]
+    fn save_transitions_reject_old_baselines_and_different_problem_indices() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest(1),
+            vec![0],
+            vec![None],
+            vec![loaded_user_inputs(&[(3, "A\r\n")])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert("C");
+        let stale = app.user_input_save_snapshot().unwrap();
+        assert_eq!(stale.baseline.as_deref(), Some("A\r\n"));
+        app.reconcile_persisted_user_input_save_failure(
+            &stale,
+            vec![PersistedUserInputState {
+                id: 3,
+                content: "B\r\n".to_string(),
+            }],
+            "conflict".to_string(),
+        )
+        .unwrap();
+        // Buffer, target, and dirty state did not change. Only the baseline did.
+        let current = app.user_input_save_snapshot().unwrap();
+        assert_eq!(current.content, stale.content);
+        assert_eq!(current.target, stale.target);
+        assert_eq!(current.dirty, stale.dirty);
+        assert_eq!(current.baseline.as_deref(), Some("B\r\n"));
+        assert_eq!(
+            app.complete_persisted_user_input_save(&stale, None),
+            Err(UserInputSaveTransitionError::StaleSnapshot)
+        );
+        assert_eq!(
+            app.fail_user_input_save(&stale, "stale error".to_string(), None),
+            Err(UserInputSaveTransitionError::StaleSnapshot)
+        );
+        let mut other_problem = current.clone();
+        other_problem.problem_index.push('X');
+        assert_eq!(
+            app.complete_persisted_user_input_save(&other_problem, None),
+            Err(UserInputSaveTransitionError::StaleSnapshot)
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().save_error(),
+            Some("conflict")
+        );
+        assert_eq!(
+            app.user_input_save_snapshot().unwrap().baseline,
+            current.baseline
+        );
+        assert_eq!(
+            app.complete_persisted_user_input_save(&current, None),
+            Ok(true)
         );
     }
 

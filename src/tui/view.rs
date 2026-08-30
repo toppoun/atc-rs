@@ -214,6 +214,7 @@ pub(super) struct DetailSectionHeaderTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UserInputDetailAction {
     Edit,
+    Save,
     Cancel,
 }
 
@@ -233,7 +234,7 @@ pub struct RenderInfo {
     pub detail_area: Rect,
     pub(super) detail_scrollbar: Option<DetailScrollbarInteraction>,
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
-    pub(super) user_input_detail_action: Option<UserInputDetailActionTarget>,
+    pub(super) user_input_detail_actions: Vec<UserInputDetailActionTarget>,
     pub(super) editor_cursor: Option<(u16, u16)>,
     pub(super) editor_scroll_reconciliation: Option<usize>,
 }
@@ -260,13 +261,16 @@ impl RenderInfo {
         column: u16,
         row: u16,
     ) -> Option<UserInputDetailActionTarget> {
-        self.user_input_detail_action.filter(|target| {
-            target.detail_revision == detail_revision
-                && column >= target.area.x
-                && column < target.area.right()
-                && row >= target.area.y
-                && row < target.area.bottom()
-        })
+        self.user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| {
+                target.detail_revision == detail_revision
+                    && column >= target.area.x
+                    && column < target.area.right()
+                    && row >= target.area.y
+                    && row < target.area.bottom()
+            })
     }
 }
 
@@ -550,11 +554,12 @@ pub(super) fn render_frontend_with_pointer(
         }
     }
 
-    let user_input_detail_action =
-        user_input_detail_action_target(app, &mut detail_section_headers, app.detail_revision());
-    if let Some(target) = user_input_detail_action {
+    let user_input_detail_actions =
+        user_input_detail_action_targets(app, &mut detail_section_headers, app.detail_revision());
+    for target in &user_input_detail_actions {
         let label = match target.action {
             UserInputDetailAction::Edit => "[Edit]",
+            UserInputDetailAction::Save => "[Save]",
             UserInputDetailAction::Cancel => "[Cancel]",
         };
         frame.render_widget(Paragraph::new(label), target.area);
@@ -568,7 +573,7 @@ pub(super) fn render_frontend_with_pointer(
         detail_area,
         detail_scrollbar,
         detail_section_headers,
-        user_input_detail_action,
+        user_input_detail_actions,
         editor_cursor,
         editor_scroll_reconciliation,
     };
@@ -638,51 +643,64 @@ fn contains_rect(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
-fn user_input_detail_action_target(
+fn user_input_detail_action_targets(
     app: &WatchApp,
     headers: &mut Vec<DetailSectionHeaderTarget>,
     detail_revision: u64,
-) -> Option<UserInputDetailActionTarget> {
-    let action = if app.user_input_editor_active() {
-        Some(UserInputDetailAction::Cancel)
+) -> Vec<UserInputDetailActionTarget> {
+    let actions: &[UserInputDetailAction] = if app.user_input_editor_active() {
+        &[UserInputDetailAction::Save, UserInputDetailAction::Cancel]
     } else if matches!(
         app.selected_user_input(),
         Some(UserInputSelection::Persisted(_))
     ) {
-        Some(UserInputDetailAction::Edit)
+        &[UserInputDetailAction::Edit]
     } else {
-        None
-    }?;
-    let index = headers
+        &[]
+    };
+    if actions.is_empty() {
+        return Vec::new();
+    }
+    let Some(index) = headers
         .iter()
-        .position(|header| header.kind == DetailSectionKind::Input)?;
+        .position(|header| header.kind == DetailSectionKind::Input)
+    else {
+        return Vec::new();
+    };
     let mut header = headers[index];
-    if action == UserInputDetailAction::Cancel {
+    if app.user_input_editor_active() {
         headers.remove(index);
     }
 
-    let width: u16 = match action {
-        UserInputDetailAction::Edit => 6,
-        UserInputDetailAction::Cancel => 8,
+    let action_width = |action| match action {
+        UserInputDetailAction::Edit | UserInputDetailAction::Save => 6_u16,
+        UserInputDetailAction::Cancel => 8_u16,
     };
-    if header.area.width < width.saturating_add(4) {
-        return None;
+    let labels_width = actions.iter().copied().map(action_width).sum::<u16>();
+    let gaps = u16::try_from(actions.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let total_width = labels_width.saturating_add(gaps);
+    if header.area.width < total_width.saturating_add(4) {
+        return Vec::new();
     }
-    let area = Rect::new(
-        header.area.right().saturating_sub(width),
-        header.area.y,
-        width,
-        1,
-    );
-    if action == UserInputDetailAction::Edit {
-        header.area.width = area.x.saturating_sub(header.area.x);
+    let mut x = header.area.right().saturating_sub(total_width);
+    let mut targets = Vec::with_capacity(actions.len());
+    for (position, action) in actions.iter().copied().enumerate() {
+        let width = action_width(action);
+        targets.push(UserInputDetailActionTarget {
+            action,
+            area: Rect::new(x, header.area.y, width, 1),
+            detail_revision,
+        });
+        x = x.saturating_add(width);
+        if position + 1 < actions.len() {
+            x = x.saturating_add(1);
+        }
+    }
+    if actions == [UserInputDetailAction::Edit] {
+        header.area.width = targets[0].area.x.saturating_sub(header.area.x);
         headers[index] = header;
     }
-    Some(UserInputDetailActionTarget {
-        action,
-        area,
-        detail_revision,
-    })
+    targets
 }
 
 fn editor_cursor_cell(
@@ -1517,7 +1535,7 @@ enum SampleRow {
     StressHeader,
     Stress { flat_index: usize },
     UserInputsHeader,
-    UserInput { id: u64 },
+    UserInput { id: u64, number: usize, dirty: bool },
     Draft,
     UserInputError,
 }
@@ -1528,7 +1546,7 @@ impl SampleRow {
             Self::Sample { flat_index, .. } | Self::Stress { flat_index } => {
                 Some(CaseSelection::Test(flat_index))
             }
-            Self::UserInput { id } => {
+            Self::UserInput { id, .. } => {
                 Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)))
             }
             Self::Draft => Some(CaseSelection::UserInput(UserInputSelection::Draft)),
@@ -1559,6 +1577,10 @@ fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
 
     match &problem.user_inputs {
         super::app::UserInputState::Ready(ready) => {
+            let dirty_target = ready
+                .edit()
+                .filter(|_| ready.edit_is_dirty() == Some(true))
+                .map(|edit| edit.target());
             let has_draft = ready
                 .edit()
                 .is_some_and(|edit| edit.target() == UserInputEditTarget::Draft);
@@ -1571,7 +1593,12 @@ fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
                     ready
                         .persisted()
                         .iter()
-                        .map(|input| SampleRow::UserInput { id: input.id }),
+                        .enumerate()
+                        .map(|(position, input)| SampleRow::UserInput {
+                            id: input.id,
+                            number: position.saturating_add(1),
+                            dirty: dirty_target == Some(UserInputEditTarget::Persisted(input.id)),
+                        }),
                 );
                 if has_draft {
                     rows.push(SampleRow::Draft);
@@ -1636,12 +1663,12 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
                 "User Inputs",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            SampleRow::UserInput { id } => lines.push(user_input_line(
-                &format!("Input {id}"),
+            SampleRow::UserInput { id, number, dirty } => lines.push(user_input_line(
+                &format!("Input {number}{}", if dirty { " *" } else { "" }),
                 selection == Some(CaseSelection::UserInput(UserInputSelection::Persisted(id))),
             )),
             SampleRow::Draft => lines.push(user_input_line(
-                "Draft",
+                "Draft *",
                 selection == Some(CaseSelection::UserInput(UserInputSelection::Draft)),
             )),
             SampleRow::UserInputError => lines.push(Line::styled(
@@ -3952,9 +3979,21 @@ mod tests {
                 },
                 SampleRow::Blank,
                 SampleRow::UserInputsHeader,
-                SampleRow::UserInput { id: 1 },
-                SampleRow::UserInput { id: 3 },
-                SampleRow::UserInput { id: 8 },
+                SampleRow::UserInput {
+                    id: 1,
+                    number: 1,
+                    dirty: false,
+                },
+                SampleRow::UserInput {
+                    id: 3,
+                    number: 2,
+                    dirty: false,
+                },
+                SampleRow::UserInput {
+                    id: 8,
+                    number: 3,
+                    dirty: false,
+                },
             ]
         );
         assert!(app.next_case());
@@ -3978,6 +4017,80 @@ mod tests {
             })
             .unwrap();
         assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+
+        assert!(app.next_case());
+        assert!(app.next_case());
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
+        );
+        let lines = text_lines(&samples_text(&app, 20));
+        assert!(lines.iter().any(|line| line == "> Input 3"));
+        assert!(!lines.iter().any(|line| line.starts_with("  Input 4")));
+    }
+
+    #[test]
+    fn contiguous_backend_ids_also_render_as_contiguous_display_ordinals() {
+        let app = app_with_user_inputs(
+            0,
+            UserInputState::loaded(
+                [1, 2, 3]
+                    .into_iter()
+                    .map(|id| PersistedUserInputState {
+                        id,
+                        content: id.to_string(),
+                    })
+                    .collect(),
+            ),
+        );
+        assert_eq!(
+            text_lines(&samples_text(&app, 10)),
+            ["User Inputs", "> Input 1", "  Input 2", "  Input 3"]
+        );
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(1)))
+        );
+    }
+
+    #[test]
+    fn dirty_marker_tracks_the_problem_local_edit_target_even_when_another_row_is_selected() {
+        let mut app = app_with_user_inputs(
+            0,
+            UserInputState::loaded(vec![
+                PersistedUserInputState {
+                    id: 3,
+                    content: "original".to_string(),
+                },
+                PersistedUserInputState {
+                    id: 8,
+                    content: "other".to_string(),
+                },
+            ]),
+        );
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(
+            !text_lines(&samples_text(&app, 10))
+                .iter()
+                .any(|line| line.contains('*'))
+        );
+        assert!(app.edit_user_input_insert("x"));
+        assert!(app.next_case());
+        assert_eq!(
+            app.case_selection(),
+            Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
+        );
+        let lines = text_lines(&samples_text(&app, 10));
+        assert!(lines.iter().any(|line| line == "  Input 1 *"));
+        assert!(lines.iter().any(|line| line == "> Input 2"));
+
+        assert!(app.previous_case());
+        assert!(app.edit_user_input_backspace());
+        assert!(
+            !text_lines(&samples_text(&app, 10))
+                .iter()
+                .any(|line| line.contains('*'))
+        );
     }
 
     #[test]
@@ -4017,7 +4130,7 @@ mod tests {
         assert!(info.samples_area.is_some());
         assert_eq!(
             text_lines(&samples_text(&app, 10)),
-            ["User Inputs", "> Input 3"]
+            ["User Inputs", "> Input 1"]
         );
     }
 
@@ -4098,7 +4211,7 @@ mod tests {
     fn persisted_edit_and_editing_cancel_actions_are_separate_from_fold_headers() {
         let mut app = user_input_detail_app();
         let (_, read_only) = render_with_pointer_position(&app, None, 100, 30);
-        let edit = read_only.user_input_detail_action.unwrap();
+        let edit = read_only.user_input_detail_actions[0];
         assert_eq!(edit.action, UserInputDetailAction::Edit);
         let input_header = read_only
             .detail_section_headers
@@ -4115,8 +4228,12 @@ mod tests {
 
         app.begin_selected_user_input_edit().unwrap();
         let (buffer, editing) = render_with_pointer_position(&app, None, 100, 30);
-        let cancel = editing.user_input_detail_action.unwrap();
+        assert_eq!(editing.user_input_detail_actions.len(), 2);
+        let save = editing.user_input_detail_actions[0];
+        let cancel = editing.user_input_detail_actions[1];
+        assert_eq!(save.action, UserInputDetailAction::Save);
         assert_eq!(cancel.action, UserInputDetailAction::Cancel);
+        assert!(save.area.right() < cancel.area.x);
         assert!(
             editing
                 .detail_section_headers
@@ -4124,7 +4241,14 @@ mod tests {
                 .all(|header| header.kind != DetailSectionKind::Input)
         );
         assert!(buffer_symbols(&buffer).contains("Input — Editing"));
-        assert!(buffer_symbols(&buffer).contains("[Cancel]"));
+        assert!(!buffer_symbols(&buffer).contains("Input — Editing *"));
+        assert!(buffer_symbols(&buffer).contains("[Save] [Cancel]"));
+        let (save_hover, _) =
+            render_with_pointer_position(&app, Some((save.area.x, save.area.y)), 100, 30);
+        assert_eq!(
+            save_hover.cell((save.area.x, save.area.y)).unwrap().bg,
+            Color::DarkGray
+        );
         let (cancel_hover, _) =
             render_with_pointer_position(&app, Some((cancel.area.x, cancel.area.y)), 100, 30);
         assert_eq!(
@@ -4134,6 +4258,20 @@ mod tests {
                 .bg,
             Color::DarkGray
         );
+
+        assert!(app.edit_user_input_insert("x"));
+        let dirty = rendered_buffer_text(&app, 100, 30);
+        assert!(dirty.contains("Input — Editing *"));
+
+        for width in 0..=20 {
+            let (_, narrow) = render_with_pointer_position(&app, None, width, 8);
+            if narrow.user_input_detail_actions.len() == 2 {
+                assert!(
+                    narrow.user_input_detail_actions[0].area.right()
+                        < narrow.user_input_detail_actions[1].area.x
+                );
+            }
+        }
     }
 
     #[test]
@@ -4371,7 +4509,7 @@ mod tests {
         );
         assert_eq!(
             text_lines(&samples_text(&app, 10)),
-            ["User Inputs", "> Draft"]
+            ["User Inputs", "> Draft *"]
         );
 
         app.toggle_samples_pane();

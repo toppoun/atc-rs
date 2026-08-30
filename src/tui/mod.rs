@@ -2101,16 +2101,19 @@ impl<'a> SessionRuntime<'a> {
 struct TerminalInputContext<'a> {
     run_tx: &'a Sender<RunWorkerCommand>,
     stress_setup: Option<StressSetupContext<'a>>,
+    current_destination: Option<&'a Path>,
 }
 
 impl<'a> TerminalInputContext<'a> {
     fn new(
         run_tx: &'a Sender<RunWorkerCommand>,
+        current_destination: Option<&'a Path>,
         stress_setup: Option<StressSetupContext<'a>>,
     ) -> Self {
         Self {
             run_tx,
             stress_setup,
+            current_destination,
         }
     }
 }
@@ -2855,7 +2858,11 @@ where
             &mut terminal_events,
             mouse_mode,
             FrontendInputContext {
-                terminal: TerminalInputContext::new(run_tx, Some(stress_setup)),
+                terminal: TerminalInputContext::new(
+                    run_tx,
+                    Some(current_destination),
+                    Some(stress_setup),
+                ),
                 contest_switch: Some(&mut contest_switch),
                 contest_refresh: Some(&mut contest_refresh),
                 command_palette: Some(&mut command_palette),
@@ -3069,6 +3076,17 @@ fn contains_global_quit_event(
         if user_input_editor_active {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
                 user_input_editor_active = false;
+            } else if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('s')
+                && key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.super_key
+            {
+                // Save can either finish the edit or retain it with an error. Defer a later q
+                // to the ordered dispatcher, just as for a pointer action whose result depends
+                // on the current rendered target.
+                user_input_editor_active = false;
+                pointer_seen = true;
             }
             continue;
         }
@@ -3144,7 +3162,7 @@ fn handle_terminal_events(
         events,
         MouseMode::Cells,
         FrontendInputContext {
-            terminal: TerminalInputContext::new(run_tx, None),
+            terminal: TerminalInputContext::new(run_tx, None, None),
             contest_switch: None,
             contest_refresh: None,
             command_palette: None,
@@ -3423,6 +3441,7 @@ fn handle_terminal_event_with_mouse_mode(
                     pointer,
                     render_info,
                     mouse_mode,
+                    input.terminal.current_destination,
                 ))
         }
 
@@ -3442,7 +3461,7 @@ fn handle_key_event(
     key: KeyEvent,
     run_tx: &Sender<RunWorkerCommand>,
 ) -> io::Result<bool> {
-    handle_key_event_with_stress_context(app, key, run_tx, None)
+    handle_key_event_with_stress_context(app, key, run_tx, None, None)
 }
 
 #[cfg(test)]
@@ -3450,13 +3469,14 @@ fn handle_key_event_with_stress_context(
     app: &mut WatchApp,
     key: KeyEvent,
     run_tx: &Sender<RunWorkerCommand>,
+    current_destination: Option<&Path>,
     stress_setup: Option<StressSetupContext<'_>>,
 ) -> io::Result<bool> {
     handle_key_event_with_frontend_context(
         app,
         key,
         &mut FrontendInputContext {
-            terminal: TerminalInputContext::new(run_tx, stress_setup),
+            terminal: TerminalInputContext::new(run_tx, current_destination, stress_setup),
             contest_switch: None,
             contest_refresh: None,
             command_palette: None,
@@ -3477,7 +3497,11 @@ fn handle_key_event_with_frontend_context(
     }
 
     if app.user_input_editor_active() {
-        return Ok(handle_user_input_editor_key(app, key));
+        return Ok(handle_user_input_editor_key(
+            app,
+            key,
+            input.terminal.current_destination,
+        ));
     }
 
     if key.code == KeyCode::Char('q') && key.kind == KeyEventKind::Press {
@@ -3517,9 +3541,267 @@ fn handle_key_event_with_frontend_context(
     }
 }
 
-fn handle_user_input_editor_key(app: &mut WatchApp, key: KeyEvent) -> bool {
+fn load_reconciled_user_inputs(
+    destination: &Path,
+    problem_index: &str,
+) -> io::Result<Vec<app::PersistedUserInputState>> {
+    crate::user_input::load_user_inputs(destination, problem_index).map(|inputs| {
+        inputs
+            .into_iter()
+            .map(|input| app::PersistedUserInputState {
+                id: input.id,
+                content: input.content,
+            })
+            .collect()
+    })
+}
+
+fn save_selected_user_input(app: &mut WatchApp, destination: &Path) -> bool {
+    let Some(snapshot) = app.user_input_save_snapshot() else {
+        return false;
+    };
+
+    if let Some(id) = snapshot.installed_draft_id {
+        return app
+            .fail_user_input_save(
+                &snapshot,
+                format!(
+                    "User Input {id} may already be installed; saving is blocked to prevent a duplicate"
+                ),
+                Some(id),
+            )
+            .unwrap_or(false);
+    }
+
+    match snapshot.target {
+        app::UserInputEditTarget::Draft => {
+            match crate::user_input::create_user_input_with_outcome(
+                destination,
+                &snapshot.problem_index,
+                &snapshot.content,
+            ) {
+                Ok(id) => match app.complete_draft_user_input_save(&snapshot, id, None) {
+                    Ok(changed) => changed,
+                    Err(error) => app
+                        .fail_user_input_save(
+                            &snapshot,
+                            format!("saved User Input {id}, but could not apply it: {error:?}"),
+                            Some(id),
+                        )
+                        .unwrap_or(false),
+                },
+                Err(crate::user_input::UserInputCreateError::BeforeInstall(error)) => app
+                    .fail_user_input_save(&snapshot, error.to_string(), None)
+                    .unwrap_or(false),
+                Err(crate::user_input::UserInputCreateError::AfterInstall { id, error }) => {
+                    reconcile_draft_create_after_install(app, destination, &snapshot, id, error)
+                }
+            }
+        }
+        app::UserInputEditTarget::Persisted(id) => {
+            let expected = snapshot
+                .baseline
+                .as_deref()
+                .expect("a persisted save snapshot must have a baseline");
+            match crate::user_input::save_user_input_if_unchanged(
+                destination,
+                &snapshot.problem_index,
+                id,
+                expected,
+                &snapshot.content,
+            ) {
+                Ok(
+                    crate::user_input::UserInputSaveOutcome::Saved
+                    | crate::user_input::UserInputSaveOutcome::Unchanged,
+                ) => app
+                    .complete_persisted_user_input_save(&snapshot, None)
+                    .unwrap_or(false),
+                Ok(crate::user_input::UserInputSaveOutcome::Conflict) => {
+                    reconcile_persisted_save_failure(
+                        app,
+                        destination,
+                        &snapshot,
+                        id,
+                        PersistedSaveFailure::Conflict,
+                    )
+                }
+                Ok(crate::user_input::UserInputSaveOutcome::Missing) => {
+                    reconcile_persisted_save_failure(
+                        app,
+                        destination,
+                        &snapshot,
+                        id,
+                        PersistedSaveFailure::Missing,
+                    )
+                }
+                Err(error) => {
+                    reconcile_persisted_save_error(app, destination, &snapshot, id, error)
+                }
+            }
+        }
+    }
+}
+
+fn reconcile_draft_create_after_install(
+    app: &mut WatchApp,
+    destination: &Path,
+    snapshot: &app::UserInputSaveSnapshot,
+    id: u64,
+    create_error: io::Error,
+) -> bool {
+    match load_reconciled_user_inputs(destination, &snapshot.problem_index) {
+        Ok(reloaded) => match reloaded.iter().find(|input| input.id == id) {
+            Some(input) if input.content == snapshot.content => app
+                .complete_draft_user_input_save(snapshot, id, Some(reloaded))
+                .unwrap_or(false),
+            Some(_) => app
+                .reconcile_draft_user_input_install_conflict(
+                    snapshot,
+                    id,
+                    reloaded,
+                    format!(
+                        "{create_error}; installed User Input {id} has different content and remains open for recovery"
+                    ),
+                )
+                .unwrap_or(false),
+            None => app
+                .fail_user_input_save(
+                    snapshot,
+                    format!(
+                        "{create_error}; reload did not find installed User Input {id}, so saving is blocked to prevent a duplicate"
+                    ),
+                    Some(id),
+                )
+                .unwrap_or(false),
+        },
+        Err(reload_error) => app
+            .fail_user_input_save(
+                snapshot,
+                format!(
+                    "{create_error}; could not reload installed User Input {id}: {reload_error}; saving is blocked to prevent a duplicate"
+                ),
+                Some(id),
+            )
+            .unwrap_or(false),
+    }
+}
+
+fn reconcile_persisted_save_error(
+    app: &mut WatchApp,
+    destination: &Path,
+    snapshot: &app::UserInputSaveSnapshot,
+    id: u64,
+    save_error: io::Error,
+) -> bool {
+    reconcile_persisted_save_failure(
+        app,
+        destination,
+        snapshot,
+        id,
+        PersistedSaveFailure::Io(save_error),
+    )
+}
+
+enum PersistedSaveFailure {
+    Conflict,
+    Missing,
+    Io(io::Error),
+}
+
+fn reconcile_persisted_save_failure(
+    app: &mut WatchApp,
+    destination: &Path,
+    snapshot: &app::UserInputSaveSnapshot,
+    id: u64,
+    failure: PersistedSaveFailure,
+) -> bool {
+    let may_have_saved = matches!(failure, PersistedSaveFailure::Io(_));
+    let known_missing = matches!(failure, PersistedSaveFailure::Missing);
+    let save_error = match failure {
+        PersistedSaveFailure::Conflict => format!(
+            "User Input {id} changed externally; save conflict (nothing written). Review the buffer before saving again"
+        ),
+        PersistedSaveFailure::Missing => format!("User Input {id} is missing (nothing written)"),
+        PersistedSaveFailure::Io(error) => error.to_string(),
+    };
+    let recovery_message = format!(
+        "{save_error}; User Input {id} was removed externally. Recovered as an unsaved Draft; save again to create a new User Input"
+    );
+    match load_reconciled_user_inputs(destination, &snapshot.problem_index) {
+        Ok(reloaded)
+            if may_have_saved
+                && reloaded
+                    .iter()
+                    .any(|input| input.id == id && input.content == snapshot.content) =>
+        {
+            app.complete_persisted_user_input_save(snapshot, Some(reloaded))
+                .unwrap_or(false)
+        }
+        Ok(reloaded) if reloaded.iter().any(|input| input.id == id) => app
+            .reconcile_persisted_user_input_save_failure(
+                snapshot,
+                reloaded,
+                format!("{save_error}; reloaded disk content as the edit baseline"),
+            )
+            .unwrap_or(false),
+        Ok(reloaded) => app
+            .reconcile_missing_persisted_user_input_save_failure(
+                snapshot,
+                reloaded,
+                recovery_message,
+            )
+            .unwrap_or(false),
+        Err(reload_error) if known_missing => {
+            // The checked operation established absence, even if a subsequent full
+            // reload fails (including a removed workspace). Drop only the known
+            // missing ID, preserving other cached inputs and the complete editor.
+            let Some(ready) = app
+                .current_problem()
+                .and_then(|problem| problem.user_inputs.ready())
+            else {
+                return false;
+            };
+            let retained = ready
+                .persisted()
+                .iter()
+                .filter(|input| input.id != id)
+                .cloned()
+                .collect();
+            app.reconcile_missing_persisted_user_input_save_failure(
+                snapshot,
+                retained,
+                format!("{recovery_message}; could not reload other User Inputs: {reload_error}"),
+            )
+            .unwrap_or(false)
+        }
+        Err(reload_error) => app
+            .fail_user_input_save(
+                snapshot,
+                format!("{save_error}; could not reload User Inputs: {reload_error}"),
+                None,
+            )
+            .unwrap_or(false),
+    }
+}
+
+fn handle_user_input_editor_key(
+    app: &mut WatchApp,
+    key: KeyEvent,
+    current_destination: Option<&Path>,
+) -> bool {
     if key.code == KeyCode::Escape {
         return app.cancel_user_input_edit();
+    }
+    if key.code == KeyCode::Char('s')
+        && key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.super_key
+    {
+        // A conflict requires another explicit Save; holding Ctrl+S must not
+        // turn an auto-repeat into permission to overwrite the refreshed baseline.
+        return key.kind == KeyEventKind::Press
+            && current_destination
+                .is_some_and(|destination| save_selected_user_input(app, destination));
     }
     if key.modifiers.control || key.modifiers.alt || key.modifiers.super_key {
         return false;
@@ -3656,6 +3938,7 @@ fn handle_pointer_event(
         pointer,
         render_info,
         MouseMode::Cells,
+        None,
     )
 }
 
@@ -3705,6 +3988,7 @@ fn handle_pointer_event_with_mouse_mode(
     pointer: PointerEvent,
     render_info: &view::RenderInfo,
     mouse_mode: MouseMode,
+    current_destination: Option<&Path>,
 ) -> bool {
     if matches!(pointer.kind, PointerKind::Up(_)) {
         detail_scrollbar_drag.cancel();
@@ -3799,6 +4083,8 @@ fn handle_pointer_event_with_mouse_mode(
             view::UserInputDetailAction::Edit => {
                 app.begin_selected_user_input_edit().unwrap_or(false)
             }
+            view::UserInputDetailAction::Save => current_destination
+                .is_some_and(|destination| save_selected_user_input(app, destination)),
             view::UserInputDetailAction::Cancel => app.cancel_user_input_edit(),
         };
     }
@@ -3965,6 +4251,7 @@ mod tests {
             app,
             key(code, KeyEventKind::Press),
             run_tx,
+            Some(destination),
             Some(StressSetupContext {
                 destination,
                 contest,
@@ -4014,6 +4301,27 @@ mod tests {
             .draw(|frame| info = view::render(frame, app, &mut layout))
             .unwrap();
         info
+    }
+
+    fn rendered_app_text(app: &WatchApp, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                view::render(frame, app, &mut layout);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer.cell((column, row)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
@@ -4088,7 +4396,7 @@ mod tests {
             events,
             MouseMode::Cells,
             FrontendInputContext {
-                terminal: TerminalInputContext::new(run_tx, stress_setup),
+                terminal: TerminalInputContext::new(run_tx, None, stress_setup),
                 contest_switch,
                 contest_refresh: None,
                 command_palette: Some(command_palette),
@@ -4233,7 +4541,7 @@ mod tests {
             events,
             MouseMode::Cells,
             FrontendInputContext {
-                terminal: TerminalInputContext::new(&run_tx, None),
+                terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch: None,
                 contest_refresh: None,
                 command_palette,
@@ -4286,7 +4594,7 @@ mod tests {
             events,
             MouseMode::Cells,
             FrontendInputContext {
-                terminal: TerminalInputContext::new(&run_tx, None),
+                terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch,
                 contest_refresh: None,
                 command_palette,
@@ -4396,7 +4704,7 @@ mod tests {
             events,
             MouseMode::Cells,
             FrontendInputContext {
-                terminal: TerminalInputContext::new(&run_tx, None),
+                terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch: None,
                 contest_refresh: Some(refresh),
                 command_palette: palette,
@@ -6150,7 +6458,7 @@ mod tests {
         let error = execute_frontend_action(
             &mut app,
             FrontendAction::StopStress,
-            TerminalInputContext::new(&run_tx, None),
+            TerminalInputContext::new(&run_tx, None, None),
             None,
             None,
             None,
@@ -6515,7 +6823,7 @@ mod tests {
                 &mut events,
                 mode,
                 FrontendInputContext {
-                    terminal: TerminalInputContext::new(&run_tx, None),
+                    terminal: TerminalInputContext::new(&run_tx, None, None),
                     contest_switch: None,
                     contest_refresh: None,
                     command_palette: Some(&mut palette),
@@ -9449,6 +9757,7 @@ mod tests {
             pixel_pointer(kind, x, y, generation),
             info,
             mode,
+            None,
         )
     }
 
@@ -9895,6 +10204,51 @@ mod tests {
         .unwrap()
     }
 
+    fn user_input_workspace() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("contest");
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(destination.join(".atc")).unwrap();
+        (temp, destination)
+    }
+
+    fn loaded_user_input_app(destination: &Path) -> WatchApp {
+        WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(
+                load_reconciled_user_inputs(destination, "A").unwrap(),
+            )],
+        )
+        .unwrap()
+    }
+
+    fn user_input_ctrl_s() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        }
+    }
+
+    fn save_user_input_by_key(app: &mut WatchApp, destination: &Path) {
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert!(
+            handle_key_event_with_stress_context(
+                app,
+                user_input_ctrl_s(),
+                &run_tx,
+                Some(destination),
+                None,
+            )
+            .unwrap()
+        );
+    }
+
     fn contains_plain_global_quit_event(events: &VecDeque<TerminalEvent>, app: &WatchApp) -> bool {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("abc123");
@@ -9966,7 +10320,12 @@ mod tests {
         let original = "original\r\n";
         let mut app = user_input_app(original);
         let info = rendered_fold_info(&app, 100, 30);
-        let edit = info.user_input_detail_action.unwrap();
+        let edit = info
+            .user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| target.action == view::UserInputDetailAction::Edit)
+            .unwrap();
         let mut events = VecDeque::from([
             TerminalEvent::Pointer(pointer(
                 PointerKind::Down(PointerButton::Left),
@@ -10102,6 +10461,1290 @@ mod tests {
     }
 
     #[test]
+    fn save_controller_creates_empty_and_exact_drafts_and_updates_persisted_inputs() {
+        for content in ["", "alpha\r\n\r\nomega\n"] {
+            let (_temp, destination) = user_input_workspace();
+            let mut draft = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+            draft.begin_new_user_input().unwrap();
+            assert_eq!(draft.edit_user_input_insert(content), !content.is_empty());
+            assert!(save_selected_user_input(&mut draft, &destination));
+            assert!(!draft.user_input_editor_active());
+            let selected_id = match draft.case_selection() {
+                Some(app::CaseSelection::UserInput(app::UserInputSelection::Persisted(id))) => id,
+                selection => panic!("unexpected selection after Draft Save: {selection:?}"),
+            };
+            let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, selected_id);
+            assert_eq!(loaded[0].content, content);
+        }
+
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "original\r\n").unwrap();
+        let mut persisted = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(vec![
+                app::PersistedUserInputState {
+                    id,
+                    content: "original\r\n".to_string(),
+                },
+            ])],
+        )
+        .unwrap();
+        persisted.begin_selected_user_input_edit().unwrap();
+        assert!(persisted.edit_user_input_insert("changed\r\n\r\n"));
+        assert!(save_selected_user_input(&mut persisted, &destination));
+        assert!(
+            !persisted.user_input_editor_active(),
+            "save error: {:?}",
+            persisted
+                .selected_user_input_edit()
+                .and_then(app::UserInputEditState::save_error)
+        );
+        assert_eq!(
+            persisted.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(id)
+            ))
+        );
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].content, "original\r\nchanged\r\n\r\n");
+    }
+
+    #[test]
+    fn unchanged_persisted_save_with_missing_destination_recovers_draft() {
+        let mut app = user_input_app("unchanged\r\n");
+        app.begin_selected_user_input_edit().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let missing_destination = temp.path().join("missing");
+
+        assert!(save_selected_user_input(&mut app, &missing_destination));
+        assert!(app.user_input_editor_active());
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert!(ready.persisted().is_empty());
+        assert_eq!(ready.edit().unwrap().buffer(), "unchanged\r\n");
+        assert_eq!(
+            ready.edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert!(
+            ready
+                .edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("could not reload")
+        );
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+        // Retrying before the workspace is restored must retain the recovery buffer.
+        save_user_input_by_key(&mut app, &missing_destination);
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "unchanged\r\n"
+        );
+    }
+
+    #[test]
+    fn unchanged_persisted_save_finishes_only_after_checked_disk_match() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A\r\n").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(!app.user_input_save_snapshot().unwrap().dirty);
+        save_user_input_by_key(&mut app, &destination);
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(id)
+            ))
+        );
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "A\r\n"
+        );
+    }
+
+    #[test]
+    fn dirty_checked_conflict_requires_explicit_retry_against_reloaded_baseline() {
+        for changes_again in [false, true] {
+            let (_temp, destination) = user_input_workspace();
+            let id = crate::user_input::create_user_input(&destination, "A", "A\r\n").unwrap();
+            let retained =
+                crate::user_input::create_user_input(&destination, "A", "retained").unwrap();
+            let mut app = loaded_user_input_app(&destination);
+            app.begin_selected_user_input_edit().unwrap();
+            app.edit_user_input_insert("C\r\n\t ");
+            app.edit_user_input_left();
+            let buffer = app.selected_user_input_edit().unwrap().buffer().to_string();
+            let cursor = app.selected_user_input_edit().unwrap().cursor();
+            crate::user_input::save_user_input(&destination, "A", id, "B\n").unwrap();
+            let added =
+                crate::user_input::create_user_input(&destination, "A", "new disk input").unwrap();
+
+            save_user_input_by_key(&mut app, &destination);
+            let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+            assert_eq!(
+                ready
+                    .persisted()
+                    .iter()
+                    .map(|input| input.id)
+                    .collect::<Vec<_>>(),
+                [id, retained, added]
+            );
+            assert_eq!(ready.persisted()[0].content, "B\n");
+            assert_eq!(ready.edit().unwrap().buffer(), buffer);
+            assert_eq!(ready.edit().unwrap().cursor(), cursor);
+            assert!(
+                ready
+                    .edit()
+                    .unwrap()
+                    .save_error()
+                    .unwrap()
+                    .contains("conflict")
+            );
+            assert_eq!(ready.edit_is_dirty(), Some(true));
+            assert_eq!(
+                app.user_input_save_snapshot().unwrap().baseline.as_deref(),
+                Some("B\n")
+            );
+            assert_eq!(
+                app.case_selection(),
+                Some(app::CaseSelection::UserInput(
+                    app::UserInputSelection::Persisted(id)
+                ))
+            );
+            assert_eq!(
+                crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+                "B\n"
+            );
+
+            if changes_again {
+                crate::user_input::save_user_input(&destination, "A", id, "D\r\n").unwrap();
+                save_user_input_by_key(&mut app, &destination);
+                assert!(app.user_input_editor_active());
+                assert_eq!(app.selected_user_input_edit().unwrap().buffer(), buffer);
+                assert_eq!(
+                    app.user_input_save_snapshot().unwrap().baseline.as_deref(),
+                    Some("D\r\n")
+                );
+                assert_eq!(
+                    crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+                    "D\r\n"
+                );
+            }
+            save_user_input_by_key(&mut app, &destination);
+            assert!(!app.user_input_editor_active());
+            let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+            assert_eq!(loaded.len(), 3);
+            assert_eq!(loaded[0].id, id);
+            assert_eq!(loaded[0].content, buffer);
+            assert_eq!(app.current_problem().unwrap().total_cases, 0);
+            assert!(app.current_problem().unwrap().run.cases.is_empty());
+        }
+    }
+
+    #[test]
+    fn clean_external_change_becomes_dirty_conflict_and_preserves_error_lifecycle() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A\r\n").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+        assert!(!app.user_input_save_snapshot().unwrap().dirty);
+        crate::user_input::save_user_input(&destination, "A", id, "B\n").unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert_eq!(ready.persisted()[0].content, "B\n");
+        assert_eq!(ready.edit().unwrap().buffer(), "A\r\n");
+        assert_eq!(ready.edit().unwrap().cursor(), cursor);
+        assert_eq!(ready.edit_is_dirty(), Some(true));
+        let error = ready.edit().unwrap().save_error().unwrap().to_string();
+        assert!(error.contains("conflict"));
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(id)
+            ))
+        );
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "B\n"
+        );
+        assert!(app.edit_user_input_left());
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().save_error(),
+            Some(error.as_str())
+        );
+        assert!(app.edit_user_input_insert("x"));
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .is_none()
+        );
+        assert!(app.cancel_user_input_edit());
+        assert!(app.active_user_input_edit().is_none());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "B\n"
+        );
+    }
+
+    #[test]
+    fn conflict_with_disk_already_equal_to_buffer_still_requires_explicit_retry() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert("C");
+        crate::user_input::save_user_input(&destination, "A", id, "AC").unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        assert!(app.user_input_editor_active());
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("conflict")
+        );
+        assert!(!app.user_input_save_snapshot().unwrap().dirty);
+        save_user_input_by_key(&mut app, &destination);
+        assert!(!app.user_input_editor_active());
+    }
+
+    #[test]
+    fn clean_external_deletion_recovers_exact_draft_and_saves_a_fresh_id() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A\r\n\n\t ").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_left();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+        fs::remove_file(destination.join(format!(".atc/user-inputs/A/{id}.in"))).unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert!(ready.persisted().is_empty());
+        assert_eq!(ready.edit().unwrap().buffer(), "A\r\n\n\t ");
+        assert_eq!(ready.edit().unwrap().cursor(), cursor);
+        assert!(ready.edit().unwrap().save_error().is_some());
+        assert_eq!(app.user_input_save_snapshot().unwrap().baseline, None);
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+        save_user_input_by_key(&mut app, &destination);
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].id > id);
+        assert_eq!(loaded[0].content, "A\r\n\n\t ");
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(loaded[0].id)
+            ))
+        );
+    }
+
+    #[test]
+    fn missing_target_with_reload_error_preserves_unrelated_cached_inputs() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A").unwrap();
+        let other = crate::user_input::create_user_input(&destination, "A", "other").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        fs::remove_file(destination.join(format!(".atc/user-inputs/A/{id}.in"))).unwrap();
+        fs::write(
+            destination.join(format!(".atc/user-inputs/A/{other}.in")),
+            [0xff],
+        )
+        .unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert_eq!(ready.persisted().len(), 1);
+        assert_eq!(ready.persisted()[0].id, other);
+        assert_eq!(ready.persisted()[0].content, "other");
+        assert_eq!(
+            ready.edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert_eq!(ready.edit().unwrap().buffer(), "A");
+        assert!(
+            ready
+                .edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("could not reload other")
+        );
+    }
+
+    #[test]
+    fn after_install_reconcile_then_external_delete_and_draft_save_never_reuses_id() {
+        let (_temp, destination) = user_input_workspace();
+        let retained = crate::user_input::create_user_input(&destination, "A", "retained").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("exact\r\n\n\t ");
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        let failure = crate::user_input::create_user_input_with_after_install_hook(
+            &destination,
+            "A",
+            &snapshot.content,
+            || Err(io::Error::other("injected post-install sync failure")),
+        )
+        .unwrap_err();
+        let crate::user_input::UserInputCreateError::AfterInstall { id, error } = failure else {
+            panic!("expected real installed input with finalization failure");
+        };
+        let directory = destination.join(".atc/user-inputs/A");
+        let metadata: toml::Value =
+            toml::from_str(&fs::read_to_string(directory.join("meta.toml")).unwrap()).unwrap();
+        assert!(metadata["next_id"].as_integer().unwrap() as u64 > id);
+        assert_eq!(
+            fs::read(directory.join(format!("{id}.in"))).unwrap(),
+            snapshot.content.as_bytes()
+        );
+        assert!(reconcile_draft_create_after_install(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            error
+        ));
+        assert!(!app.user_input_editor_active());
+
+        app.begin_selected_user_input_edit().unwrap();
+        fs::remove_file(directory.join(format!("{id}.in"))).unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            snapshot.content
+        );
+        save_user_input_by_key(&mut app, &destination);
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, retained);
+        assert!(loaded[1].id > id);
+        assert_eq!(loaded[1].content, snapshot.content);
+        assert!(!directory.join(format!("{id}.in")).exists());
+        assert!(
+            !app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()
+                .iter()
+                .any(|input| input.id == id)
+        );
+    }
+
+    #[test]
+    fn unavailable_user_input_state_never_reaches_the_save_backend() {
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::load_error(
+                "broken storage".to_string(),
+            )],
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!save_selected_user_input(&mut app, temp.path()));
+        assert_eq!(
+            app.current_problem().unwrap().user_inputs.error_message(),
+            Some("broken storage")
+        );
+    }
+
+    #[test]
+    fn draft_before_install_failure_preserves_editor_and_retry_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("contest");
+        fs::create_dir(&destination).unwrap();
+        let mut app = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("keep\r\nthis\n");
+        app.edit_user_input_left();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+
+        assert!(save_selected_user_input(&mut app, &destination));
+        let edit = app.selected_user_input_edit().unwrap();
+        assert_eq!(edit.target(), app::UserInputEditTarget::Draft);
+        assert_eq!(edit.buffer(), "keep\r\nthis\n");
+        assert_eq!(edit.cursor(), cursor);
+        assert!(edit.save_error().is_some());
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+
+        fs::create_dir(destination.join(".atc")).unwrap();
+        assert!(save_selected_user_input(&mut app, &destination));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "keep\r\nthis\n"
+        );
+    }
+
+    #[test]
+    fn draft_after_install_reconcile_converges_or_blocks_without_duplicate_create() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("installed\r\n");
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        let id = crate::user_input::create_user_input(
+            &destination,
+            &snapshot.problem_index,
+            &snapshot.content,
+        )
+        .unwrap();
+
+        assert!(reconcile_draft_create_after_install(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            io::Error::other("post-install sync failed"),
+        ));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(id)
+            ))
+        );
+        assert!(!save_selected_user_input(&mut app, &destination));
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (_temp, ambiguous_destination) = user_input_workspace();
+        let mut ambiguous = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        ambiguous.begin_new_user_input().unwrap();
+        ambiguous.edit_user_input_insert("ambiguous");
+        let snapshot = ambiguous.user_input_save_snapshot().unwrap();
+        assert!(reconcile_draft_create_after_install(
+            &mut ambiguous,
+            &ambiguous_destination,
+            &snapshot,
+            77,
+            io::Error::other("post-install failure"),
+        ));
+        assert_eq!(
+            ambiguous.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert!(
+            ambiguous
+                .selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("blocked")
+        );
+        assert!(ambiguous.edit_user_input_insert(" changed"));
+        assert_eq!(
+            ambiguous.selected_user_input_edit().unwrap().save_error(),
+            None
+        );
+        assert!(save_selected_user_input(
+            &mut ambiguous,
+            &ambiguous_destination
+        ));
+        assert!(
+            ambiguous
+                .selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("blocked")
+        );
+        assert!(
+            crate::user_input::load_user_inputs(&ambiguous_destination, "A")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn after_install_reload_failure_blocks_recreate_even_after_edit_and_storage_repair() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("installed\r\n");
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        let outcome = crate::user_input::create_user_input_with_after_install_hook(
+            &destination,
+            "A",
+            &snapshot.content,
+            || Err(io::Error::other("post-install sync failed")),
+        );
+        let Err(crate::user_input::UserInputCreateError::AfterInstall { id, error }) = outcome
+        else {
+            panic!("expected an installed input with a post-install error");
+        };
+        let metadata = destination.join(".atc/user-inputs/A/meta.toml");
+        let valid_metadata = fs::read(&metadata).unwrap();
+        fs::write(&metadata, "invalid metadata").unwrap();
+        assert!(reconcile_draft_create_after_install(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            error
+        ));
+        assert_eq!(
+            app.user_input_save_snapshot().unwrap().installed_draft_id,
+            Some(id)
+        );
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("blocked")
+        );
+
+        // Repairing storage and editing must not silently clear the install ambiguity.
+        fs::write(&metadata, valid_metadata).unwrap();
+        app.edit_user_input_insert(" changed");
+        assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+        save_user_input_by_key(&mut app, &destination);
+        assert_eq!(
+            app.user_input_save_snapshot().unwrap().installed_draft_id,
+            Some(id)
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "installed\r\n changed"
+        );
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("blocked")
+        );
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].content, snapshot.content);
+    }
+
+    #[test]
+    fn draft_after_install_content_conflict_retargets_same_id_for_safe_retry() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "disk content").unwrap();
+        let mut app = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("save snapshot\r\n");
+        app.edit_user_input_left();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+        let snapshot = app.user_input_save_snapshot().unwrap();
+
+        assert!(reconcile_draft_create_after_install(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            io::Error::other("post-install sync failed"),
+        ));
+        let edit = app.selected_user_input_edit().unwrap();
+        assert_eq!(edit.target(), app::UserInputEditTarget::Persisted(id));
+        assert_eq!(edit.buffer(), "save snapshot\r\n");
+        assert_eq!(edit.cursor(), cursor);
+        assert!(edit.save_error().is_some());
+
+        assert!(save_selected_user_input(&mut app, &destination));
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].content, "save snapshot\r\n");
+    }
+
+    #[test]
+    fn persisted_error_reconcile_uses_disk_truth_without_losing_the_edit_buffer() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "disk old").unwrap();
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(vec![
+                app::PersistedUserInputState {
+                    id,
+                    content: "runtime old".to_string(),
+                },
+            ])],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert(" snapshot\r\n");
+        app.edit_user_input_left();
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+
+        assert!(reconcile_persisted_save_error(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            io::Error::other("replacement failed"),
+        ));
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert_eq!(ready.persisted()[0].content, "disk old");
+        assert_eq!(ready.edit().unwrap().buffer(), "runtime old snapshot\r\n");
+        assert_eq!(ready.edit().unwrap().cursor(), cursor);
+        assert!(ready.edit().unwrap().save_error().is_some());
+
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        crate::user_input::save_user_input(&destination, "A", id, &snapshot.content).unwrap();
+        assert!(reconcile_persisted_save_error(
+            &mut app,
+            &destination,
+            &snapshot,
+            id,
+            io::Error::other("directory sync failed"),
+        ));
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            app.current_problem()
+                .unwrap()
+                .user_inputs
+                .ready()
+                .unwrap()
+                .persisted()[0]
+                .content,
+            "runtime old snapshot\r\n"
+        );
+    }
+
+    #[test]
+    fn missing_persisted_target_recovers_as_draft_and_next_explicit_save_creates_new_id() {
+        let (_temp, destination) = user_input_workspace();
+        let retained_id =
+            crate::user_input::create_user_input(&destination, "A", "runtime A").unwrap();
+        let missing_id =
+            crate::user_input::create_user_input(&destination, "A", "target old").unwrap();
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(
+                load_reconciled_user_inputs(&destination, "A").unwrap(),
+            )],
+        )
+        .unwrap();
+        assert!(app.next_case());
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(missing_id)
+            ))
+        );
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(app.edit_user_input_insert("\r\nrecovery buffer\t "));
+        assert!(app.edit_user_input_left());
+        assert!(app.edit_user_input_left());
+        let buffer = app.selected_user_input_edit().unwrap().buffer().to_string();
+        let cursor = app.selected_user_input_edit().unwrap().cursor();
+        let total_cases = app.current_problem().unwrap().total_cases;
+        let run_cases = app.current_problem().unwrap().run.cases.len();
+
+        crate::user_input::save_user_input(&destination, "A", retained_id, "disk B").unwrap();
+        fs::remove_file(
+            destination
+                .join(".atc")
+                .join("user-inputs")
+                .join("A")
+                .join(format!("{missing_id}.in")),
+        )
+        .unwrap();
+        let new_disk_id =
+            crate::user_input::create_user_input(&destination, "A", "new disk input").unwrap();
+
+        assert!(save_selected_user_input(&mut app, &destination));
+        let problem = app.current_problem().unwrap();
+        let ready = problem.user_inputs.ready().unwrap();
+        assert_eq!(
+            ready
+                .persisted()
+                .iter()
+                .map(|input| (input.id, input.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(retained_id, "disk B"), (new_disk_id, "new disk input")]
+        );
+        assert!(!ready.persisted().iter().any(|input| input.id == missing_id));
+        let edit = ready.edit().unwrap();
+        assert_eq!(edit.target(), app::UserInputEditTarget::Draft);
+        assert_eq!(edit.buffer(), buffer);
+        assert_eq!(edit.cursor(), cursor);
+        let recovery_message = edit.save_error().unwrap();
+        assert!(recovery_message.contains("removed externally"));
+        assert!(recovery_message.contains("save again to create a new User Input"));
+        assert_eq!(problem.total_cases, total_cases);
+        assert_eq!(problem.run.cases.len(), run_cases);
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Draft
+            ))
+        );
+
+        app.toggle_samples_pane();
+        let recovered_view = rendered_app_text(&app, 80, 18);
+        assert!(recovered_view.contains("Input 1"));
+        assert!(recovered_view.contains("Input 2"));
+        assert!(!recovered_view.contains("Input 3"));
+        assert!(recovered_view.contains("Draft *"));
+
+        assert!(save_selected_user_input(&mut app, &destination));
+        let created_id = match app.case_selection() {
+            Some(app::CaseSelection::UserInput(app::UserInputSelection::Persisted(id))) => id,
+            selection => panic!("unexpected selection after recovery Draft Save: {selection:?}"),
+        };
+        assert_ne!(created_id, missing_id);
+        assert!(created_id > new_disk_id);
+        assert!(!app.user_input_editor_active());
+        let loaded = crate::user_input::load_user_inputs(&destination, "A").unwrap();
+        assert_eq!(
+            loaded.iter().map(|input| input.id).collect::<Vec<_>>(),
+            vec![retained_id, new_disk_id, created_id]
+        );
+        assert!(!loaded.iter().any(|input| input.id == missing_id));
+        assert_eq!(
+            loaded
+                .iter()
+                .find(|input| input.id == created_id)
+                .unwrap()
+                .content,
+            buffer
+        );
+        assert!(
+            destination
+                .join(".atc")
+                .join("user-inputs")
+                .join("A")
+                .join(format!("{created_id}.in"))
+                .is_file()
+        );
+        let saved_view = rendered_app_text(&app, 80, 18);
+        assert!(saved_view.contains("Input 1"));
+        assert!(saved_view.contains("Input 2"));
+        assert!(saved_view.contains("Input 3"));
+        assert!(!saved_view.contains("Draft *"));
+        assert_eq!(app.current_problem().unwrap().total_cases, total_cases);
+        assert_eq!(app.current_problem().unwrap().run.cases.len(), run_cases);
+    }
+
+    #[test]
+    fn cancelling_missing_target_recovery_draft_keeps_only_reloaded_disk_truth() {
+        let (_temp, destination) = user_input_workspace();
+        let retained_id =
+            crate::user_input::create_user_input(&destination, "A", "retained").unwrap();
+        let missing_id = crate::user_input::create_user_input(&destination, "A", "target").unwrap();
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(
+                load_reconciled_user_inputs(&destination, "A").unwrap(),
+            )],
+        )
+        .unwrap();
+        assert!(app.next_case());
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert(" unsaved recovery");
+        fs::remove_file(
+            destination
+                .join(".atc")
+                .join("user-inputs")
+                .join("A")
+                .join(format!("{missing_id}.in")),
+        )
+        .unwrap();
+        crate::user_input::save_user_input(&destination, "A", retained_id, "disk truth").unwrap();
+
+        assert!(save_selected_user_input(&mut app, &destination));
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .is_some()
+        );
+        assert!(app.cancel_user_input_edit());
+
+        let ready = app.current_problem().unwrap().user_inputs.ready().unwrap();
+        assert!(ready.edit().is_none());
+        assert_eq!(
+            ready
+                .persisted()
+                .iter()
+                .map(|input| (input.id, input.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(retained_id, "disk truth")]
+        );
+        assert!(!ready.persisted().iter().any(|input| input.id == missing_id));
+        assert_eq!(
+            app.case_selection(),
+            Some(app::CaseSelection::UserInput(
+                app::UserInputSelection::Persisted(retained_id)
+            ))
+        );
+    }
+
+    #[test]
+    fn ctrl_s_failure_then_q_same_batch_keeps_q_in_the_recovery_editor() {
+        let (_temp, destination) = user_input_workspace();
+        let missing_id = crate::user_input::create_user_input(&destination, "A", "target").unwrap();
+        let mut app = WatchApp::new_with_session_data(
+            &contest_with_problems(&[0]),
+            vec![0],
+            vec![None],
+            vec![app::UserInputState::loaded(
+                load_reconciled_user_inputs(&destination, "A").unwrap(),
+            )],
+        )
+        .unwrap();
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert(" unsaved");
+        let before_q = app.selected_user_input_edit().unwrap().buffer().to_string();
+        fs::remove_file(
+            destination
+                .join(".atc")
+                .join("user-inputs")
+                .join("A")
+                .join(format!("{missing_id}.in")),
+        )
+        .unwrap();
+
+        let ctrl_s = KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        };
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(ctrl_s),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let mut dispatch = |app: &mut WatchApp, events: &mut VecDeque<TerminalEvent>| {
+            handle_terminal_events_with_mouse_mode(
+                app,
+                &mut layout,
+                &mut drag,
+                &view::RenderInfo::default(),
+                events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, Some(&destination), None),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+        };
+
+        assert!(dispatch(&mut app, &mut events).unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Draft
+        );
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        assert!(dispatch(&mut app, &mut events).unwrap());
+        assert!(events.is_empty());
+        assert!(!app.should_quit());
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            format!("{before_q}q")
+        );
+    }
+
+    #[test]
+    fn ctrl_s_conflict_then_q_same_batch_keeps_q_in_the_persisted_editor() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert("C");
+        crate::user_input::save_user_input(&destination, "A", id, "B").unwrap();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(user_input_ctrl_s()),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        let mut dispatch = |app: &mut WatchApp, events: &mut VecDeque<TerminalEvent>| {
+            handle_terminal_events_with_mouse_mode(
+                app,
+                &mut layout,
+                &mut drag,
+                &view::RenderInfo::default(),
+                events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, Some(&destination), None),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+        };
+        assert!(dispatch(&mut app, &mut events).unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().target(),
+            app::UserInputEditTarget::Persisted(id)
+        );
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "AC");
+        assert!(
+            app.selected_user_input_edit()
+                .unwrap()
+                .save_error()
+                .unwrap()
+                .contains("conflict")
+        );
+        assert!(!contains_plain_global_quit_event(&events, &app));
+        assert!(dispatch(&mut app, &mut events).unwrap());
+        assert!(events.is_empty());
+        assert!(!app.should_quit());
+        assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "ACq");
+        assert_eq!(app.selected_user_input_edit().unwrap().save_error(), None);
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "B"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_repeat_cannot_accept_a_conflict_but_a_new_press_can() {
+        let (_temp, destination) = user_input_workspace();
+        let id = crate::user_input::create_user_input(&destination, "A", "A").unwrap();
+        let mut app = loaded_user_input_app(&destination);
+        app.begin_selected_user_input_edit().unwrap();
+        app.edit_user_input_insert("C");
+        crate::user_input::save_user_input(&destination, "A", id, "B").unwrap();
+        save_user_input_by_key(&mut app, &destination);
+        let error = app
+            .selected_user_input_edit()
+            .unwrap()
+            .save_error()
+            .unwrap()
+            .to_string();
+        let mut repeated = user_input_ctrl_s();
+        repeated.kind = KeyEventKind::Repeat;
+        let (run_tx, _run_rx) = mpsc::channel();
+        for _ in 0..3 {
+            assert!(
+                !handle_key_event_with_stress_context(
+                    &mut app,
+                    repeated,
+                    &run_tx,
+                    Some(&destination),
+                    None,
+                )
+                .unwrap()
+            );
+            assert_eq!(app.selected_user_input_edit().unwrap().buffer(), "AC");
+            assert_eq!(
+                app.selected_user_input_edit().unwrap().save_error(),
+                Some(error.as_str())
+            );
+            assert_eq!(
+                crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+                "B"
+            );
+        }
+        save_user_input_by_key(&mut app, &destination);
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "AC"
+        );
+    }
+
+    #[test]
+    fn user_input_save_uses_current_destination_without_stress_setup() {
+        let (_temp, destination) = user_input_workspace();
+        let mut app = WatchApp::new(&contest_with_problems(&[0]), vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("independent destination");
+        let (run_tx, _run_rx) = mpsc::channel();
+        let ctrl_s = KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        };
+
+        assert!(
+            handle_key_event_with_stress_context(
+                &mut app,
+                ctrl_s,
+                &run_tx,
+                Some(&destination),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(!app.user_input_editor_active());
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "independent destination"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_and_save_click_share_the_controller_without_inserting_s() {
+        let (_temp, destination) = user_input_workspace();
+        let contest = contest_with_problems(&[0]);
+        let mut keyboard = WatchApp::new(&contest, vec![0]).unwrap();
+        keyboard.begin_new_user_input().unwrap();
+        keyboard.edit_user_input_insert("keyboard");
+        let (run_tx, _run_rx) = mpsc::channel();
+        let ctrl_s = KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        };
+        assert!(
+            handle_key_event_with_stress_context(
+                &mut keyboard,
+                ctrl_s,
+                &run_tx,
+                Some(&destination),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(!keyboard.user_input_editor_active());
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "keyboard"
+        );
+        assert!(
+            handle_key_event_with_stress_context(
+                &mut keyboard,
+                ctrl_s,
+                &run_tx,
+                Some(&destination),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(keyboard.samples_pane_enabled());
+
+        let (_temp, click_destination) = user_input_workspace();
+        let mut click = WatchApp::new(&contest, vec![0]).unwrap();
+        click.begin_new_user_input().unwrap();
+        click.edit_user_input_insert("click");
+        let info = rendered_fold_info(&click, 100, 30);
+        let save = info
+            .user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| target.action == view::UserInputDetailAction::Save)
+            .unwrap();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        assert!(handle_pointer_event_with_mouse_mode(
+            &mut click,
+            &mut layout,
+            &mut drag,
+            pointer(
+                PointerKind::Down(PointerButton::Left),
+                save.area.x,
+                save.area.y,
+            ),
+            &info,
+            MouseMode::Cells,
+            Some(&click_destination),
+        ));
+        assert!(!click.user_input_editor_active());
+        assert_eq!(
+            crate::user_input::load_user_inputs(&click_destination, "A").unwrap()[0].content,
+            "click"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_then_q_same_batch_defers_to_ordered_post_save_quit_semantics() {
+        let (_temp, destination) = user_input_workspace();
+        let contest = contest_with_problems(&[0]);
+        let mut app = WatchApp::new(&contest, vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("saved before quit");
+        let ctrl_s = KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: terminal::Modifiers {
+                control: true,
+                ..terminal::Modifiers::default()
+            },
+        };
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(ctrl_s),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        assert!(
+            handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &view::RenderInfo::default(),
+                &mut events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(
+                        &run_tx,
+                        Some(&destination),
+                        Some(StressSetupContext::new(&destination, &contest)),
+                    ),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(!app.user_input_editor_active());
+        assert_eq!(events.len(), 1);
+        assert!(contains_plain_global_quit_event(&events, &app));
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "saved before quit"
+        );
+    }
+
+    #[test]
+    fn save_pointer_then_q_same_batch_uses_the_same_ordered_quit_semantics() {
+        let (_temp, destination) = user_input_workspace();
+        let contest = contest_with_problems(&[0]);
+        let mut app = WatchApp::new(&contest, vec![0]).unwrap();
+        app.begin_new_user_input().unwrap();
+        app.edit_user_input_insert("pointer save");
+        let info = rendered_fold_info(&app, 100, 30);
+        let save = info
+            .user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| target.action == view::UserInputDetailAction::Save)
+            .unwrap();
+        let mut events = VecDeque::from([
+            TerminalEvent::Pointer(pointer(
+                PointerKind::Down(PointerButton::Left),
+                save.area.x,
+                save.area.y,
+            )),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_plain_global_quit_event(&events, &app));
+
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+        assert!(
+            handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut layout,
+                &mut drag,
+                &info,
+                &mut events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(
+                        &run_tx,
+                        Some(&destination),
+                        Some(StressSetupContext::new(&destination, &contest)),
+                    ),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(!app.user_input_editor_active());
+        assert_eq!(events.len(), 1);
+        assert!(contains_plain_global_quit_event(&events, &app));
+        assert_eq!(
+            crate::user_input::load_user_inputs(&destination, "A").unwrap()[0].content,
+            "pointer save"
+        );
+    }
+
+    #[test]
     fn multiline_paste_is_inserted_exactly_only_into_the_active_editor() {
         let mut app = user_input_app("original\r\n");
         app.begin_selected_user_input_edit().unwrap();
@@ -10187,7 +11830,12 @@ mod tests {
                 .is_collapsed(detail::DetailSectionKind::Input)
         );
         let read_only = rendered_fold_info(&app, 100, 30);
-        let edit = read_only.user_input_detail_action.unwrap();
+        let edit = read_only
+            .user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| target.action == view::UserInputDetailAction::Edit)
+            .unwrap();
         assert!(handle_pointer_event(
             &mut app,
             pointer(
@@ -10205,7 +11853,12 @@ mod tests {
         assert!(app.edit_user_input_insert("changed"));
 
         let editing = rendered_fold_info(&app, 100, 30);
-        let cancel = editing.user_input_detail_action.unwrap();
+        let cancel = editing
+            .user_input_detail_actions
+            .iter()
+            .copied()
+            .find(|target| target.action == view::UserInputDetailAction::Cancel)
+            .unwrap();
         assert!(handle_pointer_event(
             &mut app,
             pointer(
@@ -10975,7 +12628,7 @@ mod tests {
                 &mut events,
                 MouseMode::Disabled,
                 FrontendInputContext {
-                    terminal: TerminalInputContext::new(&run_tx, None),
+                    terminal: TerminalInputContext::new(&run_tx, None, None),
                     contest_switch: None,
                     contest_refresh: None,
                     command_palette: None,

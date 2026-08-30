@@ -622,7 +622,16 @@ impl<'a> DetailDocument<'a> {
         };
 
         if let Some(edit) = selected_edit {
-            self.push_semantic_editor_section(content, edit.cursor());
+            if let Some(error) = edit.save_error() {
+                self.push_owned(format!("Save failed: {error}"));
+            }
+            self.push_semantic_editor_section(
+                content,
+                edit.cursor(),
+                ready
+                    .edit_is_dirty()
+                    .expect("a selected User Input edit must have dirty state"),
+            );
         } else {
             self.push_semantic_slice_section(
                 DetailSectionKind::Input,
@@ -675,11 +684,15 @@ impl<'a> DetailDocument<'a> {
         self.push_semantic_section_with_editor(kind, label, content, folds, None);
     }
 
-    fn push_semantic_editor_section(&mut self, content: &'a str, cursor: usize) {
+    fn push_semantic_editor_section(&mut self, content: &'a str, cursor: usize, dirty: bool) {
         debug_assert!(content.is_char_boundary(cursor));
         self.push_semantic_section_with_editor(
             DetailSectionKind::Input,
-            "Input — Editing",
+            if dirty {
+                "Input — Editing *"
+            } else {
+                "Input — Editing"
+            },
             SemanticSectionContent::Slice(content),
             DetailFoldState::default(),
             Some(cursor),
@@ -1042,7 +1055,7 @@ mod tests {
         let mut app = WatchApp::new(&contest(), vec![0]).unwrap();
         app.begin_new_user_input().unwrap();
         let empty = DetailDocument::from_app(&app);
-        assert!(document_text(&empty).ends_with("▼ Input — Editing\n"));
+        assert!(document_text(&empty).ends_with("▼ Input — Editing *\n"));
         assert_eq!(empty.section_body(DetailSectionKind::Input), Some(""));
         assert_eq!(
             empty.editor_cursor().unwrap().raw_position,
@@ -1064,6 +1077,16 @@ mod tests {
             edit.cursor()
         );
         assert_eq!(edit.buffer(), "a\r\n\n界\n");
+
+        let snapshot = app.user_input_save_snapshot().unwrap();
+        app.fail_user_input_save(&snapshot, "permission denied".to_string(), None)
+            .unwrap();
+        let failed = DetailDocument::from_app(&app);
+        assert!(document_text(&failed).contains("Save failed: permission denied"));
+        assert_eq!(
+            failed.section_body(DetailSectionKind::Input),
+            Some("a\r\n\n界\n")
+        );
     }
 
     #[test]
