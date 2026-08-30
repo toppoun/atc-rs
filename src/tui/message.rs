@@ -1,6 +1,7 @@
 use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::language::Language;
@@ -9,9 +10,10 @@ use crate::stress::CandidateFailureKind;
 
 pub type RunId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunKind {
     Samples,
+    UserInput(Arc<UserInputRunSnapshot>),
     Stress {
         base_seed: u64,
         count: Option<NonZeroU64>,
@@ -19,12 +21,12 @@ pub enum RunKind {
 }
 
 impl RunKind {
-    pub(crate) fn preserve_on_preemption(self) -> bool {
+    pub(crate) fn preserve_on_preemption(&self) -> bool {
         matches!(self, Self::Samples)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
     pub run_id: RunId,
     pub problem: usize,
@@ -33,10 +35,75 @@ pub struct RunRequest {
     pub kind: RunKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunWorkerCommand {
     Run(RunRequest),
     CancelStress { problem: usize, run_id: RunId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UserInputRunTarget {
+    Persisted(u64),
+    Draft(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputRunSnapshot {
+    pub problem_index: String,
+    pub target: UserInputRunTarget,
+    // Exact stdin from Run or Save; source execution uses the normal live path.
+    pub input: Arc<str>,
+    // Reject completions after a source-change notification, without capturing source bytes.
+    pub source_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputRunStatus {
+    Queued,
+    Compiling,
+    Running,
+    Finished,
+    RuntimeError,
+    TimedOut,
+    CompileError,
+    CompileTimedOut,
+    Cancelled,
+    Failed,
+}
+
+impl UserInputRunStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Compiling | Self::Running)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Compiling => "Compiling",
+            Self::Running => "Running",
+            Self::Finished => "Finished",
+            Self::RuntimeError => "Runtime Error",
+            Self::TimedOut => "Time Limit Exceeded",
+            Self::CompileError => "Compile Error",
+            Self::CompileTimedOut => "Compile Timed Out",
+            Self::Cancelled => "Cancelled",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputRunResult {
+    pub status: UserInputRunStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug)]
+pub enum UserInputRunEvent {
+    Running,
+    Finished(UserInputRunResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +202,12 @@ pub enum StressEvent {
 
 #[derive(Debug)]
 pub enum Message {
+    UserInputRunEvent {
+        run_id: RunId,
+        problem: usize,
+        snapshot: Arc<UserInputRunSnapshot>,
+        event: UserInputRunEvent,
+    },
     SourceChanged {
         problem: usize,
         path: PathBuf,

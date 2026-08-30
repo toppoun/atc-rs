@@ -239,9 +239,12 @@ fn scheduler_loop_inner(
 
         if active.is_none() {
             let spawned = control.while_running(|| {
-                scheduler
-                    .start_next()
-                    .map(|request| (request, spawn_attempt(request, completion_tx.clone())))
+                scheduler.start_next().map(|request| {
+                    (
+                        request.clone(),
+                        spawn_attempt(request, completion_tx.clone()),
+                    )
+                })
             });
 
             match spawned {
@@ -260,7 +263,7 @@ fn scheduler_loop_inner(
                     continue;
                 }
                 Some(Some((request, Err(error)))) => {
-                    let _retired = retire_matching(scheduler, request)?;
+                    let _retired = retire_matching(scheduler, request.clone())?;
                     return Err(io::Error::new(
                         error.kind(),
                         format!(
@@ -413,7 +416,7 @@ fn complete_attempt(
         ))
     })?;
     let request = physical.request();
-    validate_completion(completion, request)?;
+    validate_completion(completion, request.clone())?;
     ensure_identity(scheduler, physical)?;
 
     // Join is authoritative and is the no-late-event boundary. Logical messages and the next
@@ -430,7 +433,7 @@ fn finish_joined_attempt(
     message_tx: &Sender<Message>,
     control: &WorkerControl,
 ) -> io::Result<()> {
-    let retired = retire_matching(scheduler, request)?;
+    let retired = retire_matching(scheduler, request.clone())?;
 
     // Shutdown and logical outcome publication are serialized by the same lifecycle gate.
     // Whichever obtains it first is the linearization point. Once shutdown wins, no terminal
@@ -615,7 +618,7 @@ mod tests {
                 let max_active = Arc::clone(&closure_max);
                 let (finish_tx, finish_rx) = mpsc::channel();
 
-                spawn_with(request, completion_tx, move |cancellation| {
+                spawn_with(request.clone(), completion_tx, move |cancellation| {
                     let current = active_count.fetch_add(1, Ordering::AcqRel) + 1;
                     max_active.fetch_max(current, Ordering::AcqRel);
                     let _guard = ActiveCountGuard(active_count);
@@ -628,7 +631,7 @@ mod tests {
                         .unwrap();
                     spawned_tx
                         .send(SpawnedAttempt {
-                            request,
+                            request: request.clone(),
                             cancellation: Arc::clone(&cancellation),
                             finish_tx,
                         })
@@ -908,7 +911,7 @@ mod tests {
     fn latest_stress_failure_is_published_without_requeue() {
         let fake = FakeWorker::start();
         let stress = stress_request(0, 1);
-        send_run(&fake.request_tx, stress);
+        send_run(&fake.request_tx, stress.clone());
         let active = fake.spawned();
         assert_eq!(active.request, stress);
 
@@ -930,7 +933,7 @@ mod tests {
     fn explicit_active_stress_cancellation_uses_attempt_token_and_allows_restart() {
         let fake = FakeWorker::start();
         let first_request = stress_request(0, 10);
-        send_run(&fake.request_tx, first_request);
+        send_run(&fake.request_tx, first_request.clone());
         let first = fake.spawned();
         assert_eq!(first.request, first_request);
 
@@ -943,7 +946,7 @@ mod tests {
         wait_cancel_requested(&first.cancellation);
 
         let second_request = stress_request(0, 11);
-        send_run(&fake.request_tx, second_request);
+        send_run(&fake.request_tx, second_request.clone());
         first.finish(Finish::Cancelled);
         let second = fake.spawned();
         assert_eq!(second.request, second_request);
@@ -968,11 +971,11 @@ mod tests {
     fn newer_stress_then_old_stop_preserves_new_physical_attempt() {
         let fake = FakeWorker::start();
         let old_request = stress_request(0, 10);
-        send_run(&fake.request_tx, old_request);
+        send_run(&fake.request_tx, old_request.clone());
         let old = fake.spawned();
 
         let new_request = stress_request(0, 11);
-        send_run(&fake.request_tx, new_request);
+        send_run(&fake.request_tx, new_request.clone());
         wait_cancel_requested(&old.cancellation);
         fake.request_tx
             .send(RunWorkerCommand::CancelStress {
@@ -996,8 +999,8 @@ mod tests {
     fn stale_stress_cancellation_does_not_touch_newer_physical_attempt() {
         let mut scheduler = RunScheduler::default();
         let current = stress_request(0, 11);
-        scheduler.request_arrived(current);
-        assert_eq!(scheduler.start_next(), Some(current));
+        scheduler.request_arrived(current.clone());
+        assert_eq!(scheduler.start_next(), Some(current.clone()));
 
         let (completion_tx, completion_rx) = mpsc::channel();
         let (cancellation_tx, cancellation_rx) = mpsc::channel();
@@ -1088,7 +1091,7 @@ mod tests {
         assert_eq!(latest_b.request, request(1, 4));
         latest_b.finish(Finish::Completed);
         let first_pending = fake.spawned();
-        let first_request = first_pending.request;
+        let first_request = first_pending.request.clone();
         assert!(first_request == request(0, 1) || first_request == request(2, 3));
         first_pending.finish(Finish::Completed);
 
@@ -1159,7 +1162,7 @@ mod tests {
         let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let release_rx = release_rx.take().unwrap();
-            spawn_with(request, completion_tx, move |cancellation| {
+            spawn_with(request.clone(), completion_tx, move |cancellation| {
                 spawned_tx
                     .send((request, Arc::clone(&cancellation)))
                     .unwrap();
@@ -1219,7 +1222,7 @@ mod tests {
             let max_active = Arc::clone(&closure_max);
             let attempt_messages = attempt_messages.clone();
 
-            spawn_with(request, completion_tx, move |cancellation| {
+            spawn_with(request.clone(), completion_tx, move |cancellation| {
                 let current = active_count.fetch_add(1, Ordering::AcqRel) + 1;
                 max_active.fetch_max(current, Ordering::AcqRel);
                 let _guard = ActiveCountGuard(active_count);
@@ -1294,12 +1297,12 @@ mod tests {
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut first = true;
         let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
-            spawned_tx.send(request).unwrap();
+            spawned_tx.send(request.clone()).unwrap();
             if first {
                 first = false;
-                spawn_with(request, completion_tx, |_| panic!("fake panic"))
+                spawn_with(request.clone(), completion_tx, |_| panic!("fake panic"))
             } else {
-                spawn_with(request, completion_tx, |cancellation| {
+                spawn_with(request.clone(), completion_tx, |cancellation| {
                     run_attempt(&cancellation, |_| Ok(()))
                 })
             }
@@ -1336,8 +1339,8 @@ mod tests {
             }
 
             let spawned_tx = spawned_tx.clone();
-            spawn_with(request, completion_tx, move |cancellation| {
-                spawned_tx.send(request).unwrap();
+            spawn_with(request.clone(), completion_tx, move |cancellation| {
+                spawned_tx.send(request.clone()).unwrap();
                 run_attempt(&cancellation, |_| Ok(()))
             })
         })
@@ -1384,7 +1387,7 @@ mod tests {
                         let spawned_tx = spawned_tx.clone();
                         let finished_tx = finished_tx.clone();
                         let release_rx = release_rx.take().unwrap();
-                        spawn_with(request, completion_tx, move |cancellation| {
+                        spawn_with(request.clone(), completion_tx, move |cancellation| {
                             spawned_tx
                                 .send((request, Arc::clone(&cancellation)))
                                 .unwrap();
@@ -1433,7 +1436,7 @@ mod tests {
         let mut worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
             let attempt_messages = attempt_messages.clone();
             let finished_tx = finished_tx.clone();
-            spawn_with(request, completion_tx, move |cancellation| {
+            spawn_with(request.clone(), completion_tx, move |cancellation| {
                 let outcome = run_attempt(&cancellation, |_| {
                     attempt_messages
                         .send(Message::RunStarted {
@@ -1629,7 +1632,7 @@ mod tests {
             let active_count = Arc::clone(&closure_active);
             let max_active = Arc::clone(&closure_max);
             let attempt_messages = attempt_messages.clone();
-            spawn_with(request, completion_tx, move |cancellation| {
+            spawn_with(request.clone(), completion_tx, move |cancellation| {
                 let current = active_count.fetch_add(1, Ordering::AcqRel) + 1;
                 max_active.fetch_max(current, Ordering::AcqRel);
                 let _guard = ActiveCountGuard(active_count);
@@ -1639,7 +1642,7 @@ mod tests {
                         problem: request.problem,
                     })
                     .unwrap();
-                spawned_tx.send(request).unwrap();
+                spawned_tx.send(request.clone()).unwrap();
 
                 while !cancellation.is_requested() && !allow_completion.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -1674,7 +1677,7 @@ mod tests {
                 debug: run_id % 2 == 0 && run_id % 5 != 0,
                 kind: crate::tui::message::RunKind::Samples,
             };
-            latest.insert(problem, request);
+            latest.insert(problem, request.clone());
             send_run(&request_tx, request);
         }
         let sentinel = RunRequest {
@@ -1684,8 +1687,8 @@ mod tests {
             debug: true,
             kind: crate::tui::message::RunKind::Samples,
         };
-        latest.insert(sentinel.problem, sentinel);
-        send_run(&request_tx, sentinel);
+        latest.insert(sentinel.problem, sentinel.clone());
+        send_run(&request_tx, sentinel.clone());
 
         loop {
             let spawned = spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1780,7 +1783,7 @@ mod tests {
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
                 let release_cancelled_attempt = Arc::clone(&closure_release);
-                spawn_with(request, completion_tx, move |cancellation| {
+                spawn_with(request.clone(), completion_tx, move |cancellation| {
                     active_count.fetch_add(1, Ordering::AcqRel);
                     let _guard = ActiveCountGuard(active_count);
                     spawned_tx

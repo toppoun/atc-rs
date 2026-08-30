@@ -396,7 +396,7 @@ impl OpenSourceController {
         };
 
         let previous_problem = app.selected_problem();
-        app.source_changed(problem, target.clone(), language);
+        app.select_source(problem, target.clone(), language);
         sync_user_inputs_on_problem_entry(app, previous_problem, Some(&self.destination));
         let launch = editor.launch(&resolved, &target);
         match launch {
@@ -1097,7 +1097,7 @@ impl RefreshResumeState {
             return;
         };
         if path.is_file() {
-            app.source_changed(problem, path, language);
+            app.select_source(problem, path, language);
         }
     }
 }
@@ -2488,6 +2488,14 @@ fn handle_messages_with_destination(
 
     for _ in 0..MAX_MESSAGES_PER_TICK {
         match message_rx.try_recv() {
+            Ok(Message::UserInputRunEvent {
+                problem,
+                run_id,
+                snapshot,
+                event,
+            }) => {
+                changed |= app.user_input_run_event(problem, run_id, &snapshot, event);
+            }
             Ok(Message::SourceChanged {
                 problem,
                 path,
@@ -3457,7 +3465,7 @@ fn handle_terminal_event_with_mouse_mode(
                 mouse_mode,
                 app.detail_revision(),
             );
-            Ok(hover_changed
+            let changed = hover_changed
                 | handle_pointer_event_with_mouse_mode(
                     app,
                     detail_layout,
@@ -3466,7 +3474,9 @@ fn handle_terminal_event_with_mouse_mode(
                     render_info,
                     mouse_mode,
                     input.terminal.current_destination,
-                ))
+                );
+            flush_user_input_run_requests(app, input.terminal.run_tx)?;
+            Ok(changed)
         }
 
         TerminalEvent::Resize(_) => {
@@ -3521,11 +3531,9 @@ fn handle_key_event_with_frontend_context(
     }
 
     if app.user_input_editor_active() {
-        return Ok(handle_user_input_editor_key(
-            app,
-            key,
-            input.terminal.current_destination,
-        ));
+        let changed = handle_user_input_editor_key(app, key, input.terminal.current_destination);
+        flush_user_input_run_requests(app, input.terminal.run_tx)?;
+        return Ok(changed);
     }
 
     if key.code == KeyCode::Char('q') && key.kind == KeyEventKind::Press {
@@ -3643,6 +3651,44 @@ fn load_reconciled_user_inputs(
             })
             .collect()
     })
+}
+
+fn flush_user_input_run_requests(
+    app: &mut WatchApp,
+    run_tx: &Sender<RunWorkerCommand>,
+) -> io::Result<()> {
+    while let Some(request) = app.take_user_input_run_request() {
+        send_run_request(run_tx, request)?;
+    }
+    Ok(())
+}
+
+fn run_selected_user_input(app: &mut WatchApp, destination: Option<&Path>) -> bool {
+    let Some(problem) = app.selected_problem() else {
+        return false;
+    };
+    let Some(selection) = app.selected_user_input() else {
+        return false;
+    };
+    if app.selected_user_input_edit().is_none() {
+        let app::UserInputSelection::Persisted(id) = selection else {
+            return false;
+        };
+        let loaded = destination
+            .ok_or_else(|| "Workspace is unavailable.".to_string())
+            .and_then(|destination| {
+                load_reconciled_user_inputs(destination, &app.problems()[problem].index)
+                    .map_err(|error| error.to_string())
+            })
+            .map(|inputs| inputs.into_iter().find(|input| input.id == id));
+        // Reconciliation may select a fallback row. Never run that row on behalf of this click.
+        if !app.refresh_user_input_run_target(problem, id, loaded)
+            || app.selected_user_input() != Some(selection)
+        {
+            return true;
+        }
+    }
+    app.enqueue_selected_user_input()
 }
 
 fn save_selected_user_input(app: &mut WatchApp, destination: &Path) -> bool {
@@ -4169,6 +4215,7 @@ fn handle_pointer_event_with_mouse_mode(
             render_info.user_input_detail_action_at(app.detail_revision(), column, row)
     {
         return match target.action {
+            view::UserInputDetailAction::Run => run_selected_user_input(app, current_destination),
             view::UserInputDetailAction::Edit => {
                 sync_selected_user_input_before_edit(app, current_destination)
             }
@@ -4290,6 +4337,7 @@ fn set_detail_scroll_from_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod user_input_runs;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;

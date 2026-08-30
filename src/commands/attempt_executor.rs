@@ -56,10 +56,10 @@ impl AttemptExecutor {
         let runner_config = Arc::clone(&self.runner_config);
         let message_tx = self.message_tx.clone();
 
-        spawn_with(request, completion_tx, move |cancellation| {
+        spawn_with(request.clone(), completion_tx, move |cancellation| {
             run_reported_attempt(
-                request,
-                message_tx,
+                request.clone(),
+                message_tx.clone(),
                 &cancellation,
                 |reporter, is_cancelled| {
                     let problem = problems.get(request.problem).ok_or_else(|| {
@@ -69,7 +69,22 @@ impl AttemptExecutor {
                         )
                     })?;
 
-                    match request.kind {
+                    match &request.kind {
+                        RunKind::UserInput(snapshot) => {
+                            if snapshot.problem_index != problem.index {
+                                return Err(io::Error::other(
+                                    "User Input problem identity mismatch",
+                                )
+                                .into());
+                            }
+                            super::user_input_run::run(
+                                &destination,
+                                &request,
+                                &runner_config,
+                                &message_tx,
+                                is_cancelled,
+                            )
+                        }
                         RunKind::Samples => test_problem_with_cancel(
                             &destination,
                             contest_id.as_str(),
@@ -88,8 +103,8 @@ impl AttemptExecutor {
                                 request.language,
                                 &runner_config,
                                 request.debug,
-                                base_seed,
-                                count,
+                                *base_seed,
+                                *count,
                             )?;
                             match crate::stress::run(&stress_request, reporter, is_cancelled)? {
                                 crate::stress::StressOutcome::Cancelled { .. } => {
@@ -114,7 +129,7 @@ pub(super) struct ActiveAttempt {
 
 impl ActiveAttempt {
     pub(super) fn request(&self) -> RunRequest {
-        self.request
+        self.request.clone()
     }
 
     pub(super) fn request_cancel(&self) {

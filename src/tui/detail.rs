@@ -621,8 +621,23 @@ impl<'a> DetailDocument<'a> {
             return;
         };
 
+        let run = ready.last_run(selection);
+        if let Some(run) = run {
+            self.push_owned(format!(
+                "{}{}",
+                run.status.label(),
+                elapsed_label(run.elapsed)
+            ));
+            if let Some(diagnostic) = &run.diagnostic {
+                self.push_owned(format!("\nError: {diagnostic}"));
+            }
+        }
+
         if let Some(edit) = selected_edit {
             if let Some(error) = edit.save_error() {
+                if run.is_some() {
+                    self.push_semantic_section_gap();
+                }
                 self.push_owned(format!("Save failed: {error}"));
             }
             self.push_semantic_editor_section(
@@ -639,6 +654,24 @@ impl<'a> DetailDocument<'a> {
                 content,
                 app.detail_fold_state(),
             );
+        }
+        if let Some(run) = run
+            && !run.status.is_active()
+        {
+            self.push_semantic_slice_section(
+                DetailSectionKind::Actual,
+                "Output",
+                &run.stdout,
+                app.detail_fold_state(),
+            );
+            if !run.stderr.is_empty() {
+                self.push_semantic_slice_section(
+                    DetailSectionKind::Stderr,
+                    "Stderr",
+                    &run.stderr,
+                    app.detail_fold_state(),
+                );
+            }
         }
     }
 

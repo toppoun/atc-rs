@@ -453,7 +453,7 @@ fn test_problem_with_debug_header_and_cancel(
     Ok(())
 }
 
-fn duration_from_seconds(seconds: f64, name: &str) -> io::Result<Duration> {
+pub(super) fn duration_from_seconds(seconds: f64, name: &str) -> io::Result<Duration> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

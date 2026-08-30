@@ -213,6 +213,7 @@ pub(super) struct DetailSectionHeaderTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UserInputDetailAction {
+    Run,
     Edit,
     Save,
     Cancel,
@@ -567,6 +568,7 @@ pub(super) fn render_frontend_with_pointer(
         user_input_detail_action_targets(app, &mut detail_section_headers, app.detail_revision());
     for target in &user_input_detail_actions {
         let label = match target.action {
+            UserInputDetailAction::Run => "[Run]",
             UserInputDetailAction::Edit => "[Edit]",
             UserInputDetailAction::Save => "[Save]",
             UserInputDetailAction::Cancel => "[Cancel]",
@@ -698,12 +700,16 @@ fn user_input_detail_action_targets(
     detail_revision: u64,
 ) -> Vec<UserInputDetailActionTarget> {
     let actions: &[UserInputDetailAction] = if app.user_input_editor_active() {
-        &[UserInputDetailAction::Save, UserInputDetailAction::Cancel]
+        &[
+            UserInputDetailAction::Save,
+            UserInputDetailAction::Run,
+            UserInputDetailAction::Cancel,
+        ]
     } else if matches!(
         app.selected_user_input(),
         Some(UserInputSelection::Persisted(_))
     ) {
-        &[UserInputDetailAction::Edit]
+        &[UserInputDetailAction::Edit, UserInputDetailAction::Run]
     } else {
         &[]
     };
@@ -722,6 +728,7 @@ fn user_input_detail_action_targets(
     }
 
     let action_width = |action| match action {
+        UserInputDetailAction::Run => 5_u16,
         UserInputDetailAction::Edit | UserInputDetailAction::Save => 6_u16,
         UserInputDetailAction::Cancel => 8_u16,
     };
@@ -745,7 +752,7 @@ fn user_input_detail_action_targets(
             x = x.saturating_add(1);
         }
     }
-    if actions == [UserInputDetailAction::Edit] {
+    if !app.user_input_editor_active() {
         header.area.width = targets[0].area.x.saturating_sub(header.area.x);
         headers[index] = header;
     }
@@ -4549,10 +4556,12 @@ mod tests {
 
         app.begin_selected_user_input_edit().unwrap();
         let (buffer, editing) = render_with_pointer_position(&app, None, 100, 30);
-        assert_eq!(editing.user_input_detail_actions.len(), 2);
+        assert_eq!(editing.user_input_detail_actions.len(), 3);
         let save = editing.user_input_detail_actions[0];
-        let cancel = editing.user_input_detail_actions[1];
+        let run = editing.user_input_detail_actions[1];
+        let cancel = editing.user_input_detail_actions[2];
         assert_eq!(save.action, UserInputDetailAction::Save);
+        assert_eq!(run.action, UserInputDetailAction::Run);
         assert_eq!(cancel.action, UserInputDetailAction::Cancel);
         assert!(save.area.right() < cancel.area.x);
         assert!(
@@ -4563,7 +4572,7 @@ mod tests {
         );
         assert!(buffer_symbols(&buffer).contains("Input — Editing"));
         assert!(!buffer_symbols(&buffer).contains("Input — Editing *"));
-        assert!(buffer_symbols(&buffer).contains("[Save] [Cancel]"));
+        assert!(buffer_symbols(&buffer).contains("[Save] [Run] [Cancel]"));
         let (save_hover, _) =
             render_with_pointer_position(&app, Some((save.area.x, save.area.y)), 100, 30);
         assert_eq!(
@@ -4586,7 +4595,7 @@ mod tests {
 
         for width in 0..=20 {
             let (_, narrow) = render_with_pointer_position(&app, None, width, 8);
-            if narrow.user_input_detail_actions.len() == 2 {
+            if narrow.user_input_detail_actions.len() == 3 {
                 assert!(
                     narrow.user_input_detail_actions[0].area.right()
                         < narrow.user_input_detail_actions[1].area.x

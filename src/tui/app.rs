@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -7,6 +8,9 @@ use std::time::Duration;
 
 use super::detail::DetailSectionKind;
 use super::message::{RunId, RunKind, RunRequest, StressEvent, TestEvent};
+use super::message::{
+    UserInputRunEvent, UserInputRunSnapshot, UserInputRunStatus, UserInputRunTarget,
+};
 use crate::language::Language;
 use crate::model::{Contest, Sample};
 use crate::stress::CandidateFailureKind;
@@ -15,6 +19,20 @@ use crate::stress::CandidateFailureKind;
 pub struct SourceState {
     pub path: PathBuf,
     pub language: Language,
+}
+
+mod user_input_run;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputRunState {
+    pub run_id: RunId,
+    pub snapshot: Arc<UserInputRunSnapshot>,
+    pub language: Option<Language>,
+    pub status: UserInputRunStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub diagnostic: Option<Arc<String>>,
+    pub elapsed: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +369,8 @@ impl std::error::Error for UserInputEditStartError {}
 pub struct UserInputReadyState {
     persisted: Vec<PersistedUserInputState>,
     edit: Option<UserInputEditState>,
+    runs: HashMap<UserInputRunTarget, UserInputRunState>,
+    draft_generation: u64,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -359,7 +379,7 @@ impl UserInputReadyState {
         persisted.sort_by_key(|input| input.id);
         Self {
             persisted,
-            edit: None,
+            ..Self::default()
         }
     }
 
@@ -379,6 +399,8 @@ impl UserInputReadyState {
         if self.edit.is_some() {
             return Err(UserInputEditStartError::AlreadyEditing);
         }
+        self.discard_draft_run();
+        self.draft_generation += 1;
         self.edit = Some(UserInputEditState {
             target: UserInputEditTarget::Draft,
             buffer: String::new(),
@@ -446,10 +468,27 @@ impl UserInputReadyState {
 
     fn replace_persisted(&mut self, mut persisted: Vec<PersistedUserInputState>) {
         persisted.sort_by_key(|input| input.id);
+        self.runs.retain(|target, _| match target {
+            UserInputRunTarget::Draft(_) => true,
+            UserInputRunTarget::Persisted(id) => {
+                let old = self.persisted.iter().find(|input| input.id == *id);
+                let new = persisted.iter().find(|input| input.id == *id);
+                old.is_some() && old == new
+            }
+        });
         self.persisted = persisted;
     }
 
     pub fn cancel_edit(&mut self) -> bool {
+        if let Some(edit) = &self.edit {
+            match edit.target {
+                UserInputEditTarget::Draft => self.discard_draft_run(),
+                UserInputEditTarget::Persisted(id) if self.edit_is_dirty() == Some(true) => {
+                    self.runs.remove(&UserInputRunTarget::Persisted(id));
+                }
+                _ => {}
+            }
+        }
         self.edit.take().is_some()
     }
 }
@@ -508,6 +547,7 @@ pub struct ProblemState {
     pub total_cases: usize,
     pub saved_stress_case: Option<SavedStressCaseState>,
     pub source: Option<SourceState>,
+    source_revision: u64,
     pub run: RunState,
     pub stress: StressState,
     pub stress_setup: StressSetupState,
@@ -626,6 +666,7 @@ pub struct WatchApp {
     detail_folds: DetailFoldState,
 
     next_run_id: RunId,
+    pending_user_input_runs: VecDeque<RunRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -912,6 +953,7 @@ impl WatchApp {
                     total_cases: sample_cases + if saved_stress_case.is_some() { 1 } else { 0 },
                     saved_stress_case,
                     source: None,
+                    source_revision: 0,
                     run: RunState::default(),
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
@@ -938,6 +980,7 @@ impl WatchApp {
             detail_revision: 0,
             detail_folds: DetailFoldState::default(),
             next_run_id: 1,
+            pending_user_input_runs: VecDeque::new(),
         })
     }
 
@@ -1094,10 +1137,16 @@ impl WatchApp {
             });
             ready.persisted.sort_by_key(|input| input.id);
         }
+        ready.discard_draft_run();
         ready.edit = None;
         problem.selection_before_draft = DraftReturnSelection::None;
         self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)));
         self.detail_folds.expand(DetailSectionKind::Input);
+        self.enqueue_user_input_snapshot(
+            snapshot.problem,
+            UserInputRunTarget::Persisted(id),
+            &snapshot.content,
+        );
         self.invalidate_detail();
         Ok(true)
     }
@@ -1137,6 +1186,11 @@ impl WatchApp {
         ready.edit = None;
         self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)));
         self.detail_folds.expand(DetailSectionKind::Input);
+        self.enqueue_user_input_snapshot(
+            snapshot.problem,
+            UserInputRunTarget::Persisted(id),
+            &snapshot.content,
+        );
         self.invalidate_detail();
         Ok(true)
     }
@@ -1188,6 +1242,7 @@ impl WatchApp {
             .ready_mut()
             .expect("a matching User Input snapshot must retain ready state");
         ready.replace_persisted(reloaded);
+        ready.discard_draft_run();
         let edit = ready
             .edit_mut()
             .expect("a matching User Input snapshot must retain its editor");
@@ -1259,6 +1314,8 @@ impl WatchApp {
         edit.target = UserInputEditTarget::Draft;
         edit.installed_draft_id = None;
         edit.save_error = Some(Arc::new(message));
+        ready.discard_draft_run();
+        ready.draft_generation += 1;
         problem.selection_before_draft = DraftReturnSelection::None;
         self.case_selection = Some(CaseSelection::UserInput(UserInputSelection::Draft));
         self.detail_folds.expand(DetailSectionKind::Input);
@@ -1373,7 +1430,11 @@ impl WatchApp {
                 };
                 cache_changed = state.user_inputs.ready().is_none() || old != persisted;
                 if cache_changed {
-                    state.user_inputs = UserInputState::loaded(persisted);
+                    if let Some(ready) = state.user_inputs.ready_mut() {
+                        ready.replace_persisted(persisted);
+                    } else {
+                        state.user_inputs = UserInputState::loaded(persisted);
+                    }
                 }
                 notice
             }
@@ -1461,6 +1522,7 @@ impl WatchApp {
             .selected_user_input_edit_mut()
             .is_some_and(|edit| edit.insert(text));
         if changed {
+            self.clear_selected_user_input_run();
             self.invalidate_detail();
         }
         changed
@@ -1471,6 +1533,7 @@ impl WatchApp {
             .selected_user_input_edit_mut()
             .is_some_and(UserInputEditState::backspace);
         if changed {
+            self.clear_selected_user_input_run();
             self.invalidate_detail();
         }
         changed
@@ -1481,6 +1544,7 @@ impl WatchApp {
             .selected_user_input_edit_mut()
             .is_some_and(UserInputEditState::delete);
         if changed {
+            self.clear_selected_user_input_run();
             self.invalidate_detail();
         }
         changed
@@ -1858,11 +1922,37 @@ impl WatchApp {
         true
     }
     pub fn source_changed(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
+        self.set_source(problem, path, language, true)
+    }
+
+    pub fn select_source(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
+        self.set_source(problem, path, language, false)
+    }
+
+    fn set_source(
+        &mut self,
+        problem: usize,
+        path: PathBuf,
+        language: Language,
+        changed: bool,
+    ) -> bool {
         if problem >= self.problems.len() {
             return false;
         }
 
         let previous_detail_case = self.displayed_detail_case();
+        let same_source = self.problems[problem]
+            .source
+            .as_ref()
+            .is_some_and(|source| source.path == path && source.language == language);
+        // Notifications invalidate results even if edits were coalesced by the watcher.
+        // Merely opening the already-selected source does not constitute a source change.
+        if changed || !same_source {
+            self.problems[problem].source_revision += 1;
+            if let Some(ready) = self.problems[problem].user_inputs.ready_mut() {
+                ready.runs.clear();
+            }
+        }
         let source = SourceState { path, language };
         debug_assert_eq!(
             source.path.extension(),
@@ -1950,6 +2040,7 @@ impl WatchApp {
             let source = problem_state.source.as_ref()?;
             (source.language, problem_state.total_cases)
         };
+        self.retire_user_input_runs();
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
@@ -2001,6 +2092,7 @@ impl WatchApp {
 
     pub fn queue_stress(&mut self, problem: usize, base_seed: u64) -> Option<RunRequest> {
         let language = self.problems.get(problem)?.source.as_ref()?.language;
+        self.retire_user_input_runs();
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
@@ -2084,6 +2176,9 @@ impl WatchApp {
     }
 
     pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
+        if self.user_input_run_started(problem, run_id) {
+            return true;
+        }
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
         };
@@ -2700,6 +2795,9 @@ impl WatchApp {
     }
 
     pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
+        if self.user_input_run_failed(problem, run_id, &error) {
+            return true;
+        }
         let Some(mode) = self.attempt_mode(problem, run_id) else {
             return false;
         };

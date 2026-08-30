@@ -2475,7 +2475,7 @@ mod tests {
                 let published_tx = published_tx.clone();
                 let attempt_messages = attempt_messages.clone();
                 crate::commands::attempt_executor::spawn_with(
-                    request,
+                    request.clone(),
                     completion_tx,
                     move |cancellation| {
                         started_tx.send(()).unwrap();
