@@ -226,6 +226,20 @@ pub(super) struct UserInputDetailActionTarget {
     pub(super) detail_revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CasesRowAction {
+    Select(CaseSelection),
+    DeleteUserInput(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CasesRowTarget {
+    pub(super) action: CasesRowAction,
+    pub(super) area: Rect,
+    pub(super) problem: usize,
+    pub(super) revision: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderInfo {
     pub max_detail_scroll: Option<usize>,
@@ -236,11 +250,25 @@ pub struct RenderInfo {
     pub(super) detail_scrollbar: Option<DetailScrollbarInteraction>,
     pub(super) detail_section_headers: Vec<DetailSectionHeaderTarget>,
     pub(super) user_input_detail_actions: Vec<UserInputDetailActionTarget>,
+    pub(super) cases_row_targets: Vec<CasesRowTarget>,
     pub(super) editor_cursor: Option<(u16, u16)>,
     pub(super) editor_scroll_reconciliation: Option<usize>,
 }
 
 impl RenderInfo {
+    pub(super) fn cases_row_target_at(
+        &self,
+        app: &WatchApp,
+        column: u16,
+        row: u16,
+    ) -> Option<CasesRowTarget> {
+        self.cases_row_targets.iter().copied().find(|target| {
+            Some(target.problem) == app.selected_problem()
+                && target.revision == app.detail_revision()
+                && contains_rect(target.area, column, row)
+        })
+    }
+
     pub(super) fn detail_section_header_at(
         &self,
         detail_revision: u64,
@@ -450,10 +478,13 @@ pub(super) fn render_frontend_with_pointer(
         (None, rows[1])
     };
 
+    let mut cases_row_targets = Vec::new();
     let (samples_body_area, new_input_area) = if let Some(samples_area) = samples_area {
         frame.render_widget(Block::default().borders(Borders::RIGHT), samples_area);
         let (body, action, separator) = cases_pane_areas(samples_area);
-        frame.render_widget(Paragraph::new(samples_text(app, body.height)), body);
+        let (text, targets) = samples_content(app, body);
+        cases_row_targets = targets;
+        frame.render_widget(Paragraph::new(text), body);
         if let Some(separator) = separator {
             frame.render_widget(Block::default().borders(Borders::TOP), separator);
         }
@@ -577,6 +608,7 @@ pub(super) fn render_frontend_with_pointer(
     }
 
     let render_info = RenderInfo {
+        cases_row_targets,
         max_detail_scroll: detail_viewport.max_scroll,
         samples_area,
         samples_body_area,
@@ -597,7 +629,14 @@ pub(super) fn render_frontend_with_pointer(
         && !matches!(mouse_mode, MouseMode::Disabled)
         && let Some((column, row)) = detail_pointer
     {
-        if let Some(action) =
+        if let Some(target) = render_info.cases_row_target_at(app, column, row)
+            && matches!(target.action, CasesRowAction::DeleteUserInput(_))
+        {
+            frame.buffer_mut().set_style(
+                target.area,
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            );
+        } else if let Some(action) =
             render_info.user_input_detail_action_at(app.detail_revision(), column, row)
         {
             frame
@@ -671,6 +710,8 @@ fn render_problem_sync_notice(
         .and_then(|count| count.parse::<usize>().ok())
     {
         format!("! {count} inputs removed")
+    } else if notice.starts_with("Could not delete User Input:") {
+        "! Input delete failed".to_string()
     } else {
         "! Input sync failed".to_string()
     };
@@ -1673,10 +1714,16 @@ fn sample_rows(problem: &ProblemState) -> Vec<SampleRow> {
     rows
 }
 
+#[cfg(test)]
 fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
+    samples_content(app, Rect::new(0, 0, SAMPLES_PANE_WIDTH - 1, height)).0
+}
+
+fn samples_content(app: &WatchApp, body: Rect) -> (Text<'static>, Vec<CasesRowTarget>) {
     let Some(problem) = app.current_problem() else {
-        return Text::default();
+        return (Text::default(), Vec::new());
     };
+    let mut targets = Vec::new();
 
     let mut lines = if problem.sample_cases > 0 {
         vec![
@@ -1688,7 +1735,7 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
     };
 
     let rows = sample_rows(problem);
-    let visible = usize::from(height).saturating_sub(lines.len());
+    let visible = usize::from(body.height).saturating_sub(lines.len());
     let selection = (problem.detail_mode == DetailMode::Samples)
         .then(|| app.case_selection())
         .flatten();
@@ -1703,6 +1750,7 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
     });
 
     for row in &rows[range] {
+        let y = body.y.saturating_add(lines.len() as u16);
         match *row {
             SampleRow::Sample { flat_index, number } => {
                 lines.push(sample_line(problem, flat_index, number, selected_test));
@@ -1719,10 +1767,34 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
                 "User Inputs",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            SampleRow::UserInput { id, number, dirty } => lines.push(user_input_line(
-                &format!("Input {number}{}", if dirty { " *" } else { "" }),
-                selection == Some(CaseSelection::UserInput(UserInputSelection::Persisted(id))),
-            )),
+            SampleRow::UserInput { id, number, dirty } => {
+                let mut line = user_input_line(
+                    &format!("Input {number}{}", if dirty { " *" } else { "" }),
+                    selection == Some(CaseSelection::UserInput(UserInputSelection::Persisted(id))),
+                );
+                let offset = line.width().saturating_add(2);
+                // Reserve the full armed width so a second click never shifts the hitbox.
+                // Hide instead of clipping the label or writing into the pane border.
+                if app.can_delete_user_input(id) && offset + 4 <= usize::from(body.width) {
+                    let armed = problem.user_input_delete_armed == Some(id);
+                    targets.push(CasesRowTarget {
+                        action: CasesRowAction::DeleteUserInput(id),
+                        area: Rect::new(body.x + offset as u16, y, 4, 1),
+                        problem: app.selected_problem().unwrap(),
+                        revision: app.detail_revision(),
+                    });
+                    line.spans.push(Span::raw("  "));
+                    line.spans.push(Span::styled(
+                        if armed { " ×? " } else { " ×  " },
+                        Style::default().fg(if armed {
+                            Color::Yellow
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ));
+                }
+                lines.push(line);
+            }
             SampleRow::Draft => lines.push(user_input_line(
                 "Draft *",
                 selection == Some(CaseSelection::UserInput(UserInputSelection::Draft)),
@@ -1732,9 +1804,31 @@ fn samples_text(app: &WatchApp, height: u16) -> Text<'static> {
                 Style::default().fg(Color::Red),
             )),
         }
+        if let Some(selection) = row.selection() {
+            let line_width = lines
+                .last()
+                .map_or(0, Line::width)
+                .min(usize::from(body.width));
+            // The label target ends before the Delete padding; targets never overlap.
+            let width = targets
+                .last()
+                .filter(|target| {
+                    target.area.y == y
+                        && matches!(target.action, CasesRowAction::DeleteUserInput(_))
+                })
+                .map_or(line_width as u16, |target| target.area.x - body.x - 2);
+            if width > 0 {
+                targets.push(CasesRowTarget {
+                    action: CasesRowAction::Select(selection),
+                    area: Rect::new(body.x, y, width, 1),
+                    problem: app.selected_problem().unwrap(),
+                    revision: app.detail_revision(),
+                });
+            }
+        }
     }
 
-    Text::from(lines)
+    (Text::from(lines), targets)
 }
 
 fn user_input_line(label: &str, selected: bool) -> Line<'static> {
@@ -4055,7 +4149,7 @@ mod tests {
         assert!(app.next_case());
         let text = samples_text(&app, 20);
         let lines = text_lines(&text);
-        assert!(lines.iter().any(|line| line == "> Input 1"));
+        assert!(lines.iter().any(|line| line == "> Input 1   ×  "));
         assert!(
             !lines
                 .iter()
@@ -4069,7 +4163,7 @@ mod tests {
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
-                    == "> Input 1"
+                    == "> Input 1   ×  "
             })
             .unwrap();
         assert!(selected.style.add_modifier.contains(Modifier::BOLD));
@@ -4081,8 +4175,59 @@ mod tests {
             Some(CaseSelection::UserInput(UserInputSelection::Persisted(8)))
         );
         let lines = text_lines(&samples_text(&app, 20));
-        assert!(lines.iter().any(|line| line == "> Input 3"));
+        assert!(lines.iter().any(|line| line == "> Input 3   ×  "));
         assert!(!lines.iter().any(|line| line.starts_with("  Input 4")));
+    }
+
+    #[test]
+    fn delete_button_hides_when_body_cannot_fit_armed_width_without_clipping_label() {
+        let mut app = app_with_user_inputs(
+            0,
+            UserInputState::loaded(vec![PersistedUserInputState {
+                id: 7,
+                content: "input".to_string(),
+            }]),
+        );
+        for armed in [false, true] {
+            if armed {
+                app.arm_user_input_delete(7);
+            }
+            for width in 0..=25 {
+                let body = Rect::new(0, 0, width, 3);
+                let (text, targets) = samples_content(&app, body);
+                let line = text.lines[1].to_string();
+                assert!(line.starts_with("> Input 1"));
+                let delete = targets
+                    .iter()
+                    .find(|t| matches!(t.action, CasesRowAction::DeleteUserInput(_)));
+                if width < 15 {
+                    assert_eq!(line, "> Input 1");
+                    assert!(delete.is_none());
+                } else {
+                    assert_eq!(
+                        line,
+                        if armed {
+                            "> Input 1   ×? "
+                        } else {
+                            "> Input 1   ×  "
+                        }
+                    );
+                    assert_eq!(delete.unwrap().area, Rect::new(11, 1, 4, 1));
+                }
+                // Render into a sentinel border to check clipping never wraps or overwrites.
+                let mut buffer = ratatui::buffer::Buffer::filled(
+                    Rect::new(0, 0, width + 1, 4),
+                    ratatui::buffer::Cell::new("#"),
+                );
+                ratatui::widgets::Widget::render(Paragraph::new(text), body, &mut buffer);
+                for y in 0..4 {
+                    assert_eq!(buffer[(width, y)].symbol(), "#");
+                }
+                for x in 0..=width {
+                    assert_eq!(buffer[(x, 3)].symbol(), "#");
+                }
+            }
+        }
     }
 
     #[test]
@@ -4101,7 +4246,12 @@ mod tests {
         );
         assert_eq!(
             text_lines(&samples_text(&app, 10)),
-            ["User Inputs", "> Input 1", "  Input 2", "  Input 3"]
+            [
+                "User Inputs",
+                "> Input 1   ×  ",
+                "  Input 2   ×  ",
+                "  Input 3   ×  "
+            ]
         );
         assert_eq!(
             app.case_selection(),
@@ -4138,7 +4288,7 @@ mod tests {
         );
         let lines = text_lines(&samples_text(&app, 10));
         assert!(lines.iter().any(|line| line == "  Input 1 *"));
-        assert!(lines.iter().any(|line| line == "> Input 2"));
+        assert!(lines.iter().any(|line| line == "> Input 2   ×  "));
 
         assert!(app.previous_case());
         assert!(app.edit_user_input_backspace());
@@ -4458,7 +4608,7 @@ mod tests {
         assert!(info.samples_area.is_some());
         assert_eq!(
             text_lines(&samples_text(&app, 10)),
-            ["User Inputs", "> Input 1"]
+            ["User Inputs", "> Input 1   ×  "]
         );
     }
 

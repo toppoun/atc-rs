@@ -67,6 +67,7 @@ impl WatchApp {
                 .as_ref()
                 .is_some_and(|edit| edit.target == UserInputEditTarget::Persisted(id))
         );
+        let mut fallback_position = None;
         let available = match loaded {
             Ok(Some(input)) => {
                 debug_assert_eq!(input.id, id);
@@ -84,10 +85,11 @@ impl WatchApp {
                     "User Input {} was removed externally.",
                     position + 1
                 )));
-                self.case_selection = ready
-                    .persisted
-                    .get(position.min(ready.persisted.len().saturating_sub(1)))
-                    .map(|input| CaseSelection::UserInput(UserInputSelection::Persisted(input.id)));
+                if self.case_selection
+                    == Some(CaseSelection::UserInput(UserInputSelection::Persisted(id)))
+                {
+                    fallback_position = Some(position);
+                }
                 false
             }
             Err(error) => {
@@ -96,7 +98,7 @@ impl WatchApp {
                 false
             }
         };
-        self.reconcile_case_selection(problem);
+        self.reconcile_user_input_selection(problem, fallback_position);
         self.reset_folds_if_displayed_case_changed(previous);
         self.invalidate_detail();
         available
@@ -104,6 +106,7 @@ impl WatchApp {
 
     // Called only after read-only sync, or directly for an editor's immutable buffer snapshot.
     pub(in crate::tui) fn enqueue_selected_user_input(&mut self) -> bool {
+        self.disarm_user_input_delete();
         let Some(problem) = self.selected_problem() else {
             return false;
         };

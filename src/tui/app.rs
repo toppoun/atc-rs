@@ -21,6 +21,7 @@ pub struct SourceState {
     pub language: Language,
 }
 
+mod user_input_delete;
 mod user_input_run;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +555,7 @@ pub struct ProblemState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub user_inputs: UserInputState,
     pub user_input_sync_notice: Option<Arc<String>>,
+    pub(super) user_input_delete_armed: Option<u64>,
     selection_before_draft: DraftReturnSelection,
     pub detail_mode: DetailMode,
 }
@@ -959,6 +961,7 @@ impl WatchApp {
                     stress_setup: StressSetupState::None,
                     user_inputs,
                     user_input_sync_notice: None,
+                    user_input_delete_armed: None,
                     selection_before_draft: DraftReturnSelection::None,
                     detail_mode: DetailMode::Samples,
                 }
@@ -1324,6 +1327,7 @@ impl WatchApp {
     }
 
     pub fn begin_new_user_input(&mut self) -> Result<bool, UserInputEditStartError> {
+        self.disarm_user_input_delete();
         let problem_index = self
             .selected_problem()
             .ok_or(UserInputEditStartError::Unavailable)?;
@@ -1444,14 +1448,15 @@ impl WatchApp {
             return false;
         }
         state.user_input_sync_notice = notice;
+        if state.user_input_delete_armed.is_some_and(|id| {
+            !state.contains_case_selection(CaseSelection::UserInput(UserInputSelection::Persisted(
+                id,
+            )))
+        }) {
+            state.user_input_delete_armed = None;
+        }
         if self.selected_problem == problem {
-            if let Some(position) = fallback_position {
-                let persisted = state.user_inputs.ready().unwrap().persisted();
-                self.case_selection = persisted
-                    .get(position.min(persisted.len().saturating_sub(1)))
-                    .map(|input| CaseSelection::UserInput(UserInputSelection::Persisted(input.id)));
-            }
-            self.reconcile_case_selection(problem);
+            self.reconcile_user_input_selection(problem, fallback_position);
             self.reset_folds_if_displayed_case_changed(previous);
             self.reset_detail_scroll();
             self.invalidate_detail();
@@ -1463,6 +1468,7 @@ impl WatchApp {
     pub(super) fn begin_selected_user_input_edit(
         &mut self,
     ) -> Result<bool, UserInputEditStartError> {
+        self.disarm_user_input_delete();
         let UserInputSelection::Persisted(id) = self
             .selected_user_input()
             .ok_or(UserInputEditStartError::Unavailable)?
@@ -1483,6 +1489,7 @@ impl WatchApp {
     }
 
     pub fn cancel_user_input_edit(&mut self) -> bool {
+        self.disarm_user_input_delete();
         let Some(problem_index) = self.selected_problem() else {
             return false;
         };
@@ -1831,6 +1838,7 @@ impl WatchApp {
             return false;
         }
 
+        self.disarm_user_input_delete();
         let previous_detail_case = self.displayed_detail_case();
         self.selected_problem = index;
         self.case_selection = self.problems[index].first_case_selection();
@@ -1885,6 +1893,7 @@ impl WatchApp {
         if Some(next) == self.case_selection && !mode_changed {
             return false;
         }
+        self.disarm_user_input_delete();
         let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.case_selection = Some(next);
@@ -1913,6 +1922,7 @@ impl WatchApp {
         if Some(previous) == self.case_selection && !mode_changed {
             return false;
         }
+        self.disarm_user_input_delete();
         let previous_detail_case = self.displayed_detail_case();
         self.problems[self.selected_problem].detail_mode = DetailMode::Samples;
         self.case_selection = Some(previous);
@@ -1940,6 +1950,7 @@ impl WatchApp {
             return false;
         }
 
+        self.disarm_user_input_delete();
         let previous_detail_case = self.displayed_detail_case();
         let same_source = self.problems[problem]
             .source
@@ -2035,6 +2046,7 @@ impl WatchApp {
     }
 
     pub fn queue_run(&mut self, problem: usize) -> Option<RunRequest> {
+        self.disarm_user_input_delete();
         let (language, total_cases) = {
             let problem_state = self.problems.get(problem)?;
             let source = problem_state.source.as_ref()?;
@@ -2091,6 +2103,7 @@ impl WatchApp {
     }
 
     pub fn queue_stress(&mut self, problem: usize, base_seed: u64) -> Option<RunRequest> {
+        self.disarm_user_input_delete();
         let language = self.problems.get(problem)?.source.as_ref()?.language;
         self.retire_user_input_runs();
         self.retire_other_stress_requests(problem);

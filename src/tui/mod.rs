@@ -2261,7 +2261,17 @@ impl DetailScrollbarDragState {
             let new_input = render_info
                 .new_input_area
                 .is_some_and(|area| contains(area, position.0, position.1));
-            (action, header, new_input)
+            let delete = render_info.cases_row_targets.iter().find_map(|target| {
+                if let view::CasesRowAction::DeleteUserInput(id) = target.action
+                    && target.revision == detail_revision
+                    && contains(target.area, position.0, position.1)
+                {
+                    Some(id)
+                } else {
+                    None
+                }
+            });
+            (action, header, new_input, delete)
         };
         let previous = self.hover_position.map(hover_target);
         let next = hover_target(position);
@@ -3247,6 +3257,7 @@ fn handle_terminal_events_with_mouse_mode(
         }
 
         let detail_revision_before = app.detail_revision();
+        let delete_armed_before = app.user_input_delete_armed();
         let samples_pane_before = app.samples_pane_enabled();
         let detail_scroll_before = app.detail_scroll();
         let is_left_drag = matches!(
@@ -3265,6 +3276,8 @@ fn handle_terminal_events_with_mouse_mode(
             mouse_mode,
             &mut input,
         )?;
+        let delete_armed_changed = app.user_input_delete_armed() != delete_armed_before;
+        changed |= delete_armed_changed;
         if input
             .editor
             .as_mut()
@@ -3285,6 +3298,11 @@ fn handle_terminal_events_with_mouse_mode(
             // The remaining queued pointer events must see geometry rendered
             // for the new document/mode/pane layout. Pure drag bursts do not
             // change either stable identity input and continue to batch.
+            break;
+        }
+        if delete_armed_changed {
+            // Show × / ×? before processing the next event, without making an
+            // active fold animation or scrollbar drag stale. Cases geometry is unchanged.
             break;
         }
         if app.detail_scroll() != detail_scroll_before {
@@ -3456,7 +3474,10 @@ fn handle_terminal_event_with_mouse_mode(
             Ok(changed)
         }
 
-        TerminalEvent::Paste(text) => Ok(app.edit_user_input_insert(&text)),
+        TerminalEvent::Paste(text) => {
+            let disarmed = app.disarm_user_input_delete();
+            Ok(app.edit_user_input_insert(&text) | disarmed)
+        }
 
         TerminalEvent::Pointer(pointer) => {
             let hover_changed = detail_scrollbar_drag.update_hover(
@@ -3522,6 +3543,28 @@ fn handle_key_event_with_stress_context(
 }
 
 fn handle_key_event_with_frontend_context(
+    app: &mut WatchApp,
+    key: KeyEvent,
+    input: &mut FrontendInputContext<'_, '_, '_, '_, '_>,
+) -> io::Result<bool> {
+    // Navigation transitions disarm only when selection/mode actually changes.
+    // The same keys are editor operations while the selected input is being edited.
+    let navigation = !app.user_input_editor_active()
+        && matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('h' | 'j' | 'k' | 'l')
+        );
+    let disarmed = matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && !navigation
+        && app.disarm_user_input_delete();
+    Ok(handle_key_event_after_delete_disarm(app, key, input)? | disarmed)
+}
+
+fn handle_key_event_after_delete_disarm(
     app: &mut WatchApp,
     key: KeyEvent,
     input: &mut FrontendInputContext<'_, '_, '_, '_, '_>,
@@ -3619,6 +3662,7 @@ fn sync_selected_user_input_before_edit(
     app: &mut WatchApp,
     current_destination: Option<&Path>,
 ) -> bool {
+    app.disarm_user_input_delete();
     let Some(problem) = app.selected_problem() else {
         return false;
     };
@@ -3664,6 +3708,7 @@ fn flush_user_input_run_requests(
 }
 
 fn run_selected_user_input(app: &mut WatchApp, destination: Option<&Path>) -> bool {
+    app.disarm_user_input_delete();
     let Some(problem) = app.selected_problem() else {
         return false;
     };
@@ -3692,6 +3737,7 @@ fn run_selected_user_input(app: &mut WatchApp, destination: Option<&Path>) -> bo
 }
 
 fn save_selected_user_input(app: &mut WatchApp, destination: &Path) -> bool {
+    app.disarm_user_input_delete();
     let Some(snapshot) = app.user_input_save_snapshot() else {
         return false;
     };
@@ -3970,6 +4016,7 @@ fn execute_frontend_action(
     open_source: Option<&mut OpenSourceController>,
     editor_targets: Option<&mut EditorTargetController>,
 ) -> io::Result<bool> {
+    app.disarm_user_input_delete();
     match action {
         FrontendAction::RunTests => {
             let Some(problem) = app.selected_problem() else {
@@ -4117,6 +4164,74 @@ fn project_pointer_to_cells(pointer: PointerEvent, mouse_mode: MouseMode) -> Opt
 }
 
 fn handle_pointer_event_with_mouse_mode(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
+    pointer: PointerEvent,
+    render_info: &view::RenderInfo,
+    mouse_mode: MouseMode,
+    current_destination: Option<&Path>,
+) -> bool {
+    let revision_before = app.detail_revision();
+    if let Some((column, row)) = project_pointer_to_cells(pointer, mouse_mode)
+        && pointer.kind == PointerKind::Down(PointerButton::Left)
+        && let Some(target) = render_info.cases_row_target_at(app, column, row)
+    {
+        detail_scrollbar_drag.cancel();
+        return match target.action {
+            view::CasesRowAction::DeleteUserInput(id) => {
+                click_user_input_delete(app, id, current_destination)
+            }
+            view::CasesRowAction::Select(selection) => app.select_case(selection),
+        };
+    }
+    // Disarming is appearance-only. Capture its redraw signal before the action
+    // (which may also disarm), and leave the current Detail interaction valid.
+    let disarmed = matches!(pointer.kind, PointerKind::Down(_)) && app.disarm_user_input_delete();
+    let changed = handle_pointer_event_after_delete_hit_test(
+        app,
+        detail_layout,
+        detail_scrollbar_drag,
+        pointer,
+        render_info,
+        mouse_mode,
+        current_destination,
+    );
+    changed | disarmed | (app.detail_revision() != revision_before)
+}
+
+fn click_user_input_delete(app: &mut WatchApp, id: u64, destination: Option<&Path>) -> bool {
+    if !app.can_delete_user_input(id) {
+        return app.disarm_user_input_delete();
+    }
+    let state = app.current_problem().expect("checked delete target");
+    if state.user_input_delete_armed != Some(id) {
+        return app.arm_user_input_delete(id);
+    }
+    let problem_index = state.index.clone();
+    app.disarm_user_input_delete();
+    let result = destination
+        .ok_or_else(|| io::Error::other("current contest destination is unavailable"))
+        .and_then(|destination| {
+            match crate::user_input::delete_user_input(destination, &problem_index, id) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // NotFound can also originate from storage/metadata operations.
+                    // Only a successful backend load proving this ID absent counts
+                    // as success. Do not refresh other rows or an editor's baseline.
+                    match crate::user_input::load_user_inputs(destination, &problem_index) {
+                        Ok(inputs) if !inputs.iter().any(|input| input.id == id) => Ok(()),
+                        Ok(_) => Err(error),
+                        Err(reload_error) => Err(reload_error),
+                    }
+                }
+                result => result,
+            }
+        });
+    app.complete_user_input_delete(id, result.map_err(|error| error.to_string()));
+    true
+}
+
+fn handle_pointer_event_after_delete_hit_test(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
@@ -4337,6 +4452,7 @@ fn set_detail_scroll_from_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod user_input_delete;
     mod user_input_runs;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
