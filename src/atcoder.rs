@@ -166,7 +166,53 @@ enum Source {
 
 struct HttpSource {
     client: Client,
+    submit_client: LazySubmitClient,
     last_request: Mutex<Option<Instant>>,
+}
+
+struct LazySubmitClient {
+    cookie: Option<String>,
+    client: Mutex<Option<Client>>,
+}
+
+impl LazySubmitClient {
+    fn new(cookie: Option<String>) -> Self {
+        Self {
+            cookie,
+            client: Mutex::new(None),
+        }
+    }
+
+    fn get(&self) -> Result<Client, AtCoderError> {
+        self.get_or_try_init_with(build_submit_http_client)
+    }
+
+    fn get_or_try_init_with(
+        &self,
+        build: impl FnOnce(Option<String>) -> Result<Client, AtCoderError>,
+    ) -> Result<Client, AtCoderError> {
+        let mut cached = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(client) = cached.as_ref() {
+            return Ok(client.clone());
+        }
+
+        let client = build(self.cookie.clone())?;
+        *cached = Some(client.clone());
+        Ok(client)
+    }
+}
+
+impl HttpSource {
+    fn new(cookie: Option<String>) -> Result<Self, AtCoderError> {
+        Ok(Self {
+            client: build_http_client(cookie.clone())?,
+            submit_client: LazySubmitClient::new(cookie),
+            last_request: Mutex::new(None),
+        })
+    }
 }
 
 pub struct AtCoderClient {
@@ -201,13 +247,9 @@ impl From<&crate::model::Problem> for ProblemOutline {
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
         let cookie = auth::load_cookie().map_err(AtCoderError::Auth)?;
-        let client = build_http_client(cookie)?;
 
         Ok(Self {
-            source: Source::Http(HttpSource {
-                client,
-                last_request: Mutex::new(None),
-            }),
+            source: Source::Http(HttpSource::new(cookie)?),
         })
     }
 
@@ -307,6 +349,19 @@ impl AtCoderClient {
 }
 
 fn build_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
+    Ok(http_client_builder(cookie)?.build()?)
+}
+
+fn build_submit_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
+    Ok(http_client_builder(cookie)?
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()?)
+}
+
+fn http_client_builder(
+    cookie: Option<String>,
+) -> Result<reqwest::blocking::ClientBuilder, AtCoderError> {
     let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
     let authenticated = cookie.is_some();
     let headers = default_headers(cookie)?;
@@ -323,7 +378,7 @@ fn build_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
         builder = builder.cookie_store(true);
     }
 
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 fn default_headers(cookie: Option<String>) -> Result<HeaderMap, AtCoderError> {
@@ -705,6 +760,73 @@ mod tests {
     fn anonymous_default_headers_have_no_cookie() {
         let headers = default_headers(None).unwrap();
         assert!(!headers.contains_key(COOKIE));
+    }
+
+    #[test]
+    fn submit_client_builder_constructs_with_no_redirects_and_retries_disabled() {
+        build_submit_http_client(None)
+            .expect("submit client configuration should construct without making a request");
+    }
+
+    #[test]
+    fn http_source_construction_leaves_submit_client_uninitialized() {
+        let http = HttpSource::new(None).expect("normal HTTP client should construct");
+        let cached = http
+            .submit_client
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn lazy_submit_client_builds_once_and_reuses_the_cached_client() {
+        let lazy = LazySubmitClient::new(None);
+        let builds = std::cell::Cell::new(0);
+
+        lazy.get_or_try_init_with(|cookie| {
+            builds.set(builds.get() + 1);
+            build_submit_http_client(cookie)
+        })
+        .expect("first access should build the submit client");
+        lazy.get_or_try_init_with(|_| {
+            builds.set(builds.get() + 1);
+            build_submit_http_client(None)
+        })
+        .expect("later access should reuse the submit client");
+
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn lazy_submit_client_build_failure_does_not_poison_later_access() {
+        let lazy = LazySubmitClient::new(None);
+        let error = lazy
+            .get_or_try_init_with(|_| Err(AtCoderError::InvalidStoredCookie))
+            .expect_err("injected submit client construction should fail");
+
+        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
+        lazy.get_or_try_init_with(build_submit_http_client)
+            .expect("a later submit client construction should still succeed");
+    }
+
+    #[test]
+    fn lazy_submit_client_initialization_failure_is_redacted_and_uncached() {
+        let secret = "REVEL_SESSION=submit-secret\r\ninvalid";
+        let lazy = LazySubmitClient::new(Some(secret.to_string()));
+        let error = lazy
+            .get()
+            .expect_err("submit client construction should reject an invalid cookie");
+        let cached = lazy
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
+        assert!(cached.is_none());
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

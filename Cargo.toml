@@ -22,7 +22,7 @@ ratatui = { version = "0.30.2", default-features = false, features = [
     "underline-color",
     "unstable-backend-writer",
 ] }
-reqwest = { version = "0.13.4", features = ["blocking", "cookies"] }
+reqwest = { version = "0.13.4", features = ["blocking", "cookies", "form"] }
 scraper = "0.27.0"
 serde = { version = "1.0.229", features = ["derive"] }
 termina = { git = "https://github.com/toppoun/termina", rev = "6c208fd5ce149db85625af75f7b526424d605550" }
