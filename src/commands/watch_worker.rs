@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::attempt::AttemptOutcome;
 use crate::config::RunnerConfig;
 use crate::model::Problem;
-use crate::tui::message::{Message, RunRequest, RunWorkerCommand};
+use crate::tui::message::{Message, RunKind, RunRequest, RunWorkerCommand};
 
 use super::attempt_executor::{ActiveAttempt, AttemptCompletion, AttemptExecutor};
 use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler, StressCancellation};
@@ -240,17 +240,27 @@ fn scheduler_loop_inner(
         if active.is_none() {
             let spawned = control.while_running(|| {
                 scheduler.start_next().map(|request| {
-                    (
-                        request.clone(),
-                        spawn_attempt(request, completion_tx.clone()),
-                    )
+                    let mut spawn = || spawn_attempt(request.clone(), completion_tx.clone());
+                    let attempt = match &request.kind {
+                        RunKind::UserInput(snapshot) => snapshot
+                            .start_gate
+                            .start_if_current(snapshot.source_revision, spawn),
+                        _ => Some(spawn()),
+                    };
+                    (request, attempt)
                 })
             });
 
             match spawned {
                 None => return Ok(()),
                 Some(None) => {}
-                Some(Some((_request, Ok(attempt)))) => {
+                Some(Some((request, None))) => {
+                    // Removal won after start_next selected this logical request, but before
+                    // any physical attempt was spawned. Retire it without publishing a run.
+                    let _retired = retire_matching(scheduler, request)?;
+                    continue;
+                }
+                Some(Some((_request, Some(Ok(attempt))))) => {
                     if let Err(identity_error) = ensure_identity(scheduler, &attempt) {
                         attempt.request_cancel();
                         let cleanup_result = attempt.join().map(|_| ());
@@ -262,7 +272,7 @@ fn scheduler_loop_inner(
                     *active = Some(attempt);
                     continue;
                 }
-                Some(Some((request, Err(error)))) => {
+                Some(Some((request, Some(Err(error))))) => {
                     let _retired = retire_matching(scheduler, request.clone())?;
                     return Err(io::Error::new(
                         error.kind(),
@@ -323,6 +333,13 @@ fn process_command(
         RunWorkerCommand::Run(request) => process_run_request(scheduler, active, request),
         RunWorkerCommand::CancelStress { problem, run_id } => {
             process_stress_cancellation(scheduler, active, problem, run_id)
+        }
+        RunWorkerCommand::RetireUserInputRuns {
+            problem,
+            before_source_revision,
+        } => {
+            scheduler.retire_user_input_runs(problem, before_source_revision);
+            Ok(())
         }
     }
 }
@@ -713,6 +730,242 @@ mod tests {
             },
             ..request(problem, run_id)
         }
+    }
+
+    fn user_input_request(problem: usize, run_id: u64, source_revision: u64) -> RunRequest {
+        use crate::tui::message::{UserInputRunSnapshot, UserInputRunTarget};
+        RunRequest {
+            kind: RunKind::UserInput(Arc::new(UserInputRunSnapshot {
+                problem_index: format!("P{problem}"),
+                target: UserInputRunTarget::Persisted(7),
+                input: Arc::from("old stdin"),
+                source_revision,
+                start_gate: Default::default(),
+            })),
+            ..request(problem, run_id)
+        }
+    }
+
+    fn retire_user_inputs(
+        sender: &Sender<RunWorkerCommand>,
+        problem: usize,
+        before_source_revision: u64,
+    ) {
+        sender
+            .send(RunWorkerCommand::RetireUserInputRuns {
+                problem,
+                before_source_revision,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn source_removal_retires_worker_sent_waiting_user_input_and_preserves_sample_requeue() {
+        // Exercise the command independently of the shared gate. X remains physically alive
+        // until the test releases it, proving A was handed off but could not already start.
+        let fake = FakeWorker::start();
+        fake.send(1, 1);
+        let x = fake.spawned();
+        send_run(&fake.request_tx, user_input_request(0, 2, 1));
+        wait_cancel_requested(&x.cancellation);
+        retire_user_inputs(&fake.request_tx, 0, 2);
+        x.finish(Finish::Cancelled);
+
+        let resumed = fake.spawned();
+        let actual = resumed.request.clone();
+        resumed.finish(Finish::Completed);
+        assert_eq!(actual, request(1, 1), "obsolete User Input must not spawn");
+        messages_until(&fake.message_rx, |message| {
+            matches!(
+                message,
+                Message::RunCompleted {
+                    problem: 1,
+                    run_id: 1
+                }
+            )
+        });
+        assert!(fake.spawned_rx.try_recv().is_err());
+        assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
+        fake.stop();
+    }
+
+    #[test]
+    fn source_removal_gate_blocks_waiting_input_even_before_retire_command_delivery() {
+        let fake = FakeWorker::start();
+        fake.send(1, 1);
+        let x = fake.spawned();
+        let old = user_input_request(0, 2, 1);
+        send_run(&fake.request_tx, old.clone());
+        wait_cancel_requested(&x.cancellation);
+        let RunKind::UserInput(snapshot) = old.kind else {
+            unreachable!()
+        };
+        snapshot.start_gate.retire_before(2); // The synchronous SourceRemoved boundary.
+        // Deliberately withhold the command until after X finishes and scheduling resumes.
+        x.finish(Finish::Cancelled);
+        let resumed = fake.spawned();
+        let actual = resumed.request.clone();
+        resumed.finish(Finish::Completed);
+        assert_eq!(
+            actual,
+            request(1, 1),
+            "channel latency must not admit the old input"
+        );
+        messages_until(&fake.message_rx, |message| {
+            matches!(
+                message,
+                Message::RunCompleted {
+                    problem: 1,
+                    run_id: 1
+                }
+            )
+        });
+        retire_user_inputs(&fake.request_tx, 0, 2);
+        assert!(fake.spawned_rx.try_recv().is_err());
+        fake.stop();
+    }
+
+    #[test]
+    fn source_removal_recreate_and_delayed_retirement_preserve_new_user_input() {
+        for delayed in [false, true] {
+            let fake = FakeWorker::start();
+            fake.send(2, 1);
+            let x = fake.spawned();
+            send_run(&fake.request_tx, user_input_request(0, 2, 1));
+            wait_cancel_requested(&x.cancellation);
+            retire_user_inputs(&fake.request_tx, 0, 2);
+            let fresh = user_input_request(0, 3, 3);
+            send_run(&fake.request_tx, fresh.clone());
+            if delayed {
+                retire_user_inputs(&fake.request_tx, 0, 2);
+            }
+            x.finish(Finish::Cancelled);
+            let started = fake.spawned();
+            let actual = started.request.clone();
+            started.finish(Finish::Completed);
+            assert_eq!(actual, fresh);
+            let resumed = fake.spawned();
+            let actual = resumed.request.clone();
+            resumed.finish(Finish::Completed);
+            assert_eq!(actual, request(2, 1));
+            messages_until(&fake.message_rx, |message| {
+                matches!(
+                    message,
+                    Message::RunCompleted {
+                        problem: 2,
+                        run_id: 1
+                    }
+                )
+            });
+            assert!(fake.spawned_rx.try_recv().is_err());
+            assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
+            fake.stop();
+        }
+    }
+
+    #[test]
+    fn source_removal_of_a_does_not_retire_waiting_user_input_for_b() {
+        let fake = FakeWorker::start();
+        fake.send(2, 1);
+        let x = fake.spawned();
+        send_run(&fake.request_tx, user_input_request(0, 2, 1));
+        wait_cancel_requested(&x.cancellation);
+        let b = user_input_request(1, 3, 1);
+        send_run(&fake.request_tx, b.clone());
+        retire_user_inputs(&fake.request_tx, 0, 2);
+        x.finish(Finish::Cancelled);
+        let started = fake.spawned();
+        let actual = started.request.clone();
+        started.finish(Finish::Completed);
+        assert_eq!(actual, b);
+        let resumed = fake.spawned();
+        let actual = resumed.request.clone();
+        resumed.finish(Finish::Completed);
+        assert_eq!(actual, request(2, 1));
+        messages_until(&fake.message_rx, |message| {
+            matches!(
+                message,
+                Message::RunCompleted {
+                    problem: 2,
+                    run_id: 1
+                }
+            )
+        });
+        assert!(fake.spawned_rx.try_recv().is_err());
+        fake.stop();
+    }
+
+    #[test]
+    fn user_input_start_gate_preserves_normal_admission_and_latest_wins() {
+        let fake = FakeWorker::start();
+        let first = user_input_request(0, 1, 1);
+        send_run(&fake.request_tx, first.clone());
+        let active = fake.spawned();
+        assert_eq!(active.request, first);
+        send_run(&fake.request_tx, user_input_request(0, 2, 1));
+        wait_cancel_requested(&active.cancellation);
+        let latest = user_input_request(0, 3, 1);
+        send_run(&fake.request_tx, latest.clone());
+        active.finish(Finish::Cancelled);
+        let started = fake.spawned();
+        let actual = started.request.clone();
+        started.finish(Finish::Completed);
+        assert_eq!(actual, latest);
+        messages_until(&fake.message_rx, |message| {
+            matches!(message, Message::RunCompleted { run_id: 3, .. })
+        });
+        assert!(fake.spawned_rx.try_recv().is_err());
+        assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
+        fake.stop();
+    }
+
+    #[test]
+    fn source_removal_gate_covers_commands_beyond_the_worker_batch_limit() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (message_tx, message_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let control = Arc::new(WorkerControl::default());
+        let thread_control = Arc::clone(&control);
+        let old = user_input_request(0, 1, 1);
+        let RunKind::UserInput(snapshot) = &old.kind else {
+            unreachable!()
+        };
+        snapshot.start_gate.retire_before(2);
+        send_run(&command_tx, old);
+        for _ in 1..MAX_RUN_COMMANDS_PER_TICK {
+            command_tx
+                .send(RunWorkerCommand::CancelStress {
+                    problem: 9,
+                    run_id: 0,
+                })
+                .unwrap();
+        }
+        retire_user_inputs(&command_tx, 0, 2);
+        let fresh = user_input_request(0, 2, 3);
+        send_run(&command_tx, fresh.clone());
+        // Preload the real command queue so retirement is deterministically beyond the cap.
+        let worker = thread::spawn(move || {
+            scheduler_loop(
+                command_rx,
+                completion_rx,
+                completion_tx,
+                thread_control,
+                message_tx,
+                move |request, completion| {
+                    spawned_tx.send(request.clone()).unwrap();
+                    spawn_with(request, completion, |cancellation| {
+                        run_attempt(&cancellation, |_| Ok(()))
+                    })
+                },
+            )
+        });
+        messages_until(&message_rx, |message| {
+            matches!(message, Message::RunCompleted { run_id: 2, .. })
+        });
+        control.begin_shutdown();
+        worker.join().unwrap().unwrap();
+        assert_eq!(spawned_rx.try_iter().collect::<Vec<_>>(), [fresh]);
     }
 
     fn send_run(sender: &Sender<RunWorkerCommand>, request: RunRequest) {

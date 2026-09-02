@@ -33,7 +33,45 @@ mod user_input;
 mod watcher;
 mod workspace;
 use crate::error::AppError;
-use ui::TerminalReporter;
+use ui::{Event, Reporter, TerminalReporter};
+
+// Only the one-shot CLI test/stress commands translate verdicts to process status. The
+// normal reporter still receives each event exactly once; TUI/plain watch keep their
+// existing outcome and operational-error semantics.
+fn run_verdict_command(
+    reporter: &mut dyn Reporter,
+    command: impl FnOnce(&mut dyn Reporter) -> Result<(), AppError>,
+) -> Result<ExitCode, AppError> {
+    struct VerdictReporter<'a> {
+        inner: &'a mut dyn Reporter,
+        failed: bool,
+    }
+    impl Reporter for VerdictReporter<'_> {
+        fn report(&mut self, event: Event<'_>) {
+            self.failed |= matches!(
+                event,
+                Event::CompileFailed { .. }
+                    | Event::CompileTimedOut { .. }
+                    | Event::TestCaseWrongAnswer { .. }
+                    | Event::TestCaseRuntimeError { .. }
+                    | Event::TestCaseTimedOut { .. }
+                    | Event::StressFailed { .. }
+                    | Event::StressCancelled { .. }
+            );
+            self.inner.report(event);
+        }
+    }
+    let mut verdict = VerdictReporter {
+        inner: reporter,
+        failed: false,
+    };
+    command(&mut verdict)?;
+    Ok(if verdict.failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -79,7 +117,9 @@ fn run() -> Result<ExitCode, AppError> {
             language,
             debug,
         }) => {
-            commands::test(&problem, contest.as_deref(), language, debug, &mut reporter)?;
+            return run_verdict_command(&mut reporter, |reporter| {
+                commands::test(&problem, contest.as_deref(), language, debug, reporter)
+            });
         }
 
         cli::Command::RunTest(cli::RunTestCommand::Watch { plain, contest }) => {
@@ -99,16 +139,18 @@ fn run() -> Result<ExitCode, AppError> {
                     .run
                     .problem
                     .expect("clap requires a problem when no stress subcommand is selected");
-                commands::stress(
-                    &problem,
-                    args.run.contest.as_deref(),
-                    args.run.language,
-                    args.run.debug,
-                    args.run.count,
-                    args.run.forever,
-                    args.run.seed,
-                    &mut reporter,
-                )?;
+                return run_verdict_command(&mut reporter, |reporter| {
+                    commands::stress(
+                        &problem,
+                        args.run.contest.as_deref(),
+                        args.run.language,
+                        args.run.debug,
+                        args.run.count,
+                        args.run.forever,
+                        args.run.seed,
+                        reporter,
+                    )
+                });
             }
         },
 

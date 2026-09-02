@@ -9,7 +9,8 @@ use std::time::Duration;
 use super::detail::DetailSectionKind;
 use super::message::{RunId, RunKind, RunRequest, StressEvent, TestEvent};
 use super::message::{
-    UserInputRunEvent, UserInputRunSnapshot, UserInputRunStatus, UserInputRunTarget,
+    UserInputRunEvent, UserInputRunSnapshot, UserInputRunStartGate, UserInputRunStatus,
+    UserInputRunTarget,
 };
 use crate::language::Language;
 use crate::model::{Contest, Sample};
@@ -549,6 +550,7 @@ pub struct ProblemState {
     pub saved_stress_case: Option<SavedStressCaseState>,
     pub source: Option<SourceState>,
     source_revision: u64,
+    user_input_start_gate: UserInputRunStartGate,
     pub run: RunState,
     pub stress: StressState,
     pub stress_setup: StressSetupState,
@@ -956,6 +958,7 @@ impl WatchApp {
                     saved_stress_case,
                     source: None,
                     source_revision: 0,
+                    user_input_start_gate: UserInputRunStartGate::default(),
                     run: RunState::default(),
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
@@ -1057,6 +1060,15 @@ impl WatchApp {
 
     pub fn user_input_editor_active(&self) -> bool {
         self.selected_user_input_edit().is_some()
+    }
+
+    pub fn has_user_input_edits(&self) -> bool {
+        self.problems.iter().any(|problem| {
+            problem
+                .user_inputs
+                .ready()
+                .is_some_and(|ready| ready.edit().is_some())
+        })
     }
 
     pub(super) fn user_input_save_snapshot(&self) -> Option<UserInputSaveSnapshot> {
@@ -1935,6 +1947,51 @@ impl WatchApp {
         self.set_source(problem, path, language, true)
     }
 
+    pub fn source_removed(
+        &mut self,
+        problem: usize,
+        path: &std::path::Path,
+        language: Language,
+    ) -> Option<u64> {
+        let state = self.problems.get_mut(problem)?;
+        // A problem can have both C++ and Python files. Removing the other source must not
+        // invalidate the one currently selected for execution.
+        if !state
+            .source
+            .as_ref()
+            .is_some_and(|source| source.path == path && source.language == language)
+        {
+            return None;
+        }
+        let before_source_revision = state.source_revision + 1;
+        state
+            .user_input_start_gate
+            .retire_before(before_source_revision);
+        state.source = None;
+        state.source_revision = before_source_revision;
+        state.user_input_delete_armed = None;
+        if let Some(ready) = state.user_inputs.ready_mut() {
+            ready.runs.clear();
+        }
+        self.pending_user_input_runs
+            .retain(|request| request.problem != problem);
+        state.run = RunState {
+            total_cases: state.total_cases,
+            cases: vec![CaseState::default(); state.total_cases],
+            ..RunState::default()
+        };
+        state.stress.id = None;
+        if matches!(
+            state.stress.phase,
+            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
+        ) {
+            state.stress.phase = StressPhase::Cancelled;
+        }
+        // Removal invalidates results, but is not a navigation action or an editor action.
+        self.invalidate_detail();
+        Some(before_source_revision)
+    }
+
     pub fn select_source(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
         self.set_source(problem, path, language, false)
     }
@@ -1950,6 +2007,7 @@ impl WatchApp {
             return false;
         }
 
+        let preserve_editor = changed && self.user_input_editor_active();
         self.disarm_user_input_delete();
         let previous_detail_case = self.displayed_detail_case();
         let same_source = self.problems[problem]
@@ -1970,6 +2028,12 @@ impl WatchApp {
             Some(OsStr::new(source.language.extension()))
         );
         self.problems[problem].source = Some(source);
+        if preserve_editor {
+            // Continue tracking and testing saves without taking input focus from an editor,
+            // even when the notification concerns a different problem.
+            self.invalidate_detail();
+            return true;
+        }
         self.problems[problem].detail_mode = DetailMode::Samples;
         self.selected_problem = problem;
         self.case_selection = self.problems[problem].first_case_selection();

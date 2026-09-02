@@ -136,6 +136,7 @@ impl WatchApp {
             target,
             input: Arc::from(input),
             source_revision: state.source_revision,
+            start_gate: state.user_input_start_gate.clone(),
         });
         let Some(language) = language else {
             // Match the sample runner's source-selection prerequisite, but make failure visible

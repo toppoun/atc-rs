@@ -360,18 +360,24 @@ fn send_source_changes(
     tx: &mpsc::Sender<Message>,
 ) -> bool {
     for path in paths {
-        if !path.is_file() {
-            continue;
-        }
-
         let Some(source) = resolve_watched_source(watched_sources, &path) else {
             continue;
         };
 
-        let message = Message::SourceChanged {
-            problem: source.problem,
-            path,
-            language: source.language,
+        // notify rename events contain both old and new paths. Resolve each canonical
+        // watched path against the post-debounce filesystem state, including missing paths.
+        let message = if path.is_file() {
+            Message::SourceChanged {
+                problem: source.problem,
+                path,
+                language: source.language,
+            }
+        } else {
+            Message::SourceRemoved {
+                problem: source.problem,
+                path,
+                language: source.language,
+            }
         };
 
         if tx.send(message).is_err() {
@@ -2651,6 +2657,47 @@ mod tests {
             Message::SourceChanged { problem: 0, path, language: crate::language::Language::Python }
                 if path == source
         ));
+    }
+
+    #[test]
+    fn real_watcher_delete_and_rename_away_emit_removal_then_recreation_emits_change() {
+        for rename in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("A.py");
+            std::fs::write(&source, "pass").unwrap();
+            let contest = Contest {
+                contest_id: "contest".into(),
+                problems: vec![problem("A")],
+            };
+            let watched = build_watched_sources(temp.path(), &contest).unwrap();
+            let watcher = crate::watcher::FileWatcher::new(temp.path()).unwrap();
+            if rename {
+                std::fs::rename(&source, temp.path().join("away.py")).unwrap();
+            } else {
+                std::fs::remove_file(&source).unwrap();
+            }
+            let paths = watcher
+                .next_batch_timeout_with_cancel(Duration::from_secs(3), &|| false)
+                .unwrap()
+                .expect("a real removal notification");
+            assert!(paths.contains(&source), "rename={rename}: {paths:?}");
+            let (tx, rx) = mpsc::channel();
+            assert!(send_source_changes(paths, &watched, &tx));
+            assert!(matches!(rx.try_recv().unwrap(),
+                Message::SourceRemoved { problem: 0, path, language: crate::language::Language::Python }
+                if path == source));
+            assert!(rx.try_recv().is_err());
+
+            std::fs::write(&source, "print(1)").unwrap();
+            let paths = watcher
+                .next_batch_timeout_with_cancel(Duration::from_secs(3), &|| false)
+                .unwrap()
+                .expect("a real recreation notification");
+            assert!(send_source_changes(paths, &watched, &tx));
+            assert!(matches!(rx.try_recv().unwrap(),
+                Message::SourceChanged { problem: 0, path, language: crate::language::Language::Python }
+                if path == source));
+        }
     }
 
     #[test]

@@ -49,6 +49,7 @@ const MAX_TERMINAL_EVENTS_PER_TICK: usize = 256;
 const DETAIL_SCROLL_LINES: usize = 3;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DETAIL_FOLD_ANIMATION_DURATION: Duration = Duration::from_millis(100);
+const REFRESH_EDIT_NOTICE: &str = "Finish editing the User Input before refreshing.";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrontendPreferences {
@@ -138,6 +139,9 @@ impl FrontendAction {
 
     fn availability(self, app: &WatchApp, workspace_available: bool) -> FrontendActionAvailability {
         match self {
+            Self::RefreshContest if app.has_user_input_edits() => {
+                FrontendActionAvailability::Unavailable(REFRESH_EDIT_NOTICE)
+            }
             Self::OpenSource if app.current_problem().is_none() => {
                 FrontendActionAvailability::Unavailable("no selected problem")
             }
@@ -1882,15 +1886,19 @@ impl RefreshContestController {
             .is_some_and(|modal| modal.state == RefreshContestModalState::Running)
     }
 
-    fn open(&mut self) -> bool {
+    fn open(&mut self, app: &WatchApp) -> bool {
         if self.modal_active() {
             return false;
         }
-        self.start()
+        self.start(app)
     }
 
-    fn start(&mut self) -> bool {
+    fn start(&mut self, app: &WatchApp) -> bool {
         self.refresh_requested = false;
+        if app.has_user_input_edits() {
+            self.fail(REFRESH_EDIT_NOTICE.to_string());
+            return true;
+        }
         self.modal = Some(RefreshContestModal {
             contest_id: self.contest_id.clone(),
             state: RefreshContestModalState::Running,
@@ -1905,7 +1913,7 @@ impl RefreshContestController {
         true
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> RefreshContestKeyResult {
+    fn handle_key(&mut self, key: KeyEvent, app: &WatchApp) -> RefreshContestKeyResult {
         if !self.modal_active() {
             return RefreshContestKeyResult::NotHandled;
         }
@@ -1918,7 +1926,7 @@ impl RefreshContestController {
 
         match key.code {
             KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                self.start();
+                self.start(app);
             }
             KeyCode::Escape if key.kind == KeyEventKind::Press => {
                 self.modal = None;
@@ -2523,6 +2531,32 @@ fn handle_messages_with_destination(
                 return Err(error);
             }
 
+            Ok(Message::SourceRemoved {
+                problem,
+                path,
+                language,
+            }) => {
+                let stress = app
+                    .active_stress_identity()
+                    .filter(|(active, _)| *active == problem);
+                if let Some(before_source_revision) = app.source_removed(problem, &path, language) {
+                    changed = true;
+                    send_run_worker_command(
+                        run_tx,
+                        RunWorkerCommand::RetireUserInputRuns {
+                            problem,
+                            before_source_revision,
+                        },
+                    )?;
+                    if let Some((problem, run_id)) = stress {
+                        send_run_worker_command(
+                            run_tx,
+                            RunWorkerCommand::CancelStress { problem, run_id },
+                        )?;
+                    }
+                }
+            }
+
             Ok(Message::WorkerFailed(error)) => {
                 return Err(error);
             }
@@ -2642,6 +2676,51 @@ fn send_detail_analysis_command(
     })
 }
 
+fn handle_background_events(
+    app: &mut WatchApp,
+    terminal_events: &VecDeque<TerminalEvent>,
+    destination: &Path,
+    channels: SessionChannels<'_>,
+    contest_switch: &mut ContestSwitchController<'_>,
+    contest_refresh: &mut RefreshContestController,
+    detail_layout: &mut detail_layout::DetailLayout,
+) -> io::Result<bool> {
+    // A delivered terminal batch owns its routing state until it is consumed. It can yield
+    // for a redraw or an earlier input action, but background events cannot reinterpret its
+    // remaining keys, paste, or pointer actions. Background work runs between bounded batches.
+    if !terminal_events.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = handle_messages_with_destination(
+        app,
+        channels.message_rx,
+        channels.run_tx,
+        Some(destination),
+    )?;
+    changed |= contest_switch.handle_operation_messages();
+    if contest_switch.switch_requested {
+        return Ok(changed);
+    }
+    changed |= contest_refresh.handle_operation_messages();
+    if contest_refresh.refresh_requested {
+        // Capture the latest source transition before the outer shutdown/apply lifecycle.
+        changed |= handle_messages_with_destination(
+            app,
+            channels.message_rx,
+            channels.run_tx,
+            Some(destination),
+        )?;
+        return Ok(changed);
+    }
+    changed |= handle_detail_analysis_results(
+        detail_layout,
+        app.detail_revision(),
+        channels.detail_analysis_rx,
+    )?;
+    changed |= apply_detail_scroll_reconciliation(app, detail_layout);
+    Ok(changed)
+}
+
 pub(crate) fn run<R>(
     terminal: &mut TerminaSession,
     app_context: &AppContext,
@@ -2721,10 +2800,6 @@ where
             dirty = true;
         }
 
-        if terminal_events.is_empty() {
-            terminal_events = read_terminal_events(terminal, Duration::ZERO)?;
-        }
-
         if contains_global_quit_event(
             &terminal_events,
             &app,
@@ -2746,45 +2821,19 @@ where
             dirty = true;
         }
 
-        if handle_messages_with_destination(
+        if handle_background_events(
             &mut app,
-            message_rx,
-            run_tx,
-            Some(current_destination),
-        )? {
-            dirty = true;
-        }
-
-        if contest_switch.handle_operation_messages() {
-            dirty = true;
-        }
-        if contest_switch.switch_requested {
-            break;
-        }
-        if contest_refresh.handle_operation_messages() {
-            dirty = true;
-        }
-        if contest_refresh.refresh_requested {
-            // Capture the most recent canonical source transition possible before the
-            // frontend yields to the outer shutdown/apply lifecycle.
-            handle_messages_with_destination(
-                &mut app,
-                message_rx,
-                run_tx,
-                Some(current_destination),
-            )?;
-            break;
-        }
-
-        if handle_detail_analysis_results(
+            &terminal_events,
+            current_destination,
+            SessionChannels::new(message_rx, run_tx, detail_analysis_tx, detail_analysis_rx),
+            &mut contest_switch,
+            &mut contest_refresh,
             &mut detail_layout,
-            app.detail_revision(),
-            detail_analysis_rx,
         )? {
             dirty = true;
         }
-        if apply_detail_scroll_reconciliation(&mut app, &mut detail_layout) {
-            dirty = true;
+        if contest_switch.switch_requested || contest_refresh.refresh_requested {
+            break;
         }
 
         // message batch処理中にqが到着していれば、重いwrap/再描画より優先する。
@@ -3334,7 +3383,7 @@ fn handle_terminal_event_with_mouse_mode(
         && let Some(contest_refresh) = input.contest_refresh.as_deref_mut()
         && contest_refresh.modal_active()
     {
-        match contest_refresh.handle_key(key) {
+        match contest_refresh.handle_key(key, app) {
             RefreshContestKeyResult::NotHandled => {}
             RefreshContestKeyResult::Handled => return Ok(true),
         }
@@ -4090,7 +4139,7 @@ fn execute_frontend_action(
             Ok(initialize_problem_stress(app, problem, stress_setup))
         }
         FrontendAction::RefreshContest => {
-            Ok(contest_refresh.is_some_and(RefreshContestController::open))
+            Ok(contest_refresh.is_some_and(|controller| controller.open(app)))
         }
         FrontendAction::SwitchContest => {
             Ok(contest_switch.is_some_and(|controller| controller.open()))
@@ -4453,6 +4502,7 @@ fn set_detail_scroll_from_user(
 mod tests {
     use super::*;
     mod user_input_delete;
+    mod user_input_lifecycle;
     mod user_input_runs;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
@@ -4590,6 +4640,9 @@ mod tests {
             RunWorkerCommand::Run(request) => request,
             RunWorkerCommand::CancelStress { problem, run_id } => {
                 panic!("expected run command, got stress cancellation {problem}/{run_id}")
+            }
+            RunWorkerCommand::RetireUserInputRuns { .. } => {
+                panic!("expected run command, got User Input retirement")
             }
         }
     }
@@ -8587,7 +8640,7 @@ mod tests {
         let mut controller =
             RefreshContestController::new("abc123", task, prepared_check(Arc::clone(&ready)), None);
 
-        assert!(controller.open());
+        assert!(controller.open(&app_with_problems(&[3])));
         assert_eq!(
             controller.modal().unwrap().state,
             RefreshContestModalState::Running
@@ -8627,7 +8680,7 @@ mod tests {
             Arc::new(|| Ok(false)),
             None,
         );
-        missing.open();
+        missing.open(&app_with_problems(&[3]));
         wait_for_refresh_operation(&mut missing);
         assert!(!missing.refresh_requested);
         assert_eq!(
@@ -8661,9 +8714,9 @@ mod tests {
         });
         let mut controller =
             RefreshContestController::new("abc123", task, prepared_check(ready), None);
-        controller.open();
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut app = app_with_problems(&[3, 3]);
+        controller.open(&app);
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         app.select_problem(1);
         app.next_case();
         app.toggle_samples_pane();
@@ -8736,7 +8789,7 @@ mod tests {
             RefreshContestController::new("abc123", task, prepared_check(ready), None);
         let mut app = app();
 
-        controller.open();
+        controller.open(&app);
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let python =
             crate::workspace::source_file_path(temp.path(), "A", Language::Python).unwrap();
@@ -8799,7 +8852,7 @@ mod tests {
         assert_eq!(controller.modal().unwrap().progress.len(), 1);
 
         assert_eq!(
-            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press), &app),
             RefreshContestKeyResult::Handled
         );
         assert!(controller.modal_is_running());
@@ -8830,7 +8883,7 @@ mod tests {
             Arc::new(|| Ok(false)),
             None,
         );
-        controller.open();
+        controller.open(&app_with_problems(&[3]));
         wait_for_refresh_operation(&mut controller);
 
         assert!(!controller.refresh_requested);

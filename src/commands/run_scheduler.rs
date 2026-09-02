@@ -51,6 +51,7 @@ pub(super) struct RunScheduler {
     foreground: Option<RunRequest>,
     pending: VecDeque<RunRequest>,
     latest_seen: HashMap<usize, RunId>,
+    retired_user_input_revisions: HashMap<usize, u64>,
 }
 
 impl RunScheduler {
@@ -59,10 +60,11 @@ impl RunScheduler {
     }
 
     pub(super) fn request_arrived(&mut self, request: RunRequest) -> RequestArrival {
-        if self
-            .latest_seen
-            .get(&request.problem)
-            .is_some_and(|latest| request.run_id <= *latest)
+        if self.user_input_request_retired(&request)
+            || self
+                .latest_seen
+                .get(&request.problem)
+                .is_some_and(|latest| request.run_id <= *latest)
         {
             return RequestArrival::IgnoredStale;
         }
@@ -96,6 +98,33 @@ impl RunScheduler {
         debug_assert!(self.invariants_hold());
 
         RequestArrival::Accepted { cancel_active }
+    }
+
+    pub(super) fn retire_user_input_runs(&mut self, problem: usize, before_source_revision: u64) {
+        let minimum = self
+            .retired_user_input_revisions
+            .entry(problem)
+            .or_default();
+        *minimum = (*minimum).max(before_source_revision);
+        let matches_retired = |request: &RunRequest| {
+            request.problem == problem
+                && matches!(&request.kind, RunKind::UserInput(snapshot)
+                    if snapshot.source_revision < *minimum)
+        };
+        if self.foreground.as_ref().is_some_and(matches_retired) {
+            self.foreground = None;
+        }
+        self.pending.retain(|request| !matches_retired(request));
+        // Active attempts retain their existing join/retire lifecycle. They never requeue,
+        // and the UI already invalidated their result identity at source removal.
+        debug_assert!(self.invariants_hold());
+    }
+
+    fn user_input_request_retired(&self, request: &RunRequest) -> bool {
+        matches!(&request.kind, RunKind::UserInput(snapshot)
+            if snapshot.start_gate.is_retired(snapshot.source_revision)
+                || self.retired_user_input_revisions.get(&request.problem)
+                    .is_some_and(|minimum| snapshot.source_revision < *minimum))
     }
 
     pub(super) fn cancel_stress(&mut self, problem: usize, run_id: RunId) -> StressCancellation {
@@ -142,10 +171,15 @@ impl RunScheduler {
             return None;
         }
 
-        let request = self
-            .foreground
-            .take()
-            .or_else(|| self.pending.pop_front())?;
+        let request = loop {
+            let request = self
+                .foreground
+                .take()
+                .or_else(|| self.pending.pop_front())?;
+            if !self.user_input_request_retired(&request) {
+                break request;
+            }
+        };
 
         debug_assert_eq!(
             self.latest_seen.get(&request.problem),
@@ -922,6 +956,7 @@ mod tests {
                 target: UserInputRunTarget::Persisted(7),
                 input: std::sync::Arc::from("exact\r\n\t界\n"),
                 source_revision: 3,
+                start_gate: Default::default(),
             })),
             ..request(problem, run_id)
         }
@@ -972,6 +1007,100 @@ mod tests {
         assert_eq!(scheduler.start_next(), Some(user_input_request(0, 2)));
         scheduler.retire_active().unwrap();
         assert_eq!(scheduler.start_next(), Some(request(1, 1)));
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn user_input_removal_retires_waiting_request_without_resurrecting_same_problem_sample() {
+        let mut scheduler = RunScheduler::default();
+        start(&mut scheduler, request(0, 1));
+        scheduler.request_arrived(user_input_request(0, 2));
+        scheduler.retire_user_input_runs(0, 4);
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!retired.is_latest());
+        assert!(!scheduler.requeue_retired(retired));
+        assert!(scheduler.start_next().is_none());
+        assert_eq!(
+            scheduler.request_arrived(user_input_request(0, 2)),
+            RequestArrival::IgnoredStale
+        );
+        assert_eq!(
+            scheduler.request_arrived(user_input_request(0, 3)),
+            RequestArrival::IgnoredStale
+        );
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn user_input_removal_boundary_is_monotonic_and_preserves_recreated_generation() {
+        let mut scheduler = RunScheduler::default();
+        scheduler.request_arrived(user_input_request(0, 1));
+        scheduler.retire_user_input_runs(0, 4);
+        let mut fresh = user_input_request(0, 2);
+        let RunKind::UserInput(snapshot) = &mut fresh.kind else {
+            unreachable!()
+        };
+        std::sync::Arc::make_mut(snapshot).source_revision = 5;
+        scheduler.request_arrived(fresh.clone());
+        scheduler.retire_user_input_runs(0, 4); // Delayed/repeated removal must not kill fresh work.
+        scheduler.retire_user_input_runs(0, 2);
+        assert_eq!(scheduler.start_next(), Some(fresh));
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!scheduler.requeue_retired(retired));
+        assert_eq!(
+            scheduler.request_arrived(user_input_request(0, 3)),
+            RequestArrival::IgnoredStale
+        );
+        assert!(scheduler.start_next().is_none());
+        assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn user_input_removal_leaves_other_problem_and_sample_stress_work_untouched() {
+        let mut with_pending = scheduler_with_three_pending();
+        let pending_before = pending_ids(&with_pending);
+        let active_before = with_pending.active_request();
+        with_pending.retire_user_input_runs(0, 4);
+        assert_eq!(pending_ids(&with_pending), pending_before);
+        assert_eq!(with_pending.active_request(), active_before);
+        assert_invariants(&with_pending);
+        for foreground in [
+            request(0, 2),
+            RunRequest {
+                kind: RunKind::Stress {
+                    base_seed: 42,
+                    count: None,
+                },
+                ..request(0, 2)
+            },
+            user_input_request(1, 2),
+        ] {
+            let mut scheduler = RunScheduler::default();
+            start(&mut scheduler, request(9, 1));
+            scheduler.request_arrived(foreground.clone());
+            scheduler.retire_user_input_runs(0, 4);
+            let retired = scheduler.retire_active().unwrap();
+            assert!(scheduler.requeue_retired(retired));
+            assert_eq!(scheduler.start_next(), Some(foreground));
+            scheduler.retire_active().unwrap();
+            assert_eq!(scheduler.start_next(), Some(request(9, 1)));
+            scheduler.retire_active().unwrap();
+            assert!(scheduler.start_next().is_none());
+            assert_invariants(&scheduler);
+        }
+    }
+
+    #[test]
+    fn user_input_removal_does_not_change_active_attempt_join_identity() {
+        let mut scheduler = RunScheduler::default();
+        let old = user_input_request(0, 1);
+        start(&mut scheduler, old.clone());
+        scheduler.retire_user_input_runs(0, 4);
+        assert_eq!(scheduler.active_request(), Some(old));
+        assert!(scheduler.start_next().is_none());
+        let retired = scheduler.retire_active().unwrap();
+        assert!(!scheduler.requeue_retired(retired));
+        assert!(scheduler.start_next().is_none());
         assert_invariants(&scheduler);
     }
 

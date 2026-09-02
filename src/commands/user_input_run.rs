@@ -212,6 +212,7 @@ mod tests {
                 target: UserInputRunTarget::Draft(4),
                 input: Arc::from(input),
                 source_revision: 8,
+                start_gate: Default::default(),
             })),
         }
     }
@@ -408,6 +409,118 @@ mod tests {
                 } | Message::RunEvent { .. }
             )));
         }
+    }
+
+    #[test]
+    fn source_removal_prevents_old_stdin_execution_on_a_recreated_real_source() {
+        use super::super::attempt_executor::spawn_with;
+        use super::super::watch_worker::RunWorker;
+        use crate::attempt::{clean_cancellation_io_error, run_attempt};
+        use crate::tui::message::RunWorkerCommand;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.py");
+        std::fs::write(&source, "pass\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let executor = executor(temp.path(), python_config(), tx.clone());
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut first_release = Some(release_rx);
+        let worker = RunWorker::start_with_test_attempt(tx, move |request, completion| {
+            spawned_tx.send(request.clone()).unwrap();
+            if matches!(request.kind, RunKind::Samples) {
+                let release = first_release.take();
+                let waiting_tx = waiting_tx.clone();
+                return spawn_with(request, completion, move |cancellation| {
+                    run_attempt(&cancellation, |is_cancelled| {
+                        if let Some(release) = release {
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !is_cancelled() {
+                                assert!(Instant::now() < deadline);
+                                std::thread::yield_now();
+                            }
+                            waiting_tx.send(()).unwrap();
+                            release.recv_timeout(Duration::from_secs(5)).unwrap();
+                            Err(clean_cancellation_io_error().into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                });
+            }
+            executor.spawn(request, completion)
+        })
+        .unwrap();
+        let sender = worker.sender();
+        let x = RunRequest {
+            problem: 1,
+            run_id: 1,
+            language: Language::Python,
+            debug: false,
+            kind: RunKind::Samples,
+        };
+        sender.send(RunWorkerCommand::Run(x.clone())).unwrap();
+        assert_eq!(spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap(), x);
+        let old = request(Language::Python, "old stdin");
+        sender.send(RunWorkerCommand::Run(old.clone())).unwrap();
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let RunKind::UserInput(old_snapshot) = &old.kind else {
+            unreachable!()
+        };
+        std::fs::remove_file(&source).unwrap();
+        let before_source_revision = old_snapshot.source_revision + 1;
+        old_snapshot
+            .start_gate
+            .retire_before(before_source_revision);
+        let retirement = RunWorkerCommand::RetireUserInputRuns {
+            problem: 0,
+            before_source_revision,
+        };
+        sender.send(retirement.clone()).unwrap();
+        std::fs::write(&source, "import sys,pathlib\ndata=sys.stdin.buffer.read()\nwith pathlib.Path('executed').open('ab') as f: f.write(data)\nsys.stdout.buffer.write(data)\n").unwrap();
+        release_tx.send(()).unwrap();
+        // The preserved sample is a scheduler barrier: an unretired old input would have
+        // started before it. No newer request has been issued yet to hide that failure.
+        let next = spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            next, x,
+            "old input was physically admitted after source recreation"
+        );
+        assert!(!temp.path().join("executed").exists());
+
+        let mut fresh = old;
+        fresh.run_id += 1;
+        let RunKind::UserInput(snapshot) = &mut fresh.kind else {
+            unreachable!()
+        };
+        let snapshot = Arc::make_mut(snapshot);
+        snapshot.source_revision += 2;
+        snapshot.input = Arc::from("new stdin");
+        let fresh_id = fresh.run_id;
+        sender.send(RunWorkerCommand::Run(fresh)).unwrap();
+        sender.send(retirement).unwrap(); // Even a delayed duplicate must preserve new work.
+        let mut output = None;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Message::UserInputRunEvent {
+                    run_id,
+                    event: UserInputRunEvent::Finished(result),
+                    ..
+                } if run_id == fresh_id => output = Some(result),
+                Message::RunCompleted { run_id, .. } if run_id == fresh_id => break,
+                Message::RunFailed { error, .. } => panic!("{error}"),
+                Message::WorkerFailed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        worker.stop_and_join().unwrap();
+        assert_eq!(output.unwrap().stdout, "new stdin");
+        assert_eq!(
+            std::fs::read(temp.path().join("executed")).unwrap(),
+            b"new stdin"
+        );
+        assert!(spawned_rx.try_iter().all(|request| request.run_id != 17));
     }
 
     #[test]
