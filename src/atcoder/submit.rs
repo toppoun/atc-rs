@@ -324,13 +324,16 @@ fn parse_task_languages(
 
         let mut languages = Vec::new();
         let mut language_ids = BTreeSet::new();
-        for option in language_select.select(&option_selector) {
-            let id = option
-                .value()
-                .attr("value")
-                .ok_or(SubmitPageError::MalformedPage(
-                    "language option ID is missing",
-                ))?;
+        for (option_index, option) in language_select.select(&option_selector).enumerate() {
+            let label = normalized_text(&option);
+            let id = option.value().attr("value");
+            if is_language_placeholder(option_index, id, &label) {
+                continue;
+            }
+
+            let id = id.ok_or(SubmitPageError::MalformedPage(
+                "language option ID is missing",
+            ))?;
             if id.is_empty() || id.trim() != id {
                 return Err(SubmitPageError::MalformedPage(
                     "language option ID is empty or invalid",
@@ -342,7 +345,6 @@ fn parse_task_languages(
                 ));
             }
 
-            let label = normalized_text(&option);
             if label.is_empty() {
                 return Err(SubmitPageError::MalformedPage(
                     "language option label is empty",
@@ -352,12 +354,6 @@ fn parse_task_languages(
                 id: id.to_string(),
                 label,
             });
-        }
-
-        if languages.is_empty() {
-            return Err(SubmitPageError::MalformedPage(
-                "task has no language options",
-            ));
         }
 
         tasks.insert(
@@ -370,6 +366,10 @@ fn parse_task_languages(
     }
 
     Ok(tasks)
+}
+
+fn is_language_placeholder(option_index: usize, id: Option<&str>, label: &str) -> bool {
+    option_index == 0 && label.is_empty() && id.is_none_or(str::is_empty)
 }
 
 fn selector(css: &str) -> Selector {
@@ -989,6 +989,26 @@ mod tests {
         parse_submit_page("abc466", html).expect_err("submit page should be rejected")
     }
 
+    fn submit_page_with_language_options(options: &str) -> String {
+        format!(
+            r#"<!doctype html>
+<html><body>
+  <form method="POST" action="/contests/abc466/submit">
+    <input type="hidden" name="csrf_token" value="dummy-submit-csrf-token">
+    <select name="data.TaskScreenName">
+      <option value="abc466_a">A</option>
+    </select>
+    <div id="select-lang" data-name="data.LanguageId">
+      <div id="select-lang-abc466_a">
+        <select>{options}</select>
+      </div>
+    </div>
+    <textarea name="sourceCode"></textarea>
+  </form>
+</body></html>"#
+        )
+    }
+
     fn page_with_languages(languages: &[(&str, &str)]) -> SubmitPage {
         let task_id = "contest_task".to_string();
         let languages = languages
@@ -1203,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn current_live_style_dom_parses() {
+    fn current_live_style_dom_with_placeholders_parses() {
         let page = current_page();
 
         assert_eq!(page.tasks().len(), 2);
@@ -1216,8 +1236,10 @@ mod tests {
             CURRENT_SUBMIT_PAGE.contains("<div id=\"select-lang\" data-name=\"data.LanguageId\">")
         );
         assert!(!CURRENT_SUBMIT_PAGE.contains("<select name=\"data.LanguageId\""));
+        assert_eq!(CURRENT_SUBMIT_PAGE.matches("<option></option>").count(), 2);
 
         let page = current_page();
+        // The value-less blank placeholder is not a SubmitLanguage.
         assert_eq!(page.tasks().next().unwrap().languages().len(), 8);
     }
 
@@ -1527,6 +1549,64 @@ mod tests {
             malformed(&html),
             SubmitPageError::MalformedPage(_)
         ));
+    }
+
+    #[test]
+    fn placeholder_only_has_no_language_and_resolution_fails_closed() {
+        let html = submit_page_with_language_options("<option></option>");
+        let page = parse_submit_page("abc466", &html).unwrap();
+        let task = page.tasks().next().unwrap();
+
+        assert!(task.languages().is_empty());
+        for language in Language::ALL {
+            assert!(matches!(
+                page.resolve_language("abc466_a", language),
+                Err(SubmitPageError::LanguageUnavailable {
+                    task_id,
+                    language: unavailable,
+                }) if task_id == "abc466_a" && unavailable == language
+            ));
+        }
+    }
+
+    #[test]
+    fn blank_first_empty_value_placeholder_is_ignored() {
+        let html = submit_page_with_language_options(concat!(
+            "<option value=\"\"></option>",
+            "<option value=\"6017\">C++23 (GCC 15.2.0)</option>"
+        ));
+        let page = parse_submit_page("abc466", &html).unwrap();
+        let selected = page.resolve_language("abc466_a", Language::Cpp).unwrap();
+
+        assert_eq!(page.tasks().next().unwrap().languages().len(), 1);
+        assert_eq!(selected.id(), "6017");
+    }
+
+    #[test]
+    fn real_language_candidate_without_an_id_is_still_malformed() {
+        let html = submit_page_with_language_options(concat!(
+            "<option></option>",
+            "<option>C++23 (GCC 15.2.0)</option>"
+        ));
+
+        assert_eq!(
+            malformed(&html),
+            SubmitPageError::MalformedPage("language option ID is missing")
+        );
+    }
+
+    #[test]
+    fn value_less_blank_option_after_the_placeholder_is_malformed() {
+        let html = submit_page_with_language_options(concat!(
+            "<option></option>",
+            "<option></option>",
+            "<option value=\"6017\">C++23 (GCC 15.2.0)</option>"
+        ));
+
+        assert_eq!(
+            malformed(&html),
+            SubmitPageError::MalformedPage("language option ID is missing")
+        );
     }
 
     #[test]
