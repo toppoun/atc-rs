@@ -14,6 +14,10 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Phase 1 deliberately exposes only a pure layer; production commands do not call it yet.
+#[allow(dead_code)]
+pub(crate) mod submit;
+
 const BASE_URL: &str = "https://atcoder.jp";
 
 // 正常時も短時間に連打しない

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>Submit - AtCoder</title></head>
+<body>
+  <form method="POST" action="/contests/abc466/submit">
+    <input type="hidden" name="csrf_token" value="dummy-submit-csrf-token">
+
+    <select id="select-task" name="data.TaskScreenName">
+      <option value="abc466_a">A - Compromise</option>
+      <option value="abc466_b">B - Unfortunate 2</option>
+    </select>
+
+    <div id="select-lang" data-name="data.LanguageId">
+      <div id="select-lang-abc466_a">
+        <select class="form-control">
+          <option value="5001">C++20 (GCC 12.2.0)</option>
+          <option value="6017">C++23 (GCC 15.2.0)</option>
+          <option value="6018">C++23 (GCC 15.2.0) [IOI-Style]</option>
+          <option value="6019">C++23 (Clang 20.1.8)</option>
+          <option value="5078">Python (CPython 3.9.7)</option>
+          <option value="6082">Python (CPython 3.13.7)</option>
+          <option value="6083">Python (PyPy 3.11-v7.3.19)</option>
+          <option value="6084">Python (Codon 0.19.3)</option>
+        </select>
+      </div>
+
+      <div id="select-lang-abc466_b">
+        <select class="form-control">
+          <option value="b-cpp20">C++20 (GCC 14.2.0)</option>
+          <option value="b-python">Python (CPython 3.12.8)</option>
+        </select>
+      </div>
+    </div>
+
+    <textarea id="plain-textarea" name="sourceCode"></textarea>
+  </form>
+</body>
+</html>
