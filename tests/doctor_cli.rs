@@ -55,6 +55,28 @@ fn warn_only_doctor_exits_zero_and_redirected_output_has_no_ansi() {
 }
 
 #[test]
+fn doctor_reports_effective_submit_policy_without_remote_details() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let config = format!(
+        "{}submit.python_runtime = \"pypy\"\n",
+        runner_config("python")
+    );
+
+    let output = run_doctor(&cwd, &temp.path().join("config"), &config);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("Submit"));
+    assert!(stdout.contains("C++     GCC (latest available)"));
+    assert!(stdout.contains("Python  PyPy (user override)"));
+    assert!(!stdout.contains("6083"));
+    assert!(!stdout.contains("7.3.19"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn error_doctor_exits_one_without_a_generic_command_error() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");
@@ -80,6 +102,7 @@ fn invalid_config_skips_runner_and_template_process_paths_end_to_end() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout.contains("Config\n  [ERROR]"));
+    assert!(stdout.contains("Submit\n  [SKIP]"));
     assert!(stdout.contains("Runners\n  [SKIP]"));
     assert!(stdout.contains("Templates\n  [SKIP]"));
     assert!(stdout.contains("Result: FAILED"));

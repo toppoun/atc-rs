@@ -1,7 +1,9 @@
 use super::{
     AtCoderClient, BASE_URL, HttpSource, MAX_429_RETRIES, Source, retry_wait, wait_for_request_slot,
 };
+#[cfg(test)]
 use crate::language::Language;
+use crate::language::{PythonRuntime, SubmissionTarget};
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -77,7 +79,7 @@ impl SubmitPage {
     pub(crate) fn resolve_language(
         &self,
         task_id: &str,
-        language: Language,
+        target: SubmissionTarget,
     ) -> Result<&SubmitLanguage, SubmitPageError> {
         let task = self
             .tasks
@@ -86,20 +88,25 @@ impl SubmitPage {
                 task_id: task_id.to_string(),
             })?;
 
-        let selected = match language {
-            Language::Cpp => select_latest(&task.languages, classify_cpp),
-            Language::Python => select_latest(&task.languages, classify_python),
+        let selected = match target {
+            SubmissionTarget::Cpp => select_latest(&task.languages, classify_cpp),
+            SubmissionTarget::Python(PythonRuntime::CPython) => {
+                select_latest(&task.languages, classify_cpython)
+            }
+            SubmissionTarget::Python(PythonRuntime::PyPy) => {
+                select_latest(&task.languages, classify_pypy)
+            }
         };
 
         match selected {
             RankedSelection::Selected(language) => Ok(language),
             RankedSelection::Unavailable => Err(SubmitPageError::LanguageUnavailable {
                 task_id: task_id.to_string(),
-                language,
+                target,
             }),
             RankedSelection::Ambiguous => Err(SubmitPageError::LanguageAmbiguous {
                 task_id: task_id.to_string(),
-                language,
+                target,
             }),
         }
     }
@@ -109,9 +116,17 @@ impl SubmitPage {
 pub(crate) enum SubmitPageError {
     SubmitUnavailable,
     MalformedPage(&'static str),
-    TaskUnavailable { task_id: String },
-    LanguageUnavailable { task_id: String, language: Language },
-    LanguageAmbiguous { task_id: String, language: Language },
+    TaskUnavailable {
+        task_id: String,
+    },
+    LanguageUnavailable {
+        task_id: String,
+        target: SubmissionTarget,
+    },
+    LanguageAmbiguous {
+        task_id: String,
+        target: SubmissionTarget,
+    },
 }
 
 impl fmt::Display for SubmitPageError {
@@ -124,13 +139,12 @@ impl fmt::Display for SubmitPageError {
             Self::TaskUnavailable { task_id } => {
                 write!(formatter, "task {task_id:?} is unavailable for submission")
             }
-            Self::LanguageUnavailable { task_id, language } => write!(
+            Self::LanguageUnavailable { task_id, target } => {
+                write!(formatter, "{target:?} is unavailable for task {task_id:?}")
+            }
+            Self::LanguageAmbiguous { task_id, target } => write!(
                 formatter,
-                "{language:?} is unavailable for task {task_id:?}"
-            ),
-            Self::LanguageAmbiguous { task_id, language } => write!(
-                formatter,
-                "AtCoder language for {language:?} is ambiguous for task {task_id:?}"
+                "AtCoder language for {target:?} is ambiguous for task {task_id:?}"
             ),
         }
     }
@@ -432,6 +446,12 @@ struct CppRank {
     gcc: NumericVersion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PyPyRank {
+    python: NumericVersion,
+    pypy: NumericVersion,
+}
+
 enum RankClassification<R> {
     NotCandidate,
     Candidate(R),
@@ -513,10 +533,7 @@ fn classify_cpp(label: &str) -> RankClassification<CppRank> {
     RankClassification::Candidate(CppRank { standard, gcc })
 }
 
-fn classify_python(label: &str) -> RankClassification<NumericVersion> {
-    if !label.starts_with("Python") {
-        return RankClassification::NotCandidate;
-    }
+fn classify_cpython(label: &str) -> RankClassification<NumericVersion> {
     if !label.contains("CPython") {
         return RankClassification::NotCandidate;
     }
@@ -530,6 +547,26 @@ fn classify_python(label: &str) -> RankClassification<NumericVersion> {
     };
 
     RankClassification::Candidate(version)
+}
+
+fn classify_pypy(label: &str) -> RankClassification<PyPyRank> {
+    if !label.contains("PyPy") {
+        return RankClassification::NotCandidate;
+    }
+
+    let Some((python, pypy)) = label
+        .strip_prefix("Python (PyPy ")
+        .and_then(|versions| versions.strip_suffix(')'))
+        .and_then(|versions| versions.split_once("-v"))
+    else {
+        return RankClassification::UnrankableCandidate;
+    };
+    let (Some(python), Some(pypy)) = (NumericVersion::parse(python), NumericVersion::parse(pypy))
+    else {
+        return RankClassification::UnrankableCandidate;
+    };
+
+    RankClassification::Candidate(PyPyRank { python, pypy })
 }
 
 fn parse_ascii_u64(value: &str) -> Option<u64> {
@@ -547,7 +584,7 @@ fn parse_ascii_u64(value: &str) -> Option<u64> {
 pub(crate) struct SubmitRequest {
     contest_id: String,
     task_id: String,
-    language: Language,
+    target: SubmissionTarget,
     source: String,
 }
 
@@ -555,20 +592,20 @@ impl SubmitRequest {
     pub(crate) fn new(
         contest_id: String,
         task_id: String,
-        language: Language,
+        target: SubmissionTarget,
         source: String,
     ) -> Self {
         Self {
             contest_id,
             task_id,
-            language,
+            target,
             source,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn test_parts(&self) -> (&str, &str, Language, &str) {
-        (&self.contest_id, &self.task_id, self.language, &self.source)
+    pub(crate) fn test_parts(&self) -> (&str, &str, SubmissionTarget, &str) {
+        (&self.contest_id, &self.task_id, self.target, &self.source)
     }
 }
 
@@ -578,7 +615,7 @@ impl fmt::Debug for SubmitRequest {
             .debug_struct("SubmitRequest")
             .field("contest_id", &self.contest_id)
             .field("task_id", &self.task_id)
-            .field("language", &self.language)
+            .field("target", &self.target)
             .field("source", &"<redacted>")
             .finish()
     }
@@ -823,7 +860,7 @@ fn submit_with_transport(
         }
     })?;
     let language = page
-        .resolve_language(&request.task_id, request.language)
+        .resolve_language(&request.task_id, request.target)
         .map_err(SubmitError::SubmitPage)?;
     let form = SubmitForm::new(&request, language.id(), page.csrf_token());
 
@@ -1162,10 +1199,14 @@ mod tests {
     }
 
     fn submit_request(language: Language, source: &str) -> SubmitRequest {
+        let target = match language {
+            Language::Cpp => SubmissionTarget::Cpp,
+            Language::Python => SubmissionTarget::Python(PythonRuntime::CPython),
+        };
         SubmitRequest::new(
             "abc466".to_string(),
             "abc466_a".to_string(),
-            language,
+            target,
             source.to_string(),
         )
     }
@@ -1558,13 +1599,17 @@ mod tests {
         let task = page.tasks().next().unwrap();
 
         assert!(task.languages().is_empty());
-        for language in Language::ALL {
+        for target in [
+            SubmissionTarget::Cpp,
+            SubmissionTarget::Python(PythonRuntime::CPython),
+            SubmissionTarget::Python(PythonRuntime::PyPy),
+        ] {
             assert!(matches!(
-                page.resolve_language("abc466_a", language),
+                page.resolve_language("abc466_a", target),
                 Err(SubmitPageError::LanguageUnavailable {
                     task_id,
-                    language: unavailable,
-                }) if task_id == "abc466_a" && unavailable == language
+                    target: unavailable,
+                }) if task_id == "abc466_a" && unavailable == target
             ));
         }
     }
@@ -1576,7 +1621,9 @@ mod tests {
             "<option value=\"6017\">C++23 (GCC 15.2.0)</option>"
         ));
         let page = parse_submit_page("abc466", &html).unwrap();
-        let selected = page.resolve_language("abc466_a", Language::Cpp).unwrap();
+        let selected = page
+            .resolve_language("abc466_a", SubmissionTarget::Cpp)
+            .unwrap();
 
         assert_eq!(page.tasks().next().unwrap().languages().len(), 1);
         assert_eq!(selected.id(), "6017");
@@ -1622,7 +1669,9 @@ mod tests {
     #[test]
     fn latest_normal_gcc_cpp_is_selected() {
         let page = current_page();
-        let selected = page.resolve_language("abc466_a", Language::Cpp).unwrap();
+        let selected = page
+            .resolve_language("abc466_a", SubmissionTarget::Cpp)
+            .unwrap();
 
         assert_eq!(selected.label(), "C++23 (GCC 15.2.0)");
         assert_eq!(selected.id(), "6017");
@@ -1636,7 +1685,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Cpp)
+            page.resolve_language("contest_task", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "gcc"
@@ -1651,7 +1700,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Cpp)
+            page.resolve_language("contest_task", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "normal"
@@ -1666,7 +1715,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Cpp)
+            page.resolve_language("contest_task", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "cpp23"
@@ -1681,7 +1730,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Cpp)
+            page.resolve_language("contest_task", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "gcc15"
@@ -1696,7 +1745,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Cpp)
+            page.resolve_language("contest_task", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "newer"
@@ -1708,7 +1757,7 @@ mod tests {
         let page = current_page();
 
         assert_eq!(
-            page.resolve_language("abc466_b", Language::Cpp)
+            page.resolve_language("abc466_b", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "b-cpp20"
@@ -1723,7 +1772,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Cpp),
+            page.resolve_language("contest_task", SubmissionTarget::Cpp),
             Err(SubmitPageError::LanguageUnavailable { .. })
         ));
     }
@@ -1734,7 +1783,7 @@ mod tests {
             page_with_languages(&[("one", "C++23 (GCC 15.2)"), ("two", "C++23 (GCC 15.2.0)")]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Cpp),
+            page.resolve_language("contest_task", SubmissionTarget::Cpp),
             Err(SubmitPageError::LanguageAmbiguous { .. })
         ));
     }
@@ -1742,7 +1791,9 @@ mod tests {
     #[test]
     fn latest_cpython_is_selected() {
         let page = current_page();
-        let selected = page.resolve_language("abc466_a", Language::Python).unwrap();
+        let selected = page
+            .resolve_language("abc466_a", SubmissionTarget::Python(PythonRuntime::CPython))
+            .unwrap();
 
         assert_eq!(selected.label(), "Python (CPython 3.13.7)");
         assert_eq!(selected.id(), "6082");
@@ -1756,9 +1807,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Python)
-                .unwrap()
-                .id(),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            )
+            .unwrap()
+            .id(),
             "cpython"
         );
     }
@@ -1771,9 +1825,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Python)
-                .unwrap()
-                .id(),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            )
+            .unwrap()
+            .id(),
             "cpython"
         );
     }
@@ -1786,9 +1843,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            page.resolve_language("contest_task", Language::Python)
-                .unwrap()
-                .id(),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            )
+            .unwrap()
+            .id(),
             "new"
         );
     }
@@ -1801,7 +1861,10 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Python),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
             Err(SubmitPageError::LanguageUnavailable { .. })
         ));
     }
@@ -1814,9 +1877,169 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Python),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
             Err(SubmitPageError::LanguageAmbiguous { .. })
         ));
+    }
+
+    #[test]
+    fn future_cpython_format_prevents_selecting_a_known_candidate() {
+        let page = page_with_languages(&[
+            ("known", "Python (CPython 3.13.7)"),
+            ("future", "CPython 3.14.0"),
+        ]);
+
+        assert!(matches!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
+            Err(SubmitPageError::LanguageAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn cpython_marker_outside_known_grammar_is_not_silently_ignored() {
+        let page = page_with_languages(&[("future", "Python CPython 3.14.0")]);
+
+        assert!(matches!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
+            Err(SubmitPageError::LanguageAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn current_pypy_label_is_selected_without_a_numeric_id_in_policy_code() {
+        let page = current_page();
+        let selected = page
+            .resolve_language("abc466_a", SubmissionTarget::Python(PythonRuntime::PyPy))
+            .unwrap();
+
+        assert_eq!(selected.label(), "Python (PyPy 3.11-v7.3.19)");
+        assert_eq!(selected.id(), "6083");
+    }
+
+    #[test]
+    fn cpython_and_codon_are_not_pypy_candidates() {
+        for label in ["Python (CPython 99.0.0)", "Python (Codon 99.0.0)"] {
+            let page = page_with_languages(&[("other", label)]);
+
+            assert!(matches!(
+                page.resolve_language(
+                    "contest_task",
+                    SubmissionTarget::Python(PythonRuntime::PyPy),
+                ),
+                Err(SubmitPageError::LanguageUnavailable { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn latest_pypy_is_ranked_by_python_then_pypy_version() {
+        let page = page_with_languages(&[
+            ("old-python", "Python (PyPy 3.10-v99.0.0)"),
+            ("old-pypy", "Python (PyPy 3.11-v7.3.9)"),
+            ("latest", "Python (PyPy 3.11-v7.3.19)"),
+        ]);
+
+        assert_eq!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            )
+            .unwrap()
+            .id(),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn future_pypy_format_prevents_selecting_a_known_candidate() {
+        let page = page_with_languages(&[
+            ("known", "Python (PyPy 3.11-v7.3.19)"),
+            ("future", "PyPy 3.12-v7.4.0"),
+        ]);
+
+        assert!(matches!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            ),
+            Err(SubmitPageError::LanguageAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn pypy_marker_outside_known_grammar_is_not_silently_ignored() {
+        for label in ["PyPy 3.12-v7.4.0", "Python PyPy 3.12-v7.4.0"] {
+            let page = page_with_languages(&[("future", label)]);
+
+            assert!(matches!(
+                page.resolve_language(
+                    "contest_task",
+                    SubmissionTarget::Python(PythonRuntime::PyPy),
+                ),
+                Err(SubmitPageError::LanguageAmbiguous { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_relevant_pypy_candidate_fails_closed() {
+        let page = page_with_languages(&[
+            ("known", "Python (PyPy 3.11-v7.3.19)"),
+            ("future", "Python (PyPy rolling)"),
+        ]);
+
+        assert!(matches!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            ),
+            Err(SubmitPageError::LanguageAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn tied_latest_pypy_candidates_are_ambiguous() {
+        let page = page_with_languages(&[
+            ("one", "Python (PyPy 3.11-v7.3.19)"),
+            ("two", "Python (PyPy 3.11.0-v7.3.19.0)"),
+        ]);
+
+        assert!(matches!(
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            ),
+            Err(SubmitPageError::LanguageAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn pypy_resolution_is_task_local_when_tasks_offer_different_versions() {
+        let html =
+            CURRENT_SUBMIT_PAGE.replace("Python (CPython 3.12.8)", "Python (PyPy 3.10-v7.3.17)");
+        let page = parse_submit_page("abc466", &html).unwrap();
+
+        assert_eq!(
+            page.resolve_language("abc466_a", SubmissionTarget::Python(PythonRuntime::PyPy),)
+                .unwrap()
+                .id(),
+            "6083"
+        );
+        assert_eq!(
+            page.resolve_language("abc466_b", SubmissionTarget::Python(PythonRuntime::PyPy),)
+                .unwrap()
+                .id(),
+            "b-python"
+        );
     }
 
     #[test]
@@ -1824,7 +2047,7 @@ mod tests {
         let page = current_page();
 
         assert!(matches!(
-            page.resolve_language("abc466_missing", Language::Cpp),
+            page.resolve_language("abc466_missing", SubmissionTarget::Cpp),
             Err(SubmitPageError::TaskUnavailable { task_id }) if task_id == "abc466_missing"
         ));
     }
@@ -1839,7 +2062,7 @@ mod tests {
         let page = parse_submit_page("abc466", &html).unwrap();
 
         assert_eq!(
-            page.resolve_language("abc466_a", Language::Cpp)
+            page.resolve_language("abc466_a", SubmissionTarget::Cpp)
                 .unwrap()
                 .id(),
             "gcc-opaque-id"
@@ -1854,7 +2077,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Cpp),
+            page.resolve_language("contest_task", SubmissionTarget::Cpp),
             Err(SubmitPageError::LanguageAmbiguous { .. })
         ));
     }
@@ -1867,7 +2090,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Cpp),
+            page.resolve_language("contest_task", SubmissionTarget::Cpp),
             Err(SubmitPageError::LanguageAmbiguous { .. })
         ));
     }
@@ -1880,7 +2103,10 @@ mod tests {
         ]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Python),
+            page.resolve_language(
+                "contest_task",
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
             Err(SubmitPageError::LanguageAmbiguous { .. })
         ));
     }
@@ -1890,7 +2116,7 @@ mod tests {
         let page = page_with_languages(&[("ioi", "C++ IOI-Style(GNU++20) (GCC 14.2.0)")]);
 
         assert!(matches!(
-            page.resolve_language("contest_task", Language::Cpp),
+            page.resolve_language("contest_task", SubmissionTarget::Cpp),
             Err(SubmitPageError::LanguageUnavailable { .. })
         ));
     }
@@ -2026,7 +2252,7 @@ mod tests {
         let request = SubmitRequest::new(
             contest_id.to_string(),
             task_id.to_string(),
-            Language::Cpp,
+            SubmissionTarget::Cpp,
             source.to_string(),
         );
 
@@ -2071,6 +2297,35 @@ mod tests {
                 .unwrap();
 
         assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert_eq!(transport.post_count(), 1);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn backend_resolves_current_pypy_for_the_requested_task_before_posting() {
+        let source = "print('dummy')\n";
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6083",
+                source,
+                Ok(accepted_response(
+                    StatusCode::FOUND,
+                    "/contests/abc466/submissions/me",
+                )),
+            ),
+        ]);
+        let request = SubmitRequest::new(
+            "abc466".to_string(),
+            "abc466_a".to_string(),
+            SubmissionTarget::Python(PythonRuntime::PyPy),
+            source.to_string(),
+        );
+
+        assert_eq!(
+            submit_with_transport(&mut transport, request).unwrap(),
+            SubmitOutcome::Accepted
+        );
         assert_eq!(transport.post_count(), 1);
         transport.assert_complete();
     }
@@ -2569,7 +2824,7 @@ mod tests {
         let request = SubmitRequest::new(
             "abc466".to_string(),
             "abc466_missing".to_string(),
-            Language::Cpp,
+            SubmissionTarget::Cpp,
             "dummy".to_string(),
         );
 
@@ -2665,7 +2920,7 @@ mod tests {
         let request = SubmitRequest::new(
             "abc999".to_string(),
             "abc466_a".to_string(),
-            Language::Cpp,
+            SubmissionTarget::Cpp,
             "dummy".to_string(),
         );
 

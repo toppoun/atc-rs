@@ -158,8 +158,9 @@ fn run() -> Result<ExitCode, AppError> {
             problem,
             contest,
             language,
+            runtime,
         }) => {
-            commands::submit(&problem, contest.as_deref(), language)?;
+            commands::submit(&problem, contest.as_deref(), language, runtime)?;
         }
 
         cli::Command::Files(cli::FileCommand::Create { name, language }) => {

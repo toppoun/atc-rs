@@ -32,7 +32,7 @@ impl Fixture {
         fs::create_dir_all(config.join("atc")).unwrap();
         fs::write(
             config.join("atc/config.toml"),
-            "defaults.language = \"python\"\n",
+            "[submit]\npython_runtime = \"pypy\"\n",
         )
         .unwrap();
 
@@ -64,7 +64,7 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn ambiguous_sources_exit_nonzero_and_ignore_the_python_config_default() {
+fn ambiguous_sources_exit_nonzero_even_with_pypy_config() {
     let fixture = Fixture::new();
     fs::write(fixture.contest.join("A.cpp"), "cpp\n").unwrap();
     fs::write(fixture.contest.join("A.py"), "python\n").unwrap();
@@ -77,6 +77,35 @@ fn ambiguous_sources_exit_nonzero_and_ignore_the_python_config_default() {
     assert!(stderr.contains("-l cpp"));
     assert!(stderr.contains("-l python"));
     assert!(!stderr.contains("HTTP request failed"));
+}
+
+#[test]
+fn runtime_override_does_not_resolve_ambiguous_sources() {
+    let fixture = Fixture::new();
+    fs::write(fixture.contest.join("A.cpp"), "cpp\n").unwrap();
+    fs::write(fixture.contest.join("A.py"), "python\n").unwrap();
+
+    let output = fixture.run(&["submit", "A", "--runtime", "pypy"]);
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("Specify a language"));
+    assert!(!stderr.contains("HTTP request failed"));
+}
+
+#[test]
+fn runtime_override_for_cpp_fails_before_network() {
+    let fixture = Fixture::new();
+    fs::write(fixture.contest.join("A.cpp"), "cpp\n").unwrap();
+
+    for runtime in ["cpython", "pypy"] {
+        let output = fixture.run(&["submit", "A", "--runtime", runtime]);
+
+        assert!(!output.status.success());
+        let stderr = stderr(&output);
+        assert!(stderr.contains("--runtime is only valid for Python submissions"));
+        assert!(!stderr.contains("HTTP request failed"));
+    }
 }
 
 #[test]
@@ -106,7 +135,7 @@ fn explicit_missing_language_exits_nonzero_without_fallback() {
 }
 
 #[test]
-fn missing_problem_and_numeric_language_are_rejected_by_clap() {
+fn missing_problem_numeric_language_and_unknown_runtime_are_rejected_by_clap() {
     let fixture = Fixture::new();
 
     for args in [&["submit"][..], &["submit", "A", "-l", "6017"][..]] {
@@ -114,4 +143,8 @@ fn missing_problem_and_numeric_language_are_rejected_by_clap() {
         assert!(!output.status.success(), "args: {args:?}");
         assert!(stderr(&output).contains("error:"), "args: {args:?}");
     }
+
+    let output = fixture.run(&["submit", "A", "--runtime", "rust"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("error:"));
 }

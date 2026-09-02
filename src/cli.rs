@@ -1,4 +1,4 @@
-use crate::language::Language;
+use crate::language::{Language, PythonRuntime};
 use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::num::NonZeroU64;
@@ -163,6 +163,10 @@ pub enum RunTestCommand {
 
         #[arg(short = 'l', long = "language")]
         language: Option<Language>,
+
+        /// Override the Python submission runtime
+        #[arg(long)]
+        runtime: Option<PythonRuntime>,
     },
 }
 
@@ -737,6 +741,7 @@ mod tests {
                 problem,
                 contest: None,
                 language: None,
+                runtime: None,
             }) if problem == "A"
         ));
 
@@ -748,7 +753,24 @@ mod tests {
                     problem,
                     contest: None,
                     language: Some(language),
+                    runtime: None,
                 }) if problem == "A" && language == expected
+            ));
+        }
+
+        for (argument, expected) in [
+            ("cpython", PythonRuntime::CPython),
+            ("pypy", PythonRuntime::PyPy),
+        ] {
+            let cli = Cli::try_parse_from(["atc", "submit", "A", "--runtime", argument]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::RunTest(RunTestCommand::Submit {
+                    problem,
+                    contest: None,
+                    language: None,
+                    runtime: Some(runtime),
+                }) if problem == "A" && runtime == expected
             ));
         }
     }
@@ -759,6 +781,7 @@ mod tests {
         for language in ["rust", "py", "6017"] {
             assert!(Cli::try_parse_from(["atc", "submit", "A", "-l", language]).is_err());
         }
+        assert!(Cli::try_parse_from(["atc", "submit", "A", "--runtime", "rust"]).is_err());
     }
 
     #[test]
@@ -773,6 +796,7 @@ mod tests {
         assert!(help.contains("submit [OPTIONS] <PROBLEM>"));
         assert!(help.contains("-l, --language <LANGUAGE>"));
         assert!(help.contains("-c, --contest <CONTEST>"));
+        assert!(help.contains("--runtime <RUNTIME>"));
     }
 
     #[test]

@@ -51,6 +51,9 @@ cpp_flags = ["-std=c++23", "-O2", "-Wall", "-Wextra"]
 timeout_seconds = 2.0
 compile_timeout_seconds = 10.0
 
+[submit]
+python_runtime = "cpython"
+
 [editor]
 command = "nvim"
 args = []
@@ -69,6 +72,7 @@ mode = "terminal"
 | `runner.cpp_flags` | `["-std=c++23", "-O2", "-Wall", "-Wextra"]` | C++ コンパイラへ渡す引数 |
 | `runner.timeout_seconds` | `2.0` | 候補プログラム、Generator、Brute Force の実行制限時間 |
 | `runner.compile_timeout_seconds` | `10.0` | C++ コンパイルの制限時間 |
+| `submit.python_runtime` | `"cpython"` | Python 提出で使う runtime (`"cpython"` / `"pypy"`) |
 | `editor.command` | なし | エディタの実行コマンド |
 | `editor.args` | `[]` | `command` の後、対象パスの前に渡す引数 |
 | `editor.mode` | コマンド名から推測 | `"terminal"` または `"external"` |
@@ -166,6 +170,31 @@ compile_timeout_seconds = 10.0
 
 `timeout_seconds` と `compile_timeout_seconds` には、0 より大きい有限値を指定する必要があります。
 
+## `[submit]`
+
+### `python_runtime`
+
+Python ソースを AtCoder へ提出するときの runtime を指定します。
+
+```toml
+[submit]
+python_runtime = "pypy"
+```
+
+指定できる値:
+
+- `cpython`
+- `pypy`
+
+デフォルトは `cpython` です。`atc submit` の `--runtime` が指定された場合はコマンドラインが優先されます。
+
+```bash
+atc submit A --runtime pypy
+atc submit A -l python --runtime cpython
+```
+
+`--runtime` は提出元の言語を選びません。C++ と Python の両方のソースがある場合は、従来どおり `-l cpp` または `-l python` が必要です。また、C++ 提出に `--runtime` は指定できません。C++ の提出先は通常の GCC の最新候補に固定されます。
+
 ## `[editor]`
 
 TUI の `Open Source`、`Open Settings`、`Open Template` などから起動するエディタを指定できます。
@@ -237,6 +266,7 @@ export VISUAL='code --reuse-window'
 
 - 未対応の設定項目
 - `cpp` / `python` 以外の言語
+- `cpython` / `pypy` 以外の Python submit runtime
 - 空の `python` / `cpp_compiler`
 - 0 以下または有限でないタイムアウト
 - 空の `editor.command`

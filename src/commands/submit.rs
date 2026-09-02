@@ -1,8 +1,9 @@
 use super::test::find_problem;
 use crate::atcoder;
 use crate::atcoder::submit::{SubmitOutcome, SubmitRequest};
+use crate::config::Config;
 use crate::error::AppError;
-use crate::language::Language;
+use crate::language::{Language, PythonRuntime, SubmissionTarget};
 use crate::model::Problem;
 use crate::workspace;
 
@@ -10,13 +11,24 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+const RUNTIME_PYTHON_ONLY_ERROR: &str = "--runtime is only valid for Python submissions";
+
 pub(crate) fn submit(
     problem_index: &str,
     cli_contest: Option<&str>,
     cli_language: Option<Language>,
+    cli_runtime: Option<PythonRuntime>,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
-    let plan = resolve_submit_plan(&cwd, problem_index, cli_contest, cli_language)?;
+    let config = Config::load()?;
+    let plan = resolve_submit_plan(
+        &cwd,
+        problem_index,
+        cli_contest,
+        cli_language,
+        cli_runtime,
+        config.submit.python_runtime,
+    )?;
     let atcoder = atcoder::AtCoderClient::new()?;
     let stdout = io::stdout();
 
@@ -37,6 +49,7 @@ struct SubmitPlan {
     task_id: String,
     problem_index: String,
     source: ResolvedSource,
+    target: SubmissionTarget,
 }
 
 fn resolve_submit_source(
@@ -113,12 +126,35 @@ fn language_label(language: Language) -> &'static str {
     }
 }
 
+fn resolve_submission_target(
+    source_language: Language,
+    cli_runtime: Option<PythonRuntime>,
+    configured_runtime: PythonRuntime,
+) -> io::Result<SubmissionTarget> {
+    match (source_language, cli_runtime) {
+        (Language::Cpp, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            RUNTIME_PYTHON_ONLY_ERROR,
+        )),
+        (Language::Cpp, None) => Ok(SubmissionTarget::Cpp),
+        (Language::Python, runtime) => Ok(SubmissionTarget::Python(
+            runtime.unwrap_or(configured_runtime),
+        )),
+    }
+}
+
 fn resolve_submit_plan(
     launch_root: &Path,
     problem_index: &str,
     cli_contest: Option<&str>,
     cli_language: Option<Language>,
+    cli_runtime: Option<PythonRuntime>,
+    configured_runtime: PythonRuntime,
 ) -> Result<SubmitPlan, AppError> {
+    if cli_language == Some(Language::Cpp) && cli_runtime.is_some() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, RUNTIME_PYTHON_ONLY_ERROR).into());
+    }
+
     let destination = workspace::resolve_contest_target(launch_root, cli_contest)?;
     workspace::validate_workspace_marker(&destination)?;
 
@@ -130,12 +166,14 @@ fn resolve_submit_plan(
 
     let problem = find_problem(&contest, problem_index)?;
     let source = resolve_submit_source(&destination, problem, cli_language)?;
+    let target = resolve_submission_target(source.language, cli_runtime, configured_runtime)?;
 
     Ok(SubmitPlan {
         contest_id: contest.contest_id.clone(),
         task_id: problem.task_id.clone(),
         problem_index: problem.index.clone(),
         source,
+        target,
     })
 }
 
@@ -154,6 +192,7 @@ where
         task_id,
         problem_index,
         source,
+        target,
     } = plan;
 
     // read_source is FnOnce and is called immediately before creating the owned request.
@@ -167,7 +206,7 @@ where
         .into());
     }
 
-    let request = SubmitRequest::new(contest_id, task_id, source.language, source_snapshot);
+    let request = SubmitRequest::new(contest_id, task_id, target, source_snapshot);
 
     // FnOnce makes a CLI-level retry impossible: this invocation can call the backend once.
     match submit_once(request)? {
@@ -196,7 +235,44 @@ where
     R: FnOnce(&Path) -> io::Result<String>,
     S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
 {
-    let plan = resolve_submit_plan(launch_root, problem_index, cli_contest, cli_language)?;
+    submit_at_with_runtime(
+        launch_root,
+        problem_index,
+        cli_contest,
+        cli_language,
+        None,
+        PythonRuntime::CPython,
+        output,
+        read_source,
+        submit_once,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn submit_at_with_runtime<R, S>(
+    launch_root: &Path,
+    problem_index: &str,
+    cli_contest: Option<&str>,
+    cli_language: Option<Language>,
+    cli_runtime: Option<PythonRuntime>,
+    configured_runtime: PythonRuntime,
+    output: &mut impl Write,
+    read_source: R,
+    submit_once: S,
+) -> Result<(), AppError>
+where
+    R: FnOnce(&Path) -> io::Result<String>,
+    S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
+{
+    let plan = resolve_submit_plan(
+        launch_root,
+        problem_index,
+        cli_contest,
+        cli_language,
+        cli_runtime,
+        configured_runtime,
+    )?;
     execute_submit(plan, output, read_source, submit_once)
 }
 
@@ -253,13 +329,29 @@ mod tests {
     fn capture_language(
         destination: &Path,
         specified_language: Option<Language>,
-    ) -> Result<Language, AppError> {
+    ) -> Result<SubmissionTarget, AppError> {
+        capture_target(
+            destination,
+            specified_language,
+            None,
+            PythonRuntime::CPython,
+        )
+    }
+
+    fn capture_target(
+        destination: &Path,
+        specified_language: Option<Language>,
+        cli_runtime: Option<PythonRuntime>,
+        configured_runtime: PythonRuntime,
+    ) -> Result<SubmissionTarget, AppError> {
         let selected = Cell::new(None);
-        submit_at(
+        submit_at_with_runtime(
             destination,
             "A",
             None,
             specified_language,
+            cli_runtime,
+            configured_runtime,
             &mut Vec::new(),
             read_source_file,
             |request| {
@@ -276,7 +368,10 @@ mod tests {
         contest(temp.path(), "abc430", "A", "abc430_a");
         write_source(temp.path(), "A", Language::Cpp, "int main() {}\n");
 
-        assert_eq!(capture_language(temp.path(), None).unwrap(), Language::Cpp);
+        assert_eq!(
+            capture_language(temp.path(), None).unwrap(),
+            SubmissionTarget::Cpp
+        );
     }
 
     #[test]
@@ -287,25 +382,27 @@ mod tests {
 
         assert_eq!(
             capture_language(temp.path(), None).unwrap(),
-            Language::Python
+            SubmissionTarget::Python(PythonRuntime::CPython)
         );
     }
 
     #[test]
-    fn both_sources_require_an_explicit_language_even_with_python_config_default() {
+    fn both_sources_require_an_explicit_language_even_with_pypy_config() {
         let temp = tempfile::tempdir().unwrap();
         contest(temp.path(), "abc430", "A", "abc430_a");
         write_source(temp.path(), "A", Language::Cpp, "cpp\n");
         write_source(temp.path(), "A", Language::Python, "python\n");
-        let config = Config::parse("defaults.language = \"python\"\n").unwrap();
-        assert_eq!(config.defaults.language, Language::Python);
+        let config = Config::parse("[submit]\npython_runtime = \"pypy\"\n").unwrap();
+        assert_eq!(config.submit.python_runtime, PythonRuntime::PyPy);
 
         let calls = Cell::new(0);
-        let error = submit_at(
+        let error = submit_at_with_runtime(
             temp.path(),
             "A",
             None,
             None,
+            None,
+            config.submit.python_runtime,
             &mut Vec::new(),
             read_source_file,
             |_| {
@@ -331,11 +428,154 @@ mod tests {
 
         assert_eq!(
             capture_language(temp.path(), Some(Language::Cpp)).unwrap(),
-            Language::Cpp
+            SubmissionTarget::Cpp
         );
         assert_eq!(
             capture_language(temp.path(), Some(Language::Python)).unwrap(),
-            Language::Python
+            SubmissionTarget::Python(PythonRuntime::CPython)
+        );
+    }
+
+    #[test]
+    fn python_runtime_precedence_is_cli_then_config_then_cpython_builtin() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Python, "print(1)\n");
+
+        for (cli, configured, expected) in [
+            (
+                None,
+                PythonRuntime::CPython,
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
+            (
+                None,
+                PythonRuntime::PyPy,
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            ),
+            (
+                Some(PythonRuntime::CPython),
+                PythonRuntime::PyPy,
+                SubmissionTarget::Python(PythonRuntime::CPython),
+            ),
+            (
+                Some(PythonRuntime::PyPy),
+                PythonRuntime::CPython,
+                SubmissionTarget::Python(PythonRuntime::PyPy),
+            ),
+        ] {
+            assert_eq!(
+                capture_target(temp.path(), None, cli, configured).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_override_does_not_resolve_source_ambiguity() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        write_source(temp.path(), "A", Language::Python, "python\n");
+        let calls = Cell::new(0);
+
+        let error = submit_at_with_runtime(
+            temp.path(),
+            "A",
+            None,
+            None,
+            Some(PythonRuntime::PyPy),
+            PythonRuntime::CPython,
+            &mut Vec::new(),
+            read_source_file,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(SubmitOutcome::Accepted)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Specify a language"));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn explicit_language_and_runtime_form_a_typed_submission_target() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        write_source(temp.path(), "A", Language::Python, "python\n");
+
+        assert_eq!(
+            capture_target(
+                temp.path(),
+                Some(Language::Python),
+                Some(PythonRuntime::PyPy),
+                PythonRuntime::CPython,
+            )
+            .unwrap(),
+            SubmissionTarget::Python(PythonRuntime::PyPy)
+        );
+        assert_eq!(
+            capture_target(temp.path(), Some(Language::Cpp), None, PythonRuntime::PyPy,).unwrap(),
+            SubmissionTarget::Cpp
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_is_rejected_for_cpp_before_backend_call() {
+        for (both_sources, runtime) in [
+            (false, PythonRuntime::CPython),
+            (false, PythonRuntime::PyPy),
+            (true, PythonRuntime::CPython),
+            (true, PythonRuntime::PyPy),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            contest(temp.path(), "abc430", "A", "abc430_a");
+            write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+            if both_sources {
+                write_source(temp.path(), "A", Language::Python, "python\n");
+            }
+            let calls = Cell::new(0);
+
+            let error = submit_at_with_runtime(
+                temp.path(),
+                "A",
+                None,
+                if both_sources {
+                    Some(Language::Cpp)
+                } else {
+                    None
+                },
+                Some(runtime),
+                PythonRuntime::CPython,
+                &mut Vec::new(),
+                read_source_file,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(SubmitOutcome::Accepted)
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("--runtime is only valid for Python submissions")
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn configured_python_runtime_is_irrelevant_to_cpp_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+
+        assert_eq!(
+            capture_target(temp.path(), None, None, PythonRuntime::PyPy).unwrap(),
+            SubmissionTarget::Cpp
         );
     }
 
@@ -426,11 +666,11 @@ mod tests {
             &mut Vec::new(),
             read_source_file,
             |request| {
-                let (contest_id, task_id, language, source) = request.test_parts();
+                let (contest_id, task_id, target, source) = request.test_parts();
                 assert_eq!(contest_id, "adt_easy_20260826_1");
                 assert_eq!(task_id, "abc430_a");
                 assert_ne!(task_id, "adt_easy_20260826_1_a");
-                assert_eq!(language, Language::Cpp);
+                assert_eq!(target, SubmissionTarget::Cpp);
                 assert_eq!(source, "cpp\n");
                 Ok(SubmitOutcome::Accepted)
             },
@@ -454,16 +694,21 @@ mod tests {
         contest(&destination, "abc430", "A", "abc430_a");
         write_source(&destination, "A", Language::Python, "print(1)\n");
 
-        submit_at(
+        submit_at_with_runtime(
             root.path(),
             "A",
             Some("abc430"),
             None,
+            None,
+            PythonRuntime::PyPy,
             &mut Vec::new(),
             read_source_file,
             |request| {
                 assert_eq!(request.test_parts().0, "abc430");
-                assert_eq!(request.test_parts().2, Language::Python);
+                assert_eq!(
+                    request.test_parts().2,
+                    SubmissionTarget::Python(PythonRuntime::PyPy)
+                );
                 Ok(SubmitOutcome::Accepted)
             },
         )

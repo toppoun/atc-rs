@@ -112,6 +112,7 @@ Command Palette からは、ソースコードや設定ファイルの編集、�
 | `atc watch` | ソースを監視して自動テスト |
 | `atc stress <problem>` | ストレステストを実行 |
 | `atc stress init <problem>` | Stress Helper を作成 |
+| `atc submit <problem>` | 解答を AtCoder へ提出 |
 | `atc create <name>` | ソースファイルを作成 |
 | `atc template init` | ユーザーテンプレートを作成 |
 | `atc config init` | 設定ファイルを作成 |

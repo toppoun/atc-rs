@@ -57,6 +57,7 @@ impl DoctorReport {
             sections: [
                 "System",
                 "Config",
+                "Submit",
                 "Runners",
                 "Templates",
                 "Workspace",
@@ -259,10 +260,18 @@ pub(crate) fn inspect(
     let resolved_config = diagnose_config(&mut report, paths.config_file);
     match resolved_config.as_ref() {
         Some(config) => {
+            diagnose_submit_policy(&mut report, config);
             diagnose_runners(&mut report, cwd, config, runner_probe);
             diagnose_templates(&mut report, paths.templates_dir, config);
         }
         None => {
+            report.push(
+                "Submit",
+                diagnostic(
+                    DiagnosticLevel::Skip,
+                    "Skipped because the effective config is unavailable",
+                ),
+            );
             report.push(
                 "Runners",
                 diagnostic(
@@ -425,6 +434,11 @@ fn config_details(resolved: &ResolvedConfig) -> Vec<String> {
         setting("C++ flags", &flags, sources.cpp_flags),
         setting("Python executable", &config.runner.python, sources.python),
         setting(
+            "Python submit",
+            config.submit.python_runtime.display_name(),
+            sources.python_runtime,
+        ),
+        setting(
             "runtime timeout",
             &format_seconds(config.runner.timeout_seconds),
             sources.timeout_seconds,
@@ -435,6 +449,31 @@ fn config_details(resolved: &ResolvedConfig) -> Vec<String> {
             sources.compile_timeout_seconds,
         ),
     ]
+}
+
+fn diagnose_submit_policy(report: &mut DoctorReport, config: &ResolvedConfig) {
+    report.push(
+        "Submit",
+        diagnostic(
+            DiagnosticLevel::Info,
+            format!("{:<7} GCC (latest available)", "C++"),
+        ),
+    );
+    report.push(
+        "Submit",
+        diagnostic(
+            DiagnosticLevel::Info,
+            format!(
+                "{:<7} {} ({})",
+                "Python",
+                config.config.submit.python_runtime.display_name(),
+                match config.sources.python_runtime {
+                    ConfigValueSource::BuiltIn => "built-in",
+                    ConfigValueSource::UserOverride => "user override",
+                }
+            ),
+        ),
+    );
 }
 
 fn setting(name: &str, value: &str, source: ConfigValueSource) -> String {
@@ -876,6 +915,9 @@ mod tests {
         assert!(text.contains("config override path"));
         assert!(text.contains("default language   cpp (built-in)"));
         assert!(text.contains("compile timeout    10.0s (built-in)"));
+        assert!(text.contains("Python submit      CPython (built-in)"));
+        assert!(text.contains("C++     GCC (latest available)"));
+        assert!(text.contains("Python  CPython (built-in)"));
     }
 
     #[test]
@@ -888,7 +930,8 @@ mod tests {
             "defaults.language = \"python\"\n\
              runner.cpp_flags = []\n\
              runner.python = \"python-custom\"\n\
-             runner.timeout_seconds = 3.5\n",
+             runner.timeout_seconds = 3.5\n\
+             submit.python_runtime = \"pypy\"\n",
         )
         .unwrap();
 
@@ -903,6 +946,17 @@ mod tests {
         assert!(text.contains("Python executable  python-custom (user override)"));
         assert!(text.contains("runtime timeout    3.5s (user override)"));
         assert!(text.contains("compile timeout    10.0s (built-in)"));
+        assert!(text.contains("Python submit      PyPy (user override)"));
+        assert!(text.contains("Python  PyPy (user override)"));
+
+        let submit_text = section(&report, "Submit")
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!submit_text.contains("6083"));
+        assert!(!submit_text.contains("7.3.19"));
     }
 
     #[test]
@@ -926,6 +980,7 @@ mod tests {
 
         assert!(!report.is_success());
         assert_eq!(levels(&report, "Config"), [DiagnosticLevel::Error]);
+        assert_eq!(levels(&report, "Submit"), [DiagnosticLevel::Skip]);
         assert_eq!(levels(&report, "Runners"), [DiagnosticLevel::Skip]);
         assert_eq!(levels(&report, "Templates"), [DiagnosticLevel::Skip]);
         assert_eq!(probe_calls, 0);

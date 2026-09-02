@@ -1,6 +1,6 @@
 use crate::editor::EditorConfig;
 use crate::error::AppError;
-use crate::language::Language;
+use crate::language::{Language, PythonRuntime};
 use serde::Deserialize;
 use std::io;
 use std::path::Path;
@@ -27,6 +27,9 @@ pub struct Config {
     pub runner: RunnerConfig,
 
     #[serde(default)]
+    pub submit: SubmitConfig,
+
+    #[serde(default)]
     pub(crate) editor: Option<EditorConfig>,
 }
 
@@ -44,6 +47,7 @@ pub(crate) struct ConfigSources {
     pub(crate) cpp_flags: ConfigValueSource,
     pub(crate) timeout_seconds: ConfigValueSource,
     pub(crate) compile_timeout_seconds: ConfigValueSource,
+    pub(crate) python_runtime: ConfigValueSource,
 }
 
 impl Default for ConfigSources {
@@ -55,6 +59,7 @@ impl Default for ConfigSources {
             cpp_flags: ConfigValueSource::BuiltIn,
             timeout_seconds: ConfigValueSource::BuiltIn,
             compile_timeout_seconds: ConfigValueSource::BuiltIn,
+            python_runtime: ConfigValueSource::BuiltIn,
         }
     }
 }
@@ -71,6 +76,7 @@ pub(crate) struct ResolvedConfig {
 struct ConfigOverrides {
     defaults: DefaultsOverrides,
     runner: RunnerOverrides,
+    submit: SubmitOverrides,
     editor: Option<EditorConfig>,
 }
 
@@ -89,6 +95,12 @@ struct RunnerOverrides {
     cpp_flags: Option<Vec<String>>,
     timeout_seconds: Option<f64>,
     compile_timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SubmitOverrides {
+    python_runtime: Option<PythonRuntime>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -156,6 +168,20 @@ impl Default for RunnerConfig {
             ],
             timeout_seconds: 2.0,
             compile_timeout_seconds: 10.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubmitConfig {
+    pub python_runtime: PythonRuntime,
+}
+
+impl Default for SubmitConfig {
+    fn default() -> Self {
+        Self {
+            python_runtime: PythonRuntime::CPython,
         }
     }
 }
@@ -275,6 +301,7 @@ impl ConfigOverrides {
             cpp_flags: value_source(&self.runner.cpp_flags),
             timeout_seconds: value_source(&self.runner.timeout_seconds),
             compile_timeout_seconds: value_source(&self.runner.compile_timeout_seconds),
+            python_runtime: value_source(&self.submit.python_runtime),
         };
 
         let runner_defaults = RunnerConfig::default();
@@ -297,6 +324,9 @@ impl ConfigOverrides {
                     .runner
                     .compile_timeout_seconds
                     .unwrap_or(runner_defaults.compile_timeout_seconds),
+            },
+            submit: SubmitConfig {
+                python_runtime: self.submit.python_runtime.unwrap_or_default(),
             },
             editor: self.editor,
         };
@@ -332,6 +362,37 @@ mod tests {
         let config = Config::load_from(&temp.path().join("config.toml")).unwrap();
 
         assert_eq!(config.defaults.language, Language::Cpp);
+        assert_eq!(config.submit.python_runtime, PythonRuntime::CPython);
+    }
+
+    #[test]
+    fn python_submit_runtime_defaults_and_explicit_values_are_strongly_typed() {
+        assert_eq!(
+            Config::parse("").unwrap().submit.python_runtime,
+            PythonRuntime::CPython
+        );
+        assert_eq!(
+            Config::parse("[submit]\npython_runtime = \"cpython\"\n")
+                .unwrap()
+                .submit
+                .python_runtime,
+            PythonRuntime::CPython
+        );
+        assert_eq!(
+            Config::parse("[submit]\npython_runtime = \"pypy\"\n")
+                .unwrap()
+                .submit
+                .python_runtime,
+            PythonRuntime::PyPy
+        );
+    }
+
+    #[test]
+    fn invalid_python_submit_runtime_is_rejected() {
+        let error = Config::parse("[submit]\npython_runtime = \"unknown\"\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unsupported Python runtime"));
     }
 
     #[test]
@@ -409,8 +470,10 @@ mod tests {
         .unwrap();
         let runner = temp.path().join("runner.toml");
         std::fs::write(&runner, "[runner]\nunexpected = true\n").unwrap();
+        let submit = temp.path().join("submit.toml");
+        std::fs::write(&submit, "[submit]\nunexpected = true\n").unwrap();
 
-        for path in [top_level, nested, runner] {
+        for path in [top_level, nested, runner, submit] {
             let err = Config::load_from(&path).unwrap_err();
             assert!(
                 matches!(err, AppError::Io(ref err) if err.kind() == io::ErrorKind::InvalidData)
@@ -468,7 +531,8 @@ mod tests {
             &path,
             "defaults.language = \"cpp\"\n\
              runner.cpp_compiler = \"g++\"\n\
-             runner.timeout_seconds = 2.0\n",
+             runner.timeout_seconds = 2.0\n\
+             submit.python_runtime = \"cpython\"\n",
         )
         .unwrap();
 
@@ -486,6 +550,10 @@ mod tests {
         );
         assert_eq!(
             resolved.sources.timeout_seconds,
+            ConfigValueSource::UserOverride
+        );
+        assert_eq!(
+            resolved.sources.python_runtime,
             ConfigValueSource::UserOverride
         );
         assert_eq!(resolved.sources.python, ConfigValueSource::BuiltIn);
@@ -510,7 +578,9 @@ mod tests {
              cpp_compiler = \"clang++\"\n\
              cpp_flags = [\"-O0\"]\n\
              timeout_seconds = 4.5\n\
-             compile_timeout_seconds = 12.0\n",
+             compile_timeout_seconds = 12.0\n\
+             [submit]\n\
+             python_runtime = \"pypy\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -520,7 +590,8 @@ mod tests {
              runner.cpp_compiler = \"clang++\"\n\
              runner.cpp_flags = [\"-O0\"]\n\
              runner.timeout_seconds = 4.5\n\
-             runner.compile_timeout_seconds = 12.0\n",
+             runner.compile_timeout_seconds = 12.0\n\
+             submit.python_runtime = \"pypy\"\n",
         )
         .unwrap();
 
@@ -538,6 +609,7 @@ mod tests {
                 cpp_flags: ConfigValueSource::UserOverride,
                 timeout_seconds: ConfigValueSource::UserOverride,
                 compile_timeout_seconds: ConfigValueSource::UserOverride,
+                python_runtime: ConfigValueSource::UserOverride,
             }
         );
     }
