@@ -153,6 +153,17 @@ pub enum RunTestCommand {
 
     /// Find counterexamples with stress testing
     Stress(StressArgs),
+
+    /// Submit a solution to AtCoder
+    Submit {
+        problem: String,
+
+        #[arg(short = 'c', long)]
+        contest: Option<String>,
+
+        #[arg(short = 'l', long = "language")]
+        language: Option<Language>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -715,6 +726,53 @@ mod tests {
                 debug: true,
             }) if problem == "A"
         ));
+    }
+
+    #[test]
+    fn parses_submit_problem_and_optional_language() {
+        let cli = Cli::try_parse_from(["atc", "submit", "A"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RunTest(RunTestCommand::Submit {
+                problem,
+                contest: None,
+                language: None,
+            }) if problem == "A"
+        ));
+
+        for (argument, expected) in [("cpp", Language::Cpp), ("python", Language::Python)] {
+            let cli = Cli::try_parse_from(["atc", "submit", "A", "-l", argument]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::RunTest(RunTestCommand::Submit {
+                    problem,
+                    contest: None,
+                    language: Some(language),
+                }) if problem == "A" && language == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn submit_rejects_missing_problem_and_unsupported_languages() {
+        assert!(Cli::try_parse_from(["atc", "submit"]).is_err());
+        for language in ["rust", "py", "6017"] {
+            assert!(Cli::try_parse_from(["atc", "submit", "A", "-l", language]).is_err());
+        }
+    }
+
+    #[test]
+    fn submit_help_documents_problem_and_language_options() {
+        let mut command = Cli::command();
+        let submit = command
+            .find_subcommand_mut("submit")
+            .expect("submit subcommand should exist");
+        let help = submit.render_long_help().to_string();
+
+        assert!(help.contains("Submit a solution to AtCoder"));
+        assert!(help.contains("submit [OPTIONS] <PROBLEM>"));
+        assert!(help.contains("-l, --language <LANGUAGE>"));
+        assert!(help.contains("-c, --contest <CONTEST>"));
     }
 
     #[test]

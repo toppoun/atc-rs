@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Phase 1 deliberately exposes only a pure layer; production commands do not call it yet.
+// Submit parsing and the one-attempt backend are shared with the one-shot CLI command.
 #[allow(dead_code)]
 pub(crate) mod submit;
 

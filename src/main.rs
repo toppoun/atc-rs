@@ -154,6 +154,14 @@ fn run() -> Result<ExitCode, AppError> {
             }
         },
 
+        cli::Command::RunTest(cli::RunTestCommand::Submit {
+            problem,
+            contest,
+            language,
+        }) => {
+            commands::submit(&problem, contest.as_deref(), language)?;
+        }
+
         cli::Command::Files(cli::FileCommand::Create { name, language }) => {
             commands::create(&name, language, &mut reporter)?;
         }

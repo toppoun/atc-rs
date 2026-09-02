@@ -1,6 +1,7 @@
 use etcetera::HomeDirError;
 
 use crate::atcoder::AtCoderError;
+use crate::atcoder::submit::SubmitError;
 use crate::editor::EditorError;
 use crate::stress::StressError;
 use std::fmt;
@@ -12,6 +13,8 @@ pub enum AppError {
     Io(std::io::Error),
     HomeDir(HomeDirError),
     Stress(StressError),
+    Submit(SubmitError),
+    UnknownSubmissionOutcome,
 }
 
 impl fmt::Display for AppError {
@@ -22,6 +25,21 @@ impl fmt::Display for AppError {
             Self::Io(error) => write!(formatter, "filesystem operation failed: {error}"),
             Self::HomeDir(error) => write!(formatter, "failed to resolve home directory: {error}"),
             Self::Stress(error) => write!(formatter, "stress failed: {error}"),
+            Self::Submit(error) => match error {
+                SubmitError::AuthenticationRequired => {
+                    formatter.write_str("AtCoder authentication is required.")
+                }
+                SubmitError::SubmissionRejected => formatter.write_str(
+                    "Submission was rejected by AtCoder.\nThe submit page may require browser verification.",
+                ),
+                SubmitError::RateLimited => {
+                    formatter.write_str("Submission was rate limited by AtCoder.")
+                }
+                _ => write!(formatter, "AtCoder submit failed: {error}"),
+            },
+            Self::UnknownSubmissionOutcome => formatter.write_str(
+                "Submission outcome is unknown.\nCheck My Submissions before retrying.",
+            ),
         }
     }
 }
@@ -34,6 +52,8 @@ impl std::error::Error for AppError {
             Self::Io(error) => Some(error),
             Self::HomeDir(error) => Some(error),
             Self::Stress(error) => Some(error),
+            Self::Submit(error) => Some(error),
+            Self::UnknownSubmissionOutcome => None,
         }
     }
 }
@@ -65,5 +85,11 @@ impl From<HomeDirError> for AppError {
 impl From<StressError> for AppError {
     fn from(err: StressError) -> Self {
         AppError::Stress(err)
+    }
+}
+
+impl From<SubmitError> for AppError {
+    fn from(err: SubmitError) -> Self {
+        AppError::Submit(err)
     }
 }

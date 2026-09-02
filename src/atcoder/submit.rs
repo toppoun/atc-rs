@@ -565,6 +565,11 @@ impl SubmitRequest {
             source,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_parts(&self) -> (&str, &str, Language, &str) {
+        (&self.contest_id, &self.task_id, self.language, &self.source)
+    }
 }
 
 impl fmt::Debug for SubmitRequest {
