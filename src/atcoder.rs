@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Submit parsing and the one-attempt backend are shared with the one-shot CLI command.
+pub(crate) mod submission_tracking;
 #[allow(dead_code)]
 pub(crate) mod submit;
 

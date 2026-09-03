@@ -684,10 +684,18 @@ impl std::error::Error for SubmitError {
 
 impl AtCoderClient {
     pub(crate) fn submit(&self, request: SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
+        self.submit_with_before_post(request, |_| {})
+    }
+
+    pub(crate) fn submit_with_before_post(
+        &self,
+        request: SubmitRequest,
+        before_post: impl FnOnce(&str),
+    ) -> Result<SubmitOutcome, SubmitError> {
         match &self.source {
             Source::Http(http) => {
                 let mut transport = HttpSubmitTransport { http };
-                submit_with_transport(&mut transport, request)
+                submit_with_transport_and_before_post(&mut transport, request, before_post)
             }
             Source::Fixture(_) => Err(SubmitError::SubmitUnavailable),
         }
@@ -734,11 +742,14 @@ trait SubmitTransport {
     fn get_submit_page(&mut self, path: &str)
     -> Result<SubmitHttpResponse, SubmitTransportFailure>;
 
-    fn post_submit_form(
+    fn post_submit_form<F>(
         &mut self,
         path: &str,
         form: &SubmitForm<'_>,
-    ) -> Result<SubmitHttpResponse, SubmitTransportFailure>;
+        before_post: F,
+    ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+    where
+        F: FnOnce();
 
     fn wait_before_get_retry(&mut self, duration: Duration);
 }
@@ -775,18 +786,26 @@ impl SubmitTransport for HttpSubmitTransport<'_> {
         collect_submit_page_response(response, path)
     }
 
-    fn post_submit_form(
+    fn post_submit_form<F>(
         &mut self,
         path: &str,
         form: &SubmitForm<'_>,
-    ) -> Result<SubmitHttpResponse, SubmitTransportFailure> {
-        wait_for_request_slot(self.http);
-        let response = self
+        before_post: F,
+    ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+    where
+        F: FnOnce(),
+    {
+        let request = self
             .submit_post_client()?
             .post(format!("{BASE_URL}{path}"))
-            .form(form.as_pairs())
-            .send()
-            .map_err(classify_transport_failure)?;
+            .form(form.as_pairs());
+
+        // All fallible submit-page parsing, language resolution, POST-client construction, and
+        // request construction are complete. Tracking captures its best-effort baseline here,
+        // immediately before the shared rate-limit slot and the one physical send.
+        before_post();
+        wait_for_request_slot(self.http);
+        let response = request.send().map_err(classify_transport_failure)?;
 
         Ok(collect_submit_response_without_body(response))
     }
@@ -843,6 +862,14 @@ fn submit_with_transport(
     transport: &mut impl SubmitTransport,
     request: SubmitRequest,
 ) -> Result<SubmitOutcome, SubmitError> {
+    submit_with_transport_and_before_post(transport, request, |_| {})
+}
+
+fn submit_with_transport_and_before_post(
+    transport: &mut impl SubmitTransport,
+    request: SubmitRequest,
+    before_post: impl FnOnce(&str),
+) -> Result<SubmitOutcome, SubmitError> {
     if !is_valid_identifier(&request.contest_id) {
         return Err(SubmitError::InvalidRequestIdentity { kind: "contest ID" });
     }
@@ -864,7 +891,9 @@ fn submit_with_transport(
         .map_err(SubmitError::SubmitPage)?;
     let form = SubmitForm::new(&request, language.id(), page.csrf_token());
 
-    let response = match transport.post_submit_form(page.form_action(), &form) {
+    let response = match transport.post_submit_form(page.form_action(), &form, || {
+        before_post(language.id());
+    }) {
         Ok(response) => response,
         Err(SubmitTransportFailure::ClientInitialization) => {
             return Err(SubmitError::SubmitClientInitializationFailed);
@@ -1004,6 +1033,7 @@ fn is_same_atcoder_origin(url: &reqwest::Url) -> bool {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderValue, RETRY_AFTER};
+    use std::cell::Cell;
     use std::collections::VecDeque;
 
     const CURRENT_SUBMIT_PAGE: &str = include_str!("../../fixtures/submit/abc466.html");
@@ -1167,11 +1197,16 @@ mod tests {
             result
         }
 
-        fn post_submit_form(
+        fn post_submit_form<F>(
             &mut self,
             path: &str,
             form: &SubmitForm<'_>,
-        ) -> Result<SubmitHttpResponse, SubmitTransportFailure> {
+            before_post: F,
+        ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+        where
+            F: FnOnce(),
+        {
+            before_post();
             self.requests.push(ObservedRequest {
                 method: "POST",
                 path: path.to_string(),
@@ -2211,6 +2246,60 @@ mod tests {
                 },
             ]
         );
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn before_post_hook_receives_the_resolved_language_exactly_once() {
+        let source = "dummy cpp source\n";
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6017",
+                source,
+                Ok(accepted_response(
+                    StatusCode::FOUND,
+                    "/contests/abc466/submissions/me",
+                )),
+            ),
+        ]);
+        let hook_calls = Cell::new(0);
+
+        let outcome = submit_with_transport_and_before_post(
+            &mut transport,
+            submit_request(Language::Cpp, source),
+            |language_id| {
+                hook_calls.set(hook_calls.get() + 1);
+                assert_eq!(language_id, "6017");
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert_eq!(hook_calls.get(), 1);
+        assert_eq!(transport.get_count(), 1);
+        assert_eq!(transport.post_count(), 1);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn pre_submit_failure_does_not_invoke_the_before_post_hook() {
+        let mut transport = ScriptedSubmitTransport::new(vec![ScriptStep::Get {
+            path: "/contests/abc466/submit".to_string(),
+            result: Err(SubmitTransportFailure::Other),
+        }]);
+        let hook_calls = Cell::new(0);
+
+        let result = submit_with_transport_and_before_post(
+            &mut transport,
+            submit_request(Language::Cpp, "source"),
+            |_| hook_calls.set(hook_calls.get() + 1),
+        );
+
+        assert_eq!(result, Err(SubmitError::SubmitPageFetchFailed));
+        assert_eq!(hook_calls.get(), 0);
+        assert_eq!(transport.get_count(), 1);
+        assert_eq!(transport.post_count(), 0);
         transport.assert_complete();
     }
 

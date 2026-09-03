@@ -1,5 +1,6 @@
 use super::test::find_problem;
 use crate::atcoder;
+use crate::atcoder::submission_tracking::{SubmissionId, SubmissionStatus};
 use crate::atcoder::submit::{SubmitOutcome, SubmitRequest};
 use crate::config::Config;
 use crate::error::AppError;
@@ -7,9 +8,11 @@ use crate::language::{Language, PythonRuntime, SubmissionTarget};
 use crate::model::Problem;
 use crate::workspace;
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const RUNTIME_PYTHON_ONLY_ERROR: &str = "--runtime is only valid for Python submissions";
 
@@ -32,9 +35,27 @@ pub(crate) fn submit(
     let atcoder = atcoder::AtCoderClient::new()?;
     let stdout = io::stdout();
 
-    execute_submit(plan, &mut stdout.lock(), read_source_file, |request| {
-        Ok(atcoder.submit(request)?)
-    })
+    execute_submit_with_tracking(
+        plan,
+        &mut stdout.lock(),
+        read_source_file,
+        |contest_id, task_id, language_id| {
+            atcoder
+                .capture_submission_baseline(contest_id, task_id, language_id)
+                .ok()
+        },
+        |request, before_post| {
+            Ok(atcoder.submit_with_before_post(request, |language_id| {
+                before_post(language_id);
+            })?)
+        },
+        |baseline| atcoder.discover_submission_id(baseline).map_err(drop),
+        |contest_id, submission_id, on_status| {
+            atcoder
+                .watch_submission(contest_id, submission_id, on_status)
+                .map_err(drop)
+        },
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -177,6 +198,7 @@ fn resolve_submit_plan(
     })
 }
 
+#[cfg(test)]
 fn execute_submit<R, S>(
     plan: SubmitPlan,
     output: &mut impl Write,
@@ -186,6 +208,30 @@ fn execute_submit<R, S>(
 where
     R: FnOnce(&Path) -> io::Result<String>,
     S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
+{
+    execute_submit_with_accepted(
+        plan,
+        output,
+        read_source,
+        submit_once,
+        |_, _, problem_index, output| {
+            let _ = writeln!(output, "Submitted: {problem_index}");
+        },
+    )
+}
+
+fn execute_submit_with_accepted<R, S, A, W>(
+    plan: SubmitPlan,
+    output: &mut W,
+    read_source: R,
+    submit_once: S,
+    on_accepted: A,
+) -> Result<(), AppError>
+where
+    R: FnOnce(&Path) -> io::Result<String>,
+    S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
+    A: FnOnce(&str, &str, &str, &mut W),
+    W: Write,
 {
     let SubmitPlan {
         contest_id,
@@ -206,18 +252,119 @@ where
         .into());
     }
 
-    let request = SubmitRequest::new(contest_id, task_id, target, source_snapshot);
+    let request = SubmitRequest::new(contest_id.clone(), task_id.clone(), target, source_snapshot);
 
     // FnOnce makes a CLI-level retry impossible: this invocation can call the backend once.
     match submit_once(request)? {
         SubmitOutcome::Accepted => {
             // The remote side effect is already confirmed. A local reporting failure must not
             // turn this into a failed command because callers commonly retry nonzero exits.
-            let _ = writeln!(output, "Submitted: {problem_index}");
+            on_accepted(&contest_id, &task_id, &problem_index, output);
             Ok(())
         }
         SubmitOutcome::UnknownSubmissionOutcome => Err(AppError::UnknownSubmissionOutcome),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_submit_with_tracking<R, S, B, C, D, P, W>(
+    plan: SubmitPlan,
+    output: &mut W,
+    read_source: R,
+    capture_baseline: C,
+    submit_once: S,
+    discover_submission: D,
+    poll_status: P,
+) -> Result<(), AppError>
+where
+    R: FnOnce(&Path) -> io::Result<String>,
+    S: FnOnce(SubmitRequest, &mut dyn FnMut(&str)) -> Result<SubmitOutcome, AppError>,
+    C: FnOnce(&str, &str, &str) -> Option<B>,
+    D: FnOnce(&B) -> Result<SubmissionId, ()>,
+    P: FnOnce(&str, SubmissionId, &mut dyn FnMut(&SubmissionStatus) -> bool) -> Result<(), ()>,
+    W: Write,
+{
+    let contest_id = plan.contest_id.clone();
+    let task_id = plan.task_id.clone();
+    let baseline = Rc::new(RefCell::new(None));
+    let baseline_before_post = Rc::clone(&baseline);
+    let baseline_after_acceptance = Rc::clone(&baseline);
+    let mut capture_baseline = Some(capture_baseline);
+
+    execute_submit_with_accepted(
+        plan,
+        output,
+        read_source,
+        move |request| {
+            let mut before_post = |language_id: &str| {
+                let Some(capture) = capture_baseline.take() else {
+                    return;
+                };
+                // The backend invokes this after submit-page parsing and language resolution,
+                // immediately before its rate-limit wait and sole physical POST attempt. Failure
+                // remains best-effort and never prevents that POST.
+                *baseline_before_post.borrow_mut() = capture(&contest_id, &task_id, language_id);
+            };
+            submit_once(request, &mut before_post)
+        },
+        move |contest_id, _, _, output| {
+            let Some(baseline) = baseline_after_acceptance.borrow_mut().take() else {
+                report_tracking_unavailable(output, false);
+                return;
+            };
+            let Ok(submission_id) = discover_submission(&baseline) else {
+                report_tracking_unavailable(output, false);
+                return;
+            };
+
+            if writeln!(output, "Submitted: #{submission_id}").is_err() {
+                return;
+            }
+
+            let mut output_available = true;
+            let poll_result = poll_status(contest_id, submission_id, &mut |status| {
+                if render_submission_status(output, status).is_ok() {
+                    true
+                } else {
+                    output_available = false;
+                    false
+                }
+            });
+            if poll_result.is_err() && output_available {
+                report_tracking_unavailable(output, true);
+            }
+        },
+    )
+}
+
+fn render_submission_status(output: &mut impl Write, status: &SubmissionStatus) -> io::Result<()> {
+    match status {
+        SubmissionStatus::WaitingForJudge => writeln!(output, "Waiting for judge..."),
+        SubmissionStatus::WaitingForRejudge => writeln!(output, "Waiting for rejudge..."),
+        SubmissionStatus::Judging => writeln!(output, "Judging..."),
+        SubmissionStatus::JudgingProgress {
+            judged,
+            total,
+            provisional,
+        } => {
+            write!(output, "Judging: {judged}/{total}")?;
+            if let Some(verdict) = provisional {
+                write!(output, " {verdict}")?;
+            }
+            writeln!(output)
+        }
+        SubmissionStatus::Finished(verdict) => writeln!(output, "{verdict}"),
+    }
+}
+
+fn report_tracking_unavailable(output: &mut impl Write, submission_id_was_reported: bool) {
+    if !submission_id_was_reported && writeln!(output, "Submitted.").is_err() {
+        return;
+    }
+    if writeln!(output, "Submission tracking is unavailable.").is_err() {
+        return;
+    }
+    let _ = writeln!(output, "Check My Submissions for the result.");
 }
 
 #[cfg(test)]
@@ -279,7 +426,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submit::SubmitError;
+    use crate::atcoder::submission_tracking::Verdict;
+    use crate::atcoder::submit::{SubmitError, SubmitPageError};
     use crate::config::Config;
     use crate::model::Contest;
 
@@ -916,5 +1064,347 @@ mod tests {
             assert!(!text.contains("COOKIE"));
             assert!(!text.contains("CSRF"));
         }
+    }
+
+    #[test]
+    fn baseline_failure_disables_tracking_but_still_submits_once() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let baseline_calls = Cell::new(0);
+        let submit_calls = Cell::new(0);
+        let mut output = Vec::new();
+
+        let result = execute_submit_with_tracking(
+            plan,
+            &mut output,
+            read_source_file,
+            |contest_id, task_id, language_id| {
+                baseline_calls.set(baseline_calls.get() + 1);
+                assert_eq!(contest_id, "abc430");
+                assert_eq!(task_id, "abc430_a");
+                assert_eq!(language_id, "6017");
+                None::<()>
+            },
+            |_, before_post| {
+                submit_calls.set(submit_calls.get() + 1);
+                before_post("6017");
+                Ok(SubmitOutcome::Accepted)
+            },
+            |_| panic!("discovery must stay disabled without a baseline"),
+            |_, _, _| panic!("polling must stay disabled without a submission ID"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(baseline_calls.get(), 1);
+        assert_eq!(submit_calls.get(), 1);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Submitted.\nSubmission tracking is unavailable.\nCheck My Submissions for the result.\n"
+        );
+    }
+
+    #[test]
+    fn accepted_submission_renders_id_changed_statuses_and_final_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let submit_calls = Cell::new(0);
+        let mut output = Vec::new();
+
+        let result = execute_submit_with_tracking(
+            plan,
+            &mut output,
+            read_source_file,
+            |_, _, language_id| {
+                assert_eq!(language_id, "6017");
+                Some(())
+            },
+            |_, before_post| {
+                submit_calls.set(submit_calls.get() + 1);
+                before_post("6017");
+                Ok(SubmitOutcome::Accepted)
+            },
+            |_| Ok(SubmissionId::for_test(78905741)),
+            |contest_id, submission_id, on_status| {
+                assert_eq!(contest_id, "abc430");
+                assert_eq!(submission_id.to_string(), "78905741");
+                for status in [
+                    SubmissionStatus::WaitingForJudge,
+                    SubmissionStatus::JudgingProgress {
+                        judged: 1,
+                        total: 36,
+                        provisional: None,
+                    },
+                    SubmissionStatus::JudgingProgress {
+                        judged: 3,
+                        total: 36,
+                        provisional: Some(Verdict::WrongAnswer),
+                    },
+                    SubmissionStatus::Finished(Verdict::WrongAnswer),
+                ] {
+                    assert!(on_status(&status));
+                }
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(submit_calls.get(), 1);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "Submitted: #78905741\n",
+                "Waiting for judge...\n",
+                "Judging: 1/36\n",
+                "Judging: 3/36 WA\n",
+                "WA\n"
+            )
+        );
+    }
+
+    #[test]
+    fn tracking_failure_after_acceptance_keeps_success_exit_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let submit_calls = Cell::new(0);
+        let mut output = Vec::new();
+
+        let result = execute_submit_with_tracking(
+            plan,
+            &mut output,
+            read_source_file,
+            |_, _, _| Some(()),
+            |_, before_post| {
+                submit_calls.set(submit_calls.get() + 1);
+                before_post("6017");
+                Ok(SubmitOutcome::Accepted)
+            },
+            |_| Ok(SubmissionId::for_test(78905741)),
+            |_, _, _| Err(()),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(submit_calls.get(), 1);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "Submitted: #78905741\n",
+                "Submission tracking is unavailable.\n",
+                "Check My Submissions for the result.\n"
+            )
+        );
+        assert!(!output.contains("outcome is unknown"));
+        assert!(!output.contains("retry"));
+    }
+
+    #[test]
+    fn accepted_tracking_stops_cleanly_when_stdout_breaks() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let submit_calls = Cell::new(0);
+        let poll_calls = Cell::new(0);
+        let mut output = BrokenPipeWriter::default();
+
+        let result = execute_submit_with_tracking(
+            plan,
+            &mut output,
+            read_source_file,
+            |_, _, _| Some(()),
+            |_, before_post| {
+                submit_calls.set(submit_calls.get() + 1);
+                before_post("6017");
+                Ok(SubmitOutcome::Accepted)
+            },
+            |_| Ok(SubmissionId::for_test(78905741)),
+            |_, _, _| {
+                poll_calls.set(poll_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(submit_calls.get(), 1);
+        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(output.writes, 1);
+    }
+
+    #[test]
+    fn tracking_wrapper_never_reenters_submit_for_any_backend_outcome() {
+        let cases = [
+            ("accepted", Ok(SubmitOutcome::Accepted), true, true),
+            (
+                "post transport has unknown outcome",
+                Ok(SubmitOutcome::UnknownSubmissionOutcome),
+                false,
+                true,
+            ),
+            (
+                "invalid request identity",
+                Err(SubmitError::InvalidRequestIdentity { kind: "task ID" }),
+                false,
+                false,
+            ),
+            (
+                "submit-page authentication required",
+                Err(SubmitError::AuthenticationRequired),
+                false,
+                false,
+            ),
+            (
+                "submit unavailable",
+                Err(SubmitError::SubmitUnavailable),
+                false,
+                false,
+            ),
+            (
+                "submit client initialization",
+                Err(SubmitError::SubmitClientInitializationFailed),
+                false,
+                false,
+            ),
+            (
+                "submit page parse",
+                Err(SubmitError::SubmitPage(SubmitPageError::MalformedPage(
+                    "test failure",
+                ))),
+                false,
+                false,
+            ),
+            (
+                "submit page transport",
+                Err(SubmitError::SubmitPageFetchFailed),
+                false,
+                false,
+            ),
+            (
+                "submission rejected",
+                Err(SubmitError::SubmissionRejected),
+                false,
+                true,
+            ),
+            (
+                "unexpected redirect",
+                Err(SubmitError::UnexpectedRedirect),
+                false,
+                true,
+            ),
+            (
+                "post rate limited",
+                Err(SubmitError::RateLimited),
+                false,
+                true,
+            ),
+        ];
+
+        for (name, submit_result, accepted, invokes_post_hook) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            contest(temp.path(), "abc430", "A", "abc430_a");
+            write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+            let plan =
+                resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+                    .unwrap();
+            let baseline_calls = Cell::new(0);
+            let submit_calls = Cell::new(0);
+            let discovery_calls = Cell::new(0);
+            let poll_calls = Cell::new(0);
+            let mut output = Vec::new();
+
+            let result = execute_submit_with_tracking(
+                plan,
+                &mut output,
+                read_source_file,
+                |contest_id, task_id, language_id| {
+                    baseline_calls.set(baseline_calls.get() + 1);
+                    assert_eq!(contest_id, "abc430");
+                    assert_eq!(task_id, "abc430_a");
+                    assert_eq!(language_id, "6017");
+                    Some(())
+                },
+                |_, before_post| {
+                    submit_calls.set(submit_calls.get() + 1);
+                    if invokes_post_hook {
+                        before_post("6017");
+                        // Even a buggy duplicate hook invocation cannot capture two baselines.
+                        before_post("6017");
+                    }
+                    submit_result.map_err(AppError::from)
+                },
+                |_| {
+                    discovery_calls.set(discovery_calls.get() + 1);
+                    Ok(SubmissionId::for_test(78905741))
+                },
+                |_, _, _| {
+                    poll_calls.set(poll_calls.get() + 1);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(submit_calls.get(), 1, "{name}");
+            assert_eq!(baseline_calls.get(), invokes_post_hook as usize, "{name}");
+            if accepted {
+                assert!(result.is_ok(), "{name}: {result:?}");
+                assert_eq!(discovery_calls.get(), 1, "{name}");
+                assert_eq!(poll_calls.get(), 1, "{name}");
+            } else {
+                assert!(result.is_err(), "{name}");
+                assert_eq!(discovery_calls.get(), 0, "{name}");
+                assert_eq!(poll_calls.get(), 0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn failure_before_the_post_hook_does_not_capture_or_start_tracking() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let baseline_calls = Cell::new(0);
+        let submit_calls = Cell::new(0);
+        let discovery_calls = Cell::new(0);
+        let poll_calls = Cell::new(0);
+        let mut output = Vec::new();
+
+        let result = execute_submit_with_tracking(
+            plan,
+            &mut output,
+            read_source_file,
+            |_, _, _| {
+                baseline_calls.set(baseline_calls.get() + 1);
+                Some(())
+            },
+            |_, _| {
+                submit_calls.set(submit_calls.get() + 1);
+                Err(SubmitError::SubmitPageFetchFailed.into())
+            },
+            |_| {
+                discovery_calls.set(discovery_calls.get() + 1);
+                Ok(SubmissionId::for_test(78905741))
+            },
+            |_, _, _| {
+                poll_calls.set(poll_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(submit_calls.get(), 1);
+        assert_eq!(baseline_calls.get(), 0);
+        assert_eq!(discovery_calls.get(), 0);
+        assert_eq!(poll_calls.get(), 0);
+        assert!(output.is_empty());
     }
 }
