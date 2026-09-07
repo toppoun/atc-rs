@@ -91,25 +91,66 @@ impl SubmissionDisplayState {
         }
     }
 
-    pub(super) fn header_label(self) -> String {
+    pub(super) fn compact_label(self) -> String {
+        if let Some(attempt) = self.attempt {
+            attempt.label().to_string()
+        } else {
+            self.current
+                .map_or_else(String::new, TuiSubmissionState::label)
+        }
+    }
+
+    pub(super) fn header_label(self, problem_label: &str) -> String {
         match (self.current, self.attempt) {
             (Some(current), Some(attempt)) => {
-                format!("SUB {} · NEW {}", current.label(), attempt.label())
+                format!(
+                    "SUB {problem_label} {} · NEW {}",
+                    current.label(),
+                    attempt.label()
+                )
             }
-            (Some(current), None) => format!("SUB {}", current.label()),
-            (None, Some(attempt)) => format!("NEW {}", attempt.label()),
+            (Some(current), None) => format!("SUB {problem_label} {}", current.label()),
+            (None, Some(attempt)) => format!("NEW {problem_label} {}", attempt.label()),
             (None, None) => String::new(),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LatestSubmissionDisplay {
+    pub(crate) key: SubmissionKey,
+    pub(crate) problem_index: String,
+    pub(crate) state: SubmissionDisplayState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmissionHeaderState {
+    pub(super) problem_label: String,
+    pub(super) state: SubmissionDisplayState,
+}
+
+impl SubmissionHeaderState {
+    pub(super) fn label(&self) -> String {
+        self.state.header_label(&self.problem_label)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SubmissionViewState {
+    pub(super) latest: Option<SubmissionHeaderState>,
+    pub(super) problems: Vec<Option<SubmissionDisplayState>>,
+}
+
 #[derive(Debug, Default)]
 struct SubmissionRecord {
+    problem_index: Option<String>,
     generation: Option<u64>,
     state: Option<TuiSubmissionState>,
+    current_activity_seq: Option<u64>,
     pending_generation: Option<u64>,
     discovering: bool,
     unknown_generation: Option<u64>,
+    attempt_activity_seq: Option<u64>,
     last_failure: Option<(u64, String)>,
 }
 
@@ -312,6 +353,7 @@ impl SubmissionExecutor for AtCoderSubmissionExecutor {
 pub(crate) struct SubmissionHub {
     records: HashMap<SubmissionKey, SubmissionRecord>,
     next_generation: u64,
+    next_activity_seq: u64,
     #[cfg(test)]
     client: Arc<LazySharedAtCoderClient>,
     executor: Arc<dyn SubmissionExecutor>,
@@ -336,6 +378,7 @@ impl SubmissionHub {
         Self {
             records: HashMap::new(),
             next_generation: 1,
+            next_activity_seq: 1,
             #[cfg(test)]
             client: Arc::clone(&client),
             executor: Arc::new(AtCoderSubmissionExecutor { client }),
@@ -374,6 +417,34 @@ impl SubmissionHub {
         }
     }
 
+    pub(crate) fn latest_activity(&self) -> Option<LatestSubmissionDisplay> {
+        self.records
+            .iter()
+            .filter_map(|(key, record)| {
+                let problem_index = record.problem_index.as_ref()?;
+                let state = self.state(key)?;
+                let current_seq = state.current.and(record.current_activity_seq);
+                let attempt_seq = state.attempt.and(record.attempt_activity_seq);
+                let activity_seq = current_seq.into_iter().chain(attempt_seq).max()?;
+                Some((activity_seq, key, problem_index, state))
+            })
+            .max_by_key(|(activity_seq, _, _, _)| *activity_seq)
+            .map(|(_, key, problem_index, state)| LatestSubmissionDisplay {
+                key: key.clone(),
+                problem_index: problem_index.clone(),
+                state,
+            })
+    }
+
+    fn take_activity_seq(&mut self) -> u64 {
+        let activity_seq = self.next_activity_seq;
+        self.next_activity_seq = self
+            .next_activity_seq
+            .checked_add(1)
+            .expect("submission activity sequence space is exhausted");
+        activity_seq
+    }
+
     pub(crate) fn ensure_start_allowed(&self, key: &SubmissionKey) -> Result<(), &'static str> {
         let Some(record) = self.records.get(key) else {
             return Ok(());
@@ -387,7 +458,12 @@ impl SubmissionHub {
         Ok(())
     }
 
-    pub(crate) fn start(&mut self, key: SubmissionKey, plan: SubmitPlan) -> Result<u64, String> {
+    pub(crate) fn start(
+        &mut self,
+        key: SubmissionKey,
+        problem_index: String,
+        plan: SubmitPlan,
+    ) -> Result<u64, String> {
         if self.stopping {
             return Err("Submission is unavailable while the TUI is stopping.".to_string());
         }
@@ -404,10 +480,6 @@ impl SubmissionHub {
 
         let cancellation = Arc::new(SubmissionCancellation::default());
         let progress = Arc::new(WorkerProgress::default());
-        self.records
-            .entry(key.clone())
-            .or_default()
-            .pending_generation = Some(generation);
         let event_tx = self.event_tx.clone();
         let executor = Arc::clone(&self.executor);
         let thread_key = key.clone();
@@ -428,15 +500,13 @@ impl SubmissionHub {
             });
         let handle = match spawn {
             Ok(handle) => handle,
-            Err(error) => {
-                if let Some(record) = self.records.get_mut(&key)
-                    && record.pending_generation == Some(generation)
-                {
-                    record.pending_generation = None;
-                }
-                return Err(format!("failed to start submission worker: {error}"));
-            }
+            Err(error) => return Err(format!("failed to start submission worker: {error}")),
         };
+        let activity_seq = self.take_activity_seq();
+        let record = self.records.entry(key.clone()).or_default();
+        record.problem_index = Some(problem_index);
+        record.pending_generation = Some(generation);
+        record.attempt_activity_seq = Some(activity_seq);
         self.workers.push(SubmissionWorker {
             key,
             generation,
@@ -490,17 +560,24 @@ impl SubmissionHub {
     fn apply_event(&mut self, event: WorkerEvent) -> bool {
         match event.kind {
             WorkerEventKind::Submission(SubmissionEvent::Accepted) => {
+                if !self.records.get(&event.key).is_some_and(|record| {
+                    record.pending_generation == Some(event.generation)
+                        && record.unknown_generation.is_none()
+                }) {
+                    return false;
+                }
+                let activity_seq = self.take_activity_seq();
                 let old_generation = {
-                    let record = self.records.entry(event.key.clone()).or_default();
-                    if record.pending_generation != Some(event.generation)
-                        || record.unknown_generation.is_some()
-                    {
-                        return false;
-                    }
+                    let record = self
+                        .records
+                        .get_mut(&event.key)
+                        .expect("a validated pending submission record must exist");
                     let old_generation = record.generation;
                     record.pending_generation = None;
+                    record.attempt_activity_seq = None;
                     record.generation = Some(event.generation);
                     record.state = Some(TuiSubmissionState::Accepted);
+                    record.current_activity_seq = Some(activity_seq);
                     record.discovering = true;
                     record.last_failure = None;
                     old_generation
@@ -534,29 +611,44 @@ impl SubmissionHub {
                     true,
                 ),
             WorkerEventKind::Failed(message) => {
-                let record = self.records.entry(event.key).or_default();
+                let Some(record) = self.records.get_mut(&event.key) else {
+                    return false;
+                };
                 if record.pending_generation != Some(event.generation) {
                     return false;
                 }
                 record.pending_generation = None;
+                record.attempt_activity_seq = None;
                 record.last_failure = Some((event.generation, message));
                 true
             }
             WorkerEventKind::Unknown => {
-                let record = self.records.entry(event.key).or_default();
-                if record.pending_generation != Some(event.generation) {
+                if !self
+                    .records
+                    .get(&event.key)
+                    .is_some_and(|record| record.pending_generation == Some(event.generation))
+                {
                     return false;
                 }
+                let activity_seq = self.take_activity_seq();
+                let record = self
+                    .records
+                    .get_mut(&event.key)
+                    .expect("a validated pending submission record must exist");
                 record.pending_generation = None;
                 record.unknown_generation = Some(event.generation);
+                record.attempt_activity_seq = Some(activity_seq);
                 true
             }
             WorkerEventKind::CancelledBeforeSubmit => {
-                let record = self.records.entry(event.key).or_default();
+                let Some(record) = self.records.get_mut(&event.key) else {
+                    return false;
+                };
                 if record.pending_generation != Some(event.generation) {
                     return false;
                 }
                 record.pending_generation = None;
+                record.attempt_activity_seq = None;
                 true
             }
             WorkerEventKind::WorkerPanicked => {
@@ -572,14 +664,24 @@ impl SubmissionHub {
         state: TuiSubmissionState,
         discovery_finished: bool,
     ) -> bool {
-        let record = self.records.entry(key).or_default();
+        let Some(record) = self.records.get_mut(&key) else {
+            return false;
+        };
         if record.generation != Some(generation) {
             return false;
         }
-        let changed = record.state != Some(state) || (discovery_finished && record.discovering);
+        let visible_changed = record.state != Some(state);
+        let changed = visible_changed || (discovery_finished && record.discovering);
         record.state = Some(state);
         if discovery_finished {
             record.discovering = false;
+        }
+        if visible_changed {
+            let activity_seq = self.take_activity_seq();
+            self.records
+                .get_mut(&key)
+                .expect("an updated submission record must still exist")
+                .current_activity_seq = Some(activity_seq);
         }
         changed
     }
@@ -621,10 +723,18 @@ impl SubmissionHub {
     }
 
     fn handle_worker_panic(&mut self, key: &SubmissionKey, generation: u64) -> bool {
-        let record = self.records.entry(key.clone()).or_default();
+        let Some(record) = self.records.get(key) else {
+            return false;
+        };
         if record.pending_generation == Some(generation) {
+            let activity_seq = self.take_activity_seq();
+            let record = self
+                .records
+                .get_mut(key)
+                .expect("a validated pending submission record must exist");
             record.pending_generation = None;
             record.unknown_generation = Some(generation);
+            record.attempt_activity_seq = Some(activity_seq);
             record.last_failure = Some((
                 generation,
                 "Submission worker stopped unexpectedly; the submission outcome is unknown."
@@ -632,6 +742,10 @@ impl SubmissionHub {
             ));
             return true;
         }
+        let record = self
+            .records
+            .get_mut(key)
+            .expect("an existing submission record must remain present");
         if record.generation != Some(generation) {
             return false;
         }
@@ -648,12 +762,20 @@ impl SubmissionHub {
         }
         let changed =
             record.state != Some(TuiSubmissionState::TrackingUnavailable) || record.discovering;
+        let visible_changed = record.state != Some(TuiSubmissionState::TrackingUnavailable);
         record.state = Some(TuiSubmissionState::TrackingUnavailable);
         record.discovering = false;
         record.last_failure = Some((
             generation,
             "Submission tracking worker stopped unexpectedly.".to_string(),
         ));
+        if visible_changed {
+            let activity_seq = self.take_activity_seq();
+            self.records
+                .get_mut(key)
+                .expect("an updated submission record must still exist")
+                .current_activity_seq = Some(activity_seq);
+        }
         changed
     }
 
@@ -663,35 +785,62 @@ impl SubmissionHub {
         generation: u64,
         progress: WorkerProgressPhase,
     ) -> bool {
-        let old_generation = {
-            let record = self.records.entry(key.clone()).or_default();
-            if record.generation == Some(generation)
-                && matches!(
-                    record.state,
-                    Some(TuiSubmissionState::Status(SubmissionStatus::Finished(_)))
-                )
-            {
-                record.last_failure = Some((
-                    generation,
-                    "Submission worker stopped unexpectedly after reporting a final status."
-                        .to_string(),
-                ));
-                return false;
-            }
-            if record.pending_generation != Some(generation)
-                && record.generation != Some(generation)
-            {
-                // A newer accepted generation already replaced this worker. Its outer failure
-                // must not resurrect a stale submission or create an unrelated Unknown lock.
-                return false;
-            }
+        let Some(record) = self.records.get(key) else {
+            return false;
+        };
+        if record.generation == Some(generation)
+            && matches!(
+                record.state,
+                Some(TuiSubmissionState::Status(SubmissionStatus::Finished(_)))
+            )
+        {
+            self.records
+                .get_mut(key)
+                .expect("an existing final submission record must remain present")
+                .last_failure = Some((
+                generation,
+                "Submission worker stopped unexpectedly after reporting a final status."
+                    .to_string(),
+            ));
+            return false;
+        }
+        if record.pending_generation != Some(generation) && record.generation != Some(generation) {
+            // A newer accepted generation already replaced this worker. Its outer failure
+            // must not resurrect a stale submission or create an unrelated Unknown lock.
+            return false;
+        }
 
+        let accepted_or_finished = matches!(
+            progress,
+            WorkerProgressPhase::AcceptedKnown | WorkerProgressPhase::FinishedKnown
+        );
+        let visible_current_changed =
+            accepted_or_finished && record.state != Some(TuiSubmissionState::TrackingUnavailable);
+        // An accepted remote attempt disappearing into the surviving Untracked state is itself
+        // visible activity. Failed and cancelled attempts intentionally do not use this path.
+        let target_attempt_removed = accepted_or_finished
+            && (record.unknown_generation == Some(generation)
+                || (record.unknown_generation.is_none()
+                    && record.pending_generation == Some(generation)));
+        let visible_attempt_changed = matches!(progress, WorkerProgressPhase::PreAccepted)
+            && record.unknown_generation.is_none();
+        let visible_changed =
+            visible_current_changed || target_attempt_removed || visible_attempt_changed;
+        let activity_seq = visible_changed.then(|| self.take_activity_seq());
+        let old_generation = {
+            let record = self
+                .records
+                .get_mut(key)
+                .expect("a validated submission record must remain present");
             match progress {
                 WorkerProgressPhase::PreAccepted => {
                     if record.pending_generation == Some(generation) {
                         record.pending_generation = None;
                     }
                     record.unknown_generation = Some(generation);
+                    if let Some(activity_seq) = activity_seq {
+                        record.attempt_activity_seq = Some(activity_seq);
+                    }
                     record.last_failure = Some((
                         generation,
                         "Submission worker stopped unexpectedly; the submission outcome is unknown."
@@ -704,11 +853,17 @@ impl SubmissionHub {
                     if record.pending_generation == Some(generation) {
                         record.pending_generation = None;
                     }
+                    if target_attempt_removed {
+                        record.attempt_activity_seq = None;
+                    }
                     if record.unknown_generation == Some(generation) {
                         record.unknown_generation = None;
                     }
                     record.generation = Some(generation);
                     record.state = Some(TuiSubmissionState::TrackingUnavailable);
+                    if let Some(activity_seq) = activity_seq {
+                        record.current_activity_seq = Some(activity_seq);
+                    }
                     record.discovering = false;
                     record.last_failure = Some((
                         generation,
@@ -852,6 +1007,7 @@ mod tests {
     use super::*;
     use crate::atcoder::submission_tracking::{SubmissionId, Verdict};
     use crate::language::{Language, PythonRuntime};
+    use crate::model::{Contest, Problem};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
@@ -937,6 +1093,44 @@ mod tests {
         })
     }
 
+    fn seed_current_activity(
+        hub: &mut SubmissionHub,
+        key: &SubmissionKey,
+        problem_index: &str,
+        generation: u64,
+        state: TuiSubmissionState,
+    ) {
+        let activity_seq = hub.take_activity_seq();
+        hub.records.insert(
+            key.clone(),
+            SubmissionRecord {
+                problem_index: Some(problem_index.to_string()),
+                generation: Some(generation),
+                state: Some(state),
+                current_activity_seq: Some(activity_seq),
+                ..SubmissionRecord::default()
+            },
+        );
+    }
+
+    fn seed_attempt_activity(
+        hub: &mut SubmissionHub,
+        key: &SubmissionKey,
+        problem_index: &str,
+        generation: u64,
+    ) {
+        let activity_seq = hub.take_activity_seq();
+        let record = hub.records.entry(key.clone()).or_default();
+        record.problem_index = Some(problem_index.to_string());
+        record.pending_generation = Some(generation);
+        record.attempt_activity_seq = Some(activity_seq);
+    }
+
+    fn latest_label(hub: &SubmissionHub) -> Option<String> {
+        hub.latest_activity()
+            .map(|latest| latest.state.header_label(&latest.problem_index))
+    }
+
     fn start_test_submission(
         hub: &mut SubmissionHub,
         key: &SubmissionKey,
@@ -953,7 +1147,8 @@ mod tests {
             Language::Cpp,
             PythonRuntime::CPython,
         );
-        hub.start(key.clone(), plan).unwrap()
+        hub.start(key.clone(), problem_index.to_string(), plan)
+            .unwrap()
     }
 
     fn wait_for_hub(
@@ -1304,7 +1499,7 @@ mod tests {
             Language::Cpp,
             PythonRuntime::CPython,
         );
-        assert!(hub.start(key.clone(), plan).is_err());
+        assert!(hub.start(key.clone(), "A".to_string(), plan).is_err());
         assert_eq!(post_count.load(Ordering::Acquire), 1);
         hub.request_stop();
     }
@@ -1347,6 +1542,10 @@ mod tests {
             )
         );
         assert!(hub.ensure_start_allowed(&key).is_err());
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A AC · NEW Unknown")
+        );
     }
 
     #[test]
@@ -1376,6 +1575,7 @@ mod tests {
             display_current(TuiSubmissionState::TrackingUnavailable)
         );
         assert!(hub.ensure_start_allowed(&key).is_ok());
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
     }
 
     #[test]
@@ -1412,6 +1612,7 @@ mod tests {
                 Verdict::Accepted
             )))
         );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A AC"));
     }
 
     fn enqueue_unrelated_backlog(hub: &SubmissionHub, count: usize) {
@@ -1558,6 +1759,7 @@ mod tests {
             hub.state(&target),
             display_current(TuiSubmissionState::TrackingUnavailable)
         );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
 
         drain_large_test_backlog(&mut hub);
         assert_eq!(hub.records[&target].unknown_generation, None);
@@ -1565,6 +1767,7 @@ mod tests {
             hub.state(&target),
             display_current(TuiSubmissionState::TrackingUnavailable)
         );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
     }
 
     #[test]
@@ -1600,6 +1803,7 @@ mod tests {
             hub.state(&target),
             display_current(TuiSubmissionState::TrackingUnavailable)
         );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
 
         drain_large_test_backlog(&mut hub);
         assert_eq!(hub.records[&target].unknown_generation, None);
@@ -1609,6 +1813,7 @@ mod tests {
                 Verdict::Accepted,
             )))
         );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A AC"));
     }
 
     #[test]
@@ -1658,6 +1863,10 @@ mod tests {
                 TuiSubmissionAttemptState::Unknown,
             )
         );
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A WJ · NEW Unknown")
+        );
         assert!(hub.ensure_start_allowed(&target).is_err());
 
         drain_large_test_backlog(&mut hub);
@@ -1669,6 +1878,10 @@ mod tests {
                 )),
                 TuiSubmissionAttemptState::Unknown,
             )
+        );
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A WJ · NEW Unknown")
         );
         assert!(hub.ensure_start_allowed(&target).is_err());
     }
@@ -1939,26 +2152,168 @@ mod tests {
     fn stale_join_fallback_cannot_replace_a_newer_generation() {
         let mut hub = SubmissionHub::new();
         let key = key();
+        hub.next_activity_seq = 23;
         hub.records.insert(
             key.clone(),
             SubmissionRecord {
+                problem_index: Some("A".to_string()),
                 generation: Some(5),
                 state: Some(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForJudge,
                 )),
+                current_activity_seq: Some(17),
+                pending_generation: Some(6),
+                attempt_activity_seq: Some(22),
                 ..SubmissionRecord::default()
             },
         );
+        let latest_before = latest_label(&hub);
 
         assert!(!hub.handle_worker_join_panic(&key, 4, WorkerProgressPhase::FinishedKnown,));
         assert_eq!(hub.records[&key].generation, Some(5));
         assert_eq!(hub.records[&key].unknown_generation, None);
+        assert_eq!(hub.records[&key].current_activity_seq, Some(17));
+        assert_eq!(hub.records[&key].pending_generation, Some(6));
+        assert_eq!(hub.records[&key].attempt_activity_seq, Some(22));
+        assert_eq!(hub.next_activity_seq, 23);
+        assert_eq!(latest_label(&hub), latest_before);
         assert_eq!(
             hub.state(&key),
-            display_current(TuiSubmissionState::Status(
-                SubmissionStatus::WaitingForJudge,
-            ))
+            display_attempt(
+                Some(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                TuiSubmissionAttemptState::Submitting,
+            )
         );
+    }
+
+    #[test]
+    fn unchanged_join_fallback_does_not_consume_activity_sequence() {
+        for progress in [
+            WorkerProgressPhase::AcceptedKnown,
+            WorkerProgressPhase::FinishedKnown,
+        ] {
+            let mut hub = SubmissionHub::new();
+            let key = key();
+            hub.next_activity_seq = 23;
+            hub.records.insert(
+                key.clone(),
+                SubmissionRecord {
+                    problem_index: Some("A".to_string()),
+                    generation: Some(5),
+                    state: Some(TuiSubmissionState::TrackingUnavailable),
+                    current_activity_seq: Some(17),
+                    ..SubmissionRecord::default()
+                },
+            );
+
+            assert!(hub.handle_worker_join_panic(&key, 5, progress));
+            assert_eq!(hub.records[&key].current_activity_seq, Some(17));
+            assert_eq!(hub.next_activity_seq, 23);
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
+        }
+    }
+
+    #[test]
+    fn accepted_join_fallback_keeps_the_problem_latest_when_its_attempt_disappears() {
+        for progress in [
+            WorkerProgressPhase::AcceptedKnown,
+            WorkerProgressPhase::FinishedKnown,
+        ] {
+            let mut hub = SubmissionHub::new();
+            let a = SubmissionKey::new("abc474", "abc474_a");
+            let b = SubmissionKey::new("abc474", "abc474_b");
+            hub.next_activity_seq = 12;
+            hub.records.insert(
+                b.clone(),
+                SubmissionRecord {
+                    problem_index: Some("B".to_string()),
+                    generation: Some(1),
+                    state: Some(TuiSubmissionState::TrackingUnavailable),
+                    current_activity_seq: Some(5),
+                    pending_generation: Some(2),
+                    attempt_activity_seq: Some(11),
+                    ..SubmissionRecord::default()
+                },
+            );
+            hub.records.insert(
+                a.clone(),
+                SubmissionRecord {
+                    problem_index: Some("A".to_string()),
+                    generation: Some(1),
+                    state: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        Verdict::Accepted,
+                    ))),
+                    current_activity_seq: Some(10),
+                    ..SubmissionRecord::default()
+                },
+            );
+
+            assert_eq!(
+                latest_label(&hub).as_deref(),
+                Some("SUB B Untracked · NEW Submitting")
+            );
+            assert!(hub.handle_worker_join_panic(&b, 2, progress));
+            assert_eq!(hub.records[&b].generation, Some(2));
+            assert_eq!(hub.records[&b].current_activity_seq, Some(12));
+            assert_eq!(hub.records[&b].pending_generation, None);
+            assert_eq!(hub.records[&b].attempt_activity_seq, None);
+            assert_eq!(hub.records[&a].current_activity_seq, Some(10));
+            assert_eq!(hub.next_activity_seq, 13);
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Untracked"));
+        }
+    }
+
+    #[test]
+    fn join_fallback_preserves_a_different_generations_attempt_activity() {
+        let mut hub = SubmissionHub::new();
+        let key = key();
+        hub.next_activity_seq = 23;
+        hub.records.insert(
+            key.clone(),
+            SubmissionRecord {
+                problem_index: Some("A".to_string()),
+                generation: Some(5),
+                state: Some(TuiSubmissionState::Accepted),
+                current_activity_seq: Some(17),
+                pending_generation: Some(6),
+                attempt_activity_seq: Some(22),
+                ..SubmissionRecord::default()
+            },
+        );
+
+        assert!(hub.handle_worker_join_panic(&key, 5, WorkerProgressPhase::AcceptedKnown));
+        assert_eq!(hub.records[&key].current_activity_seq, Some(23));
+        assert_eq!(hub.records[&key].pending_generation, Some(6));
+        assert_eq!(hub.records[&key].attempt_activity_seq, Some(22));
+        assert_eq!(hub.next_activity_seq, 24);
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A Untracked · NEW Submitting")
+        );
+    }
+
+    #[test]
+    fn visible_join_fallback_change_consumes_exactly_one_activity_sequence() {
+        let mut hub = SubmissionHub::new();
+        let key = key();
+        hub.next_activity_seq = 23;
+        hub.records.insert(
+            key.clone(),
+            SubmissionRecord {
+                problem_index: Some("A".to_string()),
+                generation: Some(5),
+                state: Some(TuiSubmissionState::Accepted),
+                current_activity_seq: Some(17),
+                ..SubmissionRecord::default()
+            },
+        );
+
+        assert!(hub.handle_worker_join_panic(&key, 5, WorkerProgressPhase::AcceptedKnown));
+        assert_eq!(hub.records[&key].current_activity_seq, Some(23));
+        assert_eq!(hub.next_activity_seq, 24);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Untracked"));
     }
 
     #[test]
@@ -2151,16 +2506,14 @@ mod tests {
             progress: Arc::new(WorkerProgress::default()),
             handle: Some(thread::spawn(|| {})),
         });
-        hub.records.insert(
-            key.clone(),
-            SubmissionRecord {
-                generation: Some(1),
-                state: Some(TuiSubmissionState::Status(
-                    SubmissionStatus::WaitingForJudge,
-                )),
-                ..SubmissionRecord::default()
-            },
+        seed_current_activity(
+            &mut hub,
+            &key,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
         );
+        let next_activity_seq = hub.next_activity_seq;
         let plan = SubmitPlan::for_selected_source(
             key.contest_id.clone(),
             key.task_id.clone(),
@@ -2170,8 +2523,10 @@ mod tests {
             PythonRuntime::CPython,
         );
 
-        assert!(hub.start(key.clone(), plan).is_err());
+        assert!(hub.start(key.clone(), "A".to_string(), plan).is_err());
         assert!(old_cancellation.should_continue());
+        assert_eq!(hub.next_activity_seq, next_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A WJ"));
         assert_eq!(
             hub.state(&key),
             display_current(TuiSubmissionState::Status(
@@ -2352,6 +2707,360 @@ mod tests {
 
         assert!(!first.should_continue());
         assert!(!second.should_continue());
+    }
+
+    #[test]
+    fn latest_activity_follows_the_last_visible_status_change_and_has_no_ttl() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(&mut hub, &a, "A", 1, TuiSubmissionState::Accepted);
+        assert!(hub.update_current(
+            a.clone(),
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+            true,
+        ));
+        seed_current_activity(&mut hub, &b, "B", 2, TuiSubmissionState::Accepted);
+        assert!(hub.update_current(
+            b,
+            2,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+            true,
+        ));
+        assert!(hub.update_current(
+            a,
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 50,
+                provisional: None,
+            }),
+            true,
+        ));
+
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A 14/50"));
+        for _ in 0..10 {
+            assert!(!hub.handle_events());
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB A 14/50"));
+        }
+    }
+
+    #[test]
+    fn successful_start_is_a_new_activity_after_the_worker_exists() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let executor = TestExecutor::for_key(
+            b.clone(),
+            vec![Box::new(move |_, _, cancellation| {
+                entered_tx.send(()).unwrap();
+                while cancellation.should_continue() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok(SubmissionCompletion::CancelledBeforeSubmit)
+            })],
+        );
+        let mut hub = SubmissionHub::with_executor(executor);
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+        );
+
+        let generation = start_test_submission(&mut hub, &b, "B");
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(latest_label(&hub).as_deref(), Some("NEW B Submitting"));
+        assert_eq!(hub.records[&b].pending_generation, Some(generation));
+        assert!(hub.records[&b].attempt_activity_seq.is_some());
+
+        hub.request_stop();
+    }
+
+    #[test]
+    fn a_new_attempt_becomes_latest_and_failed_or_cancelled_attempts_fall_back() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+
+        for terminal in [
+            WorkerEventKind::Failed("rejected".to_string()),
+            WorkerEventKind::CancelledBeforeSubmit,
+        ] {
+            let mut hub = SubmissionHub::new();
+            seed_current_activity(
+                &mut hub,
+                &a,
+                "A",
+                1,
+                TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            );
+            seed_attempt_activity(&mut hub, &b, "B", 2);
+            assert_eq!(latest_label(&hub).as_deref(), Some("NEW B Submitting"));
+
+            assert!(hub.apply_event(event(&b, 2, terminal)));
+            assert_eq!(hub.records[&b].attempt_activity_seq, None);
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB A AC"));
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_attempt_never_promotes_the_same_problems_older_current_activity() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+
+        for terminal in [
+            WorkerEventKind::Failed("rejected".to_string()),
+            WorkerEventKind::CancelledBeforeSubmit,
+        ] {
+            let mut hub = SubmissionHub::new();
+            seed_current_activity(
+                &mut hub,
+                &b,
+                "B",
+                1,
+                TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::WrongAnswer)),
+            );
+            seed_current_activity(
+                &mut hub,
+                &a,
+                "A",
+                2,
+                TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            );
+            let b_current_seq = hub.records[&b].current_activity_seq;
+            seed_attempt_activity(&mut hub, &b, "B", 3);
+            let next_activity_seq = hub.next_activity_seq;
+            assert_eq!(
+                latest_label(&hub).as_deref(),
+                Some("SUB B WA · NEW Submitting")
+            );
+
+            assert!(hub.apply_event(event(&b, 3, terminal)));
+            assert_eq!(hub.records[&b].current_activity_seq, b_current_seq);
+            assert_eq!(hub.records[&b].attempt_activity_seq, None);
+            assert_eq!(hub.next_activity_seq, next_activity_seq);
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB A AC"));
+        }
+    }
+
+    #[test]
+    fn unknown_and_untracked_are_persistent_visible_activities() {
+        let mut unknown = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        seed_attempt_activity(&mut unknown, &a, "A", 1);
+        let submitting_seq = unknown.records[&a].attempt_activity_seq;
+        assert!(unknown.apply_event(event(&a, 1, WorkerEventKind::Unknown)));
+        assert!(unknown.records[&a].attempt_activity_seq > submitting_seq);
+        assert_eq!(latest_label(&unknown).as_deref(), Some("NEW A Unknown"));
+        assert!(!unknown.handle_events());
+        assert_eq!(latest_label(&unknown).as_deref(), Some("NEW A Unknown"));
+
+        let mut untracked = SubmissionHub::new();
+        seed_current_activity(&mut untracked, &a, "A", 2, TuiSubmissionState::Accepted);
+        untracked.records.get_mut(&a).unwrap().discovering = true;
+        assert!(untracked.apply_event(event(
+            &a,
+            2,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingUnavailable {
+                submission_id: None,
+            }),
+        )));
+        assert_eq!(latest_label(&untracked).as_deref(), Some("SUB A Untracked"));
+        assert!(!untracked.handle_events());
+        assert_eq!(latest_label(&untracked).as_deref(), Some("SUB A Untracked"));
+    }
+
+    #[test]
+    fn duplicate_visible_status_and_tracking_started_do_not_steal_latest_activity() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        seed_current_activity(
+            &mut hub,
+            &b,
+            "B",
+            2,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        let next_activity_seq = hub.next_activity_seq;
+
+        assert!(!hub.apply_event(event(
+            &a,
+            1,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::WaitingForJudge,
+            }),
+        )));
+        assert_eq!(hub.next_activity_seq, next_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B WJ"));
+
+        hub.records.get_mut(&a).unwrap().state = Some(TuiSubmissionState::Accepted);
+        hub.records.get_mut(&a).unwrap().discovering = true;
+        let a_activity_seq = hub.records[&a].current_activity_seq;
+        assert!(hub.apply_event(event(
+            &a,
+            1,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
+                submission_id: SubmissionId::for_test(1),
+            }),
+        )));
+        assert_eq!(hub.records[&a].current_activity_seq, a_activity_seq);
+        assert_eq!(hub.next_activity_seq, next_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B WJ"));
+    }
+
+    #[test]
+    fn stale_generation_events_cannot_change_activity_or_latest_selection() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            2,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForRejudge),
+        );
+        seed_current_activity(
+            &mut hub,
+            &b,
+            "B",
+            3,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        let a_state = hub.records[&a].state;
+        let a_activity_seq = hub.records[&a].current_activity_seq;
+        let next_activity_seq = hub.next_activity_seq;
+
+        assert!(!hub.apply_event(event(
+            &a,
+            1,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+            }),
+        )));
+        assert!(!hub.apply_event(event(&a, 1, WorkerEventKind::WorkerPanicked,)));
+        assert_eq!(hub.records[&a].state, a_state);
+        assert_eq!(hub.records[&a].current_activity_seq, a_activity_seq);
+        assert_eq!(hub.next_activity_seq, next_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B WJ"));
+    }
+
+    #[test]
+    fn s1_progress_and_s2_attempt_keep_composite_display_with_split_activity_sequences() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 50,
+                provisional: None,
+            }),
+        );
+        seed_attempt_activity(&mut hub, &a, "A", 2);
+        let attempt_activity_seq = hub.records[&a].attempt_activity_seq;
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A 14/50 · NEW Submitting")
+        );
+
+        assert!(hub.apply_event(event(
+            &a,
+            1,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::JudgingProgress {
+                    judged: 15,
+                    total: 50,
+                    provisional: None,
+                },
+            }),
+        )));
+        assert!(hub.records[&a].current_activity_seq > attempt_activity_seq);
+        assert_eq!(
+            latest_label(&hub).as_deref(),
+            Some("SUB A 15/50 · NEW Submitting")
+        );
+
+        assert!(hub.apply_event(event(
+            &a,
+            2,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        assert_eq!(hub.records[&a].attempt_activity_seq, None);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Accepted"));
+    }
+
+    #[test]
+    fn view_snapshot_keeps_latest_independent_of_selection_and_formats_cross_contest() {
+        let contest = |contest_id: &str| Contest {
+            contest_id: contest_id.to_string(),
+            problems: ["A", "B"]
+                .into_iter()
+                .map(|index| Problem {
+                    index: index.to_string(),
+                    title: format!("Problem {index}"),
+                    task_id: format!("{contest_id}_{}", index.to_ascii_lowercase()),
+                    url: format!("https://example.invalid/{index}"),
+                    sample_count: 1,
+                })
+                .collect(),
+        };
+        let abc474 = contest("abc474");
+        let mut app = super::super::app::WatchApp::new(&abc474, vec![1, 1]).unwrap();
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+
+        let initial = super::super::submission_view_state(&app, &hub);
+        assert_eq!(initial.latest.unwrap().label(), "SUB A WJ");
+        app.toggle_problem_status_mode();
+        assert!(app.next_problem());
+        assert_eq!(
+            app.problem_status_mode(),
+            super::super::app::ProblemStatusMode::Submissions
+        );
+        let after_problem_switch = super::super::submission_view_state(&app, &hub);
+        assert_eq!(after_problem_switch.latest.unwrap().label(), "SUB A WJ");
+        assert!(after_problem_switch.problems[0].is_some());
+        assert!(after_problem_switch.problems[1].is_none());
+
+        let abc475 = contest("abc475");
+        let other_contest = super::super::app::WatchApp::new(&abc475, vec![1, 1]).unwrap();
+        assert!(hub.update_current(
+            a,
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            true,
+        ));
+        assert_eq!(
+            app.problem_status_mode(),
+            super::super::app::ProblemStatusMode::Submissions
+        );
+        let cross_contest = super::super::submission_view_state(&other_contest, &hub);
+        assert_eq!(cross_contest.latest.unwrap().label(), "SUB abc474/A AC");
+        assert!(cross_contest.problems.iter().all(Option::is_none));
     }
 
     #[test]

@@ -57,6 +57,7 @@ const REFRESH_EDIT_NOTICE: &str = "Finish editing the User Input before refreshi
 pub(crate) struct FrontendPreferences {
     debug: bool,
     samples_pane: bool,
+    problem_status_mode: app::ProblemStatusMode,
 }
 
 impl FrontendPreferences {
@@ -67,11 +68,15 @@ impl FrontendPreferences {
         if self.samples_pane != app.samples_pane_enabled() {
             app.toggle_samples_pane();
         }
+        if self.problem_status_mode != app.problem_status_mode() {
+            app.toggle_problem_status_mode();
+        }
     }
 
     fn capture(&mut self, app: &WatchApp) {
         self.debug = app.debug_enabled();
         self.samples_pane = app.samples_pane_enabled();
+        self.problem_status_mode = app.problem_status_mode();
     }
 }
 
@@ -85,6 +90,7 @@ pub(super) enum FrontendAction {
     OpenTemplate,
     ToggleDebug,
     ToggleSamples,
+    ToggleSubmissions,
     StartStress,
     StopStress,
     InitializeStress,
@@ -93,7 +99,7 @@ pub(super) enum FrontendAction {
 }
 
 impl FrontendAction {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::RunTests,
         Self::Submit,
         Self::OpenSource,
@@ -102,6 +108,7 @@ impl FrontendAction {
         Self::OpenTemplate,
         Self::ToggleDebug,
         Self::ToggleSamples,
+        Self::ToggleSubmissions,
         Self::StartStress,
         Self::StopStress,
         Self::InitializeStress,
@@ -119,6 +126,7 @@ impl FrontendAction {
             Self::OpenTemplate => "Open Template",
             Self::ToggleDebug => "Toggle Debug",
             Self::ToggleSamples => "Toggle Samples",
+            Self::ToggleSubmissions => "Toggle Submissions",
             Self::StartStress => "Start Stress",
             Self::StopStress => "Stop Stress",
             Self::InitializeStress => "Initialize Stress",
@@ -135,6 +143,7 @@ impl FrontendAction {
             Self::OpenSettings | Self::OpenWorkspaceSettings | Self::OpenTemplate => None,
             Self::ToggleDebug => Some("d"),
             Self::ToggleSamples => Some("s"),
+            Self::ToggleSubmissions => Some("v"),
             Self::StartStress => Some("S"),
             Self::StopStress => None,
             Self::InitializeStress => Some("i"),
@@ -196,6 +205,7 @@ impl FrontendAction {
             | Self::OpenTemplate
             | Self::ToggleDebug
             | Self::ToggleSamples
+            | Self::ToggleSubmissions
             | Self::StartStress
             | Self::StopStress
             | Self::InitializeStress
@@ -218,6 +228,7 @@ impl FrontendAction {
             }
             KeyCode::Char('d') => Some(Self::ToggleDebug),
             KeyCode::Char('s') => Some(Self::ToggleSamples),
+            KeyCode::Char('v') => Some(Self::ToggleSubmissions),
             KeyCode::Char('S') => Some(Self::StartStress),
             KeyCode::Char('i') => Some(Self::InitializeStress),
             KeyCode::Char('c')
@@ -270,19 +281,29 @@ fn canonical_current_source_language(
         .map(|_| source.language)
 }
 
-fn current_submission_key(app: &WatchApp) -> Option<submission::SubmissionKey> {
-    let problem = app.current_problem()?;
-    Some(submission::SubmissionKey::new(
-        app.contest_id(),
-        &problem.task_id,
-    ))
-}
-
-fn current_submission_state(
-    app: &WatchApp,
-    hub: &SubmissionHub,
-) -> Option<submission::SubmissionDisplayState> {
-    hub.state(&current_submission_key(app)?)
+fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::SubmissionViewState {
+    let latest = hub.latest_activity().map(|latest| {
+        let problem_label = if latest.key.contest_id == app.contest_id() {
+            latest.problem_index
+        } else {
+            format!("{}/{}", latest.key.contest_id, latest.problem_index)
+        };
+        submission::SubmissionHeaderState {
+            problem_label,
+            state: latest.state,
+        }
+    });
+    let problems = app
+        .problems()
+        .iter()
+        .map(|problem| {
+            hub.state(&submission::SubmissionKey::new(
+                app.contest_id(),
+                &problem.task_id,
+            ))
+        })
+        .collect();
+    submission::SubmissionViewState { latest, problems }
 }
 
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
@@ -562,7 +583,9 @@ impl SubmitController {
     }
 
     fn handle_key(&mut self, key: KeyEvent, app: &WatchApp, hub: &mut SubmissionHub) -> bool {
-        self.handle_key_with_start(key, app, |key, plan| hub.start(key, plan))
+        self.handle_key_with_start(key, app, |key, problem_index, plan| {
+            hub.start(key, problem_index, plan)
+        })
     }
 
     fn handle_key_with_start(
@@ -571,6 +594,7 @@ impl SubmitController {
         app: &WatchApp,
         start: impl FnOnce(
             submission::SubmissionKey,
+            String,
             crate::commands::submit::SubmitPlan,
         ) -> Result<u64, String>,
     ) -> bool {
@@ -615,6 +639,7 @@ impl SubmitController {
         app: &WatchApp,
         start: impl FnOnce(
             submission::SubmissionKey,
+            String,
             crate::commands::submit::SubmitPlan,
         ) -> Result<u64, String>,
     ) -> bool {
@@ -641,7 +666,7 @@ impl SubmitController {
             candidate.language,
             modal.python_runtime,
         );
-        match start(modal.key.clone(), plan) {
+        match start(modal.key.clone(), problem.index.clone(), plan) {
             Ok(generation) => {
                 modal.starting_generation = Some(generation);
                 modal.error = None;
@@ -3206,6 +3231,7 @@ where
             let mut next_render_info = view::RenderInfo::default();
             let render_mouse_mode = terminal.mouse_mode();
             let fold_animation = detail_scrollbar_drag.fold_animation_frame(&app, Instant::now());
+            let submission_view = submission_view_state(&app, submissions);
 
             terminal.draw(|frame| {
                 next_render_info = view::render_frontend_with_pointer(
@@ -3221,7 +3247,7 @@ where
                         refresh_modal: contest_refresh.modal(),
                         source_modal: open_source.modal(),
                         submit_modal: submit.modal(),
-                        submission_state: current_submission_state(&app, submissions),
+                        submission_view: Some(&submission_view),
                         editor_target_modal: editor_targets.modal(),
                         command_palette: command_palette.is_active().then_some(&command_palette),
                     },
@@ -3503,6 +3529,7 @@ fn contains_global_quit_event(
                     FrontendAction::RunTests
                     | FrontendAction::ToggleDebug
                     | FrontendAction::ToggleSamples
+                    | FrontendAction::ToggleSubmissions
                     | FrontendAction::StartStress
                     | FrontendAction::StopStress
                     | FrontendAction::InitializeStress => {}
@@ -4514,6 +4541,10 @@ fn execute_frontend_action(
         }
         FrontendAction::ToggleSamples => {
             app.toggle_samples_pane();
+            Ok(true)
+        }
+        FrontendAction::ToggleSubmissions => {
+            app.toggle_problem_status_mode();
             Ok(true)
         }
         FrontendAction::StartStress => {
@@ -5650,6 +5681,71 @@ mod tests {
     }
 
     #[test]
+    fn submissions_toggle_is_press_only_and_available_from_the_command_palette() {
+        let mut app = app_with_problems(&[1, 1]);
+        let (run_tx, _run_rx) = mpsc::channel();
+        assert_eq!(app.problem_status_mode(), app::ProblemStatusMode::Samples);
+
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('v'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            app.problem_status_mode(),
+            app::ProblemStatusMode::Submissions
+        );
+        assert!(
+            !handle_key_event(
+                &mut app,
+                key(KeyCode::Char('v'), KeyEventKind::Repeat),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(
+            !handle_key_event(
+                &mut app,
+                key(KeyCode::Char('v'), KeyEventKind::Release),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        app.next_problem();
+        assert_eq!(
+            app.problem_status_mode(),
+            app::ProblemStatusMode::Submissions
+        );
+
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "toggle subm".to_string();
+        assert_eq!(
+            palette.filtered_actions(),
+            [FrontendAction::ToggleSubmissions]
+        );
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            CommandPaletteKeyResult::ExecuteRequested(FrontendAction::ToggleSubmissions)
+        );
+        assert_eq!(
+            FrontendAction::ToggleSubmissions.availability(&app, false),
+            FrontendActionAvailability::Available
+        );
+        execute_frontend_action(
+            &mut app,
+            FrontendAction::ToggleSubmissions,
+            TerminalInputContext::new(&run_tx, None, None),
+            FrontendActionControllers::default(),
+        )
+        .unwrap();
+        assert_eq!(app.problem_status_mode(), app::ProblemStatusMode::Samples);
+    }
+
+    #[test]
     fn open_source_action_order_availability_and_palette_activation_are_deterministic() {
         assert_eq!(
             FrontendAction::ALL,
@@ -5662,6 +5758,7 @@ mod tests {
                 FrontendAction::OpenTemplate,
                 FrontendAction::ToggleDebug,
                 FrontendAction::ToggleSamples,
+                FrontendAction::ToggleSubmissions,
                 FrontendAction::StartStress,
                 FrontendAction::StopStress,
                 FrontendAction::InitializeStress,
@@ -5917,7 +6014,7 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _| panic!("a source-less modal must not reach submission orchestration"),
+            |_, _, _| panic!("a source-less modal must not reach submission orchestration"),
         ));
         assert!(
             controller
@@ -5968,13 +6065,13 @@ mod tests {
         assert!(!controller.handle_key_with_start(
             key(KeyCode::Char('t'), KeyEventKind::Press),
             &app,
-            |_, _| panic!("a second t must not confirm submission"),
+            |_, _, _| panic!("a second t must not confirm submission"),
         ));
 
         assert!(controller.handle_key_with_start(
             key(KeyCode::Down, KeyEventKind::Press),
             &app,
-            |_, _| panic!("navigation must not submit"),
+            |_, _, _| panic!("navigation must not submit"),
         ));
         assert_eq!(
             controller.modal().unwrap().policy_label().as_deref(),
@@ -5983,13 +6080,13 @@ mod tests {
         assert!(!controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Repeat),
             &app,
-            |_, _| panic!("key repeat must not submit"),
+            |_, _, _| panic!("key repeat must not submit"),
         ));
         let calls = Cell::new(0);
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _| {
+            |_, _, _| {
                 calls.set(calls.get() + 1);
                 Ok(7)
             },
@@ -5999,13 +6096,13 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _| panic!("a second Enter press must not start another worker"),
+            |_, _, _| panic!("a second Enter press must not start another worker"),
         ));
         assert_eq!(calls.get(), 1);
         assert!(controller.handle_key_with_start(
             key(KeyCode::Escape, KeyEventKind::Press),
             &app,
-            |_, _| panic!("Escape must not submit"),
+            |_, _, _| panic!("Escape must not submit"),
         ));
         assert!(!controller.modal_active());
     }
@@ -6027,7 +6124,14 @@ mod tests {
             controller.modal().unwrap().error.as_deref(),
             Some("Source file no longer exists.")
         );
-        assert!(hub.state(&current_submission_key(&app).unwrap()).is_none());
+        let problem = app.current_problem().unwrap();
+        assert!(
+            hub.state(&submission::SubmissionKey::new(
+                app.contest_id(),
+                &problem.task_id,
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -6046,7 +6150,8 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, plan| {
+            |_, problem_index, plan| {
+                assert_eq!(problem_index, "A");
                 let prepared = crate::commands::submit::prepare_submit(plan).unwrap();
                 assert_eq!(prepared.test_source_snapshot(), confirmed_snapshot);
                 Ok(9)
@@ -9733,6 +9838,7 @@ mod tests {
         let mut first = app_with_problems(&[3]);
         first.toggle_debug();
         first.toggle_samples_pane();
+        first.toggle_problem_status_mode();
         first.next_case();
         let mut preferences = FrontendPreferences::default();
         preferences.capture(&first);
@@ -9742,6 +9848,10 @@ mod tests {
 
         assert!(next.debug_enabled());
         assert!(next.samples_pane_enabled());
+        assert_eq!(
+            next.problem_status_mode(),
+            app::ProblemStatusMode::Submissions
+        );
         assert_eq!(next.selected_case(), 0);
         assert_eq!(next.contest_id(), "abc123");
     }

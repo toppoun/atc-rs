@@ -659,6 +659,7 @@ pub struct WatchApp {
     should_quit: bool,
     debug: bool,
     samples_pane_enabled: bool,
+    problem_status_mode: ProblemStatusMode,
 
     contest_id: String,
     problems: Vec<ProblemState>,
@@ -672,6 +673,22 @@ pub struct WatchApp {
 
     next_run_id: RunId,
     pending_user_input_runs: VecDeque<RunRequest>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ProblemStatusMode {
+    #[default]
+    Samples,
+    Submissions,
+}
+
+impl ProblemStatusMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Samples => Self::Submissions,
+            Self::Submissions => Self::Samples,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -980,6 +997,7 @@ impl WatchApp {
             should_quit: false,
             debug: false,
             samples_pane_enabled: false,
+            problem_status_mode: ProblemStatusMode::default(),
             contest_id: contest.contest_id.clone(),
             problems,
             selected_problem: 0,
@@ -1005,6 +1023,14 @@ impl WatchApp {
 
     pub fn toggle_samples_pane(&mut self) {
         self.samples_pane_enabled = !self.samples_pane_enabled;
+    }
+
+    pub(super) fn problem_status_mode(&self) -> ProblemStatusMode {
+        self.problem_status_mode
+    }
+
+    pub(super) fn toggle_problem_status_mode(&mut self) {
+        self.problem_status_mode = self.problem_status_mode.toggled();
     }
 
     pub fn contest_id(&self) -> &str {
@@ -5405,6 +5431,20 @@ mod tests {
 
         app.toggle_samples_pane();
         assert!(!app.samples_pane_enabled());
+    }
+
+    #[test]
+    fn problem_status_mode_defaults_to_samples_and_changes_only_on_manual_toggle() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
+        assert_eq!(app.problem_status_mode(), ProblemStatusMode::Samples);
+
+        app.toggle_problem_status_mode();
+        assert_eq!(app.problem_status_mode(), ProblemStatusMode::Submissions);
+        app.next_problem();
+        assert_eq!(app.problem_status_mode(), ProblemStatusMode::Submissions);
+
+        app.toggle_problem_status_mode();
+        assert_eq!(app.problem_status_mode(), ProblemStatusMode::Samples);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{
-    CaseSelection, CaseVerdict, DetailMode, ProblemState, RunPhase, StressPhase, StressSetupState,
-    UserInputEditTarget, UserInputSelection, WatchApp,
+    CaseSelection, CaseVerdict, DetailMode, ProblemState, ProblemStatusMode, RunPhase, StressPhase,
+    StressSetupState, UserInputEditTarget, UserInputSelection, WatchApp,
 };
 use super::detail::{
     DetailDocument, DetailFoldAnimationFrame, DetailSectionClip, DetailSectionKind,
@@ -24,11 +24,15 @@ use super::detail_scrollbar::{
     VerticalScrollbarGeometry, render_detail_scrollbar,
 };
 use super::mouse::MouseMode;
+use super::submission::{
+    SubmissionDisplayState, SubmissionViewState, TuiSubmissionAttemptState, TuiSubmissionState,
+};
 use super::{
     CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
     OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
     RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
 };
+use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
@@ -325,7 +329,7 @@ pub(super) struct FrontendOverlays<'a> {
     pub(super) refresh_modal: Option<&'a RefreshContestModal>,
     pub(super) source_modal: Option<&'a OpenSourceModal>,
     pub(super) submit_modal: Option<&'a SubmitModal>,
-    pub(super) submission_state: Option<super::submission::SubmissionDisplayState>,
+    pub(super) submission_view: Option<&'a SubmissionViewState>,
     pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
 }
@@ -432,10 +436,13 @@ pub(super) fn render_frontend_with_pointer(
         Span::raw(" │ "),
         Span::styled(summary, summary_style(current_problem)),
     ];
-    if let Some(submission) = overlays.submission_state {
+    if let Some(submission) = overlays
+        .submission_view
+        .and_then(|submission| submission.latest.as_ref())
+    {
         title_spans.push(Span::raw(" │ "));
         title_spans.push(Span::styled(
-            submission.header_label(),
+            submission.label(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     }
@@ -458,7 +465,7 @@ pub(super) fn render_frontend_with_pointer(
         .split(inner);
 
     // A ✓   B ✗   C …   D ·
-    let problem_line = problem_status_line(app);
+    let problem_line = problem_status_line(app, overlays.submission_view);
     let problem_line_width = problem_line.width();
     let problem_block = Block::default().borders(Borders::BOTTOM);
     let navigation_area = problem_block.inner(rows[0]);
@@ -669,12 +676,20 @@ pub(super) fn render_frontend_with_pointer(
         }
     }
 
+    let problem_status_target = match app.problem_status_mode() {
+        ProblemStatusMode::Samples => "submissions",
+        ProblemStatusMode::Submissions => "samples",
+    };
     let footer_base = if current_problem
         .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
     {
-        "t submit   s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
+        format!(
+            "t submit   s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   v {problem_status_target}"
+        )
     } else {
-        "t submit   s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
+        format!(
+            "t submit   s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   v {problem_status_target}"
+        )
     };
     let footer_text = if workspace_available {
         format!(": commands   c contest   q quit   {footer_base}")
@@ -1645,7 +1660,17 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
     }
 }
 
-fn problem_status_line(app: &WatchApp) -> Line<'static> {
+fn problem_status_line(
+    app: &WatchApp,
+    submission_view: Option<&SubmissionViewState>,
+) -> Line<'static> {
+    match app.problem_status_mode() {
+        ProblemStatusMode::Samples => sample_problem_status_line(app),
+        ProblemStatusMode::Submissions => submission_problem_status_line(app, submission_view),
+    }
+}
+
+fn sample_problem_status_line(app: &WatchApp) -> Line<'static> {
     let selected = app.current_problem().map(|problem| problem.index.as_str());
 
     let mut spans = Vec::new();
@@ -1667,6 +1692,53 @@ fn problem_status_line(app: &WatchApp) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn submission_problem_status_line(
+    app: &WatchApp,
+    submission_view: Option<&SubmissionViewState>,
+) -> Line<'static> {
+    let selected = app.selected_problem();
+    let mut spans = vec![Span::styled(
+        "SUB │ ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+
+    for (index, problem) in app.problems().iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let state = submission_view
+            .and_then(|view| view.problems.get(index))
+            .copied()
+            .flatten();
+        let label = state.map_or_else(|| "·".to_string(), SubmissionDisplayState::compact_label);
+        let mut style = submission_style(state);
+        if selected == Some(index) {
+            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        }
+        spans.push(Span::styled(format!("{} {label}", problem.index), style));
+    }
+
+    Line::from(spans)
+}
+
+fn submission_style(state: Option<SubmissionDisplayState>) -> Style {
+    let Some(state) = state else {
+        return Style::default().fg(Color::DarkGray);
+    };
+    match (state.attempt, state.current) {
+        (Some(TuiSubmissionAttemptState::Unknown), _) => Style::default().fg(Color::Red),
+        (Some(TuiSubmissionAttemptState::Submitting), _) => Style::default().fg(Color::Yellow),
+        (None, Some(TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)))) => {
+            Style::default().fg(Color::Green)
+        }
+        (None, Some(TuiSubmissionState::Status(SubmissionStatus::Finished(_)))) => {
+            Style::default().fg(Color::Red)
+        }
+        (None, Some(_)) => Style::default().fg(Color::Yellow),
+        (None, None) => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn problem_symbol(problem: &ProblemState) -> &'static str {
@@ -2032,7 +2104,8 @@ mod tests {
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
     use crate::tui::submission::{
-        SubmissionDisplayState, TuiSubmissionAttemptState, TuiSubmissionState,
+        SubmissionDisplayState, SubmissionHeaderState, TuiSubmissionAttemptState,
+        TuiSubmissionState,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
@@ -2173,6 +2246,13 @@ mod tests {
 
     fn rendered_submission_header(state: Option<SubmissionDisplayState>) -> String {
         let app = app();
+        let submission_view = state.map(|state| SubmissionViewState {
+            latest: Some(SubmissionHeaderState {
+                problem_label: "A".to_string(),
+                state,
+            }),
+            problems: vec![Some(state)],
+        });
         let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut detail_layout = DetailLayout::default();
@@ -2185,7 +2265,7 @@ mod tests {
                     MouseMode::Cells,
                     false,
                     FrontendOverlays {
-                        submission_state: state,
+                        submission_view: submission_view.as_ref(),
                         ..FrontendOverlays::default()
                     },
                 );
@@ -2376,7 +2456,7 @@ mod tests {
                         refresh_modal: None,
                         source_modal: None,
                         submit_modal: None,
-                        submission_state: None,
+                        submission_view: None,
                         editor_target_modal: None,
                         command_palette: palette,
                     },
@@ -2696,8 +2776,14 @@ mod tests {
     #[test]
     fn footer_advertises_initialize_only_while_setup_is_required() {
         let mut app = app();
-        assert!(rendered_buffer_text(&app, 120, 20).contains(": commands"));
+        let rendered = rendered_buffer_text(&app, 160, 20);
+        assert!(rendered.contains(": commands"));
+        assert!(rendered.contains("v submissions"));
         assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+
+        app.toggle_problem_status_mode();
+        assert!(rendered_buffer_text(&app, 160, 20).contains("v samples"));
+        app.toggle_problem_status_mode();
 
         assert!(app.set_stress_setup_required(0, true, true));
         assert!(rendered_buffer_text(&app, 120, 20).contains("i initialize"));
@@ -2710,6 +2796,30 @@ mod tests {
     }
 
     #[test]
+    fn footer_keeps_existing_shortcuts_ahead_of_the_optional_view_hint() {
+        let mut app = app();
+
+        let eighty = rendered_frontend_text_with_palette(&app, true, None, None, 80, 20);
+        assert!(eighty.contains("S stress"));
+        assert!(eighty.contains("d debug"));
+        assert!(!eighty.contains("v submissions"));
+
+        let hundred = rendered_frontend_text_with_palette(&app, true, None, None, 100, 20);
+        assert!(hundred.contains("↑↓/j k cas"));
+        assert!(!hundred.contains("v submissions"));
+
+        let wide = rendered_frontend_text_with_palette(&app, true, None, None, 160, 20);
+        assert!(wide.contains("v submissions"));
+        app.toggle_problem_status_mode();
+        let wide = rendered_frontend_text_with_palette(&app, true, None, None, 160, 20);
+        assert!(wide.contains("v samples"));
+
+        for width in [0, 1, 2, 5, 12, 24] {
+            let _ = rendered_frontend_text_with_palette(&app, true, None, None, width, 3);
+        }
+    }
+
+    #[test]
     fn header_distinguishes_every_submission_state_from_sample_results() {
         assert!(!rendered_submission_header(None).contains("SUB "));
 
@@ -2719,14 +2829,14 @@ mod tests {
                     current: None,
                     attempt: Some(TuiSubmissionAttemptState::Submitting),
                 },
-                "NEW Submitting",
+                "NEW A Submitting",
             ),
             (
                 SubmissionDisplayState {
                     current: Some(TuiSubmissionState::Accepted),
                     attempt: None,
                 },
-                "SUB Accepted",
+                "SUB A Accepted",
             ),
             (
                 SubmissionDisplayState {
@@ -2735,7 +2845,7 @@ mod tests {
                     )),
                     attempt: None,
                 },
-                "SUB WJ",
+                "SUB A WJ",
             ),
             (
                 SubmissionDisplayState {
@@ -2744,7 +2854,7 @@ mod tests {
                     )),
                     attempt: None,
                 },
-                "SUB WR",
+                "SUB A WR",
             ),
             (
                 SubmissionDisplayState {
@@ -2757,7 +2867,7 @@ mod tests {
                     )),
                     attempt: None,
                 },
-                "SUB 14/50",
+                "SUB A 14/50",
             ),
             (
                 SubmissionDisplayState {
@@ -2770,7 +2880,7 @@ mod tests {
                     )),
                     attempt: None,
                 },
-                "SUB 14/50 WA",
+                "SUB A 14/50 WA",
             ),
             (
                 SubmissionDisplayState {
@@ -2779,7 +2889,7 @@ mod tests {
                     ))),
                     attempt: None,
                 },
-                "SUB AC",
+                "SUB A AC",
             ),
             (
                 SubmissionDisplayState {
@@ -2788,21 +2898,21 @@ mod tests {
                     ))),
                     attempt: None,
                 },
-                "SUB WA",
+                "SUB A WA",
             ),
             (
                 SubmissionDisplayState {
                     current: Some(TuiSubmissionState::TrackingUnavailable),
                     attempt: None,
                 },
-                "SUB Untracked",
+                "SUB A Untracked",
             ),
             (
                 SubmissionDisplayState {
                     current: None,
                     attempt: Some(TuiSubmissionAttemptState::Unknown),
                 },
-                "NEW Unknown",
+                "NEW A Unknown",
             ),
             (
                 SubmissionDisplayState {
@@ -2815,7 +2925,7 @@ mod tests {
                     )),
                     attempt: Some(TuiSubmissionAttemptState::Submitting),
                 },
-                "SUB 14/50 · NEW Submitting",
+                "SUB A 14/50 · NEW Submitting",
             ),
             (
                 SubmissionDisplayState {
@@ -2824,13 +2934,197 @@ mod tests {
                     ))),
                     attempt: Some(TuiSubmissionAttemptState::Unknown),
                 },
-                "SUB AC · NEW Unknown",
+                "SUB A AC · NEW Unknown",
             ),
         ];
 
         for (state, expected) in cases {
             let rendered = rendered_submission_header(Some(state));
             assert!(rendered.contains(expected), "state={state:?}\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn submissions_overview_uses_compact_labels_colors_and_selected_style() {
+        let mut app = navigation_test_app(7);
+        app.toggle_problem_status_mode();
+        let current = |state| {
+            Some(SubmissionDisplayState {
+                current: Some(state),
+                attempt: None,
+            })
+        };
+        let view = SubmissionViewState {
+            latest: None,
+            problems: vec![
+                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::Accepted,
+                ))),
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::WrongAnswer,
+                ))),
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 14,
+                        total: 50,
+                        provisional: Some(Verdict::WrongAnswer),
+                    },
+                )),
+                Some(SubmissionDisplayState {
+                    current: None,
+                    attempt: Some(TuiSubmissionAttemptState::Unknown),
+                }),
+                current(TuiSubmissionState::TrackingUnavailable),
+                None,
+            ],
+        };
+
+        let line = problem_status_line(&app, Some(&view));
+        assert_eq!(
+            line.to_string(),
+            "SUB │ A AC   B WJ   C WA   D 14/50 WA   E Unknown   F Untracked   G ·"
+        );
+        let style = |label: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == label)
+                .unwrap()
+                .style
+        };
+        assert_eq!(style("A AC").fg, Some(Color::Green));
+        assert!(style("A AC").add_modifier.contains(Modifier::BOLD));
+        assert!(style("A AC").add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(style("B WJ").fg, Some(Color::Yellow));
+        assert_eq!(style("C WA").fg, Some(Color::Red));
+        assert_eq!(style("D 14/50 WA").fg, Some(Color::Yellow));
+        assert_eq!(style("E Unknown").fg, Some(Color::Red));
+        assert_eq!(style("F Untracked").fg, Some(Color::Yellow));
+        assert_eq!(style("G ·").fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn submissions_overview_prefers_attempt_and_all_nonfinal_states_are_yellow() {
+        let current_ac = Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+            Verdict::Accepted,
+        )));
+        let submitting = SubmissionDisplayState {
+            current: current_ac,
+            attempt: Some(TuiSubmissionAttemptState::Submitting),
+        };
+        let unknown = SubmissionDisplayState {
+            current: current_ac,
+            attempt: Some(TuiSubmissionAttemptState::Unknown),
+        };
+        assert_eq!(submitting.compact_label(), "Submitting");
+        assert_eq!(unknown.compact_label(), "Unknown");
+        assert_eq!(submission_style(Some(submitting)).fg, Some(Color::Yellow));
+        assert_eq!(submission_style(Some(unknown)).fg, Some(Color::Red));
+
+        for current in [
+            TuiSubmissionState::Accepted,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForRejudge),
+            TuiSubmissionState::Status(SubmissionStatus::Judging),
+            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 50,
+                provisional: None,
+            }),
+            TuiSubmissionState::TrackingUnavailable,
+        ] {
+            assert_eq!(
+                submission_style(Some(SubmissionDisplayState {
+                    current: Some(current),
+                    attempt: None,
+                }))
+                .fg,
+                Some(Color::Yellow),
+                "state={current:?}"
+            );
+        }
+        for verdict in [
+            Verdict::WrongAnswer,
+            Verdict::TimeLimitExceeded,
+            Verdict::MemoryLimitExceeded,
+            Verdict::RuntimeError,
+            Verdict::CompilationError,
+            Verdict::QueryLimitExceeded,
+            Verdict::OutputLimitExceeded,
+            Verdict::InternalError,
+        ] {
+            assert_eq!(
+                submission_style(Some(SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        verdict,
+                    ))),
+                    attempt: None,
+                }))
+                .fg,
+                Some(Color::Red),
+                "verdict={verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_problem_strip_is_identical_after_round_trip_toggle() {
+        let mut app = navigation_test_app(4);
+        let samples = problem_status_line(&app, None);
+        app.toggle_problem_status_mode();
+        assert!(
+            problem_status_line(&app, None)
+                .to_string()
+                .starts_with("SUB │ ")
+        );
+        app.toggle_problem_status_mode();
+        assert_eq!(problem_status_line(&app, None), samples);
+    }
+
+    #[test]
+    fn submissions_overview_clips_safely_without_adding_a_layout_row() {
+        let mut app = navigation_test_app(7);
+        app.toggle_problem_status_mode();
+        let state = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::JudgingProgress {
+                    judged: 14,
+                    total: 50,
+                    provisional: Some(Verdict::WrongAnswer),
+                },
+            )),
+            attempt: Some(TuiSubmissionAttemptState::Submitting),
+        };
+        let view = SubmissionViewState {
+            latest: Some(SubmissionHeaderState {
+                problem_label: "abc473/A".to_string(),
+                state,
+            }),
+            problems: vec![Some(state); 7],
+        };
+
+        for width in [1, 2, 8, 16, 28, 50, 80] {
+            for height in [1, 2, 3, 5, 8, 12] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut layout = DetailLayout::default();
+                terminal
+                    .draw(|frame| {
+                        render_frontend_with_mouse_mode(
+                            frame,
+                            &app,
+                            &mut layout,
+                            MouseMode::Cells,
+                            false,
+                            FrontendOverlays {
+                                submission_view: Some(&view),
+                                ..FrontendOverlays::default()
+                            },
+                        );
+                    })
+                    .unwrap();
+            }
         }
     }
 
@@ -4683,7 +4977,7 @@ mod tests {
             let mut layout = DetailLayout::default();
             let before = render_with_layout(&mut terminal, &app, &mut layout);
             let buffer_before = terminal.backend().buffer().clone();
-            let navigation_before = problem_status_line(&app);
+            let navigation_before = problem_status_line(&app, None);
             assert_eq!(
                 buffer_row_text(
                     &buffer_before,
@@ -4714,7 +5008,7 @@ mod tests {
             let after = render_with_layout(&mut terminal, &app, &mut layout);
             assert_eq!(after.detail_area, before.detail_area);
             assert_eq!(after.max_detail_scroll, before.max_detail_scroll);
-            assert_eq!(problem_status_line(&app), navigation_before);
+            assert_eq!(problem_status_line(&app, None), navigation_before);
             let buffer = terminal.backend().buffer();
             let navigation = buffer_row_text(buffer, 1, 1, 98);
             assert!(navigation.starts_with("A ·  "));
@@ -4747,7 +5041,8 @@ mod tests {
                         let mut layout = DetailLayout::default();
                         let before = render_with_layout(&mut terminal, &app, &mut layout);
                         let buffer_before = terminal.backend().buffer().clone();
-                        let protected_navigation_end = 1 + problem_status_line(&app).width() + 2;
+                        let protected_navigation_end =
+                            1 + problem_status_line(&app, None).width() + 2;
                         assert!(app.reconcile_user_input_sync(0, Err("read error".to_string())));
                         let after = render_with_layout(&mut terminal, &app, &mut layout);
                         assert_eq!(after.detail_area, before.detail_area);
