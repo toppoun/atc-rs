@@ -925,6 +925,9 @@ fn parse_submission_list(
     let table_selector = selector("table.table-bordered.table-striped");
     let mut tables = document.select(&table_selector);
     let Some(table) = tables.next() else {
+        if has_canonical_empty_submission_state(&document) {
+            return Ok(BTreeSet::new());
+        }
         return Err(SubmissionTrackingError::MalformedSubmissionList(
             "submission table is missing",
         ));
@@ -975,6 +978,21 @@ fn parse_submission_list(
     }
 
     Ok(ids)
+}
+
+fn has_canonical_empty_submission_state(document: &Html) -> bool {
+    let panel_selector = selector(".panel.panel-submission");
+    let mut panels = document.select(&panel_selector);
+    if panels.next().is_none() || panels.next().is_some() {
+        return false;
+    }
+
+    let body_selector = selector(".panel.panel-submission > .panel-body");
+    let mut bodies = document.select(&body_selector);
+    let Some(body) = bodies.next() else {
+        return false;
+    };
+    bodies.next().is_none() && normalized_text(&body) == "No Submissions"
 }
 
 fn required_score_id(
@@ -1228,6 +1246,8 @@ mod tests {
 
     const EMPTY_LIST: &str =
         include_str!("../../fixtures/submission_tracking/submissions_empty.html");
+    const LIVE_EMPTY_LIST: &str =
+        include_str!("../../fixtures/submission_tracking/submissions_empty_live.html");
     const SINGLE_LIST: &str =
         include_str!("../../fixtures/submission_tracking/submissions_single.html");
     const STATUS_WJ: &str = include_str!("../../fixtures/submission_tracking/status_wj.json");
@@ -1340,6 +1360,63 @@ mod tests {
             parse_submission_list("abc473", "abc473_c", "6017", EMPTY_LIST).unwrap(),
             BTreeSet::new()
         );
+    }
+
+    #[test]
+    fn live_empty_submission_panel_is_a_valid_baseline() {
+        assert_eq!(
+            parse_submission_list("abc466", "abc466_a", "6017", LIVE_EMPTY_LIST).unwrap(),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn submission_panel_without_canonical_empty_state_fails_closed() {
+        let html = r#"
+            <div class="panel panel-default panel-submission">
+                <div class="panel-body">Submission history unavailable</div>
+            </div>
+        "#;
+        assert!(matches!(
+            parse_submission_list("abc466", "abc466_a", "6017", html),
+            Err(SubmissionTrackingError::MalformedSubmissionList(
+                "submission table is missing"
+            ))
+        ));
+    }
+
+    #[test]
+    fn unrelated_no_submissions_text_is_not_an_empty_submission_state() {
+        let html = r#"
+            <p>No Submissions</p>
+            <div class="panel panel-default panel-submission">
+                <div class="panel-body">Unexpected response</div>
+            </div>
+        "#;
+        assert!(matches!(
+            parse_submission_list("abc466", "abc466_a", "6017", html),
+            Err(SubmissionTrackingError::MalformedSubmissionList(
+                "submission table is missing"
+            ))
+        ));
+    }
+
+    #[test]
+    fn canonical_empty_panel_does_not_bypass_malformed_table_validation() {
+        let html = format!(
+            "{LIVE_EMPTY_LIST}{}",
+            list(&row(
+                Some("10"),
+                Some("/contests/abc466/submissions/11"),
+                "/contests/abc466/tasks/abc466_a",
+            ))
+        );
+        assert!(matches!(
+            parse_submission_list("abc466", "abc466_a", "6017", &html),
+            Err(SubmissionTrackingError::MalformedSubmissionList(
+                "submission ID sources do not match"
+            ))
+        ));
     }
 
     #[test]
@@ -1557,6 +1634,84 @@ mod tests {
 
         assert_eq!(id, SubmissionId(78777605));
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn first_submission_is_discovered_from_live_empty_baseline() {
+        let mut transport =
+            ScriptedTransport::new([LIVE_EMPTY_LIST, SINGLE_LIST, SINGLE_LIST, SINGLE_LIST]);
+        let baseline =
+            capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
+        let id = discover_submission_with_transport(&mut transport, &baseline).unwrap();
+
+        assert!(baseline.ids.is_empty());
+        assert_eq!(id, SubmissionId(78777605));
+        assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn observed_live_empty_baseline_succeeds_with_empty_diagnostic_ids() {
+        let mut transport = ScriptedTransport::new([LIVE_EMPTY_LIST]);
+        let mut observer = RecordingObserver::default();
+
+        let baseline = capture_baseline_with_transport_until_observed(
+            &mut transport,
+            "abc466",
+            "abc466_a",
+            "6017",
+            &|| true,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert!(baseline.ids.is_empty());
+        assert_eq!(
+            observer.events,
+            [
+                SubmissionDiagnostic::BaselineStarted,
+                SubmissionDiagnostic::BaselineSucceeded {
+                    existing_ids: vec![]
+                }
+            ]
+        );
+        assert!(observer.events.iter().all(|event| !matches!(
+            event,
+            SubmissionDiagnostic::BaselineFailed {
+                kind: SubmissionTrackingErrorKind::MalformedSubmissionList,
+                ..
+            }
+        )));
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn live_empty_baseline_is_logged_as_success_when_diagnostics_are_enabled() {
+        let mut transport = ScriptedTransport::new([LIVE_EMPTY_LIST]);
+        let mut diagnostics = crate::atcoder::submission_diagnostics::AttemptDiagnostics::for_test(
+            None,
+            true,
+            false,
+            "abc466",
+            "abc466_a",
+            crate::language::SubmissionTarget::Cpp,
+        );
+
+        let baseline = capture_baseline_with_transport_until_observed(
+            &mut transport,
+            "abc466",
+            "abc466_a",
+            "6017",
+            &|| true,
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert!(baseline.ids.is_empty());
+        let trace = diagnostics.trace_text();
+        assert!(trace.contains("baseline ok ids=[]"), "{trace}");
+        assert!(!trace.contains("MalformedSubmissionList"), "{trace}");
         transport.assert_complete();
     }
 
