@@ -83,7 +83,20 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(debug_assertions)]
+fn is_exact_tui_demo_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    let _program = args.next();
+    args.next().as_deref() == Some(std::ffi::OsStr::new("--tui-demo")) && args.next().is_none()
+}
+
 fn run() -> Result<ExitCode, AppError> {
+    #[cfg(debug_assertions)]
+    if is_exact_tui_demo_invocation(std::env::args_os()) {
+        tui::demo::run()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let cli = cli::Cli::parse();
 
     let mut reporter = TerminalReporter::default();
@@ -185,4 +198,33 @@ fn run() -> Result<ExitCode, AppError> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::is_exact_tui_demo_invocation;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        std::iter::once("atc")
+            .chain(values.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    #[test]
+    fn tui_demo_dispatch_requires_the_exact_single_argument() {
+        assert!(is_exact_tui_demo_invocation(args(&["--tui-demo"])));
+        assert!(!is_exact_tui_demo_invocation(args(&[])));
+        assert!(!is_exact_tui_demo_invocation(args(&[
+            "--tui-demo",
+            "--unexpected"
+        ])));
+        assert!(!is_exact_tui_demo_invocation(args(&[
+            "--tui-demo",
+            "--help"
+        ])));
+        assert!(!is_exact_tui_demo_invocation(args(&["--tui-demo", "foo"])));
+    }
 }

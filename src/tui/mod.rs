@@ -1,4 +1,6 @@
 pub mod app;
+#[cfg(debug_assertions)]
+pub(crate) mod demo;
 mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
