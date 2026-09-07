@@ -30,12 +30,13 @@ const ANIMATION_REDRAW_INTERVAL: Duration = Duration::from_millis(80);
 const SCENARIO_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_EVENTS_PER_TICK: usize = 256;
 
-const SCENARIO: [SubmissionDisplayState; 7] = [
+const SCENARIO: [SubmissionDisplayState; 8] = [
     attempt(TuiSubmissionAttemptState::Submitting),
     current(TuiSubmissionState::Accepted),
     current(TuiSubmissionState::Status(
         SubmissionStatus::WaitingForJudge,
     )),
+    current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
     current(TuiSubmissionState::Status(
         SubmissionStatus::JudgingProgress {
             judged: 1,
@@ -196,10 +197,14 @@ impl DemoHarness {
             }),
             TuiSubmissionAttemptState::Submitting,
         );
-        let state = if self.submissions.problems.get(problem).copied().flatten() == Some(waiting) {
-            progress
-        } else {
-            waiting
+        let unknown = composite(
+            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            TuiSubmissionAttemptState::Unknown,
+        );
+        let state = match self.submissions.problems.get(problem).copied().flatten() {
+            Some(state) if state == waiting => progress,
+            Some(state) if state == progress => unknown,
+            _ => waiting,
         };
         self.set_selected_submission(Some(state));
     }
@@ -505,8 +510,10 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::raw(
             "a-e / left-right / h-l problem   v samples/submissions   s samples pane   d debug",
         ),
-        Line::raw("1 none  2 Submitting  3 Accepted  4 WJ  5 WR  6 Judging  7 1/72  8 55/72 RE"),
-        Line::raw("9 AC  0 WA  r RE  t TLE  n Untracked  u Unknown  x composite  g cross-contest"),
+        Line::raw("1 none  2 Submitting  3 internal Accepted→WJ  4 WJ  5 WR  6 Judging  7 1/72"),
+        Line::raw(
+            "8 55/72 RE  9 AC  0 WA  r RE  t TLE  n Untracked  u Unknown  x current+attempt  g cross-contest",
+        ),
         Line::raw("Space play/stop scenario   q / Esc / Ctrl-C quit"),
     ]);
     frame.render_widget(Clear, area);
@@ -555,20 +562,144 @@ mod tests {
     }
 
     #[test]
-    fn composite_uses_full_header_and_attempt_first_overview() {
+    fn demo_states_render_the_user_visible_submission_vocabulary() {
+        let cases = [
+            (attempt(TuiSubmissionAttemptState::Submitting), "Submitting"),
+            (current(TuiSubmissionState::Accepted), "WJ"),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                "WJ",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForRejudge,
+                )),
+                "WR",
+            ),
+            (
+                current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
+                "Judging",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 1,
+                        total: 72,
+                        provisional: None,
+                    },
+                )),
+                "1/72",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 55,
+                        total: 72,
+                        provisional: Some(Verdict::RuntimeError),
+                    },
+                )),
+                "55/72 RE",
+            ),
+            (
+                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::Accepted,
+                ))),
+                "AC",
+            ),
+            (
+                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::WrongAnswer,
+                ))),
+                "WA",
+            ),
+            (
+                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::RuntimeError,
+                ))),
+                "RE",
+            ),
+            (
+                current(TuiSubmissionState::TrackingUnavailable),
+                "Untracked",
+            ),
+            (attempt(TuiSubmissionAttemptState::Unknown), "Unknown"),
+        ];
+
         let mut demo = DemoHarness::new().unwrap();
         demo.show_help = false;
-        demo.app.select_problem(2);
+        for (state, expected) in cases {
+            demo.set_selected_submission(Some(state));
+            let rendered = rendered_text(&demo, 160, 20);
+            assert!(
+                rendered.contains(&format!("SUB B {expected}")),
+                "state={state:?}\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("B {expected}")),
+                "state={state:?}\n{rendered}"
+            );
+            assert!(!rendered.contains("NEW"), "state={state:?}\n{rendered}");
+            assert!(
+                !rendered.contains("Accepted"),
+                "state={state:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_and_attempt_fixture_shows_only_the_attempt() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        demo.app.select_problem(0);
+
+        let waiting = composite(
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+            TuiSubmissionAttemptState::Submitting,
+        );
+        let progress = composite(
+            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 50,
+                provisional: None,
+            }),
+            TuiSubmissionAttemptState::Submitting,
+        );
+        let unknown = composite(
+            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            TuiSubmissionAttemptState::Unknown,
+        );
+
         demo.cycle_composite();
 
         let rendered = rendered_text(&demo, 160, 20);
-        assert!(rendered.contains("SUB C WJ · NEW Submitting"));
-        assert!(rendered.contains("C Submitting"));
+        assert_eq!(demo.submissions.problems[0], Some(waiting));
+        assert!(rendered.contains("SUB A Submitting"));
+        assert!(!rendered.contains("SUB A WJ"));
+        assert!(!rendered.contains("NEW"));
+        assert!(rendered.contains("A Submitting"));
 
         demo.cycle_composite();
         let rendered = rendered_text(&demo, 160, 20);
-        assert!(rendered.contains("SUB C 14/50 · NEW Submitting"));
-        assert!(rendered.contains("C Submitting"));
+        assert_eq!(demo.submissions.problems[0], Some(progress));
+        assert!(rendered.contains("SUB A Submitting"));
+        assert!(!rendered.contains("SUB A 14/50"));
+        assert!(!rendered.contains("NEW"));
+        assert!(rendered.contains("A Submitting"));
+
+        demo.cycle_composite();
+        let rendered = rendered_text(&demo, 160, 20);
+        assert_eq!(demo.submissions.problems[0], Some(unknown));
+        assert!(rendered.contains("SUB A Unknown"));
+        assert!(rendered.contains("SUB │ A Unknown"));
+        assert!(!rendered.contains("SUB A AC"));
+        assert!(!rendered.contains("A AC"));
+        assert!(!rendered.contains("AC ·"));
+        assert!(!rendered.contains(" · NEW"));
+
+        demo.cycle_composite();
+        assert_eq!(demo.submissions.problems[0], Some(waiting));
     }
 
     #[test]

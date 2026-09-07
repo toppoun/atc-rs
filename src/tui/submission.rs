@@ -38,11 +38,17 @@ pub(crate) enum TuiSubmissionState {
 }
 
 impl TuiSubmissionState {
+    fn user_visible(self) -> Self {
+        match self {
+            Self::Accepted => Self::Status(SubmissionStatus::WaitingForJudge),
+            state => state,
+        }
+    }
+
     pub(super) fn label(self) -> String {
         match self {
-            Self::Accepted => "Accepted".to_string(),
+            Self::Accepted | Self::Status(SubmissionStatus::WaitingForJudge) => "WJ".to_string(),
             Self::TrackingUnavailable => "Untracked".to_string(),
-            Self::Status(SubmissionStatus::WaitingForJudge) => "WJ".to_string(),
             Self::Status(SubmissionStatus::WaitingForRejudge) => "WR".to_string(),
             Self::Status(SubmissionStatus::Judging) => "Judging".to_string(),
             Self::Status(SubmissionStatus::JudgingProgress {
@@ -54,6 +60,21 @@ impl TuiSubmissionState {
                 |verdict| format!("{judged}/{total} {verdict}"),
             ),
             Self::Status(SubmissionStatus::Finished(verdict)) => verdict.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserVisibleSubmissionState {
+    Current(TuiSubmissionState),
+    Attempt(TuiSubmissionAttemptState),
+}
+
+impl UserVisibleSubmissionState {
+    fn label(self) -> String {
+        match self {
+            Self::Current(current) => current.label(),
+            Self::Attempt(attempt) => attempt.label().to_string(),
         }
     }
 }
@@ -80,39 +101,28 @@ pub(crate) struct SubmissionDisplayState {
 }
 
 impl SubmissionDisplayState {
+    pub(super) fn effective(self) -> Option<UserVisibleSubmissionState> {
+        self.attempt
+            .map(UserVisibleSubmissionState::Attempt)
+            .or_else(|| {
+                self.current
+                    .map(|current| UserVisibleSubmissionState::Current(current.user_visible()))
+            })
+    }
+
     pub(super) fn summary_label(self) -> String {
-        match (self.current, self.attempt) {
-            (Some(current), Some(attempt)) => {
-                format!("{} · NEW {}", current.label(), attempt.label())
-            }
-            (Some(current), None) => current.label(),
-            (None, Some(attempt)) => attempt.label().to_string(),
-            (None, None) => String::new(),
-        }
+        self.compact_label()
     }
 
     pub(super) fn compact_label(self) -> String {
-        if let Some(attempt) = self.attempt {
-            attempt.label().to_string()
-        } else {
-            self.current
-                .map_or_else(String::new, TuiSubmissionState::label)
-        }
+        self.effective()
+            .map_or_else(String::new, UserVisibleSubmissionState::label)
     }
 
     pub(super) fn header_label(self, problem_label: &str) -> String {
-        match (self.current, self.attempt) {
-            (Some(current), Some(attempt)) => {
-                format!(
-                    "SUB {problem_label} {} · NEW {}",
-                    current.label(),
-                    attempt.label()
-                )
-            }
-            (Some(current), None) => format!("SUB {problem_label} {}", current.label()),
-            (None, Some(attempt)) => format!("NEW {problem_label} {}", attempt.label()),
-            (None, None) => String::new(),
-        }
+        self.effective().map_or_else(String::new, |state| {
+            format!("SUB {problem_label} {}", state.label())
+        })
     }
 }
 
@@ -152,6 +162,38 @@ struct SubmissionRecord {
     unknown_generation: Option<u64>,
     attempt_activity_seq: Option<u64>,
     last_failure: Option<(u64, String)>,
+}
+
+impl SubmissionRecord {
+    fn display_state(&self) -> Option<SubmissionDisplayState> {
+        let attempt = if self.unknown_generation.is_some() {
+            Some(TuiSubmissionAttemptState::Unknown)
+        } else if self.pending_generation.is_some() {
+            Some(TuiSubmissionAttemptState::Submitting)
+        } else {
+            None
+        };
+        if self.state.is_none() && attempt.is_none() {
+            None
+        } else {
+            Some(SubmissionDisplayState {
+                current: self.state,
+                attempt,
+            })
+        }
+    }
+
+    fn user_visible_state(&self) -> Option<UserVisibleSubmissionState> {
+        self.display_state()
+            .and_then(SubmissionDisplayState::effective)
+    }
+
+    fn user_visible_activity_seq(&self) -> Option<u64> {
+        match self.user_visible_state()? {
+            UserVisibleSubmissionState::Current(_) => self.current_activity_seq,
+            UserVisibleSubmissionState::Attempt(_) => self.attempt_activity_seq,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,22 +441,7 @@ impl SubmissionHub {
     }
 
     pub(crate) fn state(&self, key: &SubmissionKey) -> Option<SubmissionDisplayState> {
-        let record = self.records.get(key)?;
-        let attempt = if record.unknown_generation.is_some() {
-            Some(TuiSubmissionAttemptState::Unknown)
-        } else if record.pending_generation.is_some() {
-            Some(TuiSubmissionAttemptState::Submitting)
-        } else {
-            None
-        };
-        if record.state.is_none() && attempt.is_none() {
-            None
-        } else {
-            Some(SubmissionDisplayState {
-                current: record.state,
-                attempt,
-            })
-        }
+        self.records.get(key)?.display_state()
     }
 
     pub(crate) fn latest_activity(&self) -> Option<LatestSubmissionDisplay> {
@@ -422,10 +449,8 @@ impl SubmissionHub {
             .iter()
             .filter_map(|(key, record)| {
                 let problem_index = record.problem_index.as_ref()?;
-                let state = self.state(key)?;
-                let current_seq = state.current.and(record.current_activity_seq);
-                let attempt_seq = state.attempt.and(record.attempt_activity_seq);
-                let activity_seq = current_seq.into_iter().chain(attempt_seq).max()?;
+                let state = record.display_state()?;
+                let activity_seq = record.user_visible_activity_seq()?;
                 Some((activity_seq, key, problem_index, state))
             })
             .max_by_key(|(activity_seq, _, _, _)| *activity_seq)
@@ -566,22 +591,31 @@ impl SubmissionHub {
                 }) {
                     return false;
                 }
-                let activity_seq = self.take_activity_seq();
-                let old_generation = {
+                let (old_generation, user_visible_changed) = {
                     let record = self
                         .records
                         .get_mut(&event.key)
                         .expect("a validated pending submission record must exist");
+                    let visible_before = record.user_visible_state();
                     let old_generation = record.generation;
                     record.pending_generation = None;
                     record.attempt_activity_seq = None;
                     record.generation = Some(event.generation);
                     record.state = Some(TuiSubmissionState::Accepted);
-                    record.current_activity_seq = Some(activity_seq);
                     record.discovering = true;
                     record.last_failure = None;
-                    old_generation
+                    (
+                        old_generation,
+                        visible_before != record.user_visible_state(),
+                    )
                 };
+                if user_visible_changed {
+                    let activity_seq = self.take_activity_seq();
+                    self.records
+                        .get_mut(&event.key)
+                        .expect("an accepted submission record must still exist")
+                        .current_activity_seq = Some(activity_seq);
+                }
                 if let Some(old_generation) = old_generation
                     && old_generation != event.generation
                 {
@@ -630,14 +664,23 @@ impl SubmissionHub {
                 {
                     return false;
                 }
-                let activity_seq = self.take_activity_seq();
-                let record = self
-                    .records
-                    .get_mut(&event.key)
-                    .expect("a validated pending submission record must exist");
-                record.pending_generation = None;
-                record.unknown_generation = Some(event.generation);
-                record.attempt_activity_seq = Some(activity_seq);
+                let user_visible_changed = {
+                    let record = self
+                        .records
+                        .get_mut(&event.key)
+                        .expect("a validated pending submission record must exist");
+                    let visible_before = record.user_visible_state();
+                    record.pending_generation = None;
+                    record.unknown_generation = Some(event.generation);
+                    visible_before != record.user_visible_state()
+                };
+                if user_visible_changed {
+                    let activity_seq = self.take_activity_seq();
+                    self.records
+                        .get_mut(&event.key)
+                        .expect("an unknown submission record must still exist")
+                        .attempt_activity_seq = Some(activity_seq);
+                }
                 true
             }
             WorkerEventKind::CancelledBeforeSubmit => {
@@ -664,19 +707,23 @@ impl SubmissionHub {
         state: TuiSubmissionState,
         discovery_finished: bool,
     ) -> bool {
-        let Some(record) = self.records.get_mut(&key) else {
-            return false;
+        let (changed, user_visible_changed) = {
+            let Some(record) = self.records.get_mut(&key) else {
+                return false;
+            };
+            if record.generation != Some(generation) {
+                return false;
+            }
+            let visible_before = record.user_visible_state();
+            let state_changed = record.state != Some(state);
+            let changed = state_changed || (discovery_finished && record.discovering);
+            record.state = Some(state);
+            if discovery_finished {
+                record.discovering = false;
+            }
+            (changed, visible_before != record.user_visible_state())
         };
-        if record.generation != Some(generation) {
-            return false;
-        }
-        let visible_changed = record.state != Some(state);
-        let changed = visible_changed || (discovery_finished && record.discovering);
-        record.state = Some(state);
-        if discovery_finished {
-            record.discovering = false;
-        }
-        if visible_changed {
+        if user_visible_changed {
             let activity_seq = self.take_activity_seq();
             self.records
                 .get_mut(&key)
@@ -727,25 +774,30 @@ impl SubmissionHub {
             return false;
         };
         if record.pending_generation == Some(generation) {
-            let activity_seq = self.take_activity_seq();
-            let record = self
-                .records
-                .get_mut(key)
-                .expect("a validated pending submission record must exist");
-            record.pending_generation = None;
-            record.unknown_generation = Some(generation);
-            record.attempt_activity_seq = Some(activity_seq);
-            record.last_failure = Some((
-                generation,
-                "Submission worker stopped unexpectedly; the submission outcome is unknown."
-                    .to_string(),
-            ));
+            let user_visible_changed = {
+                let record = self
+                    .records
+                    .get_mut(key)
+                    .expect("a validated pending submission record must exist");
+                let visible_before = record.user_visible_state();
+                record.pending_generation = None;
+                record.unknown_generation = Some(generation);
+                record.last_failure = Some((
+                    generation,
+                    "Submission worker stopped unexpectedly; the submission outcome is unknown."
+                        .to_string(),
+                ));
+                visible_before != record.user_visible_state()
+            };
+            if user_visible_changed {
+                let activity_seq = self.take_activity_seq();
+                self.records
+                    .get_mut(key)
+                    .expect("an unknown submission record must still exist")
+                    .attempt_activity_seq = Some(activity_seq);
+            }
             return true;
         }
-        let record = self
-            .records
-            .get_mut(key)
-            .expect("an existing submission record must remain present");
         if record.generation != Some(generation) {
             return false;
         }
@@ -753,23 +805,33 @@ impl SubmissionHub {
             record.state,
             Some(TuiSubmissionState::Status(SubmissionStatus::Finished(_)))
         ) {
-            record.last_failure = Some((
+            self.records
+                .get_mut(key)
+                .expect("an existing final submission record must remain present")
+                .last_failure = Some((
                 generation,
                 "Submission worker stopped unexpectedly after reporting a final status."
                     .to_string(),
             ));
             return false;
         }
-        let changed =
-            record.state != Some(TuiSubmissionState::TrackingUnavailable) || record.discovering;
-        let visible_changed = record.state != Some(TuiSubmissionState::TrackingUnavailable);
-        record.state = Some(TuiSubmissionState::TrackingUnavailable);
-        record.discovering = false;
-        record.last_failure = Some((
-            generation,
-            "Submission tracking worker stopped unexpectedly.".to_string(),
-        ));
-        if visible_changed {
+        let (changed, user_visible_changed) = {
+            let record = self
+                .records
+                .get_mut(key)
+                .expect("an existing submission record must remain present");
+            let visible_before = record.user_visible_state();
+            let changed =
+                record.state != Some(TuiSubmissionState::TrackingUnavailable) || record.discovering;
+            record.state = Some(TuiSubmissionState::TrackingUnavailable);
+            record.discovering = false;
+            record.last_failure = Some((
+                generation,
+                "Submission tracking worker stopped unexpectedly.".to_string(),
+            ));
+            (changed, visible_before != record.user_visible_state())
+        };
+        if user_visible_changed {
             let activity_seq = self.take_activity_seq();
             self.records
                 .get_mut(key)
@@ -810,45 +872,44 @@ impl SubmissionHub {
             return false;
         }
 
-        let accepted_or_finished = matches!(
-            progress,
-            WorkerProgressPhase::AcceptedKnown | WorkerProgressPhase::FinishedKnown
-        );
-        let visible_current_changed =
-            accepted_or_finished && record.state != Some(TuiSubmissionState::TrackingUnavailable);
-        // An accepted remote attempt disappearing into the surviving Untracked state is itself
-        // visible activity. Failed and cancelled attempts intentionally do not use this path.
-        let target_attempt_removed = accepted_or_finished
-            && (record.unknown_generation == Some(generation)
-                || (record.unknown_generation.is_none()
-                    && record.pending_generation == Some(generation)));
-        let visible_attempt_changed = matches!(progress, WorkerProgressPhase::PreAccepted)
-            && record.unknown_generation.is_none();
-        let visible_changed =
-            visible_current_changed || target_attempt_removed || visible_attempt_changed;
-        let activity_seq = visible_changed.then(|| self.take_activity_seq());
-        let old_generation = {
-            let record = self
-                .records
-                .get_mut(key)
-                .expect("a validated submission record must remain present");
-            match progress {
-                WorkerProgressPhase::PreAccepted => {
+        match progress {
+            WorkerProgressPhase::PreAccepted => {
+                let user_visible_changed = {
+                    let record = self
+                        .records
+                        .get_mut(key)
+                        .expect("a validated submission record must remain present");
+                    let visible_before = record.user_visible_state();
                     if record.pending_generation == Some(generation) {
                         record.pending_generation = None;
                     }
                     record.unknown_generation = Some(generation);
-                    if let Some(activity_seq) = activity_seq {
-                        record.attempt_activity_seq = Some(activity_seq);
-                    }
                     record.last_failure = Some((
                         generation,
                         "Submission worker stopped unexpectedly; the submission outcome is unknown."
                             .to_string(),
                     ));
-                    return true;
+                    visible_before != record.user_visible_state()
+                };
+                if user_visible_changed {
+                    let activity_seq = self.take_activity_seq();
+                    self.records
+                        .get_mut(key)
+                        .expect("an unknown submission record must still exist")
+                        .attempt_activity_seq = Some(activity_seq);
                 }
-                WorkerProgressPhase::AcceptedKnown | WorkerProgressPhase::FinishedKnown => {
+                true
+            }
+            WorkerProgressPhase::AcceptedKnown | WorkerProgressPhase::FinishedKnown => {
+                let target_attempt_removed = record.unknown_generation == Some(generation)
+                    || (record.unknown_generation.is_none()
+                        && record.pending_generation == Some(generation));
+                let (old_generation, user_visible_changed) = {
+                    let record = self
+                        .records
+                        .get_mut(key)
+                        .expect("a validated submission record must remain present");
+                    let visible_before = record.user_visible_state();
                     let old_generation = record.generation;
                     if record.pending_generation == Some(generation) {
                         record.pending_generation = None;
@@ -861,25 +922,31 @@ impl SubmissionHub {
                     }
                     record.generation = Some(generation);
                     record.state = Some(TuiSubmissionState::TrackingUnavailable);
-                    if let Some(activity_seq) = activity_seq {
-                        record.current_activity_seq = Some(activity_seq);
-                    }
                     record.discovering = false;
                     record.last_failure = Some((
                         generation,
                         "Submission tracking worker stopped unexpectedly.".to_string(),
                     ));
-                    old_generation
+                    (
+                        old_generation,
+                        visible_before != record.user_visible_state(),
+                    )
+                };
+                if user_visible_changed {
+                    let activity_seq = self.take_activity_seq();
+                    self.records
+                        .get_mut(key)
+                        .expect("an untracked submission record must still exist")
+                        .current_activity_seq = Some(activity_seq);
                 }
+                if let Some(old_generation) = old_generation
+                    && old_generation != generation
+                {
+                    self.cancel_worker(key, old_generation);
+                }
+                true
             }
-        };
-
-        if let Some(old_generation) = old_generation
-            && old_generation != generation
-        {
-            self.cancel_worker(key, old_generation);
         }
-        true
     }
 
     pub(crate) fn request_stop(&mut self) {
@@ -1542,10 +1609,7 @@ mod tests {
             )
         );
         assert!(hub.ensure_start_allowed(&key).is_err());
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A AC · NEW Unknown")
-        );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Unknown"));
     }
 
     #[test]
@@ -1863,10 +1927,7 @@ mod tests {
                 TuiSubmissionAttemptState::Unknown,
             )
         );
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A WJ · NEW Unknown")
-        );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Unknown"));
         assert!(hub.ensure_start_allowed(&target).is_err());
 
         drain_large_test_backlog(&mut hub);
@@ -1879,10 +1940,7 @@ mod tests {
                 TuiSubmissionAttemptState::Unknown,
             )
         );
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A WJ · NEW Unknown")
-        );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Unknown"));
         assert!(hub.ensure_start_allowed(&target).is_err());
     }
 
@@ -2250,10 +2308,7 @@ mod tests {
                 },
             );
 
-            assert_eq!(
-                latest_label(&hub).as_deref(),
-                Some("SUB B Untracked · NEW Submitting")
-            );
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
             assert!(hub.handle_worker_join_panic(&b, 2, progress));
             assert_eq!(hub.records[&b].generation, Some(2));
             assert_eq!(hub.records[&b].current_activity_seq, Some(12));
@@ -2266,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn join_fallback_preserves_a_different_generations_attempt_activity() {
+    fn join_fallback_hidden_by_a_different_generations_attempt_is_not_activity() {
         let mut hub = SubmissionHub::new();
         let key = key();
         hub.next_activity_seq = 23;
@@ -2284,14 +2339,11 @@ mod tests {
         );
 
         assert!(hub.handle_worker_join_panic(&key, 5, WorkerProgressPhase::AcceptedKnown));
-        assert_eq!(hub.records[&key].current_activity_seq, Some(23));
+        assert_eq!(hub.records[&key].current_activity_seq, Some(17));
         assert_eq!(hub.records[&key].pending_generation, Some(6));
         assert_eq!(hub.records[&key].attempt_activity_seq, Some(22));
-        assert_eq!(hub.next_activity_seq, 24);
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A Untracked · NEW Submitting")
-        );
+        assert_eq!(hub.next_activity_seq, 23);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Submitting"));
     }
 
     #[test]
@@ -2772,7 +2824,7 @@ mod tests {
 
         let generation = start_test_submission(&mut hub, &b, "B");
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(latest_label(&hub).as_deref(), Some("NEW B Submitting"));
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
         assert_eq!(hub.records[&b].pending_generation, Some(generation));
         assert!(hub.records[&b].attempt_activity_seq.is_some());
 
@@ -2797,7 +2849,7 @@ mod tests {
                 TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
             );
             seed_attempt_activity(&mut hub, &b, "B", 2);
-            assert_eq!(latest_label(&hub).as_deref(), Some("NEW B Submitting"));
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
 
             assert!(hub.apply_event(event(&b, 2, terminal)));
             assert_eq!(hub.records[&b].attempt_activity_seq, None);
@@ -2832,10 +2884,7 @@ mod tests {
             let b_current_seq = hub.records[&b].current_activity_seq;
             seed_attempt_activity(&mut hub, &b, "B", 3);
             let next_activity_seq = hub.next_activity_seq;
-            assert_eq!(
-                latest_label(&hub).as_deref(),
-                Some("SUB B WA · NEW Submitting")
-            );
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
 
             assert!(hub.apply_event(event(&b, 3, terminal)));
             assert_eq!(hub.records[&b].current_activity_seq, b_current_seq);
@@ -2853,9 +2902,9 @@ mod tests {
         let submitting_seq = unknown.records[&a].attempt_activity_seq;
         assert!(unknown.apply_event(event(&a, 1, WorkerEventKind::Unknown)));
         assert!(unknown.records[&a].attempt_activity_seq > submitting_seq);
-        assert_eq!(latest_label(&unknown).as_deref(), Some("NEW A Unknown"));
+        assert_eq!(latest_label(&unknown).as_deref(), Some("SUB A Unknown"));
         assert!(!unknown.handle_events());
-        assert_eq!(latest_label(&unknown).as_deref(), Some("NEW A Unknown"));
+        assert_eq!(latest_label(&unknown).as_deref(), Some("SUB A Unknown"));
 
         let mut untracked = SubmissionHub::new();
         seed_current_activity(&mut untracked, &a, "A", 2, TuiSubmissionState::Accepted);
@@ -2920,6 +2969,123 @@ mod tests {
     }
 
     #[test]
+    fn accepted_to_waiting_for_judge_does_not_create_duplicate_visible_activity() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(&mut hub, &a, "A", 1, TuiSubmissionState::Accepted);
+        seed_attempt_activity(&mut hub, &b, "B", 2);
+        let a_activity_seq = hub.records[&a].current_activity_seq;
+        let next_activity_seq = hub.next_activity_seq;
+
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
+        assert!(hub.apply_event(event(
+            &a,
+            1,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::WaitingForJudge,
+            }),
+        )));
+
+        assert_eq!(hub.records[&a].current_activity_seq, a_activity_seq);
+        assert_eq!(hub.next_activity_seq, next_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B Submitting"));
+    }
+
+    #[test]
+    fn hidden_current_progress_and_final_status_do_not_steal_latest_activity() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 72,
+                provisional: None,
+            }),
+        );
+        seed_attempt_activity(&mut hub, &a, "A", 2);
+        seed_current_activity(
+            &mut hub,
+            &b,
+            "B",
+            3,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        let a_activity_seq = hub.records[&a].current_activity_seq;
+        let next_activity_seq = hub.next_activity_seq;
+
+        for status in [
+            SubmissionStatus::JudgingProgress {
+                judged: 15,
+                total: 72,
+                provisional: None,
+            },
+            SubmissionStatus::JudgingProgress {
+                judged: 16,
+                total: 72,
+                provisional: None,
+            },
+            SubmissionStatus::Finished(Verdict::Accepted),
+        ] {
+            assert!(hub.apply_event(event(
+                &a,
+                1,
+                WorkerEventKind::Submission(SubmissionEvent::Status {
+                    submission_id: SubmissionId::for_test(1),
+                    status,
+                }),
+            )));
+            assert_eq!(hub.records[&a].current_activity_seq, a_activity_seq);
+            assert_eq!(hub.next_activity_seq, next_activity_seq);
+            assert_eq!(latest_label(&hub).as_deref(), Some("SUB B WJ"));
+            assert_eq!(hub.state(&a).unwrap().header_label("A"), "SUB A Submitting");
+        }
+    }
+
+    #[test]
+    fn accepted_s2_changes_submitting_to_wj_and_becomes_latest_activity() {
+        let mut hub = SubmissionHub::new();
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        seed_current_activity(
+            &mut hub,
+            &a,
+            "A",
+            1,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        seed_attempt_activity(&mut hub, &a, "A", 2);
+        seed_current_activity(
+            &mut hub,
+            &b,
+            "B",
+            3,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        );
+        let next_activity_seq = hub.next_activity_seq;
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB B WJ"));
+
+        assert!(hub.apply_event(event(
+            &a,
+            2,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+
+        assert_eq!(
+            hub.records[&a].current_activity_seq,
+            Some(next_activity_seq)
+        );
+        assert_eq!(hub.next_activity_seq, next_activity_seq + 1);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A WJ"));
+    }
+
+    #[test]
     fn stale_generation_events_cannot_change_activity_or_latest_selection() {
         let mut hub = SubmissionHub::new();
         let a = SubmissionKey::new("abc474", "abc474_a");
@@ -2958,7 +3124,7 @@ mod tests {
     }
 
     #[test]
-    fn s1_progress_and_s2_attempt_keep_composite_display_with_split_activity_sequences() {
+    fn s1_progress_is_hidden_while_s2_attempt_is_visible() {
         let mut hub = SubmissionHub::new();
         let a = SubmissionKey::new("abc474", "abc474_a");
         seed_current_activity(
@@ -2974,10 +3140,7 @@ mod tests {
         );
         seed_attempt_activity(&mut hub, &a, "A", 2);
         let attempt_activity_seq = hub.records[&a].attempt_activity_seq;
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A 14/50 · NEW Submitting")
-        );
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Submitting"));
 
         assert!(hub.apply_event(event(
             &a,
@@ -2991,11 +3154,8 @@ mod tests {
                 },
             }),
         )));
-        assert!(hub.records[&a].current_activity_seq > attempt_activity_seq);
-        assert_eq!(
-            latest_label(&hub).as_deref(),
-            Some("SUB A 15/50 · NEW Submitting")
-        );
+        assert!(hub.records[&a].current_activity_seq < attempt_activity_seq);
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Submitting"));
 
         assert!(hub.apply_event(event(
             &a,
@@ -3003,7 +3163,7 @@ mod tests {
             WorkerEventKind::Submission(SubmissionEvent::Accepted),
         )));
         assert_eq!(hub.records[&a].attempt_activity_seq, None);
-        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A Accepted"));
+        assert_eq!(latest_label(&hub).as_deref(), Some("SUB A WJ"));
     }
 
     #[test]
@@ -3061,12 +3221,19 @@ mod tests {
         let cross_contest = super::super::submission_view_state(&other_contest, &hub);
         assert_eq!(cross_contest.latest.unwrap().label(), "SUB abc474/A AC");
         assert!(cross_contest.problems.iter().all(Option::is_none));
+
+        seed_attempt_activity(&mut hub, &SubmissionKey::new("abc474", "abc474_a"), "A", 2);
+        let cross_contest_attempt = super::super::submission_view_state(&other_contest, &hub);
+        assert_eq!(
+            cross_contest_attempt.latest.unwrap().label(),
+            "SUB abc474/A Submitting"
+        );
     }
 
     #[test]
     fn every_status_has_the_requested_header_label() {
         let cases = [
-            (TuiSubmissionState::Accepted, "Accepted"),
+            (TuiSubmissionState::Accepted, "WJ"),
             (
                 TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
                 "WJ",
@@ -3103,6 +3270,85 @@ mod tests {
         ];
         for (state, expected) in cases {
             assert_eq!(state.label(), expected);
+        }
+    }
+
+    #[test]
+    fn effective_user_visible_projection_is_shared_by_all_labels() {
+        let cases = [
+            (
+                SubmissionDisplayState {
+                    current: None,
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "Submitting",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Accepted),
+                    attempt: None,
+                },
+                "WJ",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForJudge,
+                    )),
+                    attempt: None,
+                },
+                "WJ",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForRejudge,
+                    )),
+                    attempt: None,
+                },
+                "WR",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForJudge,
+                    )),
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "Submitting",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::JudgingProgress {
+                            judged: 14,
+                            total: 50,
+                            provisional: None,
+                        },
+                    )),
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "Submitting",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        Verdict::Accepted,
+                    ))),
+                    attempt: Some(TuiSubmissionAttemptState::Unknown),
+                },
+                "Unknown",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(state.compact_label(), expected);
+            assert_eq!(state.summary_label(), expected);
+            let header = state.header_label("A");
+            assert_eq!(header, format!("SUB A {expected}"));
+            assert!(!header.contains("NEW"));
+            assert!(!header.contains("Accepted"));
+            assert!(!header.contains('·'));
         }
     }
 }

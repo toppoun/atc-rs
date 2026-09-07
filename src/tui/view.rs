@@ -26,6 +26,7 @@ use super::detail_scrollbar::{
 use super::mouse::MouseMode;
 use super::submission::{
     SubmissionDisplayState, SubmissionViewState, TuiSubmissionAttemptState, TuiSubmissionState,
+    UserVisibleSubmissionState,
 };
 use super::{
     CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
@@ -1724,20 +1725,23 @@ fn submission_problem_status_line(
 }
 
 fn submission_style(state: Option<SubmissionDisplayState>) -> Style {
-    let Some(state) = state else {
+    let Some(state) = state.and_then(SubmissionDisplayState::effective) else {
         return Style::default().fg(Color::DarkGray);
     };
-    match (state.attempt, state.current) {
-        (Some(TuiSubmissionAttemptState::Unknown), _) => Style::default().fg(Color::Red),
-        (Some(TuiSubmissionAttemptState::Submitting), _) => Style::default().fg(Color::Yellow),
-        (None, Some(TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)))) => {
-            Style::default().fg(Color::Green)
-        }
-        (None, Some(TuiSubmissionState::Status(SubmissionStatus::Finished(_)))) => {
+    match state {
+        UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Unknown) => {
             Style::default().fg(Color::Red)
         }
-        (None, Some(_)) => Style::default().fg(Color::Yellow),
-        (None, None) => Style::default().fg(Color::DarkGray),
+        UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Submitting) => {
+            Style::default().fg(Color::Yellow)
+        }
+        UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+            SubmissionStatus::Finished(Verdict::Accepted),
+        )) => Style::default().fg(Color::Green),
+        UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+            SubmissionStatus::Finished(_),
+        )) => Style::default().fg(Color::Red),
+        UserVisibleSubmissionState::Current(_) => Style::default().fg(Color::Yellow),
     }
 }
 
@@ -2829,14 +2833,14 @@ mod tests {
                     current: None,
                     attempt: Some(TuiSubmissionAttemptState::Submitting),
                 },
-                "NEW A Submitting",
+                "SUB A Submitting",
             ),
             (
                 SubmissionDisplayState {
                     current: Some(TuiSubmissionState::Accepted),
                     attempt: None,
                 },
-                "SUB A Accepted",
+                "SUB A WJ",
             ),
             (
                 SubmissionDisplayState {
@@ -2855,6 +2859,22 @@ mod tests {
                     attempt: None,
                 },
                 "SUB A WR",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Judging)),
+                    attempt: None,
+                },
+                "SUB A Judging",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForJudge,
+                    )),
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "SUB A Submitting",
             ),
             (
                 SubmissionDisplayState {
@@ -2912,7 +2932,7 @@ mod tests {
                     current: None,
                     attempt: Some(TuiSubmissionAttemptState::Unknown),
                 },
-                "NEW A Unknown",
+                "SUB A Unknown",
             ),
             (
                 SubmissionDisplayState {
@@ -2925,7 +2945,7 @@ mod tests {
                     )),
                     attempt: Some(TuiSubmissionAttemptState::Submitting),
                 },
-                "SUB A 14/50 · NEW Submitting",
+                "SUB A Submitting",
             ),
             (
                 SubmissionDisplayState {
@@ -2934,13 +2954,18 @@ mod tests {
                     ))),
                     attempt: Some(TuiSubmissionAttemptState::Unknown),
                 },
-                "SUB A AC · NEW Unknown",
+                "SUB A Unknown",
             ),
         ];
 
         for (state, expected) in cases {
             let rendered = rendered_submission_header(Some(state));
             assert!(rendered.contains(expected), "state={state:?}\n{rendered}");
+            assert!(!rendered.contains("NEW"), "state={state:?}\n{rendered}");
+            assert!(
+                !rendered.contains("Accepted"),
+                "state={state:?}\n{rendered}"
+            );
         }
     }
 
@@ -3783,7 +3808,7 @@ mod tests {
     #[test]
     fn submit_modal_renders_candidates_policy_current_state_and_confirmation_keys() {
         let temp = tempfile::tempdir().unwrap();
-        let modal = SubmitModal {
+        let mut modal = SubmitModal {
             key: crate::tui::submission::SubmissionKey::new("abc123", "abc123_a"),
             problem_index: "A".to_string(),
             problem_title: "Problem A".to_string(),
@@ -3819,6 +3844,25 @@ mod tests {
         assert!(rendered.contains("[Enter] Submit"));
         assert!(rendered.contains("[Esc] Cancel"));
         assert!(!rendered.contains("GCC 15"));
+
+        modal.current_submission = Some(SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Accepted),
+            attempt: None,
+        });
+        let accepted = rendered_submit_text(&app(), &modal, 100, 24);
+        assert!(accepted.contains("Current submission: WJ"));
+        assert!(!accepted.contains("Accepted"));
+
+        modal.current_submission = Some(SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: Some(TuiSubmissionAttemptState::Submitting),
+        });
+        let resubmitting = rendered_submit_text(&app(), &modal, 100, 24);
+        assert!(resubmitting.contains("Current submission: Submitting"));
+        assert!(!resubmitting.contains("Current submission: WJ"));
+        assert!(!resubmitting.contains("NEW"));
     }
 
     #[test]
