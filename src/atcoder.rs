@@ -316,9 +316,28 @@ impl AtCoderClient {
     // ============================================================
 
     fn get_text(http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
+        match Self::get_text_until(http, url, &|| true)? {
+            Some(text) => Ok(text),
+            None => unreachable!("an always-continue GET cannot be cancelled"),
+        }
+    }
+
+    fn get_text_until(
+        http: &HttpSource,
+        url: &str,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<Option<String>, AtCoderError> {
         for retry_count in 0..=MAX_429_RETRIES {
-            wait_for_request_slot(http);
+            if !wait_for_request_slot_until(http, should_continue) {
+                return Ok(None);
+            }
+            if !should_continue() {
+                return Ok(None);
+            }
             let response = http.client.get(url).send()?;
+            if !should_continue() {
+                return Ok(None);
+            }
 
             // 429だけ特別扱い
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -330,7 +349,9 @@ impl AtCoderClient {
 
                 let wait = retry_wait(response.headers());
 
-                thread::sleep(wait);
+                if !interruptible_sleep(wait, should_continue) {
+                    return Ok(None);
+                }
 
                 continue;
             }
@@ -340,7 +361,7 @@ impl AtCoderClient {
 
             let html = response.text()?;
 
-            return Ok(html);
+            return Ok(Some(html));
         }
 
         Err(AtCoderError::RateLimited {
@@ -433,23 +454,72 @@ fn validate_problem_url(url: &str) -> Result<(), AtCoderError> {
     }
 }
 
-fn wait_for_request_slot(http: &HttpSource) {
-    let mut last_request = match http.last_request.lock() {
-        Ok(last_request) => last_request,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    let now = Instant::now();
-    if let Some(wait) = remaining_request_interval(*last_request, now) {
-        thread::sleep(wait);
-    }
-
-    *last_request = Some(Instant::now());
+fn wait_for_request_slot_until(http: &HttpSource, should_continue: &dyn Fn() -> bool) -> bool {
+    reserve_request_slot_until(&http.last_request, REQUEST_INTERVAL, should_continue).is_some()
 }
 
+fn reserve_request_slot_until(
+    last_request: &Mutex<Option<Instant>>,
+    request_interval: Duration,
+    should_continue: &dyn Fn() -> bool,
+) -> Option<Instant> {
+    loop {
+        if !should_continue() {
+            return None;
+        }
+
+        let wait = {
+            let mut last_request = match last_request.lock() {
+                Ok(last_request) => last_request,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !should_continue() {
+                return None;
+            }
+
+            let now = Instant::now();
+            match remaining_request_interval_for(*last_request, now, request_interval) {
+                Some(wait) => wait,
+                None => {
+                    // Reserve while holding the mutex. Concurrent waiters will observe this
+                    // request start and compete for a later slot after sleeping without the lock.
+                    *last_request = Some(now);
+                    return Some(now);
+                }
+            }
+        };
+
+        if !interruptible_sleep(wait, should_continue) {
+            return None;
+        }
+    }
+}
+
+fn interruptible_sleep(duration: Duration, should_continue: &dyn Fn() -> bool) -> bool {
+    const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + duration;
+    while should_continue() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+    }
+    false
+}
+
+#[cfg(test)]
 fn remaining_request_interval(previous: Option<Instant>, now: Instant) -> Option<Duration> {
+    remaining_request_interval_for(previous, now, REQUEST_INTERVAL)
+}
+
+fn remaining_request_interval_for(
+    previous: Option<Instant>,
+    now: Instant,
+    request_interval: Duration,
+) -> Option<Duration> {
     previous
-        .and_then(|previous| REQUEST_INTERVAL.checked_sub(now.saturating_duration_since(previous)))
+        .and_then(|previous| request_interval.checked_sub(now.saturating_duration_since(previous)))
         .filter(|wait| !wait.is_zero())
 }
 
@@ -735,6 +805,8 @@ fn statement_confidently_has_no_normal_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
@@ -1034,6 +1106,120 @@ mod tests {
             None
         );
         assert_eq!(remaining_request_interval(None, previous), None);
+    }
+
+    #[test]
+    fn interruptible_wait_observes_cancellation_without_waiting_for_deadline() {
+        let checks = std::cell::Cell::new(0usize);
+        let started = Instant::now();
+        let completed = interruptible_sleep(Duration::from_secs(60), &|| {
+            checks.set(checks.get() + 1);
+            checks.get() < 3
+        });
+
+        assert!(!completed);
+        assert!(checks.get() >= 3);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn shared_rate_limiter_reserves_strictly_spaced_slots_without_holding_during_sleep() {
+        let last_request = Arc::new(Mutex::new(None));
+        let barrier = Arc::new(Barrier::new(5));
+        let (slot_tx, slot_rx) = mpsc::channel();
+        let interval = Duration::from_millis(8);
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let last_request = Arc::clone(&last_request);
+            let barrier = Arc::clone(&barrier);
+            let slot_tx = slot_tx.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let slot = reserve_request_slot_until(&last_request, interval, &|| true)
+                    .expect("uncancelled waiter should reserve a slot");
+                slot_tx.send(slot).unwrap();
+            }));
+        }
+        barrier.wait();
+        drop(slot_tx);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let mut slots = slot_rx.into_iter().collect::<Vec<_>>();
+        slots.sort_unstable();
+        assert_eq!(slots.len(), 4);
+        for pair in slots.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= interval,
+                "reserved request slots were too close: {:?}",
+                pair[1].duration_since(pair[0])
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_waiter_releases_mutex_and_cancels_without_request() {
+        let previous = Instant::now();
+        let last_request = Arc::new(Mutex::new(Some(previous)));
+        let should_continue = Arc::new(AtomicBool::new(true));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let worker_last_request = Arc::clone(&last_request);
+        let worker_continue = Arc::clone(&should_continue);
+        let worker_checks = Arc::clone(&checks);
+        let worker_requests = Arc::clone(&request_count);
+        let worker = thread::spawn(move || {
+            let reserved =
+                reserve_request_slot_until(&worker_last_request, Duration::from_secs(5), &|| {
+                    if worker_checks.fetch_add(1, Ordering::AcqRel) == 1 {
+                        let _ = waiting_tx.send(());
+                    }
+                    worker_continue.load(Ordering::Acquire)
+                });
+            if reserved.is_some() {
+                worker_requests.fetch_add(1, Ordering::AcqRel);
+            }
+            reserved
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let lock_started = Instant::now();
+        let observed = *last_request.lock().unwrap();
+        assert!(lock_started.elapsed() < Duration::from_millis(100));
+        assert_eq!(observed, Some(previous));
+
+        let cancel_started = Instant::now();
+        should_continue.store(false, Ordering::Release);
+        assert_eq!(worker.join().unwrap(), None);
+        assert!(cancel_started.elapsed() < Duration::from_millis(500));
+        assert_eq!(request_count.load(Ordering::Acquire), 0);
+        assert_eq!(*last_request.lock().unwrap(), Some(previous));
+        assert!(
+            checks.load(Ordering::Acquire) < 20,
+            "rate-limit wait busy-looped"
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_does_not_busy_loop_before_reserving() {
+        let interval = Duration::from_millis(35);
+        let previous = Instant::now();
+        let last_request = Mutex::new(Some(previous));
+        let checks = AtomicUsize::new(0);
+
+        let reserved = reserve_request_slot_until(&last_request, interval, &|| {
+            checks.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap();
+
+        assert!(reserved.duration_since(previous) >= interval);
+        assert!(
+            checks.load(Ordering::Relaxed) < 20,
+            "rate-limit wait busy-looped"
+        );
     }
 
     #[test]

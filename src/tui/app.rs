@@ -545,6 +545,7 @@ impl UserInputState {
 pub struct ProblemState {
     pub index: String,
     pub title: String,
+    pub task_id: String,
     pub sample_cases: usize,
     pub total_cases: usize,
     pub saved_stress_case: Option<SavedStressCaseState>,
@@ -953,6 +954,7 @@ impl WatchApp {
                 ProblemState {
                     index: problem.index.clone(),
                     title: problem.title.clone(),
+                    task_id: problem.task_id.clone(),
                     sample_cases,
                     total_cases: sample_cases + if saved_stress_case.is_some() { 1 } else { 0 },
                     saved_stress_case,

@@ -97,6 +97,7 @@ pub(crate) enum SubmissionTrackingError {
     MalformedSubmissionList(&'static str),
     SubmissionNotFound,
     AmbiguousSubmissionIds,
+    Cancelled,
     StatusPollingTimedOut,
     MalformedStatusJson(serde_json::Error),
     TargetStatusMissing,
@@ -119,6 +120,7 @@ impl fmt::Display for SubmissionTrackingError {
             Self::AmbiguousSubmissionIds => {
                 formatter.write_str("multiple new submission IDs were found")
             }
+            Self::Cancelled => formatter.write_str("submission tracking was cancelled"),
             Self::StatusPollingTimedOut => {
                 formatter.write_str("submission status polling timed out")
             }
@@ -146,6 +148,7 @@ impl std::error::Error for SubmissionTrackingError {
             | Self::MalformedSubmissionList(_)
             | Self::SubmissionNotFound
             | Self::AmbiguousSubmissionIds
+            | Self::Cancelled
             | Self::StatusPollingTimedOut
             | Self::TargetStatusMissing
             | Self::StatusHtmlMissing
@@ -171,12 +174,23 @@ impl AtCoderClient {
         task_id: &str,
         language_id: &str,
     ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
+        self.capture_submission_baseline_until(contest_id, task_id, language_id, &|| true)
+    }
+
+    pub(crate) fn capture_submission_baseline_until(
+        &self,
+        contest_id: &str,
+        task_id: &str,
+        language_id: &str,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => capture_baseline_with_transport(
+            Source::Http(http) => capture_baseline_with_transport_until(
                 &mut HttpTrackingTransport { http },
                 contest_id,
                 task_id,
                 language_id,
+                should_continue,
             ),
             Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
         }
@@ -186,10 +200,20 @@ impl AtCoderClient {
         &self,
         baseline: &SubmissionBaseline,
     ) -> Result<SubmissionId, SubmissionTrackingError> {
+        self.discover_submission_id_until(baseline, &|| true)
+    }
+
+    pub(crate) fn discover_submission_id_until(
+        &self,
+        baseline: &SubmissionBaseline,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<SubmissionId, SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => {
-                discover_submission_with_transport(&mut HttpTrackingTransport { http }, baseline)
-            }
+            Source::Http(http) => discover_submission_with_transport_until(
+                &mut HttpTrackingTransport { http },
+                baseline,
+                should_continue,
+            ),
             Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
         }
     }
@@ -200,12 +224,23 @@ impl AtCoderClient {
         submission_id: SubmissionId,
         on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
     ) -> Result<(), SubmissionTrackingError> {
+        self.watch_submission_until(contest_id, submission_id, on_status, &|| true)
+    }
+
+    pub(crate) fn watch_submission_until(
+        &self,
+        contest_id: &str,
+        submission_id: SubmissionId,
+        on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<(), SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => watch_submission_with_transport(
+            Source::Http(http) => watch_submission_with_transport_until(
                 &mut HttpTrackingTransport { http },
                 contest_id,
                 submission_id,
                 on_status,
+                should_continue,
             ),
             Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
         }
@@ -215,6 +250,29 @@ impl AtCoderClient {
 trait TrackingTransport {
     fn get_text(&mut self, path: &str) -> Result<String, SubmissionTrackingError>;
     fn wait(&mut self, duration: Duration);
+
+    fn get_text_until(
+        &mut self,
+        path: &str,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<String, SubmissionTrackingError> {
+        if !should_continue() {
+            return Err(SubmissionTrackingError::Cancelled);
+        }
+        let text = self.get_text(path)?;
+        if !should_continue() {
+            return Err(SubmissionTrackingError::Cancelled);
+        }
+        Ok(text)
+    }
+
+    fn wait_while(&mut self, duration: Duration, should_continue: &dyn Fn() -> bool) -> bool {
+        if !should_continue() {
+            return false;
+        }
+        self.wait(duration);
+        should_continue()
+    }
 }
 
 struct HttpTrackingTransport<'a> {
@@ -237,18 +295,58 @@ impl TrackingTransport for HttpTrackingTransport<'_> {
     fn wait(&mut self, duration: Duration) {
         thread::sleep(duration);
     }
+
+    fn get_text_until(
+        &mut self,
+        path: &str,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<String, SubmissionTrackingError> {
+        AtCoderClient::get_text_until(self.http, &format!("{BASE_URL}{path}"), should_continue)
+            .map_err(SubmissionTrackingError::Fetch)?
+            .ok_or(SubmissionTrackingError::Cancelled)
+    }
+
+    fn wait_while(&mut self, duration: Duration, should_continue: &dyn Fn() -> bool) -> bool {
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + duration;
+        while should_continue() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+        }
+        false
+    }
 }
 
+#[cfg(test)]
 fn capture_baseline_with_transport(
     transport: &mut impl TrackingTransport,
     contest_id: &str,
     task_id: &str,
     language_id: &str,
 ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
+    capture_baseline_with_transport_until(transport, contest_id, task_id, language_id, &|| true)
+}
+
+fn capture_baseline_with_transport_until(
+    transport: &mut impl TrackingTransport,
+    contest_id: &str,
+    task_id: &str,
+    language_id: &str,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<SubmissionBaseline, SubmissionTrackingError> {
+    if !should_continue() {
+        return Err(SubmissionTrackingError::Cancelled);
+    }
     validate_identifier(contest_id, "contest ID")?;
     validate_identifier(task_id, "task ID")?;
     validate_identifier(language_id, "language ID")?;
-    let html = transport.get_text(&submission_list_path(contest_id, task_id, language_id))?;
+    let html = transport.get_text_until(
+        &submission_list_path(contest_id, task_id, language_id),
+        should_continue,
+    )?;
     let ids = parse_submission_list(contest_id, task_id, language_id, &html)?;
 
     Ok(SubmissionBaseline {
@@ -259,18 +357,33 @@ fn capture_baseline_with_transport(
     })
 }
 
+#[cfg(test)]
 fn discover_submission_with_transport(
     transport: &mut impl TrackingTransport,
     baseline: &SubmissionBaseline,
 ) -> Result<SubmissionId, SubmissionTrackingError> {
+    discover_submission_with_transport_until(transport, baseline, &|| true)
+}
+
+fn discover_submission_with_transport_until(
+    transport: &mut impl TrackingTransport,
+    baseline: &SubmissionBaseline,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<SubmissionId, SubmissionTrackingError> {
     let mut observed_new_ids = BTreeSet::new();
 
     for attempt in 0..DISCOVERY_ATTEMPTS {
-        let html = transport.get_text(&submission_list_path(
-            &baseline.contest_id,
-            &baseline.task_id,
-            &baseline.language_id,
-        ))?;
+        if !should_continue() {
+            return Err(SubmissionTrackingError::Cancelled);
+        }
+        let html = transport.get_text_until(
+            &submission_list_path(
+                &baseline.contest_id,
+                &baseline.task_id,
+                &baseline.language_id,
+            ),
+            should_continue,
+        )?;
         let ids = parse_submission_list(
             &baseline.contest_id,
             &baseline.task_id,
@@ -279,8 +392,10 @@ fn discover_submission_with_transport(
         )?;
         observed_new_ids.extend(ids.difference(&baseline.ids).copied());
 
-        if attempt + 1 < DISCOVERY_ATTEMPTS {
-            transport.wait(DISCOVERY_INTERVAL);
+        if attempt + 1 < DISCOVERY_ATTEMPTS
+            && !transport.wait_while(DISCOVERY_INTERVAL, should_continue)
+        {
+            return Err(SubmissionTrackingError::Cancelled);
         }
     }
 
@@ -298,17 +413,32 @@ fn discover_submission_with_transport(
     }
 }
 
+#[cfg(test)]
 fn watch_submission_with_transport(
     transport: &mut impl TrackingTransport,
     contest_id: &str,
     submission_id: SubmissionId,
     on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
 ) -> Result<(), SubmissionTrackingError> {
+    watch_submission_with_transport_until(transport, contest_id, submission_id, on_status, &|| true)
+}
+
+fn watch_submission_with_transport_until(
+    transport: &mut impl TrackingTransport,
+    contest_id: &str,
+    submission_id: SubmissionId,
+    on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<(), SubmissionTrackingError> {
     validate_identifier(contest_id, "contest ID")?;
     let mut previous = None;
 
     for attempt in 0..STATUS_POLL_ATTEMPTS {
-        let json = transport.get_text(&status_path(contest_id, submission_id))?;
+        if !should_continue() {
+            return Err(SubmissionTrackingError::Cancelled);
+        }
+        let json =
+            transport.get_text_until(&status_path(contest_id, submission_id), should_continue)?;
         let status = parse_status_response(submission_id, &json)?;
         let finished = matches!(status, SubmissionStatus::Finished(_));
 
@@ -323,8 +453,10 @@ fn watch_submission_with_transport(
             return Ok(());
         }
 
-        if attempt + 1 < STATUS_POLL_ATTEMPTS {
-            transport.wait(STATUS_POLL_INTERVAL);
+        if attempt + 1 < STATUS_POLL_ATTEMPTS
+            && !transport.wait_while(STATUS_POLL_INTERVAL, should_continue)
+        {
+            return Err(SubmissionTrackingError::Cancelled);
         }
     }
 
@@ -1350,6 +1482,35 @@ mod tests {
 
         assert_eq!(transport.paths.len(), 1);
         assert!(transport.waits.is_empty());
+    }
+
+    #[test]
+    fn cancellation_is_checked_between_unchanged_status_polls() {
+        use std::cell::Cell;
+
+        let mut transport = ScriptedTransport::new([STATUS_WJ, STATUS_WJ]);
+        let checks = Cell::new(0);
+        let should_continue = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next < 5
+        };
+        let mut observed = Vec::new();
+        let result = watch_submission_with_transport_until(
+            &mut transport,
+            "abc473",
+            SubmissionId(78905773),
+            &mut |status| {
+                observed.push(*status);
+                true
+            },
+            &should_continue,
+        );
+
+        assert!(matches!(result, Err(SubmissionTrackingError::Cancelled)));
+        assert_eq!(observed, [SubmissionStatus::WaitingForJudge]);
+        assert_eq!(transport.paths.len(), 1);
+        assert_eq!(transport.waits, [STATUS_POLL_INTERVAL]);
     }
 
     #[test]

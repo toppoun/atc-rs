@@ -6,6 +6,7 @@ mod detail_scrollbar;
 pub mod message;
 mod mouse;
 pub mod reporter;
+mod submission;
 mod termina_adapter;
 mod terminal;
 pub mod view;
@@ -23,7 +24,7 @@ use crate::app_context::AppContext;
 use crate::config::Config;
 use crate::editor::{self, EditorLaunchMode, ResolvedEditor};
 use crate::error::AppError;
-use crate::language::Language;
+use crate::language::{Language, PythonRuntime};
 use crate::model::Contest;
 use crate::ui::{Event, Reporter};
 use app::WatchApp;
@@ -37,6 +38,7 @@ use message::{Message, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
+pub(crate) use submission::SubmissionHub;
 pub(crate) use terminal::TerminaSession;
 use terminal::{
     KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind, TerminalEvent,
@@ -76,6 +78,7 @@ impl FrontendPreferences {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrontendAction {
     RunTests,
+    Submit,
     OpenSource,
     OpenSettings,
     OpenWorkspaceSettings,
@@ -90,8 +93,9 @@ pub(super) enum FrontendAction {
 }
 
 impl FrontendAction {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::RunTests,
+        Self::Submit,
         Self::OpenSource,
         Self::OpenSettings,
         Self::OpenWorkspaceSettings,
@@ -108,6 +112,7 @@ impl FrontendAction {
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::RunTests => "Run Tests",
+            Self::Submit => "Submit",
             Self::OpenSource => "Open Source",
             Self::OpenSettings => "Open Settings",
             Self::OpenWorkspaceSettings => "Open Workspace Settings",
@@ -125,6 +130,7 @@ impl FrontendAction {
     pub(super) const fn shortcut(self) -> Option<&'static str> {
         match self {
             Self::RunTests => Some("r"),
+            Self::Submit => Some("t"),
             Self::OpenSource => None,
             Self::OpenSettings | Self::OpenWorkspaceSettings | Self::OpenTemplate => None,
             Self::ToggleDebug => Some("d"),
@@ -143,6 +149,9 @@ impl FrontendAction {
                 FrontendActionAvailability::Unavailable(REFRESH_EDIT_NOTICE)
             }
             Self::OpenSource if app.current_problem().is_none() => {
+                FrontendActionAvailability::Unavailable("no selected problem")
+            }
+            Self::Submit if app.current_problem().is_none() => {
                 FrontendActionAvailability::Unavailable("no selected problem")
             }
             Self::RunTests | Self::StartStress
@@ -180,6 +189,7 @@ impl FrontendAction {
                 FrontendActionAvailability::Unavailable("not in a workspace")
             }
             Self::RunTests
+            | Self::Submit
             | Self::OpenSource
             | Self::OpenSettings
             | Self::OpenWorkspaceSettings
@@ -201,6 +211,11 @@ impl FrontendAction {
 
         match key.code {
             KeyCode::Char('r') => Some(Self::RunTests),
+            KeyCode::Char('t')
+                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
+            {
+                Some(Self::Submit)
+            }
             KeyCode::Char('d') => Some(Self::ToggleDebug),
             KeyCode::Char('s') => Some(Self::ToggleSamples),
             KeyCode::Char('S') => Some(Self::StartStress),
@@ -238,9 +253,36 @@ impl OpenSourceModal {
     }
 
     pub(super) fn current_language(&self, app: &WatchApp) -> Option<Language> {
-        let source = app.problems().get(self.problem)?.source.as_ref()?;
-        (self.path_for(source.language).ok()? == source.path).then_some(source.language)
+        canonical_current_source_language(&self.source_root, app, self.problem)
     }
+}
+
+fn canonical_current_source_language(
+    destination: &Path,
+    app: &WatchApp,
+    problem: usize,
+) -> Option<Language> {
+    let problem = app.problems().get(problem)?;
+    let source = problem.source.as_ref()?;
+    crate::workspace::source_file_path(destination, &problem.index, source.language)
+        .ok()
+        .filter(|path| *path == source.path)
+        .map(|_| source.language)
+}
+
+fn current_submission_key(app: &WatchApp) -> Option<submission::SubmissionKey> {
+    let problem = app.current_problem()?;
+    Some(submission::SubmissionKey::new(
+        app.contest_id(),
+        &problem.task_id,
+    ))
+}
+
+fn current_submission_state(
+    app: &WatchApp,
+    hub: &SubmissionHub,
+) -> Option<submission::SubmissionDisplayState> {
+    hub.state(&current_submission_key(app)?)
 }
 
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
@@ -287,12 +329,8 @@ impl OpenSourceController {
             return false;
         };
         let problem_index = problem.index.clone();
-        let current_language = problem.source.as_ref().and_then(|source| {
-            crate::workspace::source_file_path(&self.destination, &problem_index, source.language)
-                .ok()
-                .filter(|path| *path == source.path)
-                .map(|_| source.language)
-        });
+        let current_language =
+            canonical_current_source_language(&self.destination, app, problem_number);
         self.modal = Some(OpenSourceModal {
             problem: problem_number,
             problem_index,
@@ -418,6 +456,267 @@ impl OpenSourceController {
             modal.error = Some(error);
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmitSourceCandidate {
+    pub(super) language: Language,
+    pub(super) path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmitModal {
+    key: submission::SubmissionKey,
+    pub(super) problem_index: String,
+    pub(super) problem_title: String,
+    pub(super) candidates: Vec<SubmitSourceCandidate>,
+    selected: usize,
+    python_runtime: PythonRuntime,
+    starting_generation: Option<u64>,
+    pub(super) current_submission: Option<submission::SubmissionDisplayState>,
+    pub(super) error: Option<String>,
+}
+
+impl SubmitModal {
+    pub(super) fn selected_candidate(&self) -> Option<&SubmitSourceCandidate> {
+        self.candidates.get(self.selected)
+    }
+
+    pub(super) fn policy_label(&self) -> Option<String> {
+        self.selected_candidate()
+            .map(|candidate| match candidate.language {
+                Language::Cpp => "C++ / GCC (latest available)".to_string(),
+                Language::Python => format!("Python / {}", self.python_runtime.display_name()),
+            })
+    }
+
+    pub(super) fn is_starting(&self) -> bool {
+        self.starting_generation.is_some()
+    }
+}
+
+#[derive(Debug)]
+struct SubmitController {
+    destination: PathBuf,
+    default_language: Language,
+    python_runtime: PythonRuntime,
+    modal: Option<SubmitModal>,
+}
+
+impl SubmitController {
+    fn new(destination: &Path, default_language: Language, python_runtime: PythonRuntime) -> Self {
+        Self {
+            destination: destination.to_path_buf(),
+            default_language,
+            python_runtime,
+            modal: None,
+        }
+    }
+
+    fn modal(&self) -> Option<&SubmitModal> {
+        self.modal.as_ref()
+    }
+
+    fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    fn close(&mut self) {
+        self.modal = None;
+    }
+
+    fn open(&mut self, app: &WatchApp, hub: &SubmissionHub) -> bool {
+        let Some(problem_number) = app.selected_problem() else {
+            return false;
+        };
+        let Some(problem) = app.problems().get(problem_number) else {
+            return false;
+        };
+        let key = submission::SubmissionKey::new(app.contest_id(), &problem.task_id);
+        let current = canonical_current_source_language(&self.destination, app, problem_number);
+        let (candidates, inspection_error) =
+            submit_source_candidates(&self.destination, &problem.index);
+        let selected = initial_submit_candidate(&candidates, current, self.default_language);
+        let error = hub
+            .ensure_start_allowed(&key)
+            .err()
+            .map(str::to_owned)
+            .or(inspection_error)
+            .or_else(|| {
+                candidates
+                    .is_empty()
+                    .then(|| "No submit-capable source file exists for this problem.".to_string())
+            });
+        self.modal = Some(SubmitModal {
+            key: key.clone(),
+            problem_index: problem.index.clone(),
+            problem_title: problem.title.clone(),
+            candidates,
+            selected,
+            python_runtime: self.python_runtime,
+            starting_generation: None,
+            current_submission: hub.state(&key),
+            error,
+        });
+        true
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, app: &WatchApp, hub: &mut SubmissionHub) -> bool {
+        self.handle_key_with_start(key, app, |key, plan| hub.start(key, plan))
+    }
+
+    fn handle_key_with_start(
+        &mut self,
+        key: KeyEvent,
+        app: &WatchApp,
+        start: impl FnOnce(
+            submission::SubmissionKey,
+            crate::commands::submit::SubmitPlan,
+        ) -> Result<u64, String>,
+    ) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
+            self.close();
+            return true;
+        }
+        let modal = self.modal.as_mut().expect("active Submit modal must exist");
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if !modal.is_starting() => {
+                if modal.candidates.is_empty() {
+                    return false;
+                }
+                modal.selected = if modal.selected == 0 {
+                    modal.candidates.len() - 1
+                } else {
+                    modal.selected - 1
+                };
+                modal.error = None;
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') if !modal.is_starting() => {
+                if modal.candidates.is_empty() {
+                    return false;
+                }
+                modal.selected = (modal.selected + 1) % modal.candidates.len();
+                modal.error = None;
+                true
+            }
+            KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                Self::confirm_with(modal, app, start)
+            }
+            _ => false,
+        }
+    }
+
+    fn confirm_with(
+        modal: &mut SubmitModal,
+        app: &WatchApp,
+        start: impl FnOnce(
+            submission::SubmissionKey,
+            crate::commands::submit::SubmitPlan,
+        ) -> Result<u64, String>,
+    ) -> bool {
+        if modal.is_starting() {
+            modal.error = Some("Submission is already being started for this problem.".to_string());
+            return true;
+        }
+        let Some(candidate) = modal.selected_candidate().cloned() else {
+            modal.error =
+                Some("No submit-capable source file exists for this problem.".to_string());
+            return true;
+        };
+        let Some(problem) = app.problems().iter().find(|problem| {
+            problem.index == modal.problem_index && problem.task_id == modal.key.task_id
+        }) else {
+            modal.error = Some("Selected problem metadata is no longer available.".to_string());
+            return true;
+        };
+        let plan = crate::commands::submit::SubmitPlan::for_selected_source(
+            modal.key.contest_id.clone(),
+            problem.task_id.clone(),
+            problem.index.clone(),
+            candidate.path,
+            candidate.language,
+            modal.python_runtime,
+        );
+        match start(modal.key.clone(), plan) {
+            Ok(generation) => {
+                modal.starting_generation = Some(generation);
+                modal.error = None;
+            }
+            Err(error) => modal.error = Some(error),
+        }
+        true
+    }
+
+    fn reconcile(&mut self, hub: &SubmissionHub) -> bool {
+        let Some(modal) = self.modal.as_mut() else {
+            return false;
+        };
+        modal.current_submission = hub.state(&modal.key);
+        let Some(generation) = modal.starting_generation else {
+            return false;
+        };
+        match hub.attempt_resolution(&modal.key, generation) {
+            Some(submission::AttemptResolution::Pending) | None => false,
+            Some(submission::AttemptResolution::Accepted) => {
+                self.close();
+                true
+            }
+            Some(submission::AttemptResolution::Failed(error)) => {
+                modal.starting_generation = None;
+                modal.error = Some(error);
+                true
+            }
+            Some(submission::AttemptResolution::Unknown) => {
+                modal.starting_generation = None;
+                modal.error = Some(
+                    "Submission outcome is unknown.\nCheck My Submissions before retrying."
+                        .to_string(),
+                );
+                true
+            }
+        }
+    }
+}
+
+fn submit_source_candidates(
+    destination: &Path,
+    problem_index: &str,
+) -> (Vec<SubmitSourceCandidate>, Option<String>) {
+    let mut candidates = Vec::new();
+    let mut error = None;
+    for language in Language::ALL {
+        match crate::workspace::source_file_path(destination, problem_index, language) {
+            Ok(path) if path.is_file() => candidates.push(SubmitSourceCandidate { language, path }),
+            Ok(_) => {}
+            Err(source) => {
+                error.get_or_insert_with(|| source.to_string());
+            }
+        }
+    }
+    (candidates, error)
+}
+
+fn initial_submit_candidate(
+    candidates: &[SubmitSourceCandidate],
+    current: Option<Language>,
+    default: Language,
+) -> usize {
+    current
+        .and_then(|language| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.language == language)
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.language == default)
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -2056,7 +2355,21 @@ pub(crate) struct SessionRuntime<'a> {
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
     user_inputs: Vec<app::UserInputState>,
+    execution: SessionExecution<'a>,
+}
+
+pub(crate) struct SessionExecution<'a> {
     channels: SessionChannels<'a>,
+    submissions: &'a mut SubmissionHub,
+}
+
+impl<'a> SessionExecution<'a> {
+    pub(crate) fn new(channels: SessionChannels<'a>, submissions: &'a mut SubmissionHub) -> Self {
+        Self {
+            channels,
+            submissions,
+        }
+    }
 }
 
 pub(crate) struct SessionFrontend<R> {
@@ -2093,7 +2406,7 @@ impl<'a> SessionRuntime<'a> {
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
         user_inputs: Vec<app::UserInputState>,
-        channels: SessionChannels<'a>,
+        execution: SessionExecution<'a>,
     ) -> Self {
         Self {
             current_destination,
@@ -2102,7 +2415,7 @@ impl<'a> SessionRuntime<'a> {
             sample_counts,
             stress_cases,
             user_inputs,
-            channels,
+            execution,
         }
     }
 }
@@ -2134,6 +2447,7 @@ struct FrontendInputContext<'run, 'controller, 'resolver, 'palette, 'editor> {
     contest_refresh: Option<&'controller mut RefreshContestController>,
     command_palette: Option<&'palette mut CommandPalette>,
     open_source: Option<OpenSourceInputContext<'palette>>,
+    submit: Option<SubmitInputContext<'palette>>,
     editor_targets: Option<&'palette mut EditorTargetController>,
     editor: Option<EditorInputContext<'editor>>,
 }
@@ -2141,6 +2455,11 @@ struct FrontendInputContext<'run, 'controller, 'resolver, 'palette, 'editor> {
 struct OpenSourceInputContext<'a> {
     controller: &'a mut OpenSourceController,
     creator: &'a mut dyn SourceCreator,
+}
+
+struct SubmitInputContext<'a> {
+    controller: &'a mut SubmitController,
+    hub: &'a mut SubmissionHub,
 }
 
 struct StressInitializationReporter;
@@ -2676,13 +2995,19 @@ fn send_detail_analysis_command(
     })
 }
 
+struct BackgroundControllers<'a, 'resolver> {
+    contest_switch: &'a mut ContestSwitchController<'resolver>,
+    contest_refresh: &'a mut RefreshContestController,
+    submissions: &'a mut SubmissionHub,
+    submit: &'a mut SubmitController,
+}
+
 fn handle_background_events(
     app: &mut WatchApp,
     terminal_events: &VecDeque<TerminalEvent>,
     destination: &Path,
     channels: SessionChannels<'_>,
-    contest_switch: &mut ContestSwitchController<'_>,
-    contest_refresh: &mut RefreshContestController,
+    controllers: BackgroundControllers<'_, '_>,
     detail_layout: &mut detail_layout::DetailLayout,
 ) -> io::Result<bool> {
     // A delivered terminal batch owns its routing state until it is consumed. It can yield
@@ -2697,12 +3022,14 @@ fn handle_background_events(
         channels.run_tx,
         Some(destination),
     )?;
-    changed |= contest_switch.handle_operation_messages();
-    if contest_switch.switch_requested {
+    changed |= controllers.submissions.handle_events();
+    changed |= controllers.submit.reconcile(controllers.submissions);
+    changed |= controllers.contest_switch.handle_operation_messages();
+    if controllers.contest_switch.switch_requested {
         return Ok(changed);
     }
-    changed |= contest_refresh.handle_operation_messages();
-    if contest_refresh.refresh_requested {
+    changed |= controllers.contest_refresh.handle_operation_messages();
+    if controllers.contest_refresh.refresh_requested {
         // Capture the latest source transition before the outer shutdown/apply lifecycle.
         changed |= handle_messages_with_destination(
             app,
@@ -2745,12 +3072,16 @@ where
         sample_counts,
         stress_cases,
         user_inputs,
-        channels:
-            SessionChannels {
-                message_rx,
-                run_tx,
-                detail_analysis_tx,
-                detail_analysis_rx,
+        execution:
+            SessionExecution {
+                channels:
+                    SessionChannels {
+                        message_rx,
+                        run_tx,
+                        detail_analysis_tx,
+                        detail_analysis_rx,
+                    },
+                submissions,
             },
     } = runtime;
     let mut app = WatchApp::new_with_session_data(
@@ -2780,6 +3111,11 @@ where
     );
     let mut command_palette = CommandPalette::default();
     let mut open_source = OpenSourceController::new(current_destination, config.defaults.language);
+    let mut submit = SubmitController::new(
+        current_destination,
+        config.defaults.language,
+        config.submit.python_runtime,
+    );
     let mut editor_targets = EditorTargetController::new(
         current_destination,
         config.defaults.language,
@@ -2807,7 +3143,7 @@ where
             contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
-            editor_targets.modal_active(),
+            editor_targets.modal_active() || submit.modal_active(),
         ) {
             app.quit();
             break;
@@ -2826,8 +3162,12 @@ where
             &terminal_events,
             current_destination,
             SessionChannels::new(message_rx, run_tx, detail_analysis_tx, detail_analysis_rx),
-            &mut contest_switch,
-            &mut contest_refresh,
+            BackgroundControllers {
+                contest_switch: &mut contest_switch,
+                contest_refresh: &mut contest_refresh,
+                submissions,
+                submit: &mut submit,
+            },
             &mut detail_layout,
         )? {
             dirty = true;
@@ -2848,7 +3188,7 @@ where
             contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
-            editor_targets.modal_active(),
+            editor_targets.modal_active() || submit.modal_active(),
         ) {
             app.quit();
             break;
@@ -2880,6 +3220,8 @@ where
                         switch_modal: contest_switch.modal(),
                         refresh_modal: contest_refresh.modal(),
                         source_modal: open_source.modal(),
+                        submit_modal: submit.modal(),
+                        submission_state: current_submission_state(&app, submissions),
                         editor_target_modal: editor_targets.modal(),
                         command_palette: command_palette.is_active().then_some(&command_palette),
                     },
@@ -2931,7 +3273,7 @@ where
             contest_refresh.modal().map(|modal| modal.state),
             &command_palette,
             &open_source,
-            editor_targets.modal_active(),
+            editor_targets.modal_active() || submit.modal_active(),
         ) {
             app.quit();
             continue;
@@ -2960,6 +3302,10 @@ where
                 open_source: Some(OpenSourceInputContext {
                     controller: &mut open_source,
                     creator: &mut creator,
+                }),
+                submit: Some(SubmitInputContext {
+                    controller: &mut submit,
+                    hub: submissions,
                 }),
                 editor_targets: Some(&mut editor_targets),
                 editor: Some(EditorInputContext {
@@ -3150,6 +3496,7 @@ fn contains_global_quit_event(
                     }
                     FrontendAction::SwitchContest => contest_modal_active = true,
                     FrontendAction::OpenSource => source_modal_active = true,
+                    FrontendAction::Submit => editor_target_modal_active = true,
                     FrontendAction::OpenSettings
                     | FrontendAction::OpenWorkspaceSettings
                     | FrontendAction::OpenTemplate => editor_target_modal_active = true,
@@ -3258,6 +3605,7 @@ fn handle_terminal_events(
             contest_refresh: None,
             command_palette: None,
             open_source: None,
+            submit: None,
             editor_targets: None,
             editor: None,
         },
@@ -3403,6 +3751,19 @@ fn handle_terminal_event_with_mouse_mode(
 
     if let TerminalEvent::Key(key) = terminal_event
         && input
+            .submit
+            .as_ref()
+            .is_some_and(|submit| submit.controller.modal_active())
+    {
+        let submit = input
+            .submit
+            .as_mut()
+            .expect("active Submit controller must exist");
+        return Ok(submit.controller.handle_key(key, app, submit.hub));
+    }
+
+    if let TerminalEvent::Key(key) = terminal_event
+        && input
             .open_source
             .as_ref()
             .is_some_and(|source| source.controller.modal_active())
@@ -3469,13 +3830,16 @@ fn handle_terminal_event_with_mouse_mode(
                     app,
                     action,
                     input.terminal,
-                    input.contest_switch.as_deref_mut(),
-                    input.contest_refresh.as_deref_mut(),
-                    input
-                        .open_source
-                        .as_mut()
-                        .map(|source| &mut *source.controller),
-                    input.editor_targets.as_deref_mut(),
+                    FrontendActionControllers {
+                        contest_switch: input.contest_switch.as_deref_mut(),
+                        contest_refresh: input.contest_refresh.as_deref_mut(),
+                        open_source: input
+                            .open_source
+                            .as_mut()
+                            .map(|source| &mut *source.controller),
+                        submit: input.submit.as_mut(),
+                        editor_targets: input.editor_targets.as_deref_mut(),
+                    },
                 );
             }
         }
@@ -3497,6 +3861,10 @@ fn handle_terminal_event_with_mouse_mode(
             .open_source
             .as_ref()
             .is_some_and(|source| source.controller.modal_active())
+        || input
+            .submit
+            .as_ref()
+            .is_some_and(|submit| submit.controller.modal_active())
         || input
             .editor_targets
             .as_ref()
@@ -3585,6 +3953,7 @@ fn handle_key_event_with_stress_context(
             contest_refresh: None,
             command_palette: None,
             open_source: None,
+            submit: None,
             editor_targets: None,
             editor: None,
         },
@@ -3646,13 +4015,16 @@ fn handle_key_event_after_delete_disarm(
             app,
             action,
             input.terminal,
-            input.contest_switch.as_deref_mut(),
-            input.contest_refresh.as_deref_mut(),
-            input
-                .open_source
-                .as_mut()
-                .map(|source| &mut *source.controller),
-            input.editor_targets.as_deref_mut(),
+            FrontendActionControllers {
+                contest_switch: input.contest_switch.as_deref_mut(),
+                contest_refresh: input.contest_refresh.as_deref_mut(),
+                open_source: input
+                    .open_source
+                    .as_mut()
+                    .map(|source| &mut *source.controller),
+                submit: input.submit.as_mut(),
+                editor_targets: input.editor_targets.as_deref_mut(),
+            },
         );
     }
 
@@ -4056,15 +4428,28 @@ fn handle_user_input_editor_key(
     }
 }
 
+#[derive(Default)]
+struct FrontendActionControllers<'controller, 'resolver, 'modal, 'submission> {
+    contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
+    contest_refresh: Option<&'controller mut RefreshContestController>,
+    open_source: Option<&'modal mut OpenSourceController>,
+    submit: Option<&'modal mut SubmitInputContext<'submission>>,
+    editor_targets: Option<&'modal mut EditorTargetController>,
+}
+
 fn execute_frontend_action(
     app: &mut WatchApp,
     action: FrontendAction,
     input: TerminalInputContext<'_>,
-    contest_switch: Option<&mut ContestSwitchController<'_>>,
-    contest_refresh: Option<&mut RefreshContestController>,
-    open_source: Option<&mut OpenSourceController>,
-    editor_targets: Option<&mut EditorTargetController>,
+    controllers: FrontendActionControllers<'_, '_, '_, '_>,
 ) -> io::Result<bool> {
+    let FrontendActionControllers {
+        contest_switch,
+        contest_refresh,
+        open_source,
+        submit,
+        editor_targets,
+    } = controllers;
     app.disarm_user_input_delete();
     match action {
         FrontendAction::RunTests => {
@@ -4074,14 +4459,29 @@ fn execute_frontend_action(
             queue_problem_run(app, problem, input.run_tx)
         }
         FrontendAction::OpenSource => {
+            if let Some(submit) = submit {
+                submit.controller.close();
+            }
             if let Some(targets) = editor_targets {
                 targets.close();
             }
             Ok(open_source.is_some_and(|controller| controller.open(app)))
         }
+        FrontendAction::Submit => {
+            if let Some(source) = open_source {
+                source.close();
+            }
+            if let Some(targets) = editor_targets {
+                targets.close();
+            }
+            Ok(submit.is_some_and(|submit| submit.controller.open(app, submit.hub)))
+        }
         FrontendAction::OpenSettings => {
             if let Some(source) = open_source {
                 source.close();
+            }
+            if let Some(submit) = submit {
+                submit.controller.close();
             }
             Ok(editor_targets.is_some_and(EditorTargetController::open_settings))
         }
@@ -4089,11 +4489,17 @@ fn execute_frontend_action(
             if let Some(source) = open_source {
                 source.close();
             }
+            if let Some(submit) = submit {
+                submit.controller.close();
+            }
             Ok(editor_targets.is_some_and(EditorTargetController::open_workspace_settings))
         }
         FrontendAction::OpenTemplate => {
             if let Some(source) = open_source {
                 source.close();
+            }
+            if let Some(submit) = submit {
+                submit.controller.close();
             }
             Ok(editor_targets.is_some_and(|controller| controller.open_template(app)))
         }
@@ -4707,6 +5113,7 @@ mod tests {
                 contest_refresh: None,
                 command_palette: Some(command_palette),
                 open_source: None,
+                submit: None,
                 editor_targets: None,
                 editor: None,
             },
@@ -4855,6 +5262,7 @@ mod tests {
                     controller,
                     creator,
                 }),
+                submit: None,
                 editor_targets: None,
                 editor: Some(EditorInputContext {
                     host: editor,
@@ -4905,6 +5313,7 @@ mod tests {
                 contest_refresh: None,
                 command_palette,
                 open_source: None,
+                submit: None,
                 editor_targets: Some(controller),
                 editor: Some(EditorInputContext {
                     host: editor,
@@ -5015,6 +5424,7 @@ mod tests {
                 contest_refresh: Some(refresh),
                 command_palette: palette,
                 open_source: None,
+                submit: None,
                 editor_targets: None,
                 editor: None,
             },
@@ -5132,7 +5542,7 @@ mod tests {
             palette.handle_key(key(KeyCode::Down, KeyEventKind::Press)),
             CommandPaletteKeyResult::Handled(true)
         );
-        assert_eq!(palette.selected_action(), Some(FrontendAction::OpenSource));
+        assert_eq!(palette.selected_action(), Some(FrontendAction::Submit));
         palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
         assert_eq!(palette.selected_action(), Some(FrontendAction::RunTests));
         palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
@@ -5245,6 +5655,7 @@ mod tests {
             FrontendAction::ALL,
             [
                 FrontendAction::RunTests,
+                FrontendAction::Submit,
                 FrontendAction::OpenSource,
                 FrontendAction::OpenSettings,
                 FrontendAction::OpenWorkspaceSettings,
@@ -5361,6 +5772,286 @@ mod tests {
                 temp.path().join("A.py")
             );
         }
+    }
+
+    #[test]
+    fn submit_candidates_and_initial_selection_follow_current_then_default_then_first() {
+        struct Case {
+            cpp: bool,
+            python: bool,
+            current: Option<Language>,
+            default: Language,
+            expected: Option<Language>,
+        }
+        for case in [
+            Case {
+                cpp: true,
+                python: false,
+                current: None,
+                default: Language::Python,
+                expected: Some(Language::Cpp),
+            },
+            Case {
+                cpp: false,
+                python: true,
+                current: None,
+                default: Language::Cpp,
+                expected: Some(Language::Python),
+            },
+            Case {
+                cpp: true,
+                python: true,
+                current: Some(Language::Cpp),
+                default: Language::Python,
+                expected: Some(Language::Cpp),
+            },
+            Case {
+                cpp: true,
+                python: true,
+                current: Some(Language::Python),
+                default: Language::Cpp,
+                expected: Some(Language::Python),
+            },
+            Case {
+                cpp: true,
+                python: true,
+                current: None,
+                default: Language::Python,
+                expected: Some(Language::Python),
+            },
+            Case {
+                cpp: false,
+                python: true,
+                current: Some(Language::Cpp),
+                default: Language::Python,
+                expected: Some(Language::Python),
+            },
+            Case {
+                cpp: true,
+                python: false,
+                current: Some(Language::Python),
+                default: Language::Python,
+                expected: Some(Language::Cpp),
+            },
+            Case {
+                cpp: false,
+                python: false,
+                current: None,
+                default: Language::Cpp,
+                expected: None,
+            },
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            if case.cpp {
+                fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
+            }
+            if case.python {
+                fs::write(temp.path().join("A.py"), "python\n").unwrap();
+            }
+            let mut app = app();
+            if let Some(current) = case.current {
+                let path = crate::workspace::source_file_path(temp.path(), "A", current).unwrap();
+                app.source_changed(0, path, current);
+            }
+            let hub = SubmissionHub::new();
+            let mut controller =
+                SubmitController::new(temp.path(), case.default, PythonRuntime::CPython);
+            assert!(controller.open(&app, &hub));
+            assert_eq!(
+                controller
+                    .modal()
+                    .unwrap()
+                    .selected_candidate()
+                    .map(|candidate| candidate.language),
+                case.expected
+            );
+            assert_eq!(
+                controller.modal().unwrap().candidates.len(),
+                usize::from(case.cpp) + usize::from(case.python)
+            );
+        }
+    }
+
+    #[test]
+    fn submit_and_open_source_share_the_exact_canonical_current_path_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let cpp = temp.path().join("A.cpp");
+        let python = temp.path().join("A.py");
+        fs::write(&cpp, "cpp\n").unwrap();
+        fs::write(&python, "python\n").unwrap();
+        for (current_path, current_language, expected) in [
+            (python.clone(), Language::Python, Some(Language::Python)),
+            (temp.path().join("nested/A.py"), Language::Python, None),
+        ] {
+            let mut app = app();
+            app.source_changed(0, current_path, current_language);
+            let mut source = OpenSourceController::new(temp.path(), Language::Cpp);
+            assert!(source.open(&app));
+            let source_current = source.modal().unwrap().current_language(&app);
+
+            let hub = SubmissionHub::new();
+            let mut submit =
+                SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+            assert!(submit.open(&app, &hub));
+            let selected = submit
+                .modal()
+                .unwrap()
+                .selected_candidate()
+                .map(|candidate| candidate.language);
+
+            assert_eq!(source_current, expected);
+            assert_eq!(selected, expected.or(Some(Language::Cpp)));
+        }
+    }
+
+    #[test]
+    fn submit_modal_without_sources_never_calls_the_start_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app();
+        let hub = SubmissionHub::new();
+        let mut controller =
+            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        assert!(controller.open(&app, &hub));
+        assert!(controller.modal().unwrap().candidates.is_empty());
+
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |_, _| panic!("a source-less modal must not reach submission orchestration"),
+        ));
+        assert!(
+            controller
+                .modal()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("No submit-capable source")
+        );
+    }
+
+    #[test]
+    fn submit_shortcut_opens_modal_and_modal_keys_require_press_to_submit() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
+        fs::write(temp.path().join("A.py"), "python\n").unwrap();
+        let mut app = app();
+        let mut hub = SubmissionHub::new();
+        let mut controller = SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::PyPy);
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut submit = SubmitInputContext {
+            controller: &mut controller,
+            hub: &mut hub,
+        };
+
+        assert_eq!(
+            FrontendAction::from_shortcut(key(KeyCode::Char('t'), KeyEventKind::Press)),
+            Some(FrontendAction::Submit)
+        );
+        assert!(
+            execute_frontend_action(
+                &mut app,
+                FrontendAction::Submit,
+                TerminalInputContext::new(&run_tx, Some(temp.path()), None),
+                FrontendActionControllers {
+                    submit: Some(&mut submit),
+                    ..FrontendActionControllers::default()
+                },
+            )
+            .unwrap()
+        );
+        assert!(controller.modal_active());
+        assert_eq!(
+            controller.modal().unwrap().policy_label().as_deref(),
+            Some("C++ / GCC (latest available)")
+        );
+        assert!(!controller.handle_key_with_start(
+            key(KeyCode::Char('t'), KeyEventKind::Press),
+            &app,
+            |_, _| panic!("a second t must not confirm submission"),
+        ));
+
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Down, KeyEventKind::Press),
+            &app,
+            |_, _| panic!("navigation must not submit"),
+        ));
+        assert_eq!(
+            controller.modal().unwrap().policy_label().as_deref(),
+            Some("Python / PyPy")
+        );
+        assert!(!controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Repeat),
+            &app,
+            |_, _| panic!("key repeat must not submit"),
+        ));
+        let calls = Cell::new(0);
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(7)
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(controller.modal().unwrap().is_starting());
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |_, _| panic!("a second Enter press must not start another worker"),
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Escape, KeyEventKind::Press),
+            &app,
+            |_, _| panic!("Escape must not submit"),
+        ));
+        assert!(!controller.modal_active());
+    }
+
+    #[test]
+    fn source_deleted_between_modal_open_and_enter_never_starts_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        fs::write(&source, "exact\r\n").unwrap();
+        let app = app();
+        let mut hub = SubmissionHub::new();
+        let mut controller =
+            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        assert!(controller.open(&app, &hub));
+        fs::remove_file(source).unwrap();
+
+        assert!(controller.handle_key(key(KeyCode::Enter, KeyEventKind::Press), &app, &mut hub,));
+        assert_eq!(
+            controller.modal().unwrap().error.as_deref(),
+            Some("Source file no longer exists.")
+        );
+        assert!(hub.state(&current_submission_key(&app).unwrap()).is_none());
+    }
+
+    #[test]
+    fn submit_confirmation_reads_the_exact_source_after_modal_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        fs::write(&source, "before modal\n").unwrap();
+        let app = app();
+        let hub = SubmissionHub::new();
+        let mut controller =
+            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        assert!(controller.open(&app, &hub));
+
+        let confirmed_snapshot = "after modal\r\nUnicode: 日本語\r\n";
+        fs::write(&source, confirmed_snapshot).unwrap();
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |_, plan| {
+                let prepared = crate::commands::submit::prepare_submit(plan).unwrap();
+                assert_eq!(prepared.test_source_snapshot(), confirmed_snapshot);
+                Ok(9)
+            },
+        ));
     }
 
     #[test]
@@ -6765,10 +7456,7 @@ mod tests {
             &mut app,
             FrontendAction::StopStress,
             TerminalInputContext::new(&run_tx, None, None),
-            None,
-            None,
-            None,
-            None,
+            FrontendActionControllers::default(),
         )
         .unwrap_err();
 
@@ -7134,6 +7822,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: Some(&mut palette),
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -10629,6 +11318,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -12389,6 +13079,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -12441,6 +13132,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -12670,6 +13362,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -12730,6 +13423,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },
@@ -13621,6 +14315,7 @@ mod tests {
                     contest_refresh: None,
                     command_palette: None,
                     open_source: None,
+                    submit: None,
                     editor_targets: None,
                     editor: None,
                 },

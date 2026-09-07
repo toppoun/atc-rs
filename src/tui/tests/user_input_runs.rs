@@ -799,6 +799,7 @@ fn dispatch(
             contest_refresh: None,
             command_palette: None,
             open_source: None,
+            submit: None,
             editor_targets: None,
             editor: None,
         },

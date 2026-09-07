@@ -1,7 +1,9 @@
 use super::test::find_problem;
 use crate::atcoder;
-use crate::atcoder::submission_tracking::{SubmissionId, SubmissionStatus};
-use crate::atcoder::submit::{SubmitOutcome, SubmitRequest};
+use crate::atcoder::submission_tracking::{
+    SubmissionId, SubmissionStatus, SubmissionTrackingError,
+};
+use crate::atcoder::submit::{SubmitExecutionOutcome, SubmitOutcome, SubmitRequest};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::language::{Language, PythonRuntime, SubmissionTarget};
@@ -59,18 +61,89 @@ pub(crate) fn submit(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ResolvedSource {
+pub(crate) struct ResolvedSource {
     language: Language,
     path: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct SubmitPlan {
+pub(crate) struct SubmitPlan {
     contest_id: String,
     task_id: String,
     problem_index: String,
     source: ResolvedSource,
     target: SubmissionTarget,
+}
+
+impl SubmitPlan {
+    pub(crate) fn for_selected_source(
+        contest_id: String,
+        task_id: String,
+        problem_index: String,
+        path: PathBuf,
+        language: Language,
+        python_runtime: PythonRuntime,
+    ) -> Self {
+        let target = match language {
+            Language::Cpp => SubmissionTarget::Cpp,
+            Language::Python => SubmissionTarget::Python(python_runtime),
+        };
+        Self {
+            contest_id,
+            task_id,
+            problem_index,
+            source: ResolvedSource { language, path },
+            target,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PreparedSubmit {
+    contest_id: String,
+    task_id: String,
+    problem_index: String,
+    target: SubmissionTarget,
+    source_snapshot: String,
+}
+
+#[cfg(test)]
+impl PreparedSubmit {
+    pub(crate) fn test_source_snapshot(&self) -> &str {
+        &self.source_snapshot
+    }
+
+    pub(crate) fn test_submission_identity(&self) -> (&str, &str) {
+        (&self.contest_id, &self.task_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionEvent {
+    Accepted,
+    TrackingStarted {
+        submission_id: SubmissionId,
+    },
+    Status {
+        submission_id: SubmissionId,
+        status: SubmissionStatus,
+    },
+    TrackingUnavailable {
+        submission_id: Option<SubmissionId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionCompletion {
+    Accepted,
+    UnknownSubmissionOutcome,
+    CancelledBeforeSubmit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackingOperationError {
+    Cancelled,
+    Unavailable,
 }
 
 fn resolve_submit_source(
@@ -220,6 +293,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn execute_submit_with_accepted<R, S, A, W>(
     plan: SubmitPlan,
     output: &mut W,
@@ -232,6 +306,18 @@ where
     S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
     A: FnOnce(&str, &str, &str, &mut W),
     W: Write,
+{
+    let prepared = prepare_submit_with(plan, read_source)?;
+    execute_prepared_with_accepted(prepared, output, submit_once, on_accepted)
+}
+
+pub(crate) fn prepare_submit(plan: SubmitPlan) -> Result<PreparedSubmit, AppError> {
+    prepare_submit_with(plan, read_source_file)
+}
+
+fn prepare_submit_with<R>(plan: SubmitPlan, read_source: R) -> Result<PreparedSubmit, AppError>
+where
+    R: FnOnce(&Path) -> io::Result<String>,
 {
     let SubmitPlan {
         contest_id,
@@ -252,6 +338,35 @@ where
         .into());
     }
 
+    Ok(PreparedSubmit {
+        contest_id,
+        task_id,
+        problem_index,
+        target,
+        source_snapshot,
+    })
+}
+
+#[cfg(test)]
+fn execute_prepared_with_accepted<S, A, W>(
+    prepared: PreparedSubmit,
+    output: &mut W,
+    submit_once: S,
+    on_accepted: A,
+) -> Result<(), AppError>
+where
+    S: FnOnce(SubmitRequest) -> Result<SubmitOutcome, AppError>,
+    A: FnOnce(&str, &str, &str, &mut W),
+    W: Write,
+{
+    let PreparedSubmit {
+        contest_id,
+        task_id,
+        problem_index,
+        target,
+        source_snapshot,
+    } = prepared;
+
     let request = SubmitRequest::new(contest_id.clone(), task_id.clone(), target, source_snapshot);
 
     // FnOnce makes a CLI-level retry impossible: this invocation can call the backend once.
@@ -263,6 +378,179 @@ where
             Ok(())
         }
         SubmitOutcome::UnknownSubmissionOutcome => Err(AppError::UnknownSubmissionOutcome),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_prepared_with_tracking_events<S, B, C, D, P, E>(
+    prepared: PreparedSubmit,
+    capture_baseline: C,
+    submit_once: S,
+    discover_submission: D,
+    poll_status: P,
+    emit: E,
+) -> Result<SubmissionCompletion, AppError>
+where
+    S: FnOnce(SubmitRequest, &mut dyn FnMut(&str)) -> Result<SubmitOutcome, AppError>,
+    C: FnOnce(&str, &str, &str) -> Option<B>,
+    D: FnOnce(&B) -> Result<SubmissionId, TrackingOperationError>,
+    P: FnOnce(
+        &str,
+        SubmissionId,
+        &mut dyn FnMut(&SubmissionStatus) -> bool,
+    ) -> Result<(), TrackingOperationError>,
+    E: FnMut(SubmissionEvent) -> bool,
+{
+    execute_prepared_with_tracking_events_until(
+        prepared,
+        capture_baseline,
+        |request, before_post| {
+            submit_once(request, before_post).map(SubmitExecutionOutcome::Submitted)
+        },
+        discover_submission,
+        poll_status,
+        emit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_prepared_with_tracking_events_until<S, B, C, D, P, E>(
+    prepared: PreparedSubmit,
+    capture_baseline: C,
+    submit_once: S,
+    discover_submission: D,
+    poll_status: P,
+    mut emit: E,
+) -> Result<SubmissionCompletion, AppError>
+where
+    S: FnOnce(SubmitRequest, &mut dyn FnMut(&str)) -> Result<SubmitExecutionOutcome, AppError>,
+    C: FnOnce(&str, &str, &str) -> Option<B>,
+    D: FnOnce(&B) -> Result<SubmissionId, TrackingOperationError>,
+    P: FnOnce(
+        &str,
+        SubmissionId,
+        &mut dyn FnMut(&SubmissionStatus) -> bool,
+    ) -> Result<(), TrackingOperationError>,
+    E: FnMut(SubmissionEvent) -> bool,
+{
+    let PreparedSubmit {
+        contest_id,
+        task_id,
+        problem_index: _,
+        target,
+        source_snapshot,
+    } = prepared;
+    let baseline = Rc::new(RefCell::new(None));
+    let baseline_before_post = Rc::clone(&baseline);
+    let mut capture_baseline = Some(capture_baseline);
+    let request = SubmitRequest::new(contest_id.clone(), task_id.clone(), target, source_snapshot);
+
+    let execution = submit_once(request, &mut |language_id: &str| {
+        let Some(capture) = capture_baseline.take() else {
+            return;
+        };
+        // This hook is entered only after fresh-page parsing, task-local language resolution,
+        // and POST-client construction, immediately before the sole physical POST attempt.
+        *baseline_before_post.borrow_mut() = capture(&contest_id, &task_id, language_id);
+    })?;
+
+    let outcome = match execution {
+        SubmitExecutionOutcome::Submitted(outcome) => outcome,
+        SubmitExecutionOutcome::CancelledBeforeSubmit => {
+            return Ok(SubmissionCompletion::CancelledBeforeSubmit);
+        }
+    };
+
+    if outcome == SubmitOutcome::UnknownSubmissionOutcome {
+        return Ok(SubmissionCompletion::UnknownSubmissionOutcome);
+    }
+
+    if !emit(SubmissionEvent::Accepted) {
+        return Ok(SubmissionCompletion::Accepted);
+    }
+
+    let Some(baseline) = baseline.borrow_mut().take() else {
+        emit(SubmissionEvent::TrackingUnavailable {
+            submission_id: None,
+        });
+        return Ok(SubmissionCompletion::Accepted);
+    };
+    let submission_id = match discover_submission(&baseline) {
+        Ok(submission_id) => submission_id,
+        Err(TrackingOperationError::Cancelled) => return Ok(SubmissionCompletion::Accepted),
+        Err(TrackingOperationError::Unavailable) => {
+            emit(SubmissionEvent::TrackingUnavailable {
+                submission_id: None,
+            });
+            return Ok(SubmissionCompletion::Accepted);
+        }
+    };
+
+    if !emit(SubmissionEvent::TrackingStarted { submission_id }) {
+        return Ok(SubmissionCompletion::Accepted);
+    }
+
+    let poll_result = poll_status(&contest_id, submission_id, &mut |status| {
+        emit(SubmissionEvent::Status {
+            submission_id,
+            status: *status,
+        })
+    });
+    if matches!(poll_result, Err(TrackingOperationError::Unavailable)) {
+        emit(SubmissionEvent::TrackingUnavailable {
+            submission_id: Some(submission_id),
+        });
+    }
+
+    Ok(SubmissionCompletion::Accepted)
+}
+
+pub(crate) fn execute_prepared_with_client(
+    prepared: PreparedSubmit,
+    atcoder: &atcoder::AtCoderClient,
+    emit: impl FnMut(SubmissionEvent) -> bool,
+    should_continue: &dyn Fn() -> bool,
+    try_begin_post: &dyn Fn() -> bool,
+) -> Result<SubmissionCompletion, AppError> {
+    execute_prepared_with_tracking_events_until(
+        prepared,
+        |contest_id, task_id, language_id| {
+            atcoder
+                .capture_submission_baseline_until(
+                    contest_id,
+                    task_id,
+                    language_id,
+                    should_continue,
+                )
+                .ok()
+        },
+        |request, before_post| {
+            Ok(atcoder.submit_with_before_post_until(
+                request,
+                |language_id| before_post(language_id),
+                should_continue,
+                try_begin_post,
+            )?)
+        },
+        |baseline| {
+            atcoder
+                .discover_submission_id_until(baseline, should_continue)
+                .map_err(classify_tracking_operation_error)
+        },
+        |contest_id, submission_id, on_status| {
+            atcoder
+                .watch_submission_until(contest_id, submission_id, on_status, should_continue)
+                .map_err(classify_tracking_operation_error)
+        },
+        emit,
+    )
+}
+
+fn classify_tracking_operation_error(error: SubmissionTrackingError) -> TrackingOperationError {
+    if matches!(error, SubmissionTrackingError::Cancelled) {
+        TrackingOperationError::Cancelled
+    } else {
+        TrackingOperationError::Unavailable
     }
 }
 
@@ -284,57 +572,43 @@ where
     P: FnOnce(&str, SubmissionId, &mut dyn FnMut(&SubmissionStatus) -> bool) -> Result<(), ()>,
     W: Write,
 {
-    let contest_id = plan.contest_id.clone();
-    let task_id = plan.task_id.clone();
-    let baseline = Rc::new(RefCell::new(None));
-    let baseline_before_post = Rc::clone(&baseline);
-    let baseline_after_acceptance = Rc::clone(&baseline);
-    let mut capture_baseline = Some(capture_baseline);
-
-    execute_submit_with_accepted(
-        plan,
-        output,
-        read_source,
-        move |request| {
-            let mut before_post = |language_id: &str| {
-                let Some(capture) = capture_baseline.take() else {
-                    return;
-                };
-                // The backend invokes this after submit-page parsing and language resolution,
-                // immediately before its rate-limit wait and sole physical POST attempt. Failure
-                // remains best-effort and never prevents that POST.
-                *baseline_before_post.borrow_mut() = capture(&contest_id, &task_id, language_id);
-            };
-            submit_once(request, &mut before_post)
+    let prepared = prepare_submit_with(plan, read_source)?;
+    let mut output_available = true;
+    let completion = execute_prepared_with_tracking_events(
+        prepared,
+        capture_baseline,
+        submit_once,
+        |baseline| discover_submission(baseline).map_err(|()| TrackingOperationError::Unavailable),
+        |contest_id, submission_id, on_status| {
+            poll_status(contest_id, submission_id, on_status)
+                .map_err(|()| TrackingOperationError::Unavailable)
         },
-        move |contest_id, _, _, output| {
-            let Some(baseline) = baseline_after_acceptance.borrow_mut().take() else {
-                report_tracking_unavailable(output, false);
-                return;
-            };
-            let Ok(submission_id) = discover_submission(&baseline) else {
-                report_tracking_unavailable(output, false);
-                return;
-            };
-
-            if writeln!(output, "Submitted: #{submission_id}").is_err() {
-                return;
+        |event| match event {
+            SubmissionEvent::Accepted => true,
+            SubmissionEvent::TrackingStarted { submission_id } => {
+                output_available = writeln!(output, "Submitted: #{submission_id}").is_ok();
+                output_available
             }
-
-            let mut output_available = true;
-            let poll_result = poll_status(contest_id, submission_id, &mut |status| {
-                if render_submission_status(output, status).is_ok() {
-                    true
-                } else {
-                    output_available = false;
-                    false
+            SubmissionEvent::Status { status, .. } => {
+                output_available = render_submission_status(output, &status).is_ok();
+                output_available
+            }
+            SubmissionEvent::TrackingUnavailable { submission_id } => {
+                if output_available {
+                    report_tracking_unavailable(output, submission_id.is_some());
                 }
-            });
-            if poll_result.is_err() && output_available {
-                report_tracking_unavailable(output, true);
+                output_available
             }
         },
-    )
+    )?;
+
+    match completion {
+        SubmissionCompletion::Accepted => Ok(()),
+        SubmissionCompletion::UnknownSubmissionOutcome => Err(AppError::UnknownSubmissionOutcome),
+        SubmissionCompletion::CancelledBeforeSubmit => {
+            unreachable!("the CLI submit path is not cancellable")
+        }
+    }
 }
 
 fn render_submission_status(output: &mut impl Write, status: &SubmissionStatus) -> io::Result<()> {
@@ -1406,5 +1680,41 @@ mod tests {
         assert_eq!(discovery_calls.get(), 0);
         assert_eq!(poll_calls.get(), 0);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cancelled_before_submit_never_emits_remote_submission_events() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        write_source(temp.path(), "A", Language::Cpp, "cpp\r\n");
+        let plan = resolve_submit_plan(temp.path(), "A", None, None, None, PythonRuntime::CPython)
+            .unwrap();
+        let prepared = prepare_submit(plan).unwrap();
+        let baseline_calls = Cell::new(0);
+        let mut events = Vec::new();
+
+        let completion = execute_prepared_with_tracking_events_until(
+            prepared,
+            |_, _, language_id| {
+                baseline_calls.set(baseline_calls.get() + 1);
+                assert_eq!(language_id, "6017");
+                Some(())
+            },
+            |_, before_post| {
+                before_post("6017");
+                Ok(SubmitExecutionOutcome::CancelledBeforeSubmit)
+            },
+            |_| panic!("cancelled submit must not discover an ID"),
+            |_, _, _| panic!("cancelled submit must not poll status"),
+            |event| {
+                events.push(event);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completion, SubmissionCompletion::CancelledBeforeSubmit);
+        assert_eq!(baseline_calls.get(), 1);
+        assert!(events.is_empty());
     }
 }

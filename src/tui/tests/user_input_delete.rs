@@ -612,10 +612,7 @@ fn new_edit_run_save_cancel_and_contest_actions_disarm() {
                         FrontendAction::StartStress
                     },
                     TerminalInputContext::new(&tx, Some(&destination), None),
-                    None,
-                    None,
-                    None,
-                    None,
+                    FrontendActionControllers::default(),
                 )
                 .unwrap();
             }
@@ -744,6 +741,7 @@ fn ordered_delete_success_failure_and_other_editor_then_q_use_post_delete_state(
                         contest_refresh: None,
                         command_palette: None,
                         open_source: None,
+                        submit: None,
                         editor_targets: None,
                         editor: None,
                     }

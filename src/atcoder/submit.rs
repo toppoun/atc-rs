@@ -1,5 +1,6 @@
 use super::{
-    AtCoderClient, BASE_URL, HttpSource, MAX_429_RETRIES, Source, retry_wait, wait_for_request_slot,
+    AtCoderClient, BASE_URL, HttpSource, MAX_429_RETRIES, Source, interruptible_sleep, retry_wait,
+    wait_for_request_slot_until,
 };
 #[cfg(test)]
 use crate::language::Language;
@@ -12,7 +13,6 @@ use scraper::{ElementRef, Html, Selector};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::thread;
 use std::time::Duration;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -627,6 +627,12 @@ pub(crate) enum SubmitOutcome {
     UnknownSubmissionOutcome,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitExecutionOutcome {
+    Submitted(SubmitOutcome),
+    CancelledBeforeSubmit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubmitError {
     InvalidRequestIdentity { kind: &'static str },
@@ -692,10 +698,31 @@ impl AtCoderClient {
         request: SubmitRequest,
         before_post: impl FnOnce(&str),
     ) -> Result<SubmitOutcome, SubmitError> {
+        match self.submit_with_before_post_until(request, before_post, &|| true, &|| true)? {
+            SubmitExecutionOutcome::Submitted(outcome) => Ok(outcome),
+            SubmitExecutionOutcome::CancelledBeforeSubmit => {
+                unreachable!("an always-continue submit cannot be cancelled")
+            }
+        }
+    }
+
+    pub(crate) fn submit_with_before_post_until(
+        &self,
+        request: SubmitRequest,
+        before_post: impl FnOnce(&str),
+        should_continue: &dyn Fn() -> bool,
+        try_begin_post: &dyn Fn() -> bool,
+    ) -> Result<SubmitExecutionOutcome, SubmitError> {
         match &self.source {
             Source::Http(http) => {
                 let mut transport = HttpSubmitTransport { http };
-                submit_with_transport_and_before_post(&mut transport, request, before_post)
+                submit_with_transport_and_before_post_until(
+                    &mut transport,
+                    request,
+                    before_post,
+                    should_continue,
+                    try_begin_post,
+                )
             }
             Source::Fixture(_) => Err(SubmitError::SubmitUnavailable),
         }
@@ -738,20 +765,34 @@ enum SubmitTransportFailure {
     Other,
 }
 
+enum SubmitTransportProgress<T> {
+    Completed(T),
+    CancelledBeforeSubmit,
+}
+
 trait SubmitTransport {
-    fn get_submit_page(&mut self, path: &str)
-    -> Result<SubmitHttpResponse, SubmitTransportFailure>;
+    fn get_submit_page(
+        &mut self,
+        path: &str,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure>;
 
     fn post_submit_form<F>(
         &mut self,
         path: &str,
         form: &SubmitForm<'_>,
         before_post: F,
-    ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+        should_continue: &dyn Fn() -> bool,
+        try_begin_post: &dyn Fn() -> bool,
+    ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure>
     where
         F: FnOnce();
 
-    fn wait_before_get_retry(&mut self, duration: Duration);
+    fn wait_before_get_retry(
+        &mut self,
+        duration: Duration,
+        should_continue: &dyn Fn() -> bool,
+    ) -> bool;
 }
 
 struct HttpSubmitTransport<'a> {
@@ -775,15 +816,24 @@ impl SubmitTransport for HttpSubmitTransport<'_> {
     fn get_submit_page(
         &mut self,
         path: &str,
-    ) -> Result<SubmitHttpResponse, SubmitTransportFailure> {
-        wait_for_request_slot(self.http);
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure> {
+        if !should_continue() || !wait_for_request_slot_until(self.http, should_continue) {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
         let response = self
             .submit_page_client()
             .get(format!("{BASE_URL}{path}"))
             .send()
             .map_err(classify_transport_failure)?;
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
 
-        collect_submit_page_response(response, path)
+        collect_submit_page_response(response, path).map(SubmitTransportProgress::Completed)
     }
 
     fn post_submit_form<F>(
@@ -791,27 +841,48 @@ impl SubmitTransport for HttpSubmitTransport<'_> {
         path: &str,
         form: &SubmitForm<'_>,
         before_post: F,
-    ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+        should_continue: &dyn Fn() -> bool,
+        try_begin_post: &dyn Fn() -> bool,
+    ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure>
     where
         F: FnOnce(),
     {
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
         let request = self
             .submit_post_client()?
             .post(format!("{BASE_URL}{path}"))
             .form(form.as_pairs());
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
 
         // All fallible submit-page parsing, language resolution, POST-client construction, and
         // request construction are complete. Tracking captures its best-effort baseline here,
         // immediately before the shared rate-limit slot and the one physical send.
         before_post();
-        wait_for_request_slot(self.http);
+        if !should_continue() || !wait_for_request_slot_until(self.http, should_continue) {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
+        // This is the cancellation linearization point. A successful gate means the physical
+        // attempt has started; cancellation after it must not change the POST outcome semantics.
+        if !try_begin_post() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
         let response = request.send().map_err(classify_transport_failure)?;
 
-        Ok(collect_submit_response_without_body(response))
+        Ok(SubmitTransportProgress::Completed(
+            collect_submit_response_without_body(response),
+        ))
     }
 
-    fn wait_before_get_retry(&mut self, duration: Duration) {
-        thread::sleep(duration);
+    fn wait_before_get_retry(
+        &mut self,
+        duration: Duration,
+        should_continue: &dyn Fn() -> bool,
+    ) -> bool {
+        interruptible_sleep(duration, should_continue)
     }
 }
 
@@ -870,6 +941,30 @@ fn submit_with_transport_and_before_post(
     request: SubmitRequest,
     before_post: impl FnOnce(&str),
 ) -> Result<SubmitOutcome, SubmitError> {
+    match submit_with_transport_and_before_post_until(
+        transport,
+        request,
+        before_post,
+        &|| true,
+        &|| true,
+    )? {
+        SubmitExecutionOutcome::Submitted(outcome) => Ok(outcome),
+        SubmitExecutionOutcome::CancelledBeforeSubmit => {
+            unreachable!("an always-continue submit cannot be cancelled")
+        }
+    }
+}
+
+fn submit_with_transport_and_before_post_until(
+    transport: &mut impl SubmitTransport,
+    request: SubmitRequest,
+    before_post: impl FnOnce(&str),
+    should_continue: &dyn Fn() -> bool,
+    try_begin_post: &dyn Fn() -> bool,
+) -> Result<SubmitExecutionOutcome, SubmitError> {
+    if !should_continue() {
+        return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+    }
     if !is_valid_identifier(&request.contest_id) {
         return Err(SubmitError::InvalidRequestIdentity { kind: "contest ID" });
     }
@@ -878,7 +973,15 @@ fn submit_with_transport_and_before_post(
     }
 
     let submit_path = format!("/contests/{}/submit", request.contest_id);
-    let response = fetch_fresh_submit_page(transport, &submit_path)?;
+    let response = match fetch_fresh_submit_page_until(transport, &submit_path, should_continue)? {
+        SubmitTransportProgress::Completed(response) => response,
+        SubmitTransportProgress::CancelledBeforeSubmit => {
+            return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+        }
+    };
+    if !should_continue() {
+        return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+    }
     let page = parse_submit_page(&request.contest_id, &response.body).map_err(|error| {
         if error == SubmitPageError::SubmitUnavailable {
             SubmitError::SubmitUnavailable
@@ -886,32 +989,74 @@ fn submit_with_transport_and_before_post(
             SubmitError::SubmitPage(error)
         }
     })?;
+    if !should_continue() {
+        return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+    }
     let language = page
         .resolve_language(&request.task_id, request.target)
         .map_err(SubmitError::SubmitPage)?;
+    if !should_continue() {
+        return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+    }
     let form = SubmitForm::new(&request, language.id(), page.csrf_token());
 
-    let response = match transport.post_submit_form(page.form_action(), &form, || {
-        before_post(language.id());
-    }) {
-        Ok(response) => response,
+    let response = match transport.post_submit_form(
+        page.form_action(),
+        &form,
+        || before_post(language.id()),
+        should_continue,
+        try_begin_post,
+    ) {
+        Ok(SubmitTransportProgress::Completed(response)) => response,
+        Ok(SubmitTransportProgress::CancelledBeforeSubmit) => {
+            return Ok(SubmitExecutionOutcome::CancelledBeforeSubmit);
+        }
         Err(SubmitTransportFailure::ClientInitialization) => {
             return Err(SubmitError::SubmitClientInitializationFailed);
         }
-        Err(_) => return Ok(SubmitOutcome::UnknownSubmissionOutcome),
+        Err(_) => {
+            return Ok(SubmitExecutionOutcome::Submitted(
+                SubmitOutcome::UnknownSubmissionOutcome,
+            ));
+        }
     };
 
-    classify_submit_response(&request.contest_id, response)
+    classify_submit_response(&request.contest_id, response).map(SubmitExecutionOutcome::Submitted)
 }
 
 fn fetch_fresh_submit_page(
     transport: &mut impl SubmitTransport,
     submit_path: &str,
 ) -> Result<SubmitHttpResponse, SubmitError> {
+    match fetch_fresh_submit_page_until(transport, submit_path, &|| true)? {
+        SubmitTransportProgress::Completed(response) => Ok(response),
+        SubmitTransportProgress::CancelledBeforeSubmit => {
+            unreachable!("an always-continue GET cannot be cancelled")
+        }
+    }
+}
+
+fn fetch_fresh_submit_page_until(
+    transport: &mut impl SubmitTransport,
+    submit_path: &str,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitError> {
     for retry_count in 0..=MAX_429_RETRIES {
-        let response = transport
-            .get_submit_page(submit_path)
-            .map_err(|_| SubmitError::SubmitPageFetchFailed)?;
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
+        let response = match transport
+            .get_submit_page(submit_path, should_continue)
+            .map_err(|_| SubmitError::SubmitPageFetchFailed)?
+        {
+            SubmitTransportProgress::Completed(response) => response,
+            SubmitTransportProgress::CancelledBeforeSubmit => {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
+        };
+        if !should_continue() {
+            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+        }
 
         if let Some(final_url) = response.final_url.as_ref() {
             if is_login_url(final_url) {
@@ -926,7 +1071,9 @@ fn fetch_fresh_submit_page(
             if retry_count == MAX_429_RETRIES {
                 return Err(SubmitError::RateLimited);
             }
-            transport.wait_before_get_retry(retry_wait(&response.headers));
+            if !transport.wait_before_get_retry(retry_wait(&response.headers), should_continue) {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
             continue;
         }
 
@@ -937,7 +1084,7 @@ fn fetch_fresh_submit_page(
             return Err(SubmitError::SubmitUnavailable);
         }
 
-        return Ok(response);
+        return Ok(SubmitTransportProgress::Completed(response));
     }
 
     Err(SubmitError::RateLimited)
@@ -1035,6 +1182,7 @@ mod tests {
     use reqwest::header::{HeaderValue, RETRY_AFTER};
     use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     const CURRENT_SUBMIT_PAGE: &str = include_str!("../../fixtures/submit/abc466.html");
 
@@ -1143,6 +1291,8 @@ mod tests {
         steps: VecDeque<ScriptStep>,
         requests: Vec<ObservedRequest>,
         get_retry_waits: usize,
+        cancel_on_retry_wait: Option<Rc<Cell<bool>>>,
+        cancel_after_post_begins: Option<Rc<Cell<bool>>>,
     }
 
     impl ScriptedSubmitTransport {
@@ -1151,7 +1301,19 @@ mod tests {
                 steps: steps.into(),
                 requests: Vec::new(),
                 get_retry_waits: 0,
+                cancel_on_retry_wait: None,
+                cancel_after_post_begins: None,
             }
+        }
+
+        fn with_cancel_on_retry_wait(mut self, active: Rc<Cell<bool>>) -> Self {
+            self.cancel_on_retry_wait = Some(active);
+            self
+        }
+
+        fn with_cancel_after_post_begins(mut self, active: Rc<Cell<bool>>) -> Self {
+            self.cancel_after_post_begins = Some(active);
+            self
         }
 
         fn get_count(&self) -> usize {
@@ -1177,7 +1339,11 @@ mod tests {
         fn get_submit_page(
             &mut self,
             path: &str,
-        ) -> Result<SubmitHttpResponse, SubmitTransportFailure> {
+            should_continue: &dyn Fn() -> bool,
+        ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure> {
+            if !should_continue() {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
             self.requests.push(ObservedRequest {
                 method: "GET",
                 path: path.to_string(),
@@ -1194,7 +1360,7 @@ mod tests {
                 panic!("script expected POST but backend sent GET");
             };
             assert_eq!(path, expected_path, "scripted GET path mismatch");
-            result
+            result.map(SubmitTransportProgress::Completed)
         }
 
         fn post_submit_form<F>(
@@ -1202,11 +1368,22 @@ mod tests {
             path: &str,
             form: &SubmitForm<'_>,
             before_post: F,
-        ) -> Result<SubmitHttpResponse, SubmitTransportFailure>
+            should_continue: &dyn Fn() -> bool,
+            try_begin_post: &dyn Fn() -> bool,
+        ) -> Result<SubmitTransportProgress<SubmitHttpResponse>, SubmitTransportFailure>
         where
             F: FnOnce(),
         {
+            if !should_continue() {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
             before_post();
+            if !should_continue() || !try_begin_post() {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
+            if let Some(active) = self.cancel_after_post_begins.as_ref() {
+                active.set(false);
+            }
             self.requests.push(ObservedRequest {
                 method: "POST",
                 path: path.to_string(),
@@ -1225,11 +1402,19 @@ mod tests {
             };
             assert_eq!(path, expected_path, "scripted POST path mismatch");
             expected_form.matches(form);
-            result
+            result.map(SubmitTransportProgress::Completed)
         }
 
-        fn wait_before_get_retry(&mut self, _duration: Duration) {
+        fn wait_before_get_retry(
+            &mut self,
+            _duration: Duration,
+            should_continue: &dyn Fn() -> bool,
+        ) -> bool {
             self.get_retry_waits += 1;
+            if let Some(active) = self.cancel_on_retry_wait.as_ref() {
+                active.set(false);
+            }
+            should_continue()
         }
     }
 
@@ -2283,6 +2468,117 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_observed_after_baseline_prevents_the_physical_post() {
+        let source = "dummy cpp source\n";
+        let active = Rc::new(Cell::new(true));
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6017",
+                source,
+                Ok(accepted_response(
+                    StatusCode::FOUND,
+                    "/contests/abc466/submissions/me",
+                )),
+            ),
+        ]);
+        let hook_calls = Cell::new(0);
+        let begin_calls = Cell::new(0);
+        let hook_active = Rc::clone(&active);
+
+        let outcome = submit_with_transport_and_before_post_until(
+            &mut transport,
+            submit_request(Language::Cpp, source),
+            |_| {
+                hook_calls.set(hook_calls.get() + 1);
+                hook_active.set(false);
+            },
+            &|| active.get(),
+            &|| {
+                begin_calls.set(begin_calls.get() + 1);
+                active.get()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SubmitExecutionOutcome::CancelledBeforeSubmit);
+        assert_eq!(hook_calls.get(), 1);
+        assert_eq!(begin_calls.get(), 0);
+        assert_eq!(transport.get_count(), 1);
+        assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn cancellation_at_the_post_gate_prevents_the_physical_post() {
+        let source = "dummy cpp source\n";
+        let active = Cell::new(true);
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6017",
+                source,
+                Ok(accepted_response(
+                    StatusCode::FOUND,
+                    "/contests/abc466/submissions/me",
+                )),
+            ),
+        ]);
+        let begin_calls = Cell::new(0);
+
+        let outcome = submit_with_transport_and_before_post_until(
+            &mut transport,
+            submit_request(Language::Cpp, source),
+            |_| {},
+            &|| active.get(),
+            &|| {
+                begin_calls.set(begin_calls.get() + 1);
+                active.set(false);
+                false
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SubmitExecutionOutcome::CancelledBeforeSubmit);
+        assert_eq!(begin_calls.get(), 1);
+        assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_the_post_gate_does_not_reclassify_an_accepted_post() {
+        let source = "dummy cpp source\n";
+        let active = Rc::new(Cell::new(true));
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6017",
+                source,
+                Ok(accepted_response(
+                    StatusCode::FOUND,
+                    "/contests/abc466/submissions/me",
+                )),
+            ),
+        ])
+        .with_cancel_after_post_begins(Rc::clone(&active));
+
+        let outcome = submit_with_transport_and_before_post_until(
+            &mut transport,
+            submit_request(Language::Cpp, source),
+            |_| {},
+            &|| active.get(),
+            &|| true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            SubmitExecutionOutcome::Submitted(SubmitOutcome::Accepted)
+        );
+        assert!(!active.get());
+        assert_eq!(transport.post_count(), 1);
+        transport.assert_complete();
+    }
+
+    #[test]
     fn pre_submit_failure_does_not_invoke_the_before_post_hook() {
         let mut transport = ScriptedSubmitTransport::new(vec![ScriptStep::Get {
             path: "/contests/abc466/submit".to_string(),
@@ -2905,6 +3201,37 @@ mod tests {
         assert_eq!(transport.get_retry_waits, 1);
         assert_eq!(transport.post_count(), 1);
         transport.assert_complete();
+    }
+
+    #[test]
+    fn cancellation_during_get_retry_wait_exits_without_posting() {
+        let active = Rc::new(Cell::new(true));
+        let mut rate_limited = response(StatusCode::TOO_MANY_REQUESTS, None, "rate limited");
+        rate_limited
+            .headers
+            .insert(RETRY_AFTER, HeaderValue::from_static("60"));
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            ScriptStep::Get {
+                path: "/contests/abc466/submit".to_string(),
+                result: Ok(rate_limited),
+            },
+            get_step(CURRENT_SUBMIT_PAGE),
+        ])
+        .with_cancel_on_retry_wait(Rc::clone(&active));
+
+        let outcome = submit_with_transport_and_before_post_until(
+            &mut transport,
+            submit_request(Language::Cpp, "dummy"),
+            |_| {},
+            &|| active.get(),
+            &|| true,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SubmitExecutionOutcome::CancelledBeforeSubmit);
+        assert_eq!(transport.get_count(), 1);
+        assert_eq!(transport.get_retry_waits, 1);
+        assert_eq!(transport.post_count(), 0);
     }
 
     #[test]

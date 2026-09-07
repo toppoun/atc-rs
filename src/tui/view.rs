@@ -27,7 +27,7 @@ use super::mouse::MouseMode;
 use super::{
     CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
     OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
-    RefreshContestModalState, SwitchContestModal, SwitchContestModalState,
+    RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
 };
 use crate::language::Language;
 
@@ -324,6 +324,8 @@ pub(super) struct FrontendOverlays<'a> {
     pub(super) switch_modal: Option<&'a SwitchContestModal>,
     pub(super) refresh_modal: Option<&'a RefreshContestModal>,
     pub(super) source_modal: Option<&'a OpenSourceModal>,
+    pub(super) submit_modal: Option<&'a SubmitModal>,
+    pub(super) submission_state: Option<super::submission::SubmissionDisplayState>,
     pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
 }
@@ -415,7 +417,7 @@ pub(super) fn render_frontend_with_pointer(
         .map(run_summary)
         .unwrap_or_else(|| "-".to_string());
 
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::raw(" "),
         Span::styled(
             app.contest_id(),
@@ -429,8 +431,16 @@ pub(super) fn render_frontend_with_pointer(
         Span::raw(debug),
         Span::raw(" │ "),
         Span::styled(summary, summary_style(current_problem)),
-        Span::raw(" "),
-    ]);
+    ];
+    if let Some(submission) = overlays.submission_state {
+        title_spans.push(Span::raw(" │ "));
+        title_spans.push(Span::styled(
+            submission.header_label(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+    let title = Line::from(title_spans);
 
     let outer = Block::default().title(title).borders(Borders::ALL);
 
@@ -623,6 +633,7 @@ pub(super) fn render_frontend_with_pointer(
     let overlay_active = overlays.switch_modal.is_some()
         || overlays.refresh_modal.is_some()
         || overlays.source_modal.is_some()
+        || overlays.submit_modal.is_some()
         || overlays.editor_target_modal.is_some()
         || overlays.command_palette.is_some();
     if !overlay_active
@@ -661,9 +672,9 @@ pub(super) fn render_frontend_with_pointer(
     let footer_base = if current_problem
         .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
     {
-        "s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
+        "t submit   s samples   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
     } else {
-        "s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
+        "t submit   s samples   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll"
     };
     let footer_text = if workspace_available {
         format!(": commands   c contest   q quit   {footer_base}")
@@ -680,6 +691,8 @@ pub(super) fn render_frontend_with_pointer(
         render_switch_contest_modal(frame, modal);
     } else if let Some(modal) = overlays.source_modal {
         render_open_source_modal(frame, app, modal);
+    } else if let Some(modal) = overlays.submit_modal {
+        render_submit_modal(frame, modal);
     } else if let Some(modal) = overlays.editor_target_modal {
         render_editor_target_modal(frame, modal);
     } else if let Some(command_palette) = overlays.command_palette {
@@ -1142,6 +1155,106 @@ fn render_open_source_modal(frame: &mut Frame, app: &WatchApp, modal: &OpenSourc
             .title(" Open Source ")
             .borders(Borders::ALL),
     );
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_submit_modal(frame: &mut Frame, modal: &SubmitModal) {
+    let frame_area = frame.area();
+    let width = frame_area.width.min(76);
+    let desired_height = 13u16
+        .saturating_add(u16::try_from(modal.candidates.len()).unwrap_or(u16::MAX))
+        .saturating_add(u16::from(modal.current_submission.is_some()));
+    let height = frame_area.height.min(desired_height);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let line_width = usize::from(inner.width);
+    let mut lines = vec![
+        Line::raw(fit_command_palette_row(
+            &format!(
+                "Problem   {} - {}",
+                modal.problem_index, modal.problem_title
+            ),
+            line_width,
+        )),
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Source", line_width)),
+    ];
+
+    for candidate in &modal.candidates {
+        let marker = if modal
+            .selected_candidate()
+            .is_some_and(|selected| selected.language == candidate.language)
+        {
+            ">"
+        } else {
+            " "
+        };
+        let file = candidate
+            .path
+            .file_name()
+            .unwrap_or(candidate.path.as_os_str())
+            .to_string_lossy();
+        let row = fit_command_palette_row(
+            &format!("{marker} {file:<12} {}", language_label(candidate.language)),
+            line_width,
+        );
+        let style = if marker == ">" {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(row, style));
+    }
+
+    lines.extend([
+        Line::raw(""),
+        Line::raw(fit_command_palette_row("Submit as", line_width)),
+        Line::raw(fit_command_palette_row(
+            &format!(
+                "  {}",
+                modal.policy_label().unwrap_or_else(|| "-".to_string())
+            ),
+            line_width,
+        )),
+    ]);
+    if let Some(current) = modal.current_submission {
+        lines.push(Line::raw(fit_command_palette_row(
+            &format!("Current submission: {}", current.summary_label()),
+            line_width,
+        )));
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::raw(fit_command_palette_row(
+            if modal.is_starting() {
+                "Submitting..."
+            } else {
+                "[Enter] Submit"
+            },
+            line_width,
+        )),
+        Line::raw(fit_command_palette_row(
+            "[↑/↓ or j/k] Select   [Esc] Cancel",
+            line_width,
+        )),
+    ]);
+    if let Some(error) = modal.error.as_deref() {
+        for line in error.lines() {
+            lines.push(Line::styled(
+                fit_command_palette_row(line, line_width),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(Block::default().title(" Submit ").borders(Borders::ALL));
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
@@ -1910,6 +2023,7 @@ fn compact_elapsed_label(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;
@@ -1917,6 +2031,9 @@ mod tests {
     use crate::tui::detail_layout::{max_scroll, viewport_text, wrap_detail_document};
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
+    use crate::tui::submission::{
+        SubmissionDisplayState, TuiSubmissionAttemptState, TuiSubmissionState,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::PathBuf;
@@ -2054,6 +2171,29 @@ mod tests {
         rendered_frontend_text_with_palette(app, switch_available, modal, None, 100, 20)
     }
 
+    fn rendered_submission_header(state: Option<SubmissionDisplayState>) -> String {
+        let app = app();
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    &app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        submission_state: state,
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        buffer_symbols(terminal.backend().buffer())
+    }
+
     fn rendered_frontend_text_with_palette(
         app: &WatchApp,
         switch_available: bool,
@@ -2113,6 +2253,33 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    fn rendered_submit_text(
+        app: &WatchApp,
+        modal: &SubmitModal,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        submit_modal: Some(modal),
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        buffer_symbols(terminal.backend().buffer())
     }
 
     fn rendered_editor_target_text(
@@ -2208,6 +2375,8 @@ mod tests {
                         switch_modal: modal,
                         refresh_modal: None,
                         source_modal: None,
+                        submit_modal: None,
+                        submission_state: None,
                         editor_target_modal: None,
                         command_palette: palette,
                     },
@@ -2538,6 +2707,131 @@ mod tests {
 
         assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
         assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+    }
+
+    #[test]
+    fn header_distinguishes_every_submission_state_from_sample_results() {
+        assert!(!rendered_submission_header(None).contains("SUB "));
+
+        let cases = [
+            (
+                SubmissionDisplayState {
+                    current: None,
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "NEW Submitting",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Accepted),
+                    attempt: None,
+                },
+                "SUB Accepted",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForJudge,
+                    )),
+                    attempt: None,
+                },
+                "SUB WJ",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForRejudge,
+                    )),
+                    attempt: None,
+                },
+                "SUB WR",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::JudgingProgress {
+                            judged: 14,
+                            total: 50,
+                            provisional: None,
+                        },
+                    )),
+                    attempt: None,
+                },
+                "SUB 14/50",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::JudgingProgress {
+                            judged: 14,
+                            total: 50,
+                            provisional: Some(Verdict::WrongAnswer),
+                        },
+                    )),
+                    attempt: None,
+                },
+                "SUB 14/50 WA",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        Verdict::Accepted,
+                    ))),
+                    attempt: None,
+                },
+                "SUB AC",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        Verdict::WrongAnswer,
+                    ))),
+                    attempt: None,
+                },
+                "SUB WA",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::TrackingUnavailable),
+                    attempt: None,
+                },
+                "SUB Untracked",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: None,
+                    attempt: Some(TuiSubmissionAttemptState::Unknown),
+                },
+                "NEW Unknown",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(
+                        SubmissionStatus::JudgingProgress {
+                            judged: 14,
+                            total: 50,
+                            provisional: None,
+                        },
+                    )),
+                    attempt: Some(TuiSubmissionAttemptState::Submitting),
+                },
+                "SUB 14/50 · NEW Submitting",
+            ),
+            (
+                SubmissionDisplayState {
+                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        Verdict::Accepted,
+                    ))),
+                    attempt: Some(TuiSubmissionAttemptState::Unknown),
+                },
+                "SUB AC · NEW Unknown",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            let rendered = rendered_submission_header(Some(state));
+            assert!(rendered.contains(expected), "state={state:?}\n{rendered}");
+        }
     }
 
     #[test]
@@ -3190,6 +3484,47 @@ mod tests {
         for (width, height) in [(20, 8), (8, 4), (1, 1), (0, 0)] {
             let _ = rendered_open_source_text(&app, controller.modal().unwrap(), width, height);
         }
+    }
+
+    #[test]
+    fn submit_modal_renders_candidates_policy_current_state_and_confirmation_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let modal = SubmitModal {
+            key: crate::tui::submission::SubmissionKey::new("abc123", "abc123_a"),
+            problem_index: "A".to_string(),
+            problem_title: "Problem A".to_string(),
+            candidates: vec![
+                super::super::SubmitSourceCandidate {
+                    language: Language::Cpp,
+                    path: temp.path().join("A.cpp"),
+                },
+                super::super::SubmitSourceCandidate {
+                    language: Language::Python,
+                    path: temp.path().join("A.py"),
+                },
+            ],
+            selected: 1,
+            python_runtime: crate::language::PythonRuntime::PyPy,
+            starting_generation: None,
+            current_submission: Some(SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                attempt: None,
+            }),
+            error: None,
+        };
+
+        let rendered = rendered_submit_text(&app(), &modal, 100, 24);
+        assert!(rendered.contains("Submit"));
+        assert!(rendered.contains("Problem   A - Problem A"));
+        assert!(rendered.contains("A.cpp"));
+        assert!(rendered.contains("A.py"));
+        assert!(rendered.contains("Python / PyPy"));
+        assert!(rendered.contains("Current submission: WJ"));
+        assert!(rendered.contains("[Enter] Submit"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        assert!(!rendered.contains("GCC 15"));
     }
 
     #[test]

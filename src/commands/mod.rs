@@ -9,7 +9,7 @@ mod new;
 mod refresh;
 mod run_scheduler;
 pub(crate) mod stress;
-mod submit;
+pub(crate) mod submit;
 mod template;
 mod test;
 mod user_input_run;

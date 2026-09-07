@@ -94,6 +94,29 @@ fn combine_primary_and_cleanup_results<const N: usize>(
     }
 }
 
+struct TuiCleanupResults {
+    submission_workers: io::Result<()>,
+    contest_session: io::Result<()>,
+    terminal_restore: io::Result<()>,
+}
+
+fn run_tui_cleanup(
+    shutdown_submission_workers: impl FnOnce() -> io::Result<()>,
+    shutdown_contest_session: impl FnOnce() -> io::Result<()>,
+    restore_terminal: impl FnOnce() -> io::Result<()>,
+) -> TuiCleanupResults {
+    // Keep the terminal managed until every background producer has stopped. Each operation is
+    // evaluated independently so an earlier cleanup error can never skip terminal restoration.
+    let submission_workers = shutdown_submission_workers();
+    let contest_session = shutdown_contest_session();
+    let terminal_restore = restore_terminal();
+    TuiCleanupResults {
+        submission_workers,
+        contest_session,
+        terminal_restore,
+    }
+}
+
 #[derive(Debug)]
 struct WatchStageError<E> {
     context: &'static str,
@@ -407,6 +430,7 @@ pub(super) fn watch_tui_at(
     // thread開始前に読み込んでおく。
     let config = Config::load()?;
     let mut session = Some(ContestSession::start(initial_input, &config.runner)?);
+    let mut submissions = crate::tui::SubmissionHub::new();
 
     let mut terminal = match crate::tui::TerminaSession::start() {
         Ok(terminal) => terminal,
@@ -505,6 +529,7 @@ pub(super) fn watch_tui_at(
             &app_context,
             &config,
             &mut preferences,
+            &mut submissions,
             frontend,
         );
 
@@ -606,12 +631,20 @@ pub(super) fn watch_tui_at(
     if let Some(session) = session.as_ref() {
         session.request_stop();
     }
+    // Submission workers outlive contest sessions, but the whole-TUI exit owns their stop.
+    submissions.request_stop();
 
-    // joinが予想外に長引いてもterminalは先に復元する。
     let mouse_mode_label = terminal.mouse_mode_label();
     let mouse_trace_line = terminal.mouse_trace_line();
-    let restore_result = terminal.restore();
-    // TerminaのDropで元のplatform mode/code pageまで戻してからjoinする。
+    let cleanup = run_tui_cleanup(
+        || submissions.shutdown(),
+        || match session.take() {
+            Some(session) => session.shutdown(),
+            None => Ok(()),
+        },
+        || terminal.restore(),
+    );
+    // Explicit restore is followed by Drop so the original platform mode/code page is restored.
     drop(terminal);
     if std::env::var_os("ATC_TUI_MOUSE_TRACE").is_some() {
         eprintln!("atc terminal mouse: {mouse_mode_label}");
@@ -620,16 +653,12 @@ pub(super) fn watch_tui_at(
         }
     }
 
-    let session_result = match session.take() {
-        Some(session) => session.shutdown(),
-        None => Ok(()),
-    };
-
     combine_primary_and_cleanup_results(
         result,
         [
-            ("terminal restoration", restore_result),
-            ("contest session shutdown", session_result),
+            ("terminal restoration", cleanup.terminal_restore),
+            ("contest session shutdown", cleanup.contest_session),
+            ("submission worker shutdown", cleanup.submission_workers),
         ],
     )
     .map_err(AppError::from)
@@ -1129,6 +1158,7 @@ impl ContestSession {
         app_context: &AppContext,
         config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
+        submissions: &mut crate::tui::SubmissionHub,
         frontend: crate::tui::SessionFrontend<R>,
     ) -> io::Result<crate::tui::SessionExit>
     where
@@ -1145,7 +1175,7 @@ impl ContestSession {
             sample_counts,
             stress_cases,
             user_inputs,
-            channels,
+            crate::tui::SessionExecution::new(channels, submissions),
         );
         crate::tui::run(terminal, app_context, preferences, runtime, frontend)
     }
@@ -2737,6 +2767,56 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn full_tui_cleanup_joins_workers_before_restoring_terminal() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let worker_order = Arc::clone(&order);
+        let worker = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            while !worker_cancelled.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            worker_order.lock().unwrap().push("worker stopped");
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let shutdown_order = Arc::clone(&order);
+        let session_order = Arc::clone(&order);
+        let restore_order = Arc::clone(&order);
+        let cleanup = run_tui_cleanup(
+            || {
+                cancelled.store(true, Ordering::Release);
+                worker.join().unwrap();
+                shutdown_order.lock().unwrap().push("submission joined");
+                Err(io::Error::other("join reported an error"))
+            },
+            || {
+                session_order.lock().unwrap().push("contest joined");
+                Ok(())
+            },
+            || {
+                restore_order.lock().unwrap().push("terminal restored");
+                Ok(())
+            },
+        );
+
+        assert!(cleanup.submission_workers.is_err());
+        assert!(cleanup.contest_session.is_ok());
+        assert!(cleanup.terminal_restore.is_ok());
+        assert_eq!(
+            *order.lock().unwrap(),
+            [
+                "worker stopped",
+                "submission joined",
+                "contest joined",
+                "terminal restored"
+            ]
+        );
     }
 
     #[test]

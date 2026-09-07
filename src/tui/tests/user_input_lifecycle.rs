@@ -83,10 +83,10 @@ fn refresh_rejects_every_active_editor_without_touching_state_or_starting_fetch(
                 &mut app,
                 FrontendAction::RefreshContest,
                 TerminalInputContext::new(&run_tx, Some(&destination), None),
-                None,
-                Some(&mut refresh),
-                None,
-                None,
+                FrontendActionControllers {
+                    contest_refresh: Some(&mut refresh),
+                    ..FrontendActionControllers::default()
+                },
             )
             .unwrap()
         );
@@ -134,10 +134,10 @@ fn refresh_without_an_editor_starts_fetch_and_requests_rebuild() {
         &mut app,
         FrontendAction::RefreshContest,
         TerminalInputContext::new(&run_tx, Some(&destination), None),
-        None,
-        Some(&mut refresh),
-        None,
-        None,
+        FrontendActionControllers {
+            contest_refresh: Some(&mut refresh),
+            ..FrontendActionControllers::default()
+        },
     )
     .unwrap();
     wait_for_refresh_operation(&mut refresh);
@@ -215,6 +215,12 @@ fn background_tick_waits_for_all_delivered_terminal_events_not_only_q() {
     let (analysis_tx, _analysis_requests) = mpsc::channel();
     let (_analysis_results, analysis_rx) = mpsc::channel();
     let mut layout = detail_layout::DetailLayout::default();
+    let mut submissions = SubmissionHub::new();
+    let mut submit = SubmitController::new(
+        &destination,
+        Language::Cpp,
+        crate::language::PythonRuntime::CPython,
+    );
     tx.send(Message::SourceChanged {
         problem: 1,
         path: destination.join("B.py"),
@@ -233,8 +239,12 @@ fn background_tick_waits_for_all_delivered_terminal_events_not_only_q() {
                 &events,
                 &destination,
                 SessionChannels::new(&rx, &run_tx, &analysis_tx, &analysis_rx),
-                &mut switch,
-                &mut refresh,
+                BackgroundControllers {
+                    contest_switch: &mut switch,
+                    contest_refresh: &mut refresh,
+                    submissions: &mut submissions,
+                    submit: &mut submit,
+                },
                 &mut layout
             )
             .unwrap()
@@ -247,8 +257,12 @@ fn background_tick_waits_for_all_delivered_terminal_events_not_only_q() {
             &VecDeque::new(),
             &destination,
             SessionChannels::new(&rx, &run_tx, &analysis_tx, &analysis_rx),
-            &mut switch,
-            &mut refresh,
+            BackgroundControllers {
+                contest_switch: &mut switch,
+                contest_refresh: &mut refresh,
+                submissions: &mut submissions,
+                submit: &mut submit,
+            },
             &mut layout
         )
         .unwrap()
