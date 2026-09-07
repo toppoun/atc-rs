@@ -30,6 +30,10 @@ pub fn debug_include_dir() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(cache_dir()?.join("include"))
 }
 
+pub(crate) fn submission_tracking_dir() -> Result<PathBuf, etcetera::HomeDirError> {
+    Ok(cache_dir()?.join("submission-tracking"))
+}
+
 #[cfg(test)]
 pub fn state_dir() -> Result<PathBuf, etcetera::HomeDirError> {
     Ok(cookie_location()?.state_dir)
@@ -78,13 +82,15 @@ mod tests {
     }
 
     #[test]
-    fn debug_include_directory_is_under_atc_cache_directory() {
+    fn derived_directories_are_under_atc_cache_directory() {
         let cache = cache_dir().unwrap();
         let include = debug_include_dir().unwrap();
+        let submission_tracking = submission_tracking_dir().unwrap();
 
         assert!(cache.is_absolute());
         assert_eq!(cache.file_name().unwrap(), "atc");
         assert_eq!(include, cache.join("include"));
+        assert_eq!(submission_tracking, cache.join("submission-tracking"));
     }
     #[test]
     fn cookie_file_is_under_state_directory() {

@@ -1,9 +1,11 @@
 use super::test::find_problem;
 use crate::atcoder;
+use crate::atcoder::submission_diagnostics::AttemptDiagnostics;
 use crate::atcoder::submission_tracking::{
-    SubmissionId, SubmissionStatus, SubmissionTrackingError,
+    SubmissionDiagnostic, SubmissionDiagnosticObserver, SubmissionId, SubmissionStatus,
+    SubmissionTrackingError,
 };
-use crate::atcoder::submit::{SubmitExecutionOutcome, SubmitOutcome, SubmitRequest};
+use crate::atcoder::submit::{SubmitError, SubmitExecutionOutcome, SubmitOutcome, SubmitRequest};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::language::{Language, PythonRuntime, SubmissionTarget};
@@ -14,6 +16,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::rc::Rc;
 
 const RUNTIME_PYTHON_ONLY_ERROR: &str = "--runtime is only valid for Python submissions";
@@ -37,27 +40,39 @@ pub(crate) fn submit(
     let atcoder = atcoder::AtCoderClient::new()?;
     let stdout = io::stdout();
 
-    execute_submit_with_tracking(
-        plan,
-        &mut stdout.lock(),
-        read_source_file,
-        |contest_id, task_id, language_id| {
-            atcoder
-                .capture_submission_baseline(contest_id, task_id, language_id)
-                .ok()
+    let prepared = prepare_submit_with(plan, read_source_file)?;
+    let mut output_available = true;
+    let completion = execute_prepared_with_client(
+        prepared,
+        &atcoder,
+        |event| match event {
+            SubmissionEvent::Accepted => true,
+            SubmissionEvent::TrackingStarted { submission_id } => {
+                output_available = writeln!(stdout.lock(), "Submitted: #{submission_id}").is_ok();
+                output_available
+            }
+            SubmissionEvent::Status { status, .. } => {
+                output_available = render_submission_status(&mut stdout.lock(), &status).is_ok();
+                output_available
+            }
+            SubmissionEvent::TrackingUnavailable { submission_id } => {
+                if output_available {
+                    report_tracking_unavailable(&mut stdout.lock(), submission_id.is_some());
+                }
+                output_available
+            }
         },
-        |request, before_post| {
-            Ok(atcoder.submit_with_before_post(request, |language_id| {
-                before_post(language_id);
-            })?)
-        },
-        |baseline| atcoder.discover_submission_id(baseline).map_err(drop),
-        |contest_id, submission_id, on_status| {
-            atcoder
-                .watch_submission(contest_id, submission_id, on_status)
-                .map_err(drop)
-        },
-    )
+        &|| true,
+        &|| true,
+    )?;
+
+    match completion {
+        SubmissionCompletion::Accepted => Ok(()),
+        SubmissionCompletion::UnknownSubmissionOutcome => Err(AppError::UnknownSubmissionOutcome),
+        SubmissionCompletion::CancelledBeforeSubmit => {
+            unreachable!("the CLI submit path is not cancellable")
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -140,6 +155,8 @@ pub(crate) enum SubmissionCompletion {
     CancelledBeforeSubmit,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackingOperationError {
     Cancelled,
@@ -382,6 +399,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn execute_prepared_with_tracking_events<S, B, C, D, P, E>(
     prepared: PreparedSubmit,
     capture_baseline: C,
@@ -414,6 +432,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn execute_prepared_with_tracking_events_until<S, B, C, D, P, E>(
     prepared: PreparedSubmit,
     capture_baseline: C,
@@ -512,49 +531,220 @@ pub(crate) fn execute_prepared_with_client(
     should_continue: &dyn Fn() -> bool,
     try_begin_post: &dyn Fn() -> bool,
 ) -> Result<SubmissionCompletion, AppError> {
-    execute_prepared_with_tracking_events_until(
+    let mut diagnostics =
+        AttemptDiagnostics::from_env(&prepared.contest_id, &prepared.task_id, prepared.target);
+    execute_prepared_with_tracking_diagnostics(
         prepared,
-        |contest_id, task_id, language_id| {
-            atcoder
-                .capture_submission_baseline_until(
-                    contest_id,
-                    task_id,
-                    language_id,
-                    should_continue,
-                )
-                .ok()
+        &mut diagnostics,
+        |contest_id, task_id, language_id, observer| {
+            atcoder.capture_submission_baseline_until_observed(
+                contest_id,
+                task_id,
+                language_id,
+                should_continue,
+                observer,
+            )
         },
         |request, before_post| {
-            Ok(atcoder.submit_with_before_post_until(
+            atcoder.submit_with_before_post_until(
                 request,
                 |language_id| before_post(language_id),
                 should_continue,
                 try_begin_post,
-            )?)
+            )
         },
-        |baseline| {
-            atcoder
-                .discover_submission_id_until(baseline, should_continue)
-                .map_err(classify_tracking_operation_error)
+        |baseline, observer| {
+            atcoder.discover_submission_id_until_observed(baseline, should_continue, observer)
         },
-        |contest_id, submission_id, on_status| {
-            atcoder
-                .watch_submission_until(contest_id, submission_id, on_status, should_continue)
-                .map_err(classify_tracking_operation_error)
+        |contest_id, submission_id, on_status, observer| {
+            atcoder.watch_submission_until_observed(
+                contest_id,
+                submission_id,
+                on_status,
+                should_continue,
+                observer,
+            )
         },
         emit,
     )
 }
 
-fn classify_tracking_operation_error(error: SubmissionTrackingError) -> TrackingOperationError {
-    if matches!(error, SubmissionTrackingError::Cancelled) {
-        TrackingOperationError::Cancelled
-    } else {
-        TrackingOperationError::Unavailable
+#[allow(clippy::too_many_arguments)]
+fn execute_prepared_with_tracking_diagnostics<S, B, C, D, P, E>(
+    prepared: PreparedSubmit,
+    diagnostics: &mut AttemptDiagnostics,
+    capture_baseline: C,
+    submit_once: S,
+    discover_submission: D,
+    poll_status: P,
+    mut emit: E,
+) -> Result<SubmissionCompletion, AppError>
+where
+    S: FnOnce(SubmitRequest, &mut dyn FnMut(&str)) -> Result<SubmitExecutionOutcome, SubmitError>,
+    C: FnOnce(
+        &str,
+        &str,
+        &str,
+        &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<B, SubmissionTrackingError>,
+    D: FnOnce(
+        &B,
+        &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<SubmissionId, SubmissionTrackingError>,
+    P: FnOnce(
+        &str,
+        SubmissionId,
+        &mut dyn FnMut(&SubmissionStatus) -> bool,
+        &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<(), SubmissionTrackingError>,
+    E: FnMut(SubmissionEvent) -> bool,
+{
+    let PreparedSubmit {
+        contest_id,
+        task_id,
+        problem_index: _,
+        target,
+        source_snapshot,
+    } = prepared;
+    let baseline = RefCell::new(None);
+    let mut capture_baseline = Some(capture_baseline);
+    let request = SubmitRequest::new(contest_id.clone(), task_id.clone(), target, source_snapshot);
+
+    let execution = submit_once(request, &mut |language_id| {
+        let Some(capture_baseline) = capture_baseline.take() else {
+            return;
+        };
+        diagnostics.observe(SubmissionDiagnostic::LanguageResolved {
+            language_id: language_id.to_string(),
+        });
+        let captured = capture_baseline(&contest_id, &task_id, language_id, diagnostics);
+        *baseline.borrow_mut() = Some(captured);
+    });
+
+    // The submit backend has returned, so no physical POST can still begin. This is the first
+    // point at which diagnostics may touch disk after the immediately-pre-POST baseline hook.
+    diagnostics.arm_safe_flush();
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            diagnostics.observe(SubmissionDiagnostic::SubmitFailed {
+                after_baseline: baseline.borrow().is_some(),
+                kind: error.diagnostic_kind().to_string(),
+                message: error.to_string(),
+            });
+            diagnostics.finish("submission_failed");
+            return Err(error.into());
+        }
+    };
+
+    let outcome = match execution {
+        SubmitExecutionOutcome::Submitted(outcome) => outcome,
+        SubmitExecutionOutcome::CancelledBeforeSubmit => {
+            diagnostics.observe(SubmissionDiagnostic::Cancelled {
+                stage: "before submit",
+            });
+            diagnostics.finish("cancelled_before_submit");
+            return Ok(SubmissionCompletion::CancelledBeforeSubmit);
+        }
+    };
+
+    match outcome {
+        SubmitOutcome::Accepted => {
+            diagnostics.observe(SubmissionDiagnostic::PostAccepted);
+            diagnostics.flush();
+        }
+        SubmitOutcome::UnknownSubmissionOutcome => {
+            diagnostics.observe(SubmissionDiagnostic::PostUnknown);
+            diagnostics.finish("unknown_submission_outcome");
+            return Ok(SubmissionCompletion::UnknownSubmissionOutcome);
+        }
     }
+
+    if !emit(SubmissionEvent::Accepted) {
+        diagnostics.observe(SubmissionDiagnostic::Cancelled {
+            stage: "after acceptance before discovery",
+        });
+        diagnostics.finish("accepted_observer_stopped");
+        return Ok(SubmissionCompletion::Accepted);
+    }
+
+    let Some(baseline) = baseline.into_inner() else {
+        diagnostics.finish("tracking_unavailable_baseline_missing");
+        emit(SubmissionEvent::TrackingUnavailable {
+            submission_id: None,
+        });
+        return Ok(SubmissionCompletion::Accepted);
+    };
+    let baseline = match baseline {
+        Ok(baseline) => baseline,
+        Err(SubmissionTrackingError::Cancelled) => {
+            diagnostics.finish("cancelled_during_baseline");
+            return Ok(SubmissionCompletion::Accepted);
+        }
+        Err(_) => {
+            diagnostics.finish("tracking_unavailable_baseline");
+            emit(SubmissionEvent::TrackingUnavailable {
+                submission_id: None,
+            });
+            return Ok(SubmissionCompletion::Accepted);
+        }
+    };
+
+    let submission_id = match discover_submission(&baseline, diagnostics) {
+        Ok(submission_id) => submission_id,
+        Err(SubmissionTrackingError::Cancelled) => {
+            diagnostics.finish("cancelled_during_discovery");
+            return Ok(SubmissionCompletion::Accepted);
+        }
+        Err(_) => {
+            diagnostics.finish("tracking_unavailable_discovery");
+            emit(SubmissionEvent::TrackingUnavailable {
+                submission_id: None,
+            });
+            return Ok(SubmissionCompletion::Accepted);
+        }
+    };
+
+    if !emit(SubmissionEvent::TrackingStarted { submission_id }) {
+        diagnostics.observe(SubmissionDiagnostic::Cancelled {
+            stage: "after discovery before status polling",
+        });
+        diagnostics.finish("accepted_observer_stopped");
+        return Ok(SubmissionCompletion::Accepted);
+    }
+
+    let mut finished = false;
+    let poll_result = poll_status(
+        &contest_id,
+        submission_id,
+        &mut |status| {
+            finished |= matches!(status, SubmissionStatus::Finished(_));
+            emit(SubmissionEvent::Status {
+                submission_id,
+                status: *status,
+            })
+        },
+        diagnostics,
+    );
+    match poll_result {
+        Ok(()) if finished => diagnostics.finish("finished"),
+        Ok(()) => diagnostics.finish("accepted_observer_stopped"),
+        Err(SubmissionTrackingError::Cancelled) => {
+            diagnostics.finish("cancelled_during_status_polling");
+        }
+        Err(_) => {
+            diagnostics.finish("tracking_unavailable_status");
+            emit(SubmissionEvent::TrackingUnavailable {
+                submission_id: Some(submission_id),
+            });
+        }
+    }
+
+    Ok(SubmissionCompletion::Accepted)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn execute_submit_with_tracking<R, S, B, C, D, P, W>(
     plan: SubmitPlan,
     output: &mut W,
@@ -700,12 +890,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submission_tracking::Verdict;
+    use crate::atcoder::submission_tracking::{SubmissionTrackingErrorKind, Verdict};
     use crate::atcoder::submit::{SubmitError, SubmitPageError};
     use crate::config::Config;
     use crate::model::Contest;
 
     use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct BrokenPipeWriter {
@@ -1716,5 +1908,414 @@ mod tests {
         assert_eq!(completion, SubmissionCompletion::CancelledBeforeSubmit);
         assert_eq!(baseline_calls.get(), 1);
         assert!(events.is_empty());
+    }
+
+    fn diagnostic_prepared() -> PreparedSubmit {
+        PreparedSubmit {
+            contest_id: "abc473".to_string(),
+            task_id: "abc473_c".to_string(),
+            problem_index: "C".to_string(),
+            target: SubmissionTarget::Cpp,
+            source_snapshot: "SOURCE_COOKIE_CSRF_SECRET\n".to_string(),
+        }
+    }
+
+    fn run_successful_diagnostic_attempt(
+        diagnostics: &mut AttemptDiagnostics,
+        physical_posts: &AtomicUsize,
+        flushes: Option<&AtomicUsize>,
+    ) -> (SubmissionCompletion, Vec<SubmissionEvent>) {
+        let mut ui_events = Vec::new();
+        let completion = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            diagnostics,
+            |_, _, _, observer| {
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                observer.observe(SubmissionDiagnostic::BaselineSucceeded {
+                    existing_ids: vec![SubmissionId::for_test(10)],
+                });
+                Ok(())
+            },
+            |_, before_post| {
+                before_post("6017");
+                if let Some(flushes) = flushes {
+                    assert_eq!(
+                        flushes.load(Ordering::SeqCst),
+                        0,
+                        "diagnostics wrote between baseline and physical POST"
+                    );
+                }
+                physical_posts.fetch_add(1, Ordering::SeqCst);
+                Ok(SubmitExecutionOutcome::Submitted(SubmitOutcome::Accepted))
+            },
+            |_, observer| {
+                observer.observe(SubmissionDiagnostic::DiscoveryAttempt {
+                    attempt: 1,
+                    visible_ids: vec![SubmissionId::for_test(10)],
+                    new_ids: vec![],
+                    observed_union: vec![],
+                });
+                observer.observe(SubmissionDiagnostic::DiscoveryAttempt {
+                    attempt: 2,
+                    visible_ids: vec![SubmissionId::for_test(10), SubmissionId::for_test(11)],
+                    new_ids: vec![SubmissionId::for_test(11)],
+                    observed_union: vec![SubmissionId::for_test(11)],
+                });
+                observer.observe(SubmissionDiagnostic::DiscoveryResolved {
+                    submission_id: SubmissionId::for_test(11),
+                });
+                Ok(SubmissionId::for_test(11))
+            },
+            |_, submission_id, on_status, observer| {
+                for (attempt, status) in [
+                    (1, SubmissionStatus::WaitingForJudge),
+                    (
+                        2,
+                        SubmissionStatus::JudgingProgress {
+                            judged: 1,
+                            total: 50,
+                            provisional: None,
+                        },
+                    ),
+                    (3, SubmissionStatus::Finished(Verdict::Accepted)),
+                ] {
+                    observer.observe(SubmissionDiagnostic::StatusObserved {
+                        attempt,
+                        submission_id,
+                        status,
+                    });
+                    assert!(on_status(&status));
+                }
+                Ok(())
+            },
+            |event| {
+                ui_events.push(event);
+                true
+            },
+        )
+        .unwrap();
+        (completion, ui_events)
+    }
+
+    #[test]
+    fn diagnostics_never_flush_between_baseline_and_the_physical_post() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = temp.path().join("critical-timing");
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let physical_posts = AtomicUsize::new(0);
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            Some(attempt.clone()),
+            true,
+            true,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        diagnostics.set_flush_probe(Arc::clone(&flushes));
+
+        let (completion, events) =
+            run_successful_diagnostic_attempt(&mut diagnostics, &physical_posts, Some(&flushes));
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(physical_posts.load(Ordering::SeqCst), 1);
+        assert!(flushes.load(Ordering::SeqCst) >= 2);
+        assert!(matches!(events.first(), Some(SubmissionEvent::Accepted)));
+        assert!(matches!(
+            events.last(),
+            Some(SubmissionEvent::Status {
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+                ..
+            })
+        ));
+        let trace = fs::read_to_string(attempt.join("trace.log")).unwrap();
+        assert!(trace.contains("language resolved id=6017"));
+        assert!(trace.contains("post accepted"));
+        assert!(trace.contains("result=finished"));
+        for forbidden in ["SOURCE", "COOKIE", "CSRF", "SECRET"] {
+            assert!(!trace.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn diagnostics_disabled_safe_and_raw_modes_all_keep_exactly_one_post() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, enabled, raw_enabled) in [
+            ("disabled", false, false),
+            ("safe", true, false),
+            ("raw", true, true),
+        ] {
+            let physical_posts = AtomicUsize::new(0);
+            let directory = temp.path().join(name);
+            let mut diagnostics = AttemptDiagnostics::for_test(
+                Some(directory.clone()),
+                enabled,
+                raw_enabled,
+                "abc473",
+                "abc473_c",
+                SubmissionTarget::Cpp,
+            );
+
+            let (completion, _) =
+                run_successful_diagnostic_attempt(&mut diagnostics, &physical_posts, None);
+
+            assert_eq!(completion, SubmissionCompletion::Accepted, "{name}");
+            assert_eq!(physical_posts.load(Ordering::SeqCst), 1, "{name}");
+            assert_eq!(directory.exists(), enabled, "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_baseline_error_is_diagnostic_only_and_ui_remains_untracked() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = temp.path().join("baseline-failure");
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            Some(attempt.clone()),
+            true,
+            false,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let physical_posts = AtomicUsize::new(0);
+        let mut events = Vec::new();
+
+        let completion = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            &mut diagnostics,
+            |_, _, _, observer| {
+                let error = SubmissionTrackingError::MalformedSubmissionList(
+                    "submission score data-id is missing or malformed",
+                );
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                observer.observe(SubmissionDiagnostic::BaselineFailed {
+                    kind: SubmissionTrackingErrorKind::MalformedSubmissionList,
+                    message: error.to_string(),
+                });
+                Err(error)
+            },
+            |_, before_post| {
+                before_post("6017");
+                physical_posts.fetch_add(1, Ordering::SeqCst);
+                Ok(SubmitExecutionOutcome::Submitted(SubmitOutcome::Accepted))
+            },
+            |_: &(), _| panic!("discovery must not run after baseline failure"),
+            |_, _, _, _| panic!("status polling must not run after baseline failure"),
+            |event| {
+                events.push(event);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(physical_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events,
+            [
+                SubmissionEvent::Accepted,
+                SubmissionEvent::TrackingUnavailable {
+                    submission_id: None
+                }
+            ]
+        );
+        let trace = fs::read_to_string(attempt.join("trace.log")).unwrap();
+        assert!(trace.contains("baseline failed kind=MalformedSubmissionList"));
+        assert!(trace.contains("submission score data-id is missing or malformed"));
+        assert!(trace.contains("result=tracking_unavailable_baseline"));
+    }
+
+    #[test]
+    fn diagnostics_filesystem_failure_cannot_change_an_accepted_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_file = temp.path().join("not-a-directory");
+        fs::write(&parent_file, b"file").unwrap();
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            Some(parent_file.join("attempt")),
+            true,
+            true,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let physical_posts = AtomicUsize::new(0);
+
+        let (completion, events) =
+            run_successful_diagnostic_attempt(&mut diagnostics, &physical_posts, None);
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(physical_posts.load(Ordering::SeqCst), 1);
+        assert!(matches!(events.first(), Some(SubmissionEvent::Accepted)));
+        assert!(parent_file.is_file());
+    }
+
+    #[test]
+    fn diagnostics_distinguish_rejected_and_unknown_post_outcomes_without_retry() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let rejected_dir = temp.path().join("rejected");
+        let rejected_posts = AtomicUsize::new(0);
+        let mut rejected_diagnostics = AttemptDiagnostics::for_test(
+            Some(rejected_dir.clone()),
+            true,
+            false,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let rejected = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            &mut rejected_diagnostics,
+            |_, _, _, observer| {
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                observer.observe(SubmissionDiagnostic::BaselineSucceeded {
+                    existing_ids: vec![],
+                });
+                Ok(())
+            },
+            |_, before_post| {
+                before_post("6017");
+                rejected_posts.fetch_add(1, Ordering::SeqCst);
+                Err(SubmitError::SubmissionRejected)
+            },
+            |_: &(), _| panic!("rejected submission must not be discovered"),
+            |_, _, _, _| panic!("rejected submission must not be polled"),
+            |_| panic!("rejected submission must not emit accepted UI events"),
+        );
+        assert!(matches!(
+            rejected,
+            Err(AppError::Submit(SubmitError::SubmissionRejected))
+        ));
+        assert_eq!(rejected_posts.load(Ordering::SeqCst), 1);
+        let rejected_trace = fs::read_to_string(rejected_dir.join("trace.log")).unwrap();
+        assert!(rejected_trace.contains("post rejected kind=SubmissionRejected"));
+        assert!(rejected_trace.contains("result=submission_failed"));
+
+        let unknown_dir = temp.path().join("unknown");
+        let unknown_posts = AtomicUsize::new(0);
+        let mut unknown_diagnostics = AttemptDiagnostics::for_test(
+            Some(unknown_dir.clone()),
+            true,
+            false,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let unknown = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            &mut unknown_diagnostics,
+            |_, _, _, observer| {
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                observer.observe(SubmissionDiagnostic::BaselineSucceeded {
+                    existing_ids: vec![],
+                });
+                Ok(())
+            },
+            |_, before_post| {
+                before_post("6017");
+                unknown_posts.fetch_add(1, Ordering::SeqCst);
+                Ok(SubmitExecutionOutcome::Submitted(
+                    SubmitOutcome::UnknownSubmissionOutcome,
+                ))
+            },
+            |_: &(), _| panic!("unknown submission must not be discovered"),
+            |_, _, _, _| panic!("unknown submission must not be polled"),
+            |_| panic!("unknown submission must not emit accepted UI events"),
+        )
+        .unwrap();
+        assert_eq!(unknown, SubmissionCompletion::UnknownSubmissionOutcome);
+        assert_eq!(unknown_posts.load(Ordering::SeqCst), 1);
+        let unknown_trace = fs::read_to_string(unknown_dir.join("trace.log")).unwrap();
+        assert!(unknown_trace.contains("post outcome=unknown"));
+        assert!(unknown_trace.contains("result=unknown_submission_outcome"));
+    }
+
+    #[test]
+    fn raw_limit_does_not_change_submission_or_tracking_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = temp.path().join("raw-limit-completion");
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            Some(attempt.clone()),
+            true,
+            true,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        diagnostics.capture_raw(
+            crate::atcoder::submission_tracking::RawCaptureKind::Baseline,
+            &"x".repeat(crate::atcoder::submission_diagnostics::RAW_CAPTURE_LIMIT_BYTES + 1),
+        );
+        let physical_posts = AtomicUsize::new(0);
+
+        let (completion, events) =
+            run_successful_diagnostic_attempt(&mut diagnostics, &physical_posts, None);
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(physical_posts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.last(),
+            Some(SubmissionEvent::Status {
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::metadata(attempt.join("baseline.html")).unwrap().len(),
+            crate::atcoder::submission_diagnostics::RAW_CAPTURE_LIMIT_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn tracking_cancellation_is_not_misreported_as_untracked() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = temp.path().join("cancelled-discovery");
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            Some(attempt.clone()),
+            true,
+            false,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let mut events = Vec::new();
+
+        let completion = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            &mut diagnostics,
+            |_, _, _, observer| {
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                observer.observe(SubmissionDiagnostic::BaselineSucceeded {
+                    existing_ids: vec![],
+                });
+                Ok(())
+            },
+            |_, before_post| {
+                before_post("6017");
+                Ok(SubmitExecutionOutcome::Submitted(SubmitOutcome::Accepted))
+            },
+            |_, observer| {
+                let error = SubmissionTrackingError::Cancelled;
+                observer.observe(SubmissionDiagnostic::DiscoveryFailed {
+                    attempt: Some(1),
+                    kind: SubmissionTrackingErrorKind::Cancelled,
+                    message: error.to_string(),
+                    observed_new_ids: vec![],
+                });
+                Err(error)
+            },
+            |_, _, _, _| panic!("cancelled discovery must not poll status"),
+            |event| {
+                events.push(event);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(events, [SubmissionEvent::Accepted]);
+        let trace = fs::read_to_string(attempt.join("trace.log")).unwrap();
+        assert!(trace.contains("discovery failed attempt=1 kind=Cancelled"));
+        assert!(trace.contains("result=cancelled_during_discovery"));
+        assert!(!trace.contains("result=tracking_unavailable"));
     }
 }

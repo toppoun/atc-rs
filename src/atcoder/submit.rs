@@ -688,6 +688,22 @@ impl std::error::Error for SubmitError {
     }
 }
 
+impl SubmitError {
+    pub(crate) fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::InvalidRequestIdentity { .. } => "InvalidRequestIdentity",
+            Self::AuthenticationRequired => "AuthenticationRequired",
+            Self::SubmitUnavailable => "SubmitUnavailable",
+            Self::SubmitClientInitializationFailed => "SubmitClientInitializationFailed",
+            Self::SubmitPage(_) => "SubmitPage",
+            Self::SubmitPageFetchFailed => "SubmitPageFetchFailed",
+            Self::SubmissionRejected => "SubmissionRejected",
+            Self::UnexpectedRedirect => "UnexpectedRedirect",
+            Self::RateLimited => "RateLimited",
+        }
+    }
+}
+
 impl AtCoderClient {
     pub(crate) fn submit(&self, request: SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
         self.submit_with_before_post(request, |_| {})

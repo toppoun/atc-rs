@@ -89,6 +89,138 @@ pub(crate) enum SubmissionStatus {
     Finished(Verdict),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionTrackingErrorKind {
+    Unavailable,
+    HttpStatus,
+    HttpTransport,
+    RateLimited,
+    Fetch,
+    InvalidIdentity,
+    MalformedSubmissionList,
+    SubmissionNotFound,
+    AmbiguousSubmissionIds,
+    Cancelled,
+    StatusPollingTimedOut,
+    MalformedStatusJson,
+    TargetStatusMissing,
+    StatusHtmlMissing,
+    StatusCellMissing,
+    MultipleStatusCells,
+    InvalidStatus,
+}
+
+impl fmt::Display for SubmissionTrackingErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "Unavailable",
+            Self::HttpStatus => "HttpStatus",
+            Self::HttpTransport => "HttpTransport",
+            Self::RateLimited => "RateLimited",
+            Self::Fetch => "Fetch",
+            Self::InvalidIdentity => "InvalidIdentity",
+            Self::MalformedSubmissionList => "MalformedSubmissionList",
+            Self::SubmissionNotFound => "SubmissionNotFound",
+            Self::AmbiguousSubmissionIds => "AmbiguousSubmissionIds",
+            Self::Cancelled => "Cancelled",
+            Self::StatusPollingTimedOut => "StatusPollingTimedOut",
+            Self::MalformedStatusJson => "MalformedStatusJson",
+            Self::TargetStatusMissing => "TargetStatusMissing",
+            Self::StatusHtmlMissing => "StatusHtmlMissing",
+            Self::StatusCellMissing => "StatusCellMissing",
+            Self::MultipleStatusCells => "MultipleStatusCells",
+            Self::InvalidStatus => "InvalidStatus",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubmissionDiagnostic {
+    LanguageResolved {
+        language_id: String,
+    },
+    BaselineStarted,
+    BaselineSucceeded {
+        existing_ids: Vec<SubmissionId>,
+    },
+    BaselineFailed {
+        kind: SubmissionTrackingErrorKind,
+        message: String,
+    },
+    PostAccepted,
+    SubmitFailed {
+        after_baseline: bool,
+        kind: String,
+        message: String,
+    },
+    PostUnknown,
+    DiscoveryAttempt {
+        attempt: usize,
+        visible_ids: Vec<SubmissionId>,
+        new_ids: Vec<SubmissionId>,
+        observed_union: Vec<SubmissionId>,
+    },
+    DiscoveryResolved {
+        submission_id: SubmissionId,
+    },
+    DiscoveryFailed {
+        attempt: Option<usize>,
+        kind: SubmissionTrackingErrorKind,
+        message: String,
+        observed_new_ids: Vec<SubmissionId>,
+    },
+    StatusObserved {
+        attempt: usize,
+        submission_id: SubmissionId,
+        status: SubmissionStatus,
+    },
+    StatusFailed {
+        attempt: usize,
+        submission_id: SubmissionId,
+        kind: SubmissionTrackingErrorKind,
+        message: String,
+    },
+    Cancelled {
+        stage: &'static str,
+    },
+    RawCaptureLimited {
+        filename: String,
+        original_bytes: usize,
+        captured_bytes: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawCaptureKind {
+    Baseline,
+    Discovery { attempt: usize },
+    Status { attempt: usize },
+}
+
+impl RawCaptureKind {
+    pub(crate) fn filename(self) -> String {
+        match self {
+            Self::Baseline => "baseline.html".to_string(),
+            Self::Discovery { attempt } => format!("discover-{attempt:03}.html"),
+            Self::Status { attempt } => format!("status-{attempt:03}.json"),
+        }
+    }
+}
+
+pub(crate) trait SubmissionDiagnosticObserver {
+    fn observe(&mut self, event: SubmissionDiagnostic);
+    fn capture_raw(&mut self, kind: RawCaptureKind, text: &str);
+}
+
+#[allow(dead_code)]
+struct NoopSubmissionDiagnosticObserver;
+
+impl SubmissionDiagnosticObserver for NoopSubmissionDiagnosticObserver {
+    fn observe(&mut self, _event: SubmissionDiagnostic) {}
+
+    fn capture_raw(&mut self, _kind: RawCaptureKind, _text: &str) {}
+}
+
 #[derive(Debug)]
 pub(crate) enum SubmissionTrackingError {
     Unavailable,
@@ -159,6 +291,36 @@ impl std::error::Error for SubmissionTrackingError {
     }
 }
 
+impl SubmissionTrackingError {
+    pub(crate) fn diagnostic_kind(&self) -> SubmissionTrackingErrorKind {
+        match self {
+            Self::Unavailable => SubmissionTrackingErrorKind::Unavailable,
+            Self::Fetch(AtCoderError::Http(error)) if error.status().is_some() => {
+                SubmissionTrackingErrorKind::HttpStatus
+            }
+            Self::Fetch(AtCoderError::Http(_)) => SubmissionTrackingErrorKind::HttpTransport,
+            Self::Fetch(AtCoderError::RateLimited { .. }) => {
+                SubmissionTrackingErrorKind::RateLimited
+            }
+            Self::Fetch(_) => SubmissionTrackingErrorKind::Fetch,
+            Self::InvalidIdentity(_) => SubmissionTrackingErrorKind::InvalidIdentity,
+            Self::MalformedSubmissionList(_) => {
+                SubmissionTrackingErrorKind::MalformedSubmissionList
+            }
+            Self::SubmissionNotFound => SubmissionTrackingErrorKind::SubmissionNotFound,
+            Self::AmbiguousSubmissionIds => SubmissionTrackingErrorKind::AmbiguousSubmissionIds,
+            Self::Cancelled => SubmissionTrackingErrorKind::Cancelled,
+            Self::StatusPollingTimedOut => SubmissionTrackingErrorKind::StatusPollingTimedOut,
+            Self::MalformedStatusJson(_) => SubmissionTrackingErrorKind::MalformedStatusJson,
+            Self::TargetStatusMissing => SubmissionTrackingErrorKind::TargetStatusMissing,
+            Self::StatusHtmlMissing => SubmissionTrackingErrorKind::StatusHtmlMissing,
+            Self::StatusCellMissing => SubmissionTrackingErrorKind::StatusCellMissing,
+            Self::MultipleStatusCells => SubmissionTrackingErrorKind::MultipleStatusCells,
+            Self::InvalidStatus => SubmissionTrackingErrorKind::InvalidStatus,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionBaseline {
     contest_id: String,
@@ -168,6 +330,7 @@ pub(crate) struct SubmissionBaseline {
 }
 
 impl AtCoderClient {
+    #[allow(dead_code)]
     pub(crate) fn capture_submission_baseline(
         &self,
         contest_id: &str,
@@ -177,6 +340,7 @@ impl AtCoderClient {
         self.capture_submission_baseline_until(contest_id, task_id, language_id, &|| true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn capture_submission_baseline_until(
         &self,
         contest_id: &str,
@@ -184,18 +348,43 @@ impl AtCoderClient {
         language_id: &str,
         should_continue: &dyn Fn() -> bool,
     ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
+        let mut observer = NoopSubmissionDiagnosticObserver;
+        self.capture_submission_baseline_until_observed(
+            contest_id,
+            task_id,
+            language_id,
+            should_continue,
+            &mut observer,
+        )
+    }
+
+    pub(crate) fn capture_submission_baseline_until_observed(
+        &self,
+        contest_id: &str,
+        task_id: &str,
+        language_id: &str,
+        should_continue: &dyn Fn() -> bool,
+        observer: &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => capture_baseline_with_transport_until(
+            Source::Http(http) => capture_baseline_with_transport_until_observed(
                 &mut HttpTrackingTransport { http },
                 contest_id,
                 task_id,
                 language_id,
                 should_continue,
+                observer,
             ),
-            Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
+            Source::Fixture(_) => {
+                observer.observe(SubmissionDiagnostic::BaselineStarted);
+                let error = SubmissionTrackingError::Unavailable;
+                observe_baseline_error(observer, &error);
+                Err(error)
+            }
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn discover_submission_id(
         &self,
         baseline: &SubmissionBaseline,
@@ -203,21 +392,38 @@ impl AtCoderClient {
         self.discover_submission_id_until(baseline, &|| true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn discover_submission_id_until(
         &self,
         baseline: &SubmissionBaseline,
         should_continue: &dyn Fn() -> bool,
     ) -> Result<SubmissionId, SubmissionTrackingError> {
+        let mut observer = NoopSubmissionDiagnosticObserver;
+        self.discover_submission_id_until_observed(baseline, should_continue, &mut observer)
+    }
+
+    pub(crate) fn discover_submission_id_until_observed(
+        &self,
+        baseline: &SubmissionBaseline,
+        should_continue: &dyn Fn() -> bool,
+        observer: &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<SubmissionId, SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => discover_submission_with_transport_until(
+            Source::Http(http) => discover_submission_with_transport_until_observed(
                 &mut HttpTrackingTransport { http },
                 baseline,
                 should_continue,
+                observer,
             ),
-            Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
+            Source::Fixture(_) => {
+                let error = SubmissionTrackingError::Unavailable;
+                observe_discovery_error(observer, None, &BTreeSet::new(), &error);
+                Err(error)
+            }
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn watch_submission(
         &self,
         contest_id: &str,
@@ -227,6 +433,7 @@ impl AtCoderClient {
         self.watch_submission_until(contest_id, submission_id, on_status, &|| true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn watch_submission_until(
         &self,
         contest_id: &str,
@@ -234,15 +441,38 @@ impl AtCoderClient {
         on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
         should_continue: &dyn Fn() -> bool,
     ) -> Result<(), SubmissionTrackingError> {
+        let mut observer = NoopSubmissionDiagnosticObserver;
+        self.watch_submission_until_observed(
+            contest_id,
+            submission_id,
+            on_status,
+            should_continue,
+            &mut observer,
+        )
+    }
+
+    pub(crate) fn watch_submission_until_observed(
+        &self,
+        contest_id: &str,
+        submission_id: SubmissionId,
+        on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
+        should_continue: &dyn Fn() -> bool,
+        observer: &mut dyn SubmissionDiagnosticObserver,
+    ) -> Result<(), SubmissionTrackingError> {
         match &self.source {
-            Source::Http(http) => watch_submission_with_transport_until(
+            Source::Http(http) => watch_submission_with_transport_until_observed(
                 &mut HttpTrackingTransport { http },
                 contest_id,
                 submission_id,
                 on_status,
                 should_continue,
+                observer,
             ),
-            Source::Fixture(_) => Err(SubmissionTrackingError::Unavailable),
+            Source::Fixture(_) => {
+                let error = SubmissionTrackingError::Unavailable;
+                observe_status_error(observer, 1, submission_id, &error);
+                Err(error)
+            }
         }
     }
 }
@@ -330,6 +560,7 @@ fn capture_baseline_with_transport(
     capture_baseline_with_transport_until(transport, contest_id, task_id, language_id, &|| true)
 }
 
+#[allow(dead_code)]
 fn capture_baseline_with_transport_until(
     transport: &mut impl TrackingTransport,
     contest_id: &str,
@@ -337,24 +568,55 @@ fn capture_baseline_with_transport_until(
     language_id: &str,
     should_continue: &dyn Fn() -> bool,
 ) -> Result<SubmissionBaseline, SubmissionTrackingError> {
-    if !should_continue() {
-        return Err(SubmissionTrackingError::Cancelled);
-    }
-    validate_identifier(contest_id, "contest ID")?;
-    validate_identifier(task_id, "task ID")?;
-    validate_identifier(language_id, "language ID")?;
-    let html = transport.get_text_until(
-        &submission_list_path(contest_id, task_id, language_id),
+    let mut observer = NoopSubmissionDiagnosticObserver;
+    capture_baseline_with_transport_until_observed(
+        transport,
+        contest_id,
+        task_id,
+        language_id,
         should_continue,
-    )?;
-    let ids = parse_submission_list(contest_id, task_id, language_id, &html)?;
+        &mut observer,
+    )
+}
 
-    Ok(SubmissionBaseline {
-        contest_id: contest_id.to_string(),
-        task_id: task_id.to_string(),
-        language_id: language_id.to_string(),
-        ids,
-    })
+fn capture_baseline_with_transport_until_observed(
+    transport: &mut impl TrackingTransport,
+    contest_id: &str,
+    task_id: &str,
+    language_id: &str,
+    should_continue: &dyn Fn() -> bool,
+    observer: &mut dyn SubmissionDiagnosticObserver,
+) -> Result<SubmissionBaseline, SubmissionTrackingError> {
+    observer.observe(SubmissionDiagnostic::BaselineStarted);
+    let result = (|| {
+        if !should_continue() {
+            return Err(SubmissionTrackingError::Cancelled);
+        }
+        validate_identifier(contest_id, "contest ID")?;
+        validate_identifier(task_id, "task ID")?;
+        validate_identifier(language_id, "language ID")?;
+        let html = transport.get_text_until(
+            &submission_list_path(contest_id, task_id, language_id),
+            should_continue,
+        )?;
+        observer.capture_raw(RawCaptureKind::Baseline, &html);
+        let ids = parse_submission_list(contest_id, task_id, language_id, &html)?;
+
+        Ok(SubmissionBaseline {
+            contest_id: contest_id.to_string(),
+            task_id: task_id.to_string(),
+            language_id: language_id.to_string(),
+            ids,
+        })
+    })();
+
+    match &result {
+        Ok(baseline) => observer.observe(SubmissionDiagnostic::BaselineSucceeded {
+            existing_ids: baseline.ids.iter().copied().collect(),
+        }),
+        Err(error) => observe_baseline_error(observer, error),
+    }
+    result
 }
 
 #[cfg(test)]
@@ -365,37 +627,86 @@ fn discover_submission_with_transport(
     discover_submission_with_transport_until(transport, baseline, &|| true)
 }
 
+#[allow(dead_code)]
 fn discover_submission_with_transport_until(
     transport: &mut impl TrackingTransport,
     baseline: &SubmissionBaseline,
     should_continue: &dyn Fn() -> bool,
 ) -> Result<SubmissionId, SubmissionTrackingError> {
+    let mut observer = NoopSubmissionDiagnosticObserver;
+    discover_submission_with_transport_until_observed(
+        transport,
+        baseline,
+        should_continue,
+        &mut observer,
+    )
+}
+
+fn discover_submission_with_transport_until_observed(
+    transport: &mut impl TrackingTransport,
+    baseline: &SubmissionBaseline,
+    should_continue: &dyn Fn() -> bool,
+    observer: &mut dyn SubmissionDiagnosticObserver,
+) -> Result<SubmissionId, SubmissionTrackingError> {
     let mut observed_new_ids = BTreeSet::new();
 
     for attempt in 0..DISCOVERY_ATTEMPTS {
+        let attempt_number = attempt + 1;
         if !should_continue() {
-            return Err(SubmissionTrackingError::Cancelled);
+            let error = SubmissionTrackingError::Cancelled;
+            observe_discovery_error(observer, Some(attempt_number), &observed_new_ids, &error);
+            return Err(error);
         }
-        let html = transport.get_text_until(
+        let html = match transport.get_text_until(
             &submission_list_path(
                 &baseline.contest_id,
                 &baseline.task_id,
                 &baseline.language_id,
             ),
             should_continue,
-        )?;
-        let ids = parse_submission_list(
+        ) {
+            Ok(html) => html,
+            Err(error) => {
+                observe_discovery_error(observer, Some(attempt_number), &observed_new_ids, &error);
+                return Err(error);
+            }
+        };
+        observer.capture_raw(
+            RawCaptureKind::Discovery {
+                attempt: attempt_number,
+            },
+            &html,
+        );
+        let ids = match parse_submission_list(
             &baseline.contest_id,
             &baseline.task_id,
             &baseline.language_id,
             &html,
-        )?;
-        observed_new_ids.extend(ids.difference(&baseline.ids).copied());
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                observe_discovery_error(observer, Some(attempt_number), &observed_new_ids, &error);
+                return Err(error);
+            }
+        };
+        let new_ids = ids
+            .difference(&baseline.ids)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        observed_new_ids.extend(&new_ids);
+        observer.observe(SubmissionDiagnostic::DiscoveryAttempt {
+            attempt: attempt_number,
+            visible_ids: ids.into_iter().collect(),
+            new_ids: new_ids.into_iter().collect(),
+            observed_union: observed_new_ids.iter().copied().collect(),
+        });
 
         if attempt + 1 < DISCOVERY_ATTEMPTS
             && !transport.wait_while(DISCOVERY_INTERVAL, should_continue)
         {
-            return Err(SubmissionTrackingError::Cancelled);
+            let error = SubmissionTrackingError::Cancelled;
+            observe_discovery_error(observer, Some(attempt_number), &observed_new_ids, &error);
+            return Err(error);
         }
     }
 
@@ -407,9 +718,24 @@ fn discover_submission_with_transport_until(
     // catches delayed races without ever narrowing an ambiguous observation back to a singleton.
     let mut candidates = observed_new_ids.into_iter();
     match (candidates.next(), candidates.next()) {
-        (Some(id), None) => Ok(id),
-        (Some(_), Some(_)) => Err(SubmissionTrackingError::AmbiguousSubmissionIds),
-        (None, _) => Err(SubmissionTrackingError::SubmissionNotFound),
+        (Some(id), None) => {
+            observer.observe(SubmissionDiagnostic::DiscoveryResolved { submission_id: id });
+            Ok(id)
+        }
+        (Some(first), Some(second)) => {
+            let observed = std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(candidates)
+                .collect::<BTreeSet<_>>();
+            let error = SubmissionTrackingError::AmbiguousSubmissionIds;
+            observe_discovery_error(observer, Some(DISCOVERY_ATTEMPTS), &observed, &error);
+            Err(error)
+        }
+        (None, _) => {
+            let error = SubmissionTrackingError::SubmissionNotFound;
+            observe_discovery_error(observer, Some(DISCOVERY_ATTEMPTS), &BTreeSet::new(), &error);
+            Err(error)
+        }
     }
 }
 
@@ -423,6 +749,7 @@ fn watch_submission_with_transport(
     watch_submission_with_transport_until(transport, contest_id, submission_id, on_status, &|| true)
 }
 
+#[allow(dead_code)]
 fn watch_submission_with_transport_until(
     transport: &mut impl TrackingTransport,
     contest_id: &str,
@@ -430,16 +757,65 @@ fn watch_submission_with_transport_until(
     on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
     should_continue: &dyn Fn() -> bool,
 ) -> Result<(), SubmissionTrackingError> {
-    validate_identifier(contest_id, "contest ID")?;
+    let mut observer = NoopSubmissionDiagnosticObserver;
+    watch_submission_with_transport_until_observed(
+        transport,
+        contest_id,
+        submission_id,
+        on_status,
+        should_continue,
+        &mut observer,
+    )
+}
+
+fn watch_submission_with_transport_until_observed(
+    transport: &mut impl TrackingTransport,
+    contest_id: &str,
+    submission_id: SubmissionId,
+    on_status: &mut dyn FnMut(&SubmissionStatus) -> bool,
+    should_continue: &dyn Fn() -> bool,
+    observer: &mut dyn SubmissionDiagnosticObserver,
+) -> Result<(), SubmissionTrackingError> {
+    if let Err(error) = validate_identifier(contest_id, "contest ID") {
+        observe_status_error(observer, 1, submission_id, &error);
+        return Err(error);
+    }
     let mut previous = None;
 
     for attempt in 0..STATUS_POLL_ATTEMPTS {
+        let attempt_number = attempt + 1;
         if !should_continue() {
-            return Err(SubmissionTrackingError::Cancelled);
+            let error = SubmissionTrackingError::Cancelled;
+            observe_status_error(observer, attempt_number, submission_id, &error);
+            return Err(error);
         }
-        let json =
-            transport.get_text_until(&status_path(contest_id, submission_id), should_continue)?;
-        let status = parse_status_response(submission_id, &json)?;
+        let json = match transport
+            .get_text_until(&status_path(contest_id, submission_id), should_continue)
+        {
+            Ok(json) => json,
+            Err(error) => {
+                observe_status_error(observer, attempt_number, submission_id, &error);
+                return Err(error);
+            }
+        };
+        observer.capture_raw(
+            RawCaptureKind::Status {
+                attempt: attempt_number,
+            },
+            &json,
+        );
+        let status = match parse_status_response(submission_id, &json) {
+            Ok(status) => status,
+            Err(error) => {
+                observe_status_error(observer, attempt_number, submission_id, &error);
+                return Err(error);
+            }
+        };
+        observer.observe(SubmissionDiagnostic::StatusObserved {
+            attempt: attempt_number,
+            submission_id,
+            status,
+        });
         let finished = matches!(status, SubmissionStatus::Finished(_));
 
         if previous != Some(status) {
@@ -456,11 +832,53 @@ fn watch_submission_with_transport_until(
         if attempt + 1 < STATUS_POLL_ATTEMPTS
             && !transport.wait_while(STATUS_POLL_INTERVAL, should_continue)
         {
-            return Err(SubmissionTrackingError::Cancelled);
+            let error = SubmissionTrackingError::Cancelled;
+            observe_status_error(observer, attempt_number, submission_id, &error);
+            return Err(error);
         }
     }
 
-    Err(SubmissionTrackingError::StatusPollingTimedOut)
+    let error = SubmissionTrackingError::StatusPollingTimedOut;
+    observe_status_error(observer, STATUS_POLL_ATTEMPTS, submission_id, &error);
+    Err(error)
+}
+
+fn observe_baseline_error(
+    observer: &mut dyn SubmissionDiagnosticObserver,
+    error: &SubmissionTrackingError,
+) {
+    observer.observe(SubmissionDiagnostic::BaselineFailed {
+        kind: error.diagnostic_kind(),
+        message: error.to_string(),
+    });
+}
+
+fn observe_discovery_error(
+    observer: &mut dyn SubmissionDiagnosticObserver,
+    attempt: Option<usize>,
+    observed_new_ids: &BTreeSet<SubmissionId>,
+    error: &SubmissionTrackingError,
+) {
+    observer.observe(SubmissionDiagnostic::DiscoveryFailed {
+        attempt,
+        kind: error.diagnostic_kind(),
+        message: error.to_string(),
+        observed_new_ids: observed_new_ids.iter().copied().collect(),
+    });
+}
+
+fn observe_status_error(
+    observer: &mut dyn SubmissionDiagnosticObserver,
+    attempt: usize,
+    submission_id: SubmissionId,
+    error: &SubmissionTrackingError,
+) {
+    observer.observe(SubmissionDiagnostic::StatusFailed {
+        attempt,
+        submission_id,
+        kind: error.diagnostic_kind(),
+        message: error.to_string(),
+    });
 }
 
 fn submission_list_path(contest_id: &str, task_id: &str, language_id: &str) -> String {
@@ -861,6 +1279,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Vec<SubmissionDiagnostic>,
+        raw: Vec<(RawCaptureKind, String)>,
+    }
+
+    impl SubmissionDiagnosticObserver for RecordingObserver {
+        fn observe(&mut self, event: SubmissionDiagnostic) {
+            self.events.push(event);
+        }
+
+        fn capture_raw(&mut self, kind: RawCaptureKind, text: &str) {
+            self.raw.push((kind, text.to_string()));
+        }
+    }
+
     fn row_with_links(
         data_id: Option<&str>,
         detail_href: Option<&str>,
@@ -1127,6 +1561,136 @@ mod tests {
     }
 
     #[test]
+    fn observed_tracking_records_every_discovery_and_status_poll_including_duplicates() {
+        let after = SINGLE_LIST.to_string();
+        let status_wj = STATUS_WJ.replace("78905773", "78777605");
+        let status_judging = STATUS_JUDGING.replace("78905773", "78777605");
+        let status_ac = STATUS_AC.replace("78905773", "78777605");
+        let mut transport = ScriptedTransport::new([
+            EMPTY_LIST.to_string(),
+            EMPTY_LIST.to_string(),
+            after.clone(),
+            after,
+            status_wj.clone(),
+            status_wj,
+            status_judging,
+            status_ac,
+        ]);
+        let mut observer = RecordingObserver::default();
+
+        let baseline = capture_baseline_with_transport_until_observed(
+            &mut transport,
+            "abc473",
+            "abc473_c",
+            "6017",
+            &|| true,
+            &mut observer,
+        )
+        .unwrap();
+        let id = discover_submission_with_transport_until_observed(
+            &mut transport,
+            &baseline,
+            &|| true,
+            &mut observer,
+        )
+        .unwrap();
+        let mut ui_statuses = Vec::new();
+        watch_submission_with_transport_until_observed(
+            &mut transport,
+            "abc473",
+            id,
+            &mut |status| {
+                ui_statuses.push(*status);
+                true
+            },
+            &|| true,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert_eq!(id, SubmissionId(78777605));
+        let attempts = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SubmissionDiagnostic::DiscoveryAttempt {
+                    attempt,
+                    visible_ids,
+                    new_ids,
+                    observed_union,
+                } => Some((
+                    *attempt,
+                    visible_ids.clone(),
+                    new_ids.clone(),
+                    observed_union.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [
+                (1, vec![], vec![], vec![]),
+                (
+                    2,
+                    vec![SubmissionId(78777605)],
+                    vec![SubmissionId(78777605)],
+                    vec![SubmissionId(78777605)]
+                ),
+                (
+                    3,
+                    vec![SubmissionId(78777605)],
+                    vec![SubmissionId(78777605)],
+                    vec![SubmissionId(78777605)]
+                ),
+            ]
+        );
+        assert!(
+            observer
+                .events
+                .contains(&SubmissionDiagnostic::DiscoveryResolved {
+                    submission_id: SubmissionId(78777605)
+                })
+        );
+        let diagnostic_statuses = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SubmissionDiagnostic::StatusObserved { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostic_statuses.len(), 4);
+        assert_eq!(
+            diagnostic_statuses[..2],
+            [SubmissionStatus::WaitingForJudge; 2]
+        );
+        assert_eq!(
+            ui_statuses.len(),
+            3,
+            "duplicate UI statuses must stay suppressed"
+        );
+        assert_eq!(
+            observer
+                .raw
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            [
+                RawCaptureKind::Baseline,
+                RawCaptureKind::Discovery { attempt: 1 },
+                RawCaptureKind::Discovery { attempt: 2 },
+                RawCaptureKind::Discovery { attempt: 3 },
+                RawCaptureKind::Status { attempt: 1 },
+                RawCaptureKind::Status { attempt: 2 },
+                RawCaptureKind::Status { attempt: 3 },
+                RawCaptureKind::Status { attempt: 4 },
+            ]
+        );
+        transport.assert_complete();
+    }
+
+    #[test]
     fn missing_candidate_exhausts_the_bounded_discovery_window() {
         let mut transport =
             ScriptedTransport::new([EMPTY_LIST, EMPTY_LIST, EMPTY_LIST, EMPTY_LIST]);
@@ -1139,6 +1703,87 @@ mod tests {
         ));
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
         transport.assert_complete();
+    }
+
+    #[test]
+    fn observed_not_found_preserves_all_three_empty_poll_snapshots() {
+        let mut transport = ScriptedTransport::new([EMPTY_LIST, EMPTY_LIST, EMPTY_LIST]);
+        let baseline = SubmissionBaseline {
+            contest_id: "abc473".to_string(),
+            task_id: "abc473_c".to_string(),
+            language_id: "6017".to_string(),
+            ids: BTreeSet::new(),
+        };
+        let mut observer = RecordingObserver::default();
+
+        let error = discover_submission_with_transport_until_observed(
+            &mut transport,
+            &baseline,
+            &|| true,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SubmissionTrackingError::SubmissionNotFound));
+        assert_eq!(
+            observer
+                .events
+                .iter()
+                .filter(|event| matches!(event, SubmissionDiagnostic::DiscoveryAttempt { .. }))
+                .count(),
+            3
+        );
+        assert!(matches!(
+            observer.events.last(),
+            Some(SubmissionDiagnostic::DiscoveryFailed {
+                kind: SubmissionTrackingErrorKind::SubmissionNotFound,
+                observed_new_ids,
+                ..
+            }) if observed_new_ids.is_empty()
+        ));
+    }
+
+    #[test]
+    fn observed_discovery_malformed_row_preserves_poll_number_and_exact_error() {
+        let malformed = list(&row(
+            Some("10"),
+            Some("/contests/abc473/submissions/11"),
+            "/contests/abc473/tasks/abc473_c",
+        ));
+        let mut transport = ScriptedTransport::new([malformed.clone()]);
+        let baseline = SubmissionBaseline {
+            contest_id: "abc473".to_string(),
+            task_id: "abc473_c".to_string(),
+            language_id: "6017".to_string(),
+            ids: BTreeSet::new(),
+        };
+        let mut observer = RecordingObserver::default();
+
+        let error = discover_submission_with_transport_until_observed(
+            &mut transport,
+            &baseline,
+            &|| true,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SubmissionTrackingError::MalformedSubmissionList("submission ID sources do not match")
+        ));
+        assert!(matches!(
+            observer.events.last(),
+            Some(SubmissionDiagnostic::DiscoveryFailed {
+                attempt: Some(1),
+                kind: SubmissionTrackingErrorKind::MalformedSubmissionList,
+                message,
+                observed_new_ids,
+            }) if message.contains("submission ID sources do not match") && observed_new_ids.is_empty()
+        ));
+        assert_eq!(
+            observer.raw,
+            [(RawCaptureKind::Discovery { attempt: 1 }, malformed)]
+        );
     }
 
     #[test]
@@ -1173,6 +1818,86 @@ mod tests {
         ));
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
         transport.assert_complete();
+    }
+
+    #[test]
+    fn observed_ambiguity_reports_the_complete_new_id_union() {
+        let rows = [
+            row(
+                Some("10"),
+                Some("/contests/abc473/submissions/10"),
+                "/contests/abc473/tasks/abc473_c",
+            ),
+            row(
+                Some("11"),
+                Some("/contests/abc473/submissions/11"),
+                "/contests/abc473/tasks/abc473_c",
+            ),
+        ]
+        .join("");
+        let two = list(&rows);
+        let mut transport = ScriptedTransport::new([two.clone(), two.clone(), two]);
+        let baseline = SubmissionBaseline {
+            contest_id: "abc473".to_string(),
+            task_id: "abc473_c".to_string(),
+            language_id: "6017".to_string(),
+            ids: BTreeSet::new(),
+        };
+        let mut observer = RecordingObserver::default();
+
+        let error = discover_submission_with_transport_until_observed(
+            &mut transport,
+            &baseline,
+            &|| true,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SubmissionTrackingError::AmbiguousSubmissionIds
+        ));
+        assert!(matches!(
+            observer.events.last(),
+            Some(SubmissionDiagnostic::DiscoveryFailed {
+                kind: SubmissionTrackingErrorKind::AmbiguousSubmissionIds,
+                observed_new_ids,
+                ..
+            }) if observed_new_ids == &vec![SubmissionId(10), SubmissionId(11)]
+        ));
+    }
+
+    #[test]
+    fn observed_baseline_parse_failure_keeps_its_exact_error_and_raw_html() {
+        let malformed = "<html><body>logged-in page without submissions</body></html>";
+        let mut transport = ScriptedTransport::new([malformed]);
+        let mut observer = RecordingObserver::default();
+
+        let error = capture_baseline_with_transport_until_observed(
+            &mut transport,
+            "abc473",
+            "abc473_c",
+            "6017",
+            &|| true,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SubmissionTrackingError::MalformedSubmissionList("submission table is missing")
+        ));
+        assert!(matches!(
+            observer.events.last(),
+            Some(SubmissionDiagnostic::BaselineFailed {
+                kind: SubmissionTrackingErrorKind::MalformedSubmissionList,
+                message,
+            }) if message.contains("submission table is missing")
+        ));
+        assert_eq!(
+            observer.raw,
+            [(RawCaptureKind::Baseline, malformed.to_string())]
+        );
     }
 
     #[test]
@@ -1362,6 +2087,70 @@ mod tests {
             parse_status_response(id, r#"{"Result":{"1":{"Html":"<div>WJ</div>"}}}"#),
             Err(SubmissionTrackingError::StatusCellMissing)
         ));
+    }
+
+    #[test]
+    fn observed_status_failure_includes_attempt_submission_id_and_exact_parser_error() {
+        let malformed = r#"{"Result":{"42":{"Html":"<div>WJ</div>"}}}"#;
+        let mut transport = ScriptedTransport::new([malformed]);
+        let mut observer = RecordingObserver::default();
+
+        let error = watch_submission_with_transport_until_observed(
+            &mut transport,
+            "abc473",
+            SubmissionId(42),
+            &mut |_| true,
+            &|| true,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SubmissionTrackingError::StatusCellMissing));
+        assert!(matches!(
+            observer.events.last(),
+            Some(SubmissionDiagnostic::StatusFailed {
+                attempt: 1,
+                submission_id: SubmissionId(42),
+                kind: SubmissionTrackingErrorKind::StatusCellMissing,
+                message,
+            }) if message == "submission status cell is missing"
+        ));
+        assert_eq!(
+            observer.raw,
+            [(RawCaptureKind::Status { attempt: 1 }, malformed.to_string())]
+        );
+    }
+
+    #[test]
+    fn http_status_fetch_error_has_a_distinct_diagnostic_category_and_status_message() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let error = reqwest::blocking::Client::new()
+            .get(format!("http://{address}/contests/abc473/submissions/me"))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        server.join().unwrap();
+        let error = SubmissionTrackingError::Fetch(AtCoderError::Http(error));
+
+        assert_eq!(
+            error.diagnostic_kind(),
+            SubmissionTrackingErrorKind::HttpStatus
+        );
+        assert!(error.to_string().contains("403"));
+        assert!(error.to_string().contains("submissions/me"));
     }
 
     #[test]
