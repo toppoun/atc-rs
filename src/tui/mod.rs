@@ -288,7 +288,14 @@ fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::Sub
         })
         .collect();
     let history = hub.history_for_contest(app.contest_id()).cloned().collect();
-    submission::SubmissionViewState { problems, history }
+    let latest_started = hub
+        .latest_started()
+        .map(submission::LatestStartedSubmission::from);
+    submission::SubmissionViewState {
+        problems,
+        history,
+        latest_started,
+    }
 }
 
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {

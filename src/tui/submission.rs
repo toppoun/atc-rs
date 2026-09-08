@@ -209,10 +209,28 @@ pub(super) struct SubmissionHistoryEntry {
     pub(super) state: SubmissionDisplayState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LatestStartedSubmission {
+    pub(super) contest_id: String,
+    pub(super) problem_index: String,
+    pub(super) state: SubmissionDisplayState,
+}
+
+impl From<&SubmissionHistoryEntry> for LatestStartedSubmission {
+    fn from(entry: &SubmissionHistoryEntry) -> Self {
+        Self {
+            contest_id: entry.key.contest_id.clone(),
+            problem_index: entry.problem_index.clone(),
+            state: entry.state,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SubmissionViewState {
     pub(super) problems: Vec<Option<SubmissionDisplayState>>,
     pub(super) history: Vec<SubmissionHistoryEntry>,
+    pub(super) latest_started: Option<LatestStartedSubmission>,
 }
 
 #[derive(Debug, Default)]
@@ -500,6 +518,10 @@ impl SubmissionHub {
             .iter()
             .rev()
             .filter(move |entry| entry.key.contest_id == contest_id)
+    }
+
+    pub(super) fn latest_started(&self) -> Option<&SubmissionHistoryEntry> {
+        self.history.last()
     }
 
     fn update_history(
@@ -2885,6 +2907,16 @@ mod tests {
             .collect()
     }
 
+    fn latest_started_label(hub: &SubmissionHub) -> Option<(String, String, String)> {
+        hub.latest_started().map(|entry| {
+            (
+                entry.key.contest_id.clone(),
+                entry.problem_index.clone(),
+                entry.state.compact_label(),
+            )
+        })
+    }
+
     fn start_finished_ac_then_pending(hub: &mut SubmissionHub, key: &SubmissionKey) -> (u64, u64) {
         let first = start_test_submission(hub, key, "B");
         assert!(hub.apply_event(event(
@@ -3038,6 +3070,76 @@ mod tests {
     }
 
     #[test]
+    fn latest_started_identity_survives_older_updates_and_final_until_next_start() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        let d = SubmissionKey::new("abc475", "abc475_d");
+        let executor = TestExecutor::with_keyed_runs(vec![
+            (a.clone(), vec![waiting_test_run()]),
+            (b.clone(), vec![waiting_test_run()]),
+            (d.clone(), vec![waiting_test_run()]),
+        ]);
+        let mut hub = SubmissionHub::with_executor(executor);
+        let a_generation = start_test_submission(&mut hub, &a, "A");
+        let b_generation = start_test_submission(&mut hub, &b, "B");
+
+        assert_eq!(
+            latest_started_label(&hub),
+            Some((
+                "abc474".to_string(),
+                "B".to_string(),
+                "Submitting".to_string()
+            ))
+        );
+        assert!(hub.apply_event(event(
+            &a,
+            a_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        assert!(hub.apply_event(event(
+            &a,
+            a_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+            }),
+        )));
+        assert_eq!(hub.latest_started().unwrap().generation, b_generation);
+        assert_eq!(latest_started_label(&hub).unwrap().2, "Submitting");
+
+        assert!(hub.apply_event(event(
+            &b,
+            b_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        assert!(hub.apply_event(event(
+            &b,
+            b_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(2),
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+            }),
+        )));
+        assert_eq!(
+            latest_started_label(&hub),
+            Some(("abc474".to_string(), "B".to_string(), "AC".to_string()))
+        );
+        assert_eq!(hub.latest_started().unwrap().generation, b_generation);
+
+        let d_generation = start_test_submission(&mut hub, &d, "D");
+        assert_eq!(hub.latest_started().unwrap().generation, d_generation);
+        assert_eq!(
+            latest_started_label(&hub),
+            Some((
+                "abc475".to_string(),
+                "D".to_string(),
+                "Submitting".to_string()
+            ))
+        );
+        hub.request_stop();
+    }
+
+    #[test]
     fn contest_filtering_preserves_cross_contest_history() {
         let abc474 = SubmissionKey::new("abc474", "abc474_a");
         let abc475 = SubmissionKey::new("abc475", "abc475_c");
@@ -3100,12 +3202,20 @@ mod tests {
         assert_eq!(abc475_view.history.len(), 1);
         assert_eq!(abc475_view.history[0].generation, 2);
         assert_eq!(abc475_view.history[0].state.compact_label(), "AC");
+        assert_eq!(
+            abc475_view.latest_started.as_ref().unwrap().contest_id,
+            "abc475"
+        );
 
         let abc474 = super::super::app::WatchApp::new(&contest("abc474"), vec![1]).unwrap();
         let abc474_view = super::super::submission_view_state(&abc474, &hub);
         assert_eq!(abc474_view.history.len(), 1);
         assert_eq!(abc474_view.history[0].generation, 1);
         assert_eq!(abc474_view.history[0].state.compact_label(), "WA");
+        let latest = abc474_view.latest_started.as_ref().unwrap();
+        assert_eq!(latest.contest_id, "abc475");
+        assert_eq!(latest.problem_index, "A");
+        assert_eq!(latest.state.compact_label(), "AC");
         assert_eq!(hub.history.len(), 2);
     }
 

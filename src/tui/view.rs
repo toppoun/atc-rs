@@ -25,19 +25,23 @@ use super::detail_scrollbar::{
 };
 use super::mouse::MouseMode;
 use super::submission::{
-    SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone, SubmissionViewState,
-    UserVisibleSubmissionState,
+    LatestStartedSubmission, SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone,
+    SubmissionViewState, UserVisibleSubmissionState,
 };
 use super::{
-    CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
-    OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
-    RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
+    CommandPalette, EditorTargetModal, FrontendAction, FrontendActionAvailability,
+    OpenSettingsModal, OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal,
+    RefreshContestModal, RefreshContestModalState, SubmitModal, SwitchContestModal,
+    SwitchContestModalState,
 };
 use crate::language::Language;
 
 const SIDE_PANE_WIDTH: u16 = 20;
 const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SIDE_PANE_LAYOUT_WIDTH: u16 = SIDE_PANE_WIDTH + MIN_DETAIL_WIDTH;
+const COMMANDS_HINT: &str = ": commands";
+const FOOTER_HINT_GAP: &str = "   ";
+const MIN_COMMAND_FOOTER_WIDTH: u16 = COMMANDS_HINT.len() as u16;
 const COMMAND_PALETTE_WIDTH: u16 = 76;
 const COMMAND_PALETTE_BORDER_ROWS: u16 = 2;
 const COMMAND_PALETTE_COMMAND_ROW_OFFSET: u16 = 2;
@@ -243,6 +247,29 @@ fn fit_styled_row(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> 
     Line::from(fitted)
 }
 
+fn clip_styled_row(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut clipped = Vec::new();
+    let mut clipped_width = 0usize;
+    for span in spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if clipped_width.saturating_add(grapheme_width) > width {
+                if !content.is_empty() {
+                    clipped.push(Span::styled(content, span.style));
+                }
+                return Line::from(clipped);
+            }
+            content.push_str(grapheme);
+            clipped_width = clipped_width.saturating_add(grapheme_width);
+        }
+        if !content.is_empty() {
+            clipped.push(Span::styled(content, span.style));
+        }
+    }
+    Line::from(clipped)
+}
+
 fn command_palette_row(marker: &str, label: &str, shortcut: Option<&str>, width: usize) -> String {
     let shortcut = shortcut.unwrap_or("");
     let aligned = format!("{marker} {label:<COMMAND_PALETTE_LABEL_WIDTH$} {shortcut}");
@@ -384,6 +411,250 @@ fn side_pane_body_area(area: Rect) -> Rect {
         area.width,
         area.height.saturating_sub(2),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FooterHintPriority {
+    Primary,
+    Secondary,
+    Navigation,
+    Additional,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FooterHint {
+    label: String,
+    priority: FooterHintPriority,
+}
+
+impl FooterHint {
+    fn new(label: impl Into<String>, priority: FooterHintPriority) -> Self {
+        Self {
+            label: label.into(),
+            priority,
+        }
+    }
+}
+
+fn push_available_footer_hint(
+    hints: &mut Vec<FooterHint>,
+    app: &WatchApp,
+    workspace_available: bool,
+    action: FrontendAction,
+    label: impl Into<String>,
+    priority: FooterHintPriority,
+) {
+    if action.availability(app, workspace_available) == FrontendActionAvailability::Available {
+        hints.push(FooterHint::new(label, priority));
+    }
+}
+
+fn footer_hints(app: &WatchApp, workspace_available: bool) -> Vec<FooterHint> {
+    use FooterHintPriority::{Additional, Navigation, Primary, Secondary};
+
+    let mut hints = vec![FooterHint::new(COMMANDS_HINT, Primary)];
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::Submit,
+        "t submit",
+        Primary,
+    );
+    hints.push(FooterHint::new("q quit", Primary));
+
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::ToggleSamples,
+        "s pane",
+        Secondary,
+    );
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::ToggleSubmissions,
+        "v view",
+        Secondary,
+    );
+
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::RunTests,
+        "r rerun",
+        Navigation,
+    );
+    if app.current_problem().is_some() {
+        hints.extend([
+            FooterHint::new("↑↓ case", Navigation),
+            FooterHint::new("←→ problem", Navigation),
+        ]);
+    }
+
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::StartStress,
+        "S stress",
+        Additional,
+    );
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::InitializeStress,
+        "i initialize",
+        Additional,
+    );
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::ToggleDebug,
+        "d debug",
+        Additional,
+    );
+    if app.current_problem().is_some() {
+        hints.push(FooterHint::new("wheel scroll", Additional));
+    }
+    push_available_footer_hint(
+        &mut hints,
+        app,
+        workspace_available,
+        FrontendAction::SwitchContest,
+        "c contest",
+        Additional,
+    );
+
+    hints.sort_by_key(|hint| hint.priority);
+    hints
+}
+
+fn responsive_footer_hint_text(
+    app: &WatchApp,
+    workspace_available: bool,
+    available_width: usize,
+) -> String {
+    let hints = footer_hints(app, workspace_available);
+    let mut packed = String::new();
+    let mut packed_width = 0usize;
+
+    for hint in hints {
+        let label_width = UnicodeWidthStr::width(hint.label.as_str());
+        let gap_width = if packed.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(FOOTER_HINT_GAP)
+        };
+        let next_width = packed_width
+            .saturating_add(gap_width)
+            .saturating_add(label_width);
+        if next_width > available_width {
+            break;
+        }
+        if !packed.is_empty() {
+            packed.push_str(FOOTER_HINT_GAP);
+        }
+        packed.push_str(&hint.label);
+        packed_width = next_width;
+    }
+
+    if packed.is_empty() {
+        COMMANDS_HINT.to_string()
+    } else {
+        packed
+    }
+}
+
+fn footer_areas(area: Rect) -> (Option<Rect>, Rect) {
+    let split_width = SIDE_PANE_WIDTH.saturating_add(MIN_COMMAND_FOOTER_WIDTH);
+    if area.width < split_width {
+        return (None, area);
+    }
+
+    let current = Rect::new(area.x, area.y, SIDE_PANE_WIDTH, area.height);
+    let commands = Rect::new(
+        area.x.saturating_add(SIDE_PANE_WIDTH),
+        area.y,
+        area.width.saturating_sub(SIDE_PANE_WIDTH),
+        area.height,
+    );
+    (Some(current), commands)
+}
+
+fn empty_current_submission_line(width: usize) -> Line<'static> {
+    clip_styled_row(
+        vec![
+            Span::raw("SUB "),
+            Span::styled("·", submission_tone_style(SubmissionTone::None)),
+        ],
+        width,
+    )
+}
+
+fn current_submission_line(
+    current_contest_id: &str,
+    latest_started: Option<&LatestStartedSubmission>,
+    width: usize,
+) -> Line<'static> {
+    let Some(latest_started) = latest_started else {
+        return empty_current_submission_line(width);
+    };
+    let Some(state) = latest_started.state.effective() else {
+        return empty_current_submission_line(width);
+    };
+    let primary_tone = state
+        .status_segments()
+        .first()
+        .map(|segment| segment.tone)
+        .unwrap_or(SubmissionTone::None);
+    let problem_label = if latest_started.contest_id == current_contest_id {
+        latest_started.problem_index.clone()
+    } else {
+        format!(
+            "{}/{}",
+            latest_started.contest_id, latest_started.problem_index
+        )
+    };
+    let mut spans = vec![
+        Span::styled(
+            problem_label,
+            submission_tone_style(primary_tone).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    spans.extend(submission_status_spans(state));
+    clip_styled_row(spans, width)
+}
+
+fn render_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &WatchApp,
+    submission_view: Option<&SubmissionViewState>,
+    workspace_available: bool,
+) {
+    let (current_area, commands_area) = footer_areas(area);
+    if let Some(current_area) = current_area {
+        let block = Block::default().borders(Borders::TOP | Borders::RIGHT);
+        let content_width = usize::from(block.inner(current_area).width);
+        let line = current_submission_line(
+            app.contest_id(),
+            submission_view.and_then(|view| view.latest_started.as_ref()),
+            content_width,
+        );
+        frame.render_widget(Paragraph::new(line).block(block), current_area);
+    }
+
+    let block = Block::default().borders(Borders::TOP);
+    let content_width = usize::from(block.inner(commands_area).width);
+    let text = responsive_footer_hint_text(app, workspace_available, content_width);
+    frame.render_widget(Paragraph::new(text).block(block), commands_area);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -760,29 +1031,13 @@ pub(super) fn render_frontend_with_pointer(
         }
     }
 
-    let problem_status_target = match app.side_pane_mode() {
-        SidePaneMode::Samples => "submissions",
-        SidePaneMode::Submissions => "samples",
-    };
-    let footer_base = if current_problem
-        .is_some_and(|problem| matches!(&problem.stress_setup, StressSetupState::Required { .. }))
-    {
-        format!(
-            "t submit   s pane   S stress   i initialize   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   v {problem_status_target}"
-        )
-    } else {
-        format!(
-            "t submit   s pane   S stress   d debug   r rerun   ↑↓/j k case   ←→/h l problem   wheel scroll   v {problem_status_target}"
-        )
-    };
-    let footer_text = if workspace_available {
-        format!(": commands   c contest   q quit   {footer_base}")
-    } else {
-        format!(": commands   q quit   {footer_base}")
-    };
-    let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::TOP));
-
-    frame.render_widget(footer, rows[2]);
+    render_footer(
+        frame,
+        rows[2],
+        app,
+        overlays.submission_view,
+        workspace_available,
+    );
 
     if let Some(modal) = overlays.refresh_modal {
         render_refresh_contest_modal(frame, modal);
@@ -2270,8 +2525,8 @@ mod tests {
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
     use crate::tui::submission::{
-        SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey, TuiSubmissionAttemptState,
-        TuiSubmissionState,
+        LatestStartedSubmission, SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey,
+        TuiSubmissionAttemptState, TuiSubmissionState,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
@@ -2412,9 +2667,13 @@ mod tests {
 
     fn rendered_submission_header(state: Option<SubmissionDisplayState>) -> String {
         let app = app();
-        let submission_view = state.map(|state| SubmissionViewState {
-            problems: vec![Some(state)],
-            history: vec![submission_history_entry(1, "A", state)],
+        let submission_view = state.map(|state| {
+            let entry = submission_history_entry(1, "A", state);
+            SubmissionViewState {
+                problems: vec![Some(state)],
+                latest_started: Some(LatestStartedSubmission::from(&entry)),
+                history: vec![entry],
+            }
         });
         let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2434,7 +2693,7 @@ mod tests {
                 );
             })
             .unwrap();
-        buffer_symbols(terminal.backend().buffer())
+        buffer_row_text(terminal.backend().buffer(), 0, 0, 160)
     }
 
     fn submission_history_entry(
@@ -2448,6 +2707,18 @@ mod tests {
                 "abc123",
                 format!("abc123_{}", problem_index.to_ascii_lowercase()),
             ),
+            problem_index: problem_index.to_string(),
+            state,
+        }
+    }
+
+    fn latest_started_submission(
+        contest_id: &str,
+        problem_index: &str,
+        state: SubmissionDisplayState,
+    ) -> LatestStartedSubmission {
+        LatestStartedSubmission {
+            contest_id: contest_id.to_string(),
             problem_index: problem_index.to_string(),
             state,
         }
@@ -2638,6 +2909,34 @@ mod tests {
                         submission_view: None,
                         editor_target_modal: None,
                         command_palette: palette,
+                    },
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn rendered_frontend_buffer_with_submission_view(
+        app: &WatchApp,
+        submission_view: &SubmissionViewState,
+        workspace_available: bool,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut detail_layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    app,
+                    &mut detail_layout,
+                    MouseMode::Cells,
+                    workspace_available,
+                    FrontendOverlays {
+                        submission_view: Some(submission_view),
+                        ..FrontendOverlays::default()
                     },
                 );
             })
@@ -2953,49 +3252,257 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_initialize_only_while_setup_is_required() {
+    fn footer_hints_follow_action_availability_without_changing_palette_actions() {
         let mut app = app();
-        let rendered = rendered_buffer_text(&app, 160, 20);
-        assert!(rendered.contains(": commands"));
-        assert!(rendered.contains("v submissions"));
-        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+        let labels = |app: &WatchApp, workspace_available| {
+            footer_hints(app, workspace_available)
+                .into_iter()
+                .map(|hint| hint.label)
+                .collect::<Vec<_>>()
+        };
+        let initial = labels(&app, false);
+        assert!(initial.iter().any(|label| label == COMMANDS_HINT));
+        assert!(initial.iter().any(|label| label == "v view"));
+        assert!(!initial.iter().any(|label| label == "r rerun"));
+        assert!(!initial.iter().any(|label| label == "S stress"));
+        assert!(!initial.iter().any(|label| label == "i initialize"));
+        assert!(!initial.iter().any(|label| label == "c contest"));
 
-        app.toggle_problem_status_mode();
-        assert!(rendered_buffer_text(&app, 160, 20).contains("v samples"));
-        app.toggle_problem_status_mode();
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
+        let ready = labels(&app, true);
+        assert!(ready.iter().any(|label| label == "r rerun"));
+        assert!(ready.iter().any(|label| label == "S stress"));
+        assert!(ready.iter().any(|label| label == "c contest"));
 
         assert!(app.set_stress_setup_required(0, true, true));
-        assert!(rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+        let required = labels(&app, true);
+        assert!(!required.iter().any(|label| label == "S stress"));
+        assert!(required.iter().any(|label| label == "i initialize"));
+        assert!(responsive_footer_hint_text(&app, false, 98).contains("i initialize"));
 
         assert!(app.set_stress_setup_initialized(0));
-        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+        assert!(labels(&app, true).iter().any(|label| label == "S stress"));
+        assert!(
+            !labels(&app, true)
+                .iter()
+                .any(|label| label == "i initialize")
+        );
 
         assert!(app.set_stress_setup_error(0, "invalid target".to_string()));
-        assert!(!rendered_buffer_text(&app, 120, 20).contains("i initialize"));
+        assert!(
+            !labels(&app, true)
+                .iter()
+                .any(|label| label == "i initialize")
+        );
+
+        assert_eq!(FrontendAction::ALL.len(), 14);
     }
 
     #[test]
-    fn footer_keeps_existing_shortcuts_ahead_of_the_optional_view_hint() {
+    fn responsive_footer_packs_whole_hints_in_priority_order() {
         let mut app = app();
+        assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
 
-        let eighty = rendered_frontend_text_with_palette(&app, true, None, None, 80, 20);
-        assert!(eighty.contains("S stress"));
-        assert!(eighty.contains("d debug"));
-        assert!(!eighty.contains("v submissions"));
-
-        let hundred = rendered_frontend_text_with_palette(&app, true, None, None, 100, 20);
-        assert!(hundred.contains("↑↓/j k cas"));
-        assert!(!hundred.contains("v submissions"));
-
-        let wide = rendered_frontend_text_with_palette(&app, true, None, None, 160, 20);
-        assert!(wide.contains("v submissions"));
-        app.toggle_problem_status_mode();
-        let wide = rendered_frontend_text_with_palette(&app, true, None, None, 160, 20);
-        assert!(wide.contains("v samples"));
-
-        for width in [0, 1, 2, 5, 12, 24] {
-            let _ = rendered_frontend_text_with_palette(&app, true, None, None, width, 3);
+        let all = footer_hints(&app, false)
+            .into_iter()
+            .map(|hint| hint.label)
+            .collect::<Vec<_>>();
+        for width in 0..=130 {
+            let packed = responsive_footer_hint_text(&app, false, width);
+            if width < usize::from(MIN_COMMAND_FOOTER_WIDTH) {
+                assert_eq!(packed, COMMANDS_HINT);
+                continue;
+            }
+            assert!(UnicodeWidthStr::width(packed.as_str()) <= width);
+            let visible = packed
+                .split(FOOTER_HINT_GAP)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(visible.as_slice(), &all[..visible.len()]);
         }
+
+        let primary = responsive_footer_hint_text(&app, false, 30);
+        assert_eq!(primary, ": commands   t submit   q quit");
+        let secondary = responsive_footer_hint_text(&app, false, 48);
+        assert!(secondary.ends_with("s pane   v view"));
+        assert!(!secondary.contains("r rerun"));
+        let navigation = responsive_footer_hint_text(&app, false, 81);
+        assert!(navigation.ends_with("↑↓ case   ←→ problem"));
+        assert!(!navigation.contains("S stress"));
+        let wide = responsive_footer_hint_text(&app, false, 117);
+        for hint in ["S stress", "d debug", "wheel scroll"] {
+            assert!(wide.contains(hint));
+        }
+    }
+
+    #[test]
+    fn current_submission_footer_formats_empty_same_contest_and_cross_contest_states() {
+        let empty = current_submission_line("abc123", None, 19);
+        assert_eq!(empty.to_string(), "SUB ·");
+        assert_eq!(empty.spans[0].style.fg, None);
+        assert_eq!(empty.spans[1].style.fg, Some(Color::DarkGray));
+
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let same = latest_started_submission("abc123", "B", waiting);
+        let same = current_submission_line("abc123", Some(&same), 19);
+        assert_eq!(same.to_string(), "B  WJ");
+        assert_eq!(same.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(same.spans[2].style.fg, Some(Color::Yellow));
+
+        let cross = latest_started_submission("abc474", "B", waiting);
+        let cross = current_submission_line("abc123", Some(&cross), 19);
+        assert_eq!(cross.to_string(), "abc474/B  WJ");
+    }
+
+    #[test]
+    fn current_submission_footer_reuses_multicolor_and_attempt_precedence() {
+        let progress = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::JudgingProgress {
+                    judged: 7,
+                    total: 15,
+                    provisional: Some(Verdict::RuntimeError),
+                },
+            )),
+            attempt: None,
+        };
+        let latest = latest_started_submission("abc123", "C", progress);
+        let line = current_submission_line("abc123", Some(&latest), 19);
+        assert_eq!(line.to_string(), "C  7/15 RE");
+        let style = |label: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == label)
+                .unwrap()
+                .style
+        };
+        assert_eq!(style("C").fg, Some(Color::Yellow));
+        assert_eq!(style("7/15").fg, Some(Color::Yellow));
+        assert_eq!(style("RE").fg, Some(Color::Red));
+
+        let accepted = TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted));
+        for (attempt, expected, color) in [
+            (
+                TuiSubmissionAttemptState::Submitting,
+                "B  Submitting",
+                Color::Yellow,
+            ),
+            (TuiSubmissionAttemptState::Unknown, "B  Unknown", Color::Red),
+        ] {
+            let latest = latest_started_submission(
+                "abc123",
+                "B",
+                SubmissionDisplayState {
+                    current: Some(accepted),
+                    attempt: Some(attempt),
+                },
+            );
+            let line = current_submission_line("abc123", Some(&latest), 19);
+            assert_eq!(line.to_string(), expected);
+            assert!(!line.to_string().contains("AC"));
+            assert_eq!(line.spans[0].style.fg, Some(color));
+            assert_eq!(line.spans[2].style.fg, Some(color));
+        }
+    }
+
+    #[test]
+    fn current_submission_footer_clips_graphemes_and_styles_inside_fixed_width() {
+        let latest = latest_started_submission(
+            "very-long-contest-id",
+            "日本語問題",
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 123,
+                        total: 456,
+                        provisional: Some(Verdict::RuntimeError),
+                    },
+                )),
+                attempt: None,
+            },
+        );
+        for width in 0..=usize::from(SIDE_PANE_WIDTH) {
+            let line = current_submission_line("abc123", Some(&latest), width);
+            assert!(line.width() <= width);
+            assert!(!line.to_string().contains('…'));
+        }
+    }
+
+    #[test]
+    fn footer_boundary_aligns_with_side_pane_and_survives_pane_toggle() {
+        let mut app = app();
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            problems: vec![Some(waiting)],
+            history: vec![submission_history_entry(1, "B", waiting)],
+            latest_started: Some(latest_started_submission("abc123", "B", waiting)),
+        };
+
+        for side_pane_open in [false, true] {
+            if side_pane_open {
+                app.toggle_side_pane();
+            }
+            let buffer = rendered_frontend_buffer_with_submission_view(&app, &view, false, 80, 20);
+            assert!(buffer_row_text(&buffer, 1, 18, 19).starts_with("B  WJ"));
+            assert_eq!(buffer.cell((20, 18)).unwrap().symbol(), "│");
+            assert_eq!(buffer.cell((21, 18)).unwrap().symbol(), ":");
+            if side_pane_open {
+                assert_eq!(buffer.cell((20, 5)).unwrap().symbol(), "│");
+                assert!(buffer_symbols(&buffer).contains("+ New Input"));
+            }
+        }
+    }
+
+    #[test]
+    fn footer_extreme_narrow_fallback_and_boundaries_are_underflow_safe() {
+        let app = app();
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            problems: vec![Some(waiting)],
+            history: vec![submission_history_entry(1, "B", waiting)],
+            latest_started: Some(latest_started_submission("abc123", "B", waiting)),
+        };
+
+        for width in [0, 1, 8, 16, 19, 20, 21, 29, 30, 31, 40, 80, 120] {
+            let area = Rect::new(7, 3, width, 2);
+            let (current, commands) = footer_areas(area);
+            if width < SIDE_PANE_WIDTH + MIN_COMMAND_FOOTER_WIDTH {
+                assert!(current.is_none());
+                assert_eq!(commands, area);
+            } else {
+                assert_eq!(current.unwrap(), Rect::new(7, 3, SIDE_PANE_WIDTH, 2));
+                assert_eq!(commands.x, 7 + SIDE_PANE_WIDTH);
+                assert_eq!(commands.width, width - SIDE_PANE_WIDTH);
+            }
+
+            let height = if width == 0 { 0 } else { 5 };
+            let _ =
+                rendered_frontend_buffer_with_submission_view(&app, &view, false, width, height);
+        }
+
+        let below = rendered_frontend_buffer_with_submission_view(&app, &view, false, 31, 8);
+        assert_eq!(below.cell((1, 6)).unwrap().symbol(), ":");
+        assert!(!buffer_row_text(&below, 1, 6, 29).contains("B  WJ"));
+
+        let exact = rendered_frontend_buffer_with_submission_view(&app, &view, false, 32, 8);
+        assert!(buffer_row_text(&exact, 1, 6, 19).starts_with("B  WJ"));
+        assert_eq!(exact.cell((20, 6)).unwrap().symbol(), "│");
+        assert_eq!(exact.cell((21, 6)).unwrap().symbol(), ":");
     }
 
     #[test]
@@ -3063,6 +3570,7 @@ mod tests {
                 submission_history_entry(2, "B", progress),
                 submission_history_entry(1, "A", accepted),
             ],
+            latest_started: None,
         };
 
         let text = submissions_content(Some(&view), Rect::new(0, 0, SIDE_PANE_WIDTH, 2));
@@ -3119,6 +3627,7 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![None],
             history: Vec::new(),
+            latest_started: None,
         };
         let render = |app: &WatchApp, width, height| {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -3210,6 +3719,7 @@ mod tests {
                 None,
             ],
             history: Vec::new(),
+            latest_started: None,
         };
 
         let line = problem_status_line(&app, Some(&view));
@@ -3383,6 +3893,7 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![Some(state); 7],
             history: Vec::new(),
+            latest_started: None,
         };
 
         for width in [1, 2, 8, 16, 28, 50, 80] {
@@ -3983,8 +4494,14 @@ mod tests {
     #[test]
     fn workspace_footer_and_switch_modal_render_destination_and_error() {
         let app = app();
-        assert!(!rendered_frontend_text(&app, false, None).contains("c contest"));
-        assert!(rendered_frontend_text(&app, true, None).contains("c contest"));
+        assert!(
+            !rendered_frontend_text_with_palette(&app, false, None, None, 180, 20)
+                .contains("c contest")
+        );
+        assert!(
+            rendered_frontend_text_with_palette(&app, true, None, None, 180, 20)
+                .contains("c contest")
+        );
 
         let modal = SwitchContestModal {
             contest_id: "abc467".to_string(),
