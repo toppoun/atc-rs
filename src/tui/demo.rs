@@ -24,6 +24,7 @@ use super::{TerminaSession, view};
 use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
 use crate::language::Language;
 use crate::model::{Contest, Problem};
+use view::SubmissionAnimationPhase;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ANIMATION_REDRAW_INTERVAL: Duration = Duration::from_millis(80);
@@ -381,15 +382,18 @@ impl DemoHarness {
     }
 
     fn wants_animation_redraw(&self) -> bool {
-        self.playback.is_some()
-            || self.submissions.problems.iter().flatten().any(|state| {
-                matches!(
-                    state.current,
-                    Some(TuiSubmissionState::Status(
-                        SubmissionStatus::WaitingForJudge
-                    ))
-                )
-            })
+        self.submissions
+            .latest
+            .as_ref()
+            .is_some_and(|latest| view::submission_animation_target(latest.state))
+            || (self.app.problem_status_mode() == super::app::ProblemStatusMode::Submissions
+                && self
+                    .submissions
+                    .problems
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .any(view::submission_animation_target))
     }
 }
 
@@ -411,6 +415,7 @@ fn run_loop(terminal: &mut TerminaSession) -> io::Result<()> {
     let mut demo = DemoHarness::new()?;
     let mut detail_layout = DetailLayout::default();
     let mut dirty = true;
+    let animation_epoch = Instant::now();
     let mut next_animation_redraw = Instant::now();
 
     loop {
@@ -423,8 +428,16 @@ fn run_loop(terminal: &mut TerminaSession) -> io::Result<()> {
 
         if dirty {
             let render_mouse_mode = terminal.mouse_mode();
+            let submission_animation_phase =
+                SubmissionAnimationPhase::from_elapsed(now.duration_since(animation_epoch));
             terminal.draw(|frame| {
-                render_demo(frame, &demo, &mut detail_layout, render_mouse_mode);
+                render_demo(
+                    frame,
+                    &demo,
+                    &mut detail_layout,
+                    render_mouse_mode,
+                    submission_animation_phase,
+                );
             })?;
             dirty = false;
             terminal.note_redraw_completed();
@@ -465,6 +478,7 @@ fn render_demo(
     demo: &DemoHarness,
     detail_layout: &mut DetailLayout,
     mouse_mode: super::mouse::MouseMode,
+    submission_animation_phase: SubmissionAnimationPhase,
 ) {
     view::render_frontend_with_pointer(
         frame,
@@ -476,6 +490,7 @@ fn render_demo(
         false,
         view::FrontendOverlays {
             submission_view: Some(&demo.submissions),
+            submission_animation_phase,
             ..view::FrontendOverlays::default()
         },
     );
@@ -537,10 +552,27 @@ mod tests {
     use crate::tui::mouse::MouseMode;
 
     fn rendered_buffer(demo: &DemoHarness, width: u16, height: u16) -> Buffer {
+        rendered_buffer_at_phase(demo, width, height, SubmissionAnimationPhase::default())
+    }
+
+    fn rendered_buffer_at_phase(
+        demo: &DemoHarness,
+        width: u16,
+        height: u16,
+        submission_animation_phase: SubmissionAnimationPhase,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut detail_layout = DetailLayout::default();
         terminal
-            .draw(|frame| render_demo(frame, demo, &mut detail_layout, MouseMode::Disabled))
+            .draw(|frame| {
+                render_demo(
+                    frame,
+                    demo,
+                    &mut detail_layout,
+                    MouseMode::Disabled,
+                    submission_animation_phase,
+                )
+            })
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -700,6 +732,60 @@ mod tests {
                 let verdict_x = header_x + u16::try_from("SUB B 55/72 ".chars().count()).unwrap();
                 assert_eq!(buffer.cell((verdict_x, header_y)).unwrap().fg, Color::Red);
             }
+        }
+    }
+
+    #[test]
+    fn demo_animates_only_wj_and_judging_through_the_production_renderer() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        for (status, expected) in [
+            (
+                SubmissionStatus::WaitingForJudge,
+                ["WJ   ", "WJ.  ", "WJ.. ", "WJ..."],
+            ),
+            (
+                SubmissionStatus::Judging,
+                ["Judging   ", "Judging.  ", "Judging.. ", "Judging..."],
+            ),
+        ] {
+            demo.set_selected_submission(Some(current(TuiSubmissionState::Status(status))));
+            assert!(demo.wants_animation_redraw());
+            for (index, expected) in expected.into_iter().enumerate() {
+                let phase = SubmissionAnimationPhase::from_elapsed(Duration::from_millis(
+                    350 * index as u64,
+                ));
+                let rendered = rendered_buffer_at_phase(&demo, 160, 20, phase)
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    rendered.contains(&format!("SUB B {expected}")),
+                    "status={status:?} phase={index}\n{rendered}"
+                );
+            }
+        }
+
+        for status in [
+            SubmissionStatus::JudgingProgress {
+                judged: 14,
+                total: 72,
+                provisional: None,
+            },
+            SubmissionStatus::Finished(Verdict::Accepted),
+        ] {
+            demo.set_selected_submission(Some(current(TuiSubmissionState::Status(status))));
+            assert!(!demo.wants_animation_redraw());
+            let phase_zero =
+                rendered_buffer_at_phase(&demo, 160, 20, SubmissionAnimationPhase::default());
+            let phase_three = rendered_buffer_at_phase(
+                &demo,
+                160,
+                20,
+                SubmissionAnimationPhase::from_elapsed(Duration::from_millis(1050)),
+            );
+            assert_eq!(phase_zero, phase_three);
         }
     }
 

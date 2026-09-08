@@ -308,6 +308,27 @@ fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::Sub
     submission::SubmissionViewState { latest, problems }
 }
 
+fn submission_animation_visible(
+    app: &WatchApp,
+    submission_view: &submission::SubmissionViewState,
+    submit_modal: Option<&SubmitModal>,
+) -> bool {
+    submission_view
+        .latest
+        .as_ref()
+        .is_some_and(|latest| view::submission_animation_target(latest.state))
+        || (app.problem_status_mode() == app::ProblemStatusMode::Submissions
+            && submission_view
+                .problems
+                .iter()
+                .flatten()
+                .copied()
+                .any(view::submission_animation_target))
+        || submit_modal
+            .and_then(|modal| modal.current_submission)
+            .is_some_and(view::submission_animation_target)
+}
+
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Escape
 }
@@ -3152,6 +3173,8 @@ where
     );
 
     let mut dirty = true;
+    let submission_animation_epoch = Instant::now();
+    let mut rendered_submission_animation_phase = None;
 
     let mut render_info = view::RenderInfo::default();
     let mut detail_layout = detail_layout::DetailLayout::default();
@@ -3229,6 +3252,16 @@ where
             dirty = true;
         }
 
+        let render_now = Instant::now();
+        let submission_animation_phase = view::SubmissionAnimationPhase::from_elapsed(
+            render_now.duration_since(submission_animation_epoch),
+        );
+        if rendered_submission_animation_phase
+            .is_some_and(|rendered| rendered != submission_animation_phase)
+        {
+            dirty = true;
+        }
+
         if dirty {
             let mut next_render_info = view::RenderInfo::default();
             let render_mouse_mode = terminal.mouse_mode();
@@ -3252,6 +3285,7 @@ where
                         submission_view: Some(&submission_view),
                         editor_target_modal: editor_targets.modal(),
                         command_palette: command_palette.is_active().then_some(&command_palette),
+                        submission_animation_phase,
                     },
                 );
             })?;
@@ -3273,6 +3307,9 @@ where
             }
 
             dirty = false;
+            rendered_submission_animation_phase =
+                submission_animation_visible(&app, &submission_view, submit.modal())
+                    .then_some(submission_animation_phase);
             terminal.note_redraw_completed();
             let resize_pending = resize_event_count(&terminal_events) != 0;
             terminal.refresh_mouse_after_redraw(resize_pending)?;
@@ -4963,6 +5000,69 @@ mod tests {
             sample_counts.to_vec(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn submission_animation_redraw_is_requested_only_for_visible_wj_or_judging() {
+        let mut app = app_with_problems(&[1, 1]);
+        let display = |status| submission::SubmissionDisplayState {
+            current: Some(submission::TuiSubmissionState::Status(status)),
+            attempt: None,
+        };
+        let waiting =
+            display(crate::atcoder::submission_tracking::SubmissionStatus::WaitingForJudge);
+        let judging = display(crate::atcoder::submission_tracking::SubmissionStatus::Judging);
+        let accepted = display(
+            crate::atcoder::submission_tracking::SubmissionStatus::Finished(
+                crate::atcoder::submission_tracking::Verdict::Accepted,
+            ),
+        );
+
+        let mut view = submission::SubmissionViewState {
+            latest: None,
+            problems: vec![Some(waiting), None],
+        };
+        assert!(!submission_animation_visible(&app, &view, None));
+
+        app.toggle_problem_status_mode();
+        assert!(submission_animation_visible(&app, &view, None));
+
+        app.toggle_problem_status_mode();
+        view.latest = Some(submission::SubmissionHeaderState {
+            problem_label: "abc474/B".to_string(),
+            state: judging,
+        });
+        assert!(submission_animation_visible(&app, &view, None));
+
+        view.latest.as_mut().unwrap().state = accepted;
+        view.problems[0] = Some(accepted);
+        assert!(!submission_animation_visible(&app, &view, None));
+
+        let modal = SubmitModal {
+            key: submission::SubmissionKey::new("abc123", "abc123_a"),
+            problem_index: "A".to_string(),
+            problem_title: "Problem A".to_string(),
+            candidates: Vec::new(),
+            selected: 0,
+            python_runtime: PythonRuntime::PyPy,
+            starting_generation: None,
+            current_submission: Some(waiting),
+            error: None,
+        };
+        assert!(submission_animation_visible(&app, &view, Some(&modal)));
+
+        let mut overridden = modal;
+        overridden.current_submission = Some(submission::SubmissionDisplayState {
+            current: Some(submission::TuiSubmissionState::Status(
+                crate::atcoder::submission_tracking::SubmissionStatus::Judging,
+            )),
+            attempt: Some(submission::TuiSubmissionAttemptState::Submitting),
+        });
+        assert!(!submission_animation_visible(
+            &app,
+            &view,
+            Some(&overridden)
+        ));
     }
 
     fn contest_with_problems(sample_counts: &[usize]) -> Contest {

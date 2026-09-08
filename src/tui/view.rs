@@ -26,13 +26,14 @@ use super::detail_scrollbar::{
 use super::mouse::MouseMode;
 use super::submission::{
     SubmissionDisplayState, SubmissionHeaderState, SubmissionTone, SubmissionViewState,
-    UserVisibleSubmissionState,
+    TuiSubmissionState, UserVisibleSubmissionState,
 };
 use super::{
     CommandPalette, EditorTargetModal, FrontendActionAvailability, OpenSettingsModal,
     OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
     RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
 };
+use crate::atcoder::submission_tracking::SubmissionStatus;
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
@@ -48,6 +49,39 @@ const COMMAND_PALETTE_FIXED_HEIGHT: u16 = COMMAND_PALETTE_BORDER_ROWS
 const COMMAND_PALETTE_MAX_VISIBLE_COMMANDS: usize = 10;
 const COMMAND_PALETTE_LABEL_WIDTH: usize = 18;
 const COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH: u16 = 2;
+pub(super) const SUBMISSION_ANIMATION_PHASE_DURATION: Duration = Duration::from_millis(350);
+const SUBMISSION_ANIMATION_PHASES: u128 = 4;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SubmissionAnimationPhase(u8);
+
+impl SubmissionAnimationPhase {
+    pub(super) fn from_elapsed(elapsed: Duration) -> Self {
+        let phase = (elapsed.as_millis() / SUBMISSION_ANIMATION_PHASE_DURATION.as_millis()
+            % SUBMISSION_ANIMATION_PHASES) as u8;
+        Self(phase)
+    }
+
+    const fn suffix(self) -> &'static str {
+        match self.0 {
+            0 => "",
+            1 => ".",
+            2 => "..",
+            _ => "...",
+        }
+    }
+}
+
+pub(super) fn submission_animation_target(state: SubmissionDisplayState) -> bool {
+    matches!(
+        state.effective(),
+        Some(UserVisibleSubmissionState::Current(
+            TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge | SubmissionStatus::Judging
+            )
+        ))
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandPaletteLayout {
@@ -385,6 +419,7 @@ pub(super) struct FrontendOverlays<'a> {
     pub(super) submission_view: Option<&'a SubmissionViewState>,
     pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
+    pub(super) submission_animation_phase: SubmissionAnimationPhase,
 }
 
 #[cfg(test)]
@@ -494,7 +529,10 @@ pub(super) fn render_frontend_with_pointer(
         .and_then(|submission| submission.latest.as_ref())
     {
         title_spans.push(Span::raw(" │ "));
-        title_spans.extend(submission_header_spans(submission));
+        title_spans.extend(submission_header_spans(
+            submission,
+            overlays.submission_animation_phase,
+        ));
     }
     title_spans.push(Span::raw(" "));
     let title = Line::from(title_spans);
@@ -515,7 +553,11 @@ pub(super) fn render_frontend_with_pointer(
         .split(inner);
 
     // A ✓   B ✗   C …   D ·
-    let problem_line = problem_status_line(app, overlays.submission_view);
+    let problem_line = problem_status_line(
+        app,
+        overlays.submission_view,
+        overlays.submission_animation_phase,
+    );
     let problem_line_width = problem_line.width();
     let problem_block = Block::default().borders(Borders::BOTTOM);
     let navigation_area = problem_block.inner(rows[0]);
@@ -757,7 +799,7 @@ pub(super) fn render_frontend_with_pointer(
     } else if let Some(modal) = overlays.source_modal {
         render_open_source_modal(frame, app, modal);
     } else if let Some(modal) = overlays.submit_modal {
-        render_submit_modal(frame, modal);
+        render_submit_modal(frame, modal, overlays.submission_animation_phase);
     } else if let Some(modal) = overlays.editor_target_modal {
         render_editor_target_modal(frame, modal);
     } else if let Some(command_palette) = overlays.command_palette {
@@ -1224,7 +1266,11 @@ fn render_open_source_modal(frame: &mut Frame, app: &WatchApp, modal: &OpenSourc
     frame.render_widget(paragraph, area);
 }
 
-fn render_submit_modal(frame: &mut Frame, modal: &SubmitModal) {
+fn render_submit_modal(
+    frame: &mut Frame,
+    modal: &SubmitModal,
+    submission_animation_phase: SubmissionAnimationPhase,
+) {
     let frame_area = frame.area();
     let width = frame_area.width.min(76);
     let desired_height = 13u16
@@ -1294,6 +1340,7 @@ fn render_submit_modal(frame: &mut Frame, modal: &SubmitModal) {
         lines.push(padded_submission_status_line(
             "Current submission: ",
             state,
+            submission_animation_phase,
             line_width,
         ));
     }
@@ -1716,10 +1763,13 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
 fn problem_status_line(
     app: &WatchApp,
     submission_view: Option<&SubmissionViewState>,
+    submission_animation_phase: SubmissionAnimationPhase,
 ) -> Line<'static> {
     match app.problem_status_mode() {
         ProblemStatusMode::Samples => sample_problem_status_line(app),
-        ProblemStatusMode::Submissions => submission_problem_status_line(app, submission_view),
+        ProblemStatusMode::Submissions => {
+            submission_problem_status_line(app, submission_view, submission_animation_phase)
+        }
     }
 }
 
@@ -1750,6 +1800,7 @@ fn sample_problem_status_line(app: &WatchApp) -> Line<'static> {
 fn submission_problem_status_line(
     app: &WatchApp,
     submission_view: Option<&SubmissionViewState>,
+    submission_animation_phase: SubmissionAnimationPhase,
 ) -> Line<'static> {
     let selected = app.selected_problem();
     let mut spans = vec![Span::styled(
@@ -1776,7 +1827,7 @@ fn submission_problem_status_line(
         spans.push(Span::styled(problem.index.clone(), problem_style));
         spans.push(Span::raw(" "));
         match state {
-            Some(state) => spans.extend(submission_status_spans(state)),
+            Some(state) => spans.extend(submission_status_spans(state, submission_animation_phase)),
             None => spans.push(Span::styled(
                 "·",
                 submission_tone_style(SubmissionTone::None),
@@ -1787,7 +1838,10 @@ fn submission_problem_status_line(
     Line::from(spans)
 }
 
-fn submission_header_spans(submission: &SubmissionHeaderState) -> Vec<Span<'static>> {
+fn submission_header_spans(
+    submission: &SubmissionHeaderState,
+    submission_animation_phase: SubmissionAnimationPhase,
+) -> Vec<Span<'static>> {
     let Some(state) = submission.state.effective() else {
         return Vec::new();
     };
@@ -1796,11 +1850,37 @@ fn submission_header_spans(submission: &SubmissionHeaderState) -> Vec<Span<'stat
         Style::default().add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::raw(" "));
-    spans.extend(submission_status_spans(state));
+    spans.extend(submission_status_spans(state, submission_animation_phase));
     spans
 }
 
-fn submission_status_spans(state: UserVisibleSubmissionState) -> Vec<Span<'static>> {
+fn animated_submission_label(
+    state: UserVisibleSubmissionState,
+    phase: SubmissionAnimationPhase,
+) -> Option<(String, SubmissionTone)> {
+    let (base, width, tone) = match state {
+        UserVisibleSubmissionState::Current(TuiSubmissionState::Accepted)
+        | UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+            SubmissionStatus::WaitingForJudge,
+        )) => ("WJ", 5, SubmissionTone::Waiting),
+        UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+            SubmissionStatus::Judging,
+        )) => ("Judging", 10, SubmissionTone::Active),
+        _ => return None,
+    };
+    let mut label = format!("{base}{}", phase.suffix());
+    label.push_str(&" ".repeat(width - label.len()));
+    Some((label, tone))
+}
+
+fn submission_status_spans(
+    state: UserVisibleSubmissionState,
+    submission_animation_phase: SubmissionAnimationPhase,
+) -> Vec<Span<'static>> {
+    if let Some((label, tone)) = animated_submission_label(state, submission_animation_phase) {
+        return vec![Span::styled(label, submission_tone_style(tone))];
+    }
+
     let mut spans = Vec::new();
     for (index, segment) in state.status_segments().into_iter().enumerate() {
         if index > 0 {
@@ -1817,10 +1897,11 @@ fn submission_status_spans(state: UserVisibleSubmissionState) -> Vec<Span<'stati
 fn padded_submission_status_line(
     prefix: &str,
     state: UserVisibleSubmissionState,
+    submission_animation_phase: SubmissionAnimationPhase,
     width: usize,
 ) -> Line<'static> {
     let mut spans = vec![Span::raw(prefix.to_string())];
-    spans.extend(submission_status_spans(state));
+    spans.extend(submission_status_spans(state, submission_animation_phase));
     fit_styled_row(spans, width)
 }
 
@@ -2192,7 +2273,7 @@ fn compact_elapsed_label(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
+    use crate::atcoder::submission_tracking::Verdict;
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;
@@ -2207,6 +2288,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::PathBuf;
+
+    fn submission_animation_phase(index: u64) -> SubmissionAnimationPhase {
+        SubmissionAnimationPhase::from_elapsed(Duration::from_millis(350 * index))
+    }
 
     fn app() -> WatchApp {
         WatchApp::new(
@@ -2556,6 +2641,7 @@ mod tests {
                         submission_view: None,
                         editor_target_modal: None,
                         command_palette: palette,
+                        submission_animation_phase: SubmissionAnimationPhase::default(),
                     },
                 );
             })
@@ -3074,7 +3160,7 @@ mod tests {
             },
         };
 
-        let spans = submission_header_spans(&submission);
+        let spans = submission_header_spans(&submission, SubmissionAnimationPhase::default());
         assert_eq!(
             spans
                 .iter()
@@ -3126,10 +3212,10 @@ mod tests {
             ],
         };
 
-        let line = problem_status_line(&app, Some(&view));
+        let line = problem_status_line(&app, Some(&view), SubmissionAnimationPhase::default());
         assert_eq!(
             line.to_string(),
-            "SUB │ A AC   B WJ   C WA   D 14/50 WA   E Unknown   F Untracked   G ·"
+            "SUB │ A AC   B WJ      C WA   D 14/50 WA   E Unknown   F Untracked   G ·"
         );
         let style = |label: &str| {
             line.spans
@@ -3154,7 +3240,7 @@ mod tests {
         }
 
         assert_eq!(style("AC").fg, Some(Color::Green));
-        assert_eq!(style("WJ").fg, Some(Color::Yellow));
+        assert_eq!(style("WJ   ").fg, Some(Color::Yellow));
         assert_eq!(style("WA").fg, Some(Color::Red));
         assert_eq!(style("14/50").fg, Some(Color::Yellow));
         assert_eq!(style("Unknown").fg, Some(Color::Red));
@@ -3163,7 +3249,7 @@ mod tests {
         for status in line.spans.iter().filter(|span| {
             matches!(
                 span.content.as_ref(),
-                "AC" | "WJ" | "WA" | "14/50" | "Unknown" | "Untracked" | "·"
+                "AC" | "WJ   " | "WA" | "14/50" | "Unknown" | "Untracked" | "·"
             )
         }) {
             assert_eq!(status.style.add_modifier, Modifier::empty());
@@ -3196,6 +3282,344 @@ mod tests {
     }
 
     #[test]
+    fn submission_animation_phase_cycles_every_350ms() {
+        assert_eq!(
+            SUBMISSION_ANIMATION_PHASE_DURATION,
+            Duration::from_millis(350)
+        );
+        let suffixes = (0..=4)
+            .map(|index| submission_animation_phase(index).suffix())
+            .collect::<Vec<_>>();
+        assert_eq!(suffixes, ["", ".", "..", "...", ""]);
+        for (millis, expected) in [
+            (349, ""),
+            (350, "."),
+            (699, "."),
+            (700, ".."),
+            (1049, ".."),
+            (1050, "..."),
+            (1399, "..."),
+            (1400, ""),
+        ] {
+            assert_eq!(
+                SubmissionAnimationPhase::from_elapsed(Duration::from_millis(millis)).suffix(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn wj_and_judging_animation_labels_are_fixed_width_and_yellow() {
+        let cases = [
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                ["WJ   ", "WJ.  ", "WJ.. ", "WJ..."],
+                5,
+            ),
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::Judging,
+                )),
+                ["Judging   ", "Judging.  ", "Judging.. ", "Judging..."],
+                10,
+            ),
+        ];
+
+        for (state, expected, width) in cases {
+            for (index, expected) in expected.into_iter().enumerate() {
+                let spans =
+                    submission_status_spans(state, submission_animation_phase(index as u64));
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].content, expected);
+                assert_eq!(Line::from(spans.clone()).width(), width);
+                assert_eq!(spans[0].style.fg, Some(Color::Yellow));
+                assert_eq!(spans[0].style.add_modifier, Modifier::empty());
+            }
+        }
+    }
+
+    #[test]
+    fn non_animated_submission_states_ignore_animation_time() {
+        let cases = [
+            (
+                UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Submitting),
+                "Submitting",
+            ),
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForRejudge,
+                )),
+                "WR",
+            ),
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 14,
+                        total: 72,
+                        provisional: None,
+                    },
+                )),
+                "14/72",
+            ),
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::Finished(Verdict::Accepted),
+                )),
+                "AC",
+            ),
+            (
+                UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                    SubmissionStatus::Finished(Verdict::RuntimeError),
+                )),
+                "RE",
+            ),
+            (
+                UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Unknown),
+                "Unknown",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            let baseline = submission_status_spans(state, submission_animation_phase(0));
+            assert_eq!(Line::from(baseline.clone()).to_string(), expected);
+            for index in 1..=4 {
+                assert_eq!(
+                    submission_status_spans(state, submission_animation_phase(index)),
+                    baseline,
+                    "state={state:?} phase={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overview_selection_modifies_only_the_problem_label_during_animation() {
+        let mut app = navigation_test_app(2);
+        app.toggle_problem_status_mode();
+        app.select_problem(1);
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            latest: None,
+            problems: vec![None, Some(waiting)],
+        };
+
+        let line = problem_status_line(&app, Some(&view), submission_animation_phase(3));
+        let problem = line.spans.iter().find(|span| span.content == "B").unwrap();
+        let status = line
+            .spans
+            .iter()
+            .find(|span| span.content == "WJ...")
+            .unwrap();
+        assert_eq!(problem.style.fg, Some(Color::Yellow));
+        assert!(
+            problem
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(status.style.fg, Some(Color::Yellow));
+        assert_eq!(status.style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn one_frame_uses_one_submission_animation_phase_in_header_overview_and_modal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = navigation_test_app(2);
+        app.toggle_problem_status_mode();
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            latest: Some(SubmissionHeaderState {
+                problem_label: "B".to_string(),
+                state: waiting,
+            }),
+            problems: vec![None, Some(waiting)],
+        };
+        let modal = SubmitModal {
+            key: crate::tui::submission::SubmissionKey::new("abc123", "abc123_b"),
+            problem_index: "B".to_string(),
+            problem_title: "Problem B".to_string(),
+            candidates: vec![super::super::SubmitSourceCandidate {
+                language: Language::Cpp,
+                path: temp.path().join("B.cpp"),
+            }],
+            selected: 0,
+            python_runtime: crate::language::PythonRuntime::PyPy,
+            starting_generation: None,
+            current_submission: Some(waiting),
+            error: None,
+        };
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut layout = DetailLayout::default();
+        terminal
+            .draw(|frame| {
+                render_frontend_with_mouse_mode(
+                    frame,
+                    &app,
+                    &mut layout,
+                    MouseMode::Cells,
+                    false,
+                    FrontendOverlays {
+                        submit_modal: Some(&modal),
+                        submission_view: Some(&view),
+                        submission_animation_phase: submission_animation_phase(2),
+                        ..FrontendOverlays::default()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = buffer_symbols(terminal.backend().buffer());
+        assert!(rendered.contains("SUB B WJ.. "));
+        assert!(rendered.contains("SUB │ A ·   B WJ.. "));
+        assert!(rendered.contains("Current submission: WJ.. "));
+    }
+
+    #[test]
+    fn fixed_width_keeps_following_problem_and_header_extent_stable() {
+        let mut app = navigation_test_app(3);
+        app.toggle_problem_status_mode();
+        let current = |state| {
+            Some(SubmissionDisplayState {
+                current: Some(state),
+                attempt: None,
+            })
+        };
+        let view = SubmissionViewState {
+            latest: Some(SubmissionHeaderState {
+                problem_label: "abc474/B".to_string(),
+                state: current(TuiSubmissionState::Status(SubmissionStatus::Judging)).unwrap(),
+            }),
+            problems: vec![
+                None,
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
+            ],
+        };
+        let mut c_offsets = Vec::new();
+        let mut header_widths = Vec::new();
+        for index in 0..4 {
+            let phase = submission_animation_phase(index);
+            let overview = problem_status_line(&app, Some(&view), phase).to_string();
+            c_offsets.push(overview.find("C Judging").unwrap());
+            header_widths.push(
+                Line::from(submission_header_spans(
+                    view.latest.as_ref().unwrap(),
+                    phase,
+                ))
+                .width(),
+            );
+        }
+        assert!(c_offsets.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(header_widths.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn animated_submission_rendering_is_safe_in_narrow_frames_and_clears_old_dots() {
+        let mut app = navigation_test_app(2);
+        app.toggle_problem_status_mode();
+        for status in [SubmissionStatus::WaitingForJudge, SubmissionStatus::Judging] {
+            let state = SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(status)),
+                attempt: None,
+            };
+            let view = SubmissionViewState {
+                latest: Some(SubmissionHeaderState {
+                    problem_label: "abc474/A".to_string(),
+                    state,
+                }),
+                problems: vec![Some(state), None],
+            };
+            let modal = SubmitModal {
+                key: crate::tui::submission::SubmissionKey::new("abc123", "abc123_a"),
+                problem_index: "A".to_string(),
+                problem_title: "Problem A".to_string(),
+                candidates: Vec::new(),
+                selected: 0,
+                python_runtime: crate::language::PythonRuntime::PyPy,
+                starting_generation: None,
+                current_submission: Some(state),
+                error: None,
+            };
+            for phase_index in 0..4 {
+                for (width, height) in [(0, 0), (1, 1), (8, 3), (16, 5), (28, 8), (32, 16)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    let mut layout = DetailLayout::default();
+                    terminal
+                        .draw(|frame| {
+                            render_frontend_with_mouse_mode(
+                                frame,
+                                &app,
+                                &mut layout,
+                                MouseMode::Cells,
+                                false,
+                                FrontendOverlays {
+                                    submit_modal: Some(&modal),
+                                    submission_view: Some(&view),
+                                    submission_animation_phase: submission_animation_phase(
+                                        phase_index,
+                                    ),
+                                    ..FrontendOverlays::default()
+                                },
+                            );
+                        })
+                        .unwrap();
+                }
+            }
+        }
+
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            latest: Some(SubmissionHeaderState {
+                problem_label: "A".to_string(),
+                state: waiting,
+            }),
+            problems: vec![Some(waiting), None],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let mut layout = DetailLayout::default();
+        for phase_index in [3, 0] {
+            terminal
+                .draw(|frame| {
+                    render_frontend_with_mouse_mode(
+                        frame,
+                        &app,
+                        &mut layout,
+                        MouseMode::Cells,
+                        false,
+                        FrontendOverlays {
+                            submission_view: Some(&view),
+                            submission_animation_phase: submission_animation_phase(phase_index),
+                            ..FrontendOverlays::default()
+                        },
+                    );
+                })
+                .unwrap();
+        }
+        let rendered = buffer_symbols(terminal.backend().buffer());
+        assert!(rendered.contains("SUB A WJ   "));
+        assert!(!rendered.contains("WJ."));
+    }
+
+    #[test]
     fn submission_status_spans_use_effective_state_and_semantic_colors() {
         let current_ac = Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
             Verdict::Accepted,
@@ -3211,15 +3635,21 @@ mod tests {
         assert_eq!(submitting.compact_label(), "Submitting");
         assert_eq!(unknown.compact_label(), "Unknown");
         assert_eq!(
-            submission_status_spans(submitting.effective().unwrap())[0]
-                .style
-                .fg,
+            submission_status_spans(
+                submitting.effective().unwrap(),
+                SubmissionAnimationPhase::default(),
+            )[0]
+            .style
+            .fg,
             Some(Color::Yellow)
         );
         assert_eq!(
-            submission_status_spans(unknown.effective().unwrap())[0]
-                .style
-                .fg,
+            submission_status_spans(
+                unknown.effective().unwrap(),
+                SubmissionAnimationPhase::default(),
+            )[0]
+            .style
+            .fg,
             Some(Color::Red)
         );
 
@@ -3255,6 +3685,7 @@ mod tests {
                     }
                     .effective()
                     .unwrap(),
+                    SubmissionAnimationPhase::default(),
                 )[0]
                 .style
                 .fg,
@@ -3282,6 +3713,7 @@ mod tests {
                     }
                     .effective()
                     .unwrap(),
+                    SubmissionAnimationPhase::default(),
                 )[0]
                 .style
                 .fg,
@@ -3294,15 +3726,18 @@ mod tests {
     #[test]
     fn sample_problem_strip_is_identical_after_round_trip_toggle() {
         let mut app = navigation_test_app(4);
-        let samples = problem_status_line(&app, None);
+        let samples = problem_status_line(&app, None, SubmissionAnimationPhase::default());
         app.toggle_problem_status_mode();
         assert!(
-            problem_status_line(&app, None)
+            problem_status_line(&app, None, SubmissionAnimationPhase::default())
                 .to_string()
                 .starts_with("SUB │ ")
         );
         app.toggle_problem_status_mode();
-        assert_eq!(problem_status_line(&app, None), samples);
+        assert_eq!(
+            problem_status_line(&app, None, SubmissionAnimationPhase::default()),
+            samples
+        );
     }
 
     #[test]
@@ -4044,18 +4479,25 @@ mod tests {
         let current_line = padded_submission_status_line(
             "Current submission: ",
             modal.current_submission.unwrap().effective().unwrap(),
+            SubmissionAnimationPhase::default(),
             40,
         );
         assert_eq!(current_line.spans[0].content, "Current submission: ");
         assert_eq!(current_line.spans[0].style, Style::default());
-        assert_eq!(current_line.spans[1].content, "WJ");
+        assert_eq!(current_line.spans[1].content, "WJ   ");
         assert_eq!(current_line.spans[1].style.fg, Some(Color::Yellow));
         assert_eq!(current_line.spans[1].style.add_modifier, Modifier::empty());
         let current = modal.current_submission.unwrap().effective().unwrap();
         for width in 0..=24 {
             assert_eq!(
-                padded_submission_status_line("Current submission: ", current, width).to_string(),
-                fit_command_palette_row("Current submission: WJ", width)
+                padded_submission_status_line(
+                    "Current submission: ",
+                    current,
+                    SubmissionAnimationPhase::default(),
+                    width,
+                )
+                .to_string(),
+                fit_command_palette_row("Current submission: WJ   ", width)
             );
         }
 
@@ -5239,7 +5681,8 @@ mod tests {
             let mut layout = DetailLayout::default();
             let before = render_with_layout(&mut terminal, &app, &mut layout);
             let buffer_before = terminal.backend().buffer().clone();
-            let navigation_before = problem_status_line(&app, None);
+            let navigation_before =
+                problem_status_line(&app, None, SubmissionAnimationPhase::default());
             assert_eq!(
                 buffer_row_text(
                     &buffer_before,
@@ -5270,7 +5713,10 @@ mod tests {
             let after = render_with_layout(&mut terminal, &app, &mut layout);
             assert_eq!(after.detail_area, before.detail_area);
             assert_eq!(after.max_detail_scroll, before.max_detail_scroll);
-            assert_eq!(problem_status_line(&app, None), navigation_before);
+            assert_eq!(
+                problem_status_line(&app, None, SubmissionAnimationPhase::default()),
+                navigation_before
+            );
             let buffer = terminal.backend().buffer();
             let navigation = buffer_row_text(buffer, 1, 1, 98);
             assert!(navigation.starts_with("A ·  "));
@@ -5303,8 +5749,10 @@ mod tests {
                         let mut layout = DetailLayout::default();
                         let before = render_with_layout(&mut terminal, &app, &mut layout);
                         let buffer_before = terminal.backend().buffer().clone();
-                        let protected_navigation_end =
-                            1 + problem_status_line(&app, None).width() + 2;
+                        let protected_navigation_end = 1
+                            + problem_status_line(&app, None, SubmissionAnimationPhase::default())
+                                .width()
+                            + 2;
                         assert!(app.reconcile_user_input_sync(0, Err("read error".to_string())));
                         let after = render_with_layout(&mut terminal, &app, &mut layout);
                         assert_eq!(after.detail_area, before.detail_area);
