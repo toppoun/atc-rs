@@ -58,8 +58,7 @@ const REFRESH_EDIT_NOTICE: &str = "Finish editing the User Input before refreshi
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrontendPreferences {
     debug: bool,
-    samples_pane: bool,
-    problem_status_mode: app::ProblemStatusMode,
+    side_pane: app::SidePaneState,
 }
 
 impl FrontendPreferences {
@@ -67,18 +66,12 @@ impl FrontendPreferences {
         if self.debug != app.debug_enabled() {
             app.toggle_debug();
         }
-        if self.samples_pane != app.samples_pane_enabled() {
-            app.toggle_samples_pane();
-        }
-        if self.problem_status_mode != app.problem_status_mode() {
-            app.toggle_problem_status_mode();
-        }
+        app.set_side_pane_state(self.side_pane);
     }
 
     fn capture(&mut self, app: &WatchApp) {
         self.debug = app.debug_enabled();
-        self.samples_pane = app.samples_pane_enabled();
-        self.problem_status_mode = app.problem_status_mode();
+        self.side_pane = app.side_pane_state();
     }
 }
 
@@ -127,8 +120,8 @@ impl FrontendAction {
             Self::OpenWorkspaceSettings => "Open Workspace Settings",
             Self::OpenTemplate => "Open Template",
             Self::ToggleDebug => "Toggle Debug",
-            Self::ToggleSamples => "Toggle Samples",
-            Self::ToggleSubmissions => "Toggle Submissions",
+            Self::ToggleSamples => "Toggle Side Pane",
+            Self::ToggleSubmissions => "Change Side Pane Mode",
             Self::StartStress => "Start Stress",
             Self::StopStress => "Stop Stress",
             Self::InitializeStress => "Initialize Stress",
@@ -284,17 +277,6 @@ fn canonical_current_source_language(
 }
 
 fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::SubmissionViewState {
-    let latest = hub.latest_activity().map(|latest| {
-        let problem_label = if latest.key.contest_id == app.contest_id() {
-            latest.problem_index
-        } else {
-            format!("{}/{}", latest.key.contest_id, latest.problem_index)
-        };
-        submission::SubmissionHeaderState {
-            problem_label,
-            state: latest.state,
-        }
-    });
     let problems = app
         .problems()
         .iter()
@@ -305,7 +287,8 @@ fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::Sub
             ))
         })
         .collect();
-    submission::SubmissionViewState { latest, problems }
+    let history = hub.history_for_contest(app.contest_id()).cloned().collect();
+    submission::SubmissionViewState { problems, history }
 }
 
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
@@ -3684,7 +3667,7 @@ fn handle_terminal_events_with_mouse_mode(
 
         let detail_revision_before = app.detail_revision();
         let delete_armed_before = app.user_input_delete_armed();
-        let samples_pane_before = app.samples_pane_enabled();
+        let side_pane_before = app.side_pane_state();
         let detail_scroll_before = app.detail_scroll();
         let is_left_drag = matches!(
             terminal_event,
@@ -3719,7 +3702,7 @@ fn handle_terminal_events_with_mouse_mode(
             break;
         }
         if app.detail_revision() != detail_revision_before
-            || app.samples_pane_enabled() != samples_pane_before
+            || app.side_pane_state() != side_pane_before
         {
             // The remaining queued pointer events must see geometry rendered
             // for the new document/mode/pane layout. Pure drag bursts do not
@@ -4542,11 +4525,11 @@ fn execute_frontend_action(
             Ok(true)
         }
         FrontendAction::ToggleSamples => {
-            app.toggle_samples_pane();
+            app.toggle_side_pane();
             Ok(true)
         }
         FrontendAction::ToggleSubmissions => {
-            app.toggle_problem_status_mode();
+            app.toggle_side_pane_mode();
             Ok(true)
         }
         FrontendAction::StartStress => {
@@ -5535,7 +5518,7 @@ mod tests {
             ("stop", vec!["Stop Stress"]),
             ("ini", vec!["Initialize Stress"]),
             ("deb", vec!["Toggle Debug"]),
-            ("sam", vec!["Toggle Samples"]),
+            ("pan", vec!["Toggle Side Pane", "Change Side Pane Mode"]),
             ("tes", vec!["Run Tests"]),
             (
                 "open",
@@ -5555,7 +5538,7 @@ mod tests {
             ("template", vec!["Open Template"]),
             ("Sw", vec!["Switch Contest"]),
             ("sW cOn", vec!["Switch Contest"]),
-            ("to sam", vec!["Toggle Samples"]),
+            ("to side", vec!["Toggle Side Pane"]),
             ("does-not-match", vec![]),
         ] {
             assert_eq!(palette_labels(query), expected, "query {query:?}");
@@ -5683,7 +5666,7 @@ mod tests {
     }
 
     #[test]
-    fn submissions_toggle_is_press_only_and_available_from_the_command_palette() {
+    fn side_pane_mode_toggle_is_press_only_and_preserves_visibility() {
         let mut app = app_with_problems(&[1, 1]);
         let (run_tx, _run_rx) = mpsc::channel();
         assert_eq!(app.problem_status_mode(), app::ProblemStatusMode::Samples);
@@ -5700,6 +5683,7 @@ mod tests {
             app.problem_status_mode(),
             app::ProblemStatusMode::Submissions
         );
+        assert!(!app.side_pane_enabled());
         assert!(
             !handle_key_event(
                 &mut app,
@@ -5721,10 +5705,19 @@ mod tests {
             app.problem_status_mode(),
             app::ProblemStatusMode::Submissions
         );
+        assert!(
+            handle_key_event(
+                &mut app,
+                key(KeyCode::Char('s'), KeyEventKind::Press),
+                &run_tx,
+            )
+            .unwrap()
+        );
+        assert!(app.side_pane_enabled());
 
         let mut palette = CommandPalette::default();
         palette.open();
-        palette.query = "toggle subm".to_string();
+        palette.query = "change side".to_string();
         assert_eq!(
             palette.filtered_actions(),
             [FrontendAction::ToggleSubmissions]
@@ -5745,6 +5738,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.problem_status_mode(), app::ProblemStatusMode::Samples);
+        assert!(app.side_pane_enabled());
     }
 
     #[test]

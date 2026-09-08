@@ -658,8 +658,7 @@ impl ProblemState {
 pub struct WatchApp {
     should_quit: bool,
     debug: bool,
-    samples_pane_enabled: bool,
-    problem_status_mode: ProblemStatusMode,
+    side_pane: SidePaneState,
 
     contest_id: String,
     problems: Vec<ProblemState>,
@@ -676,13 +675,19 @@ pub struct WatchApp {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum ProblemStatusMode {
+pub(super) struct SidePaneState {
+    pub(super) enabled: bool,
+    pub(super) mode: SidePaneMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum SidePaneMode {
     #[default]
     Samples,
     Submissions,
 }
 
-impl ProblemStatusMode {
+impl SidePaneMode {
     fn toggled(self) -> Self {
         match self {
             Self::Samples => Self::Submissions,
@@ -690,6 +695,9 @@ impl ProblemStatusMode {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) type ProblemStatusMode = SidePaneMode;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct DetailFoldState {
@@ -996,8 +1004,7 @@ impl WatchApp {
         Ok(Self {
             should_quit: false,
             debug: false,
-            samples_pane_enabled: false,
-            problem_status_mode: ProblemStatusMode::default(),
+            side_pane: SidePaneState::default(),
             contest_id: contest.contest_id.clone(),
             problems,
             selected_problem: 0,
@@ -1017,20 +1024,48 @@ impl WatchApp {
     pub fn debug_enabled(&self) -> bool {
         self.debug
     }
+    pub(super) fn side_pane_state(&self) -> SidePaneState {
+        self.side_pane
+    }
+
+    pub(super) fn set_side_pane_state(&mut self, state: SidePaneState) {
+        self.side_pane = state;
+    }
+
+    pub(super) fn side_pane_enabled(&self) -> bool {
+        self.side_pane.enabled
+    }
+
+    pub(super) fn toggle_side_pane(&mut self) {
+        self.side_pane.enabled = !self.side_pane.enabled;
+    }
+
+    pub(super) fn side_pane_mode(&self) -> SidePaneMode {
+        self.side_pane.mode
+    }
+
+    pub(super) fn toggle_side_pane_mode(&mut self) {
+        self.side_pane.mode = self.side_pane.mode.toggled();
+    }
+
+    #[cfg(test)]
     pub fn samples_pane_enabled(&self) -> bool {
-        self.samples_pane_enabled
+        self.side_pane_enabled()
     }
 
+    #[cfg(test)]
     pub fn toggle_samples_pane(&mut self) {
-        self.samples_pane_enabled = !self.samples_pane_enabled;
+        self.toggle_side_pane();
     }
 
+    #[cfg(test)]
     pub(super) fn problem_status_mode(&self) -> ProblemStatusMode {
-        self.problem_status_mode
+        self.side_pane_mode()
     }
 
+    #[cfg(test)]
     pub(super) fn toggle_problem_status_mode(&mut self) {
-        self.problem_status_mode = self.problem_status_mode.toggled();
+        self.toggle_side_pane_mode();
     }
 
     pub fn contest_id(&self) -> &str {
@@ -5445,6 +5480,52 @@ mod tests {
 
         app.toggle_problem_status_mode();
         assert_eq!(app.problem_status_mode(), ProblemStatusMode::Samples);
+    }
+
+    #[test]
+    fn side_pane_models_hidden_samples_and_submissions_without_coupling_mode_to_visibility() {
+        let mut app = WatchApp::new(&contest(2), vec![3, 3]).unwrap();
+        assert_eq!(
+            app.side_pane_state(),
+            SidePaneState {
+                enabled: false,
+                mode: SidePaneMode::Samples,
+            }
+        );
+
+        app.toggle_side_pane_mode();
+        assert_eq!(
+            app.side_pane_state(),
+            SidePaneState {
+                enabled: false,
+                mode: SidePaneMode::Submissions,
+            }
+        );
+        app.toggle_side_pane();
+        assert_eq!(
+            app.side_pane_state(),
+            SidePaneState {
+                enabled: true,
+                mode: SidePaneMode::Submissions,
+            }
+        );
+
+        app.toggle_side_pane_mode();
+        assert_eq!(
+            app.side_pane_state(),
+            SidePaneState {
+                enabled: true,
+                mode: SidePaneMode::Samples,
+            }
+        );
+        app.toggle_side_pane();
+        assert_eq!(
+            app.side_pane_state(),
+            SidePaneState {
+                enabled: false,
+                mode: SidePaneMode::Samples,
+            }
+        );
     }
 
     #[test]

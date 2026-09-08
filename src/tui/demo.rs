@@ -16,8 +16,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::app::WatchApp;
 use super::detail_layout::DetailLayout;
 use super::submission::{
-    SubmissionDisplayState, SubmissionHeaderState, SubmissionViewState, TuiSubmissionAttemptState,
-    TuiSubmissionState,
+    SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey, SubmissionViewState,
+    TuiSubmissionAttemptState, TuiSubmissionState,
 };
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::{TerminaSession, view};
@@ -26,7 +26,6 @@ use crate::language::Language;
 use crate::model::{Contest, Problem};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const ANIMATION_REDRAW_INTERVAL: Duration = Duration::from_millis(80);
 const SCENARIO_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_EVENTS_PER_TICK: usize = 256;
 
@@ -99,7 +98,6 @@ struct DemoHarness {
     app: WatchApp,
     submissions: SubmissionViewState,
     show_help: bool,
-    cross_contest_header: bool,
     playback: Option<ScenarioPlayback>,
 }
 
@@ -135,7 +133,7 @@ impl DemoHarness {
         }
         app.toggle_debug();
         app.select_problem(1);
-        app.toggle_problem_status_mode();
+        app.toggle_side_pane_mode();
 
         let ac = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
             Verdict::Accepted,
@@ -143,17 +141,32 @@ impl DemoHarness {
         let re = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
             Verdict::RuntimeError,
         )));
+        let waiting = current(TuiSubmissionState::Status(
+            SubmissionStatus::WaitingForJudge,
+        ));
+        let wa = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+            Verdict::WrongAnswer,
+        )));
+        let progress_re = current(TuiSubmissionState::Status(
+            SubmissionStatus::JudgingProgress {
+                judged: 7,
+                total: 15,
+                provisional: Some(Verdict::RuntimeError),
+            },
+        ));
         Ok(Self {
             app,
             submissions: SubmissionViewState {
-                latest: Some(SubmissionHeaderState {
-                    problem_label: "B".to_string(),
-                    state: re,
-                }),
-                problems: vec![Some(ac), Some(re), None, None, None],
+                problems: vec![Some(ac), Some(waiting), Some(progress_re), None, None],
+                history: vec![
+                    demo_history_entry(5, "B", waiting),
+                    demo_history_entry(4, "B", wa),
+                    demo_history_entry(3, "B", re),
+                    demo_history_entry(2, "A", ac),
+                    demo_history_entry(1, "C", progress_re),
+                ],
             },
             show_help: true,
-            cross_contest_header: false,
             playback: None,
         })
     }
@@ -174,11 +187,29 @@ impl DemoHarness {
             return;
         };
         *slot = state;
-        self.cross_contest_header = false;
-        self.submissions.latest = state.map(|state| SubmissionHeaderState {
-            problem_label: self.app.problems()[problem].index.clone(),
-            state,
-        });
+        let problem_index = self.app.problems()[problem].index.clone();
+        if let Some(state) = state {
+            if let Some(entry) = self
+                .submissions
+                .history
+                .iter_mut()
+                .find(|entry| entry.problem_index == problem_index)
+            {
+                entry.state = state;
+            } else {
+                let generation = self
+                    .submissions
+                    .history
+                    .iter()
+                    .map(|entry| entry.generation)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                self.submissions
+                    .history
+                    .insert(0, demo_history_entry(generation, &problem_index, state));
+            }
+        }
     }
 
     fn cycle_composite(&mut self) {
@@ -207,35 +238,6 @@ impl DemoHarness {
             _ => waiting,
         };
         self.set_selected_submission(Some(state));
-    }
-
-    fn toggle_cross_contest_header(&mut self) {
-        self.playback = None;
-        self.cross_contest_header = !self.cross_contest_header;
-        if self.cross_contest_header {
-            self.submissions.latest = Some(SubmissionHeaderState {
-                problem_label: "abc474/A".to_string(),
-                state: current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
-                ))),
-            });
-        } else {
-            self.refresh_selected_header();
-        }
-    }
-
-    fn refresh_selected_header(&mut self) {
-        self.submissions.latest = self.selected_problem().and_then(|problem| {
-            self.submissions
-                .problems
-                .get(problem)
-                .copied()
-                .flatten()
-                .map(|state| SubmissionHeaderState {
-                    problem_label: self.app.problems()[problem].index.clone(),
-                    state,
-                })
-        });
     }
 
     fn toggle_scenario(&mut self, now: Instant) {
@@ -294,13 +296,16 @@ impl DemoHarness {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Escape => return true,
                 KeyCode::Char('?') => self.show_help = !self.show_help,
-                KeyCode::Char('v') => self.app.toggle_problem_status_mode(),
-                KeyCode::Char('s') => self.app.toggle_samples_pane(),
+                KeyCode::Char('v') => self.app.toggle_side_pane_mode(),
+                KeyCode::Char('s') => self.app.toggle_side_pane(),
                 KeyCode::Char('d') => self.app.toggle_debug(),
                 KeyCode::Char(label @ 'a'..='e') => {
                     self.app.select_problem(usize::from(label as u8 - b'a'));
                 }
-                KeyCode::Char('1') => self.set_selected_submission(None),
+                KeyCode::Char('1') => {
+                    self.set_selected_submission(None);
+                    self.submissions.history.clear();
+                }
                 KeyCode::Char('2') => self
                     .set_selected_submission(Some(attempt(TuiSubmissionAttemptState::Submitting))),
                 KeyCode::Char('3') => {
@@ -352,7 +357,11 @@ impl DemoHarness {
                     self.set_selected_submission(Some(attempt(TuiSubmissionAttemptState::Unknown)));
                 }
                 KeyCode::Char('x') => self.cycle_composite(),
-                KeyCode::Char('g') => self.toggle_cross_contest_header(),
+                KeyCode::Char('g') => {
+                    let replacement = Self::new().expect("the in-memory demo fixture must rebuild");
+                    self.submissions = replacement.submissions;
+                    self.playback = None;
+                }
                 KeyCode::Char(' ') => self.toggle_scenario(now),
                 KeyCode::Enter
                 | KeyCode::Backspace
@@ -379,17 +388,21 @@ impl DemoHarness {
         }
         false
     }
+}
 
-    fn wants_animation_redraw(&self) -> bool {
-        self.playback.is_some()
-            || self.submissions.problems.iter().flatten().any(|state| {
-                matches!(
-                    state.current,
-                    Some(TuiSubmissionState::Status(
-                        SubmissionStatus::WaitingForJudge
-                    ))
-                )
-            })
+fn demo_history_entry(
+    generation: u64,
+    problem_index: &str,
+    state: SubmissionDisplayState,
+) -> SubmissionHistoryEntry {
+    SubmissionHistoryEntry {
+        generation,
+        key: SubmissionKey::new(
+            "awc0151",
+            format!("awc0151_{}", problem_index.to_ascii_lowercase()),
+        ),
+        problem_index: problem_index.to_string(),
+        state,
     }
 }
 
@@ -411,15 +424,10 @@ fn run_loop(terminal: &mut TerminaSession) -> io::Result<()> {
     let mut demo = DemoHarness::new()?;
     let mut detail_layout = DetailLayout::default();
     let mut dirty = true;
-    let mut next_animation_redraw = Instant::now();
 
     loop {
         let now = Instant::now();
         dirty |= demo.advance_scenario(now);
-        if demo.wants_animation_redraw() && now >= next_animation_redraw {
-            dirty = true;
-            next_animation_redraw = now + ANIMATION_REDRAW_INTERVAL;
-        }
 
         if dirty {
             let render_mouse_mode = terminal.mouse_mode();
@@ -507,12 +515,12 @@ fn render_help(frame: &mut Frame<'_>) {
         Span::raw("  ? hide"),
     ]);
     let help = Text::from(vec![
+        Line::raw("a-e / left-right / h-l problem   v samples/submissions   s side pane   d debug"),
         Line::raw(
-            "a-e / left-right / h-l problem   v samples/submissions   s samples pane   d debug",
+            "1 empty history  2 Submitting  3 internal Accepted→WJ  4 WJ  5 WR  6 Judging  7 1/72",
         ),
-        Line::raw("1 none  2 Submitting  3 internal Accepted→WJ  4 WJ  5 WR  6 Judging  7 1/72"),
         Line::raw(
-            "8 55/72 RE  9 AC  0 WA  r RE  t TLE  n Untracked  u Unknown  x current+attempt  g cross-contest",
+            "8 55/72 RE  9 AC  0 WA  r RE  t TLE  n Untracked  u Unknown  x current+attempt  g reset fixture",
         ),
         Line::raw("Space play/stop scenario   q / Esc / Ctrl-C quit"),
     ]);
@@ -530,346 +538,30 @@ fn render_help(frame: &mut Frame<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::{Terminal, buffer::Buffer};
 
     use super::*;
     use crate::tui::mouse::MouseMode;
 
-    fn rendered_buffer(demo: &DemoHarness, width: u16, height: u16) -> Buffer {
+    fn rendered_lines(demo: &DemoHarness, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut detail_layout = DetailLayout::default();
         terminal
             .draw(|frame| render_demo(frame, demo, &mut detail_layout, MouseMode::Disabled))
             .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    fn rendered_text(demo: &DemoHarness, width: u16, height: u16) -> String {
-        rendered_buffer(demo, width, height)
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer.cell((column, row)).unwrap().symbol())
+                    .collect::<String>()
+            })
             .collect()
     }
 
-    fn find_cell_sequence(buffer: &Buffer, needle: &str) -> (u16, u16) {
-        for y in 0..buffer.area.height {
-            for start_x in 0..buffer.area.width {
-                let mut candidate = String::new();
-                for x in start_x..buffer.area.width {
-                    candidate.push_str(buffer.cell((x, y)).unwrap().symbol());
-                    if candidate == needle {
-                        return (start_x, y);
-                    }
-                    if !needle.starts_with(&candidate) {
-                        break;
-                    }
-                }
-            }
-        }
-        panic!("could not find {needle:?} in rendered demo buffer");
-    }
-
-    #[test]
-    fn in_memory_fixture_renders_through_the_production_frontend() {
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-
-        let rendered = rendered_text(&demo, 160, 20);
-        assert!(rendered.contains("awc0151 │ B.cpp │ C++ │ DEBUG ON │ Idle │ SUB B RE"));
-        assert!(rendered.contains("SUB │ A AC   B RE   C ·   D ·   E ·"));
-    }
-
-    #[test]
-    fn demo_states_render_the_user_visible_submission_vocabulary() {
-        let cases = [
-            (
-                attempt(TuiSubmissionAttemptState::Submitting),
-                "Submitting",
-                Color::Yellow,
-            ),
-            (current(TuiSubmissionState::Accepted), "WJ", Color::Yellow),
-            (
-                current(TuiSubmissionState::Status(
-                    SubmissionStatus::WaitingForJudge,
-                )),
-                "WJ",
-                Color::Yellow,
-            ),
-            (
-                current(TuiSubmissionState::Status(
-                    SubmissionStatus::WaitingForRejudge,
-                )),
-                "WR",
-                Color::Yellow,
-            ),
-            (
-                current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
-                "Judging",
-                Color::Yellow,
-            ),
-            (
-                current(TuiSubmissionState::Status(
-                    SubmissionStatus::JudgingProgress {
-                        judged: 1,
-                        total: 72,
-                        provisional: None,
-                    },
-                )),
-                "1/72",
-                Color::Yellow,
-            ),
-            (
-                current(TuiSubmissionState::Status(
-                    SubmissionStatus::JudgingProgress {
-                        judged: 55,
-                        total: 72,
-                        provisional: Some(Verdict::RuntimeError),
-                    },
-                )),
-                "55/72 RE",
-                Color::Yellow,
-            ),
-            (
-                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
-                ))),
-                "AC",
-                Color::Green,
-            ),
-            (
-                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::WrongAnswer,
-                ))),
-                "WA",
-                Color::Red,
-            ),
-            (
-                current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::RuntimeError,
-                ))),
-                "RE",
-                Color::Red,
-            ),
-            (
-                current(TuiSubmissionState::TrackingUnavailable),
-                "Untracked",
-                Color::Yellow,
-            ),
-            (
-                attempt(TuiSubmissionAttemptState::Unknown),
-                "Unknown",
-                Color::Red,
-            ),
-        ];
-
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-        for (state, expected, expected_color) in cases {
-            demo.set_selected_submission(Some(state));
-            let buffer = rendered_buffer(&demo, 160, 20);
-            let rendered = buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(
-                rendered.contains(&format!("SUB B {expected}")),
-                "state={state:?}\n{rendered}"
-            );
-            assert!(
-                rendered.contains(&format!("B {expected}")),
-                "state={state:?}\n{rendered}"
-            );
-            assert!(!rendered.contains("NEW"), "state={state:?}\n{rendered}");
-            assert!(
-                !rendered.contains("Accepted"),
-                "state={state:?}\n{rendered}"
-            );
-
-            let header = format!("SUB B {expected}");
-            let (header_x, header_y) = find_cell_sequence(&buffer, &header);
-            let status_x = header_x + u16::try_from("SUB B ".chars().count()).unwrap();
-            assert_eq!(
-                buffer.cell((status_x, header_y)).unwrap().fg,
-                expected_color,
-                "state={state:?}"
-            );
-            if expected == "55/72 RE" {
-                let verdict_x = header_x + u16::try_from("SUB B 55/72 ".chars().count()).unwrap();
-                assert_eq!(buffer.cell((verdict_x, header_y)).unwrap().fg, Color::Red);
-            }
-        }
-    }
-
-    #[test]
-    fn overview_selection_moves_only_problem_label_modifiers() {
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-
-        let selected_b = rendered_buffer(&demo, 160, 20);
-        let (row_x, row_y) = find_cell_sequence(&selected_b, "SUB │ A AC   B RE");
-        let offset = |prefix: &str| row_x + u16::try_from(prefix.chars().count()).unwrap();
-        let a_label_x = offset("SUB │ ");
-        let ac_x = offset("SUB │ A ");
-        let b_label_x = offset("SUB │ A AC   ");
-        let re_x = offset("SUB │ A AC   B ");
-        assert!(
-            !selected_b
-                .cell((a_label_x, row_y))
-                .unwrap()
-                .modifier
-                .contains(Modifier::BOLD)
-        );
-        assert!(
-            selected_b
-                .cell((b_label_x, row_y))
-                .unwrap()
-                .modifier
-                .contains(Modifier::BOLD | Modifier::UNDERLINED)
-        );
-        let ac_style = selected_b.cell((ac_x, row_y)).unwrap().style();
-        let re_style = selected_b.cell((re_x, row_y)).unwrap().style();
-        assert_eq!(ac_style.fg, Some(Color::Green));
-        assert_eq!(re_style.fg, Some(Color::Red));
-        assert_eq!(ac_style.add_modifier, Modifier::empty());
-        assert_eq!(re_style.add_modifier, Modifier::empty());
-
-        demo.app.select_problem(0);
-        let selected_a = rendered_buffer(&demo, 160, 20);
-        let (row_x, row_y) = find_cell_sequence(&selected_a, "SUB │ A AC   B RE");
-        let offset = |prefix: &str| row_x + u16::try_from(prefix.chars().count()).unwrap();
-        assert!(
-            selected_a
-                .cell((offset("SUB │ "), row_y))
-                .unwrap()
-                .modifier
-                .contains(Modifier::BOLD | Modifier::UNDERLINED)
-        );
-        assert!(
-            !selected_a
-                .cell((offset("SUB │ A AC   "), row_y))
-                .unwrap()
-                .modifier
-                .intersects(Modifier::BOLD | Modifier::UNDERLINED)
-        );
-        assert_eq!(
-            selected_a
-                .cell((offset("SUB │ A "), row_y))
-                .unwrap()
-                .style(),
-            ac_style
-        );
-        assert_eq!(
-            selected_a
-                .cell((offset("SUB │ A AC   B "), row_y))
-                .unwrap()
-                .style(),
-            re_style
-        );
-    }
-
-    #[test]
-    fn current_and_attempt_fixture_shows_only_the_attempt() {
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-        demo.app.select_problem(0);
-
-        let waiting = composite(
-            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
-            TuiSubmissionAttemptState::Submitting,
-        );
-        let progress = composite(
-            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
-                judged: 14,
-                total: 50,
-                provisional: None,
-            }),
-            TuiSubmissionAttemptState::Submitting,
-        );
-        let unknown = composite(
-            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
-            TuiSubmissionAttemptState::Unknown,
-        );
-
-        demo.cycle_composite();
-
-        let rendered = rendered_text(&demo, 160, 20);
-        assert_eq!(demo.submissions.problems[0], Some(waiting));
-        assert!(rendered.contains("SUB A Submitting"));
-        assert!(!rendered.contains("SUB A WJ"));
-        assert!(!rendered.contains("NEW"));
-        assert!(rendered.contains("A Submitting"));
-
-        demo.cycle_composite();
-        let rendered = rendered_text(&demo, 160, 20);
-        assert_eq!(demo.submissions.problems[0], Some(progress));
-        assert!(rendered.contains("SUB A Submitting"));
-        assert!(!rendered.contains("SUB A 14/50"));
-        assert!(!rendered.contains("NEW"));
-        assert!(rendered.contains("A Submitting"));
-
-        demo.cycle_composite();
-        let rendered = rendered_text(&demo, 160, 20);
-        assert_eq!(demo.submissions.problems[0], Some(unknown));
-        assert!(rendered.contains("SUB A Unknown"));
-        assert!(rendered.contains("SUB │ A Unknown"));
-        assert!(!rendered.contains("SUB A AC"));
-        assert!(!rendered.contains("A AC"));
-        assert!(!rendered.contains("AC ·"));
-        assert!(!rendered.contains(" · NEW"));
-
-        demo.cycle_composite();
-        assert_eq!(demo.submissions.problems[0], Some(waiting));
-    }
-
-    #[test]
-    fn both_problem_status_modes_and_narrow_frames_render_without_panicking() {
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-        assert!(rendered_text(&demo, 100, 12).contains("SUB │"));
-        demo.app.toggle_problem_status_mode();
-        assert!(!rendered_text(&demo, 100, 12).contains("SUB │"));
-
-        for width in [1, 2, 8, 16, 28] {
-            for height in [1, 2, 3, 5, 8] {
-                let _ = rendered_text(&demo, width, height);
-            }
-        }
-    }
-
-    #[test]
-    fn global_latest_and_cross_contest_header_follow_demo_updates() {
-        let mut demo = DemoHarness::new().unwrap();
-        demo.show_help = false;
-        demo.app.select_problem(2);
-        demo.set_selected_submission(Some(current(TuiSubmissionState::Status(
-            SubmissionStatus::WaitingForJudge,
-        ))));
-        assert!(rendered_text(&demo, 160, 20).contains("SUB C WJ"));
-
-        demo.toggle_cross_contest_header();
-        assert!(rendered_text(&demo, 160, 20).contains("SUB abc474/A AC"));
-    }
-
-    #[test]
-    fn scenario_advances_in_memory_to_the_final_verdict() {
-        let mut demo = DemoHarness::new().unwrap();
-        let mut now = Instant::now();
-        demo.toggle_scenario(now);
-        assert_eq!(demo.submissions.problems[1], Some(SCENARIO[0]));
-
-        for expected in &SCENARIO[1..] {
-            now += SCENARIO_INTERVAL;
-            assert!(demo.advance_scenario(now));
-            assert_eq!(demo.submissions.problems[1], Some(*expected));
-        }
-        assert!(demo.playback.is_none());
-        assert_eq!(
-            demo.submissions.latest.as_ref().map(|latest| latest.state),
-            SCENARIO.last().copied()
-        );
+    fn rendered_text(demo: &DemoHarness, width: u16, height: u16) -> String {
+        rendered_lines(demo, width, height).join("\n")
     }
 
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
@@ -881,37 +573,117 @@ mod tests {
     }
 
     #[test]
+    fn fixture_shows_compact_overview_and_same_problem_history_rows() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        demo.app.toggle_side_pane();
+
+        let lines = rendered_lines(&demo, 100, 20);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("SUB │ A   B   C   D   E"))
+        );
+        assert!(lines.iter().any(|line| line.contains("Submissions")));
+        for row in ["B  WJ", "B  WA", "B  RE", "A  AC", "C  7/15 RE"] {
+            assert!(
+                lines.iter().any(|line| line.contains(row)),
+                "missing {row:?}"
+            );
+        }
+        assert!(!lines[0].contains("SUB "));
+    }
+
+    #[test]
+    fn demo_keys_cover_hidden_samples_submissions_and_empty_history() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        let now = Instant::now();
+
+        assert!(!demo.app.side_pane_enabled());
+        assert_eq!(
+            demo.app.side_pane_mode(),
+            super::super::app::SidePaneMode::Submissions
+        );
+        demo.handle_key(key(KeyCode::Char('v'), KeyEventKind::Press), now);
+        assert!(!demo.app.side_pane_enabled());
+        assert_eq!(
+            demo.app.side_pane_mode(),
+            super::super::app::SidePaneMode::Samples
+        );
+
+        demo.handle_key(key(KeyCode::Char('s'), KeyEventKind::Press), now);
+        assert!(rendered_text(&demo, 100, 20).contains("Samples"));
+        demo.handle_key(key(KeyCode::Char('v'), KeyEventKind::Press), now);
+        assert!(demo.app.side_pane_enabled());
+        assert!(rendered_text(&demo, 100, 20).contains("Submissions"));
+
+        demo.handle_key(key(KeyCode::Char('1'), KeyEventKind::Press), now);
+        assert!(rendered_text(&demo, 100, 20).contains("No submissions"));
+        demo.handle_key(key(KeyCode::Char('s'), KeyEventKind::Press), now);
+        assert!(!demo.app.side_pane_enabled());
+    }
+
+    #[test]
+    fn scenario_updates_one_history_entry_to_the_final_verdict() {
+        let mut demo = DemoHarness::new().unwrap();
+        let mut now = Instant::now();
+        let history_len = demo.submissions.history.len();
+        demo.toggle_scenario(now);
+
+        for expected in &SCENARIO[1..] {
+            now += SCENARIO_INTERVAL;
+            assert!(demo.advance_scenario(now));
+            assert_eq!(demo.submissions.problems[1], Some(*expected));
+            assert_eq!(demo.submissions.history.len(), history_len);
+        }
+        assert!(demo.playback.is_none());
+        assert_eq!(
+            demo.submissions.history[0].state,
+            SCENARIO.last().copied().unwrap()
+        );
+    }
+
+    #[test]
+    fn narrow_demo_frames_do_not_panic() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        demo.app.toggle_side_pane();
+        for (width, height) in [
+            (0, 0),
+            (1, 1),
+            (2, 3),
+            (8, 5),
+            (28, 8),
+            (51, 12),
+            (52, 12),
+            (53, 12),
+        ] {
+            let _ = rendered_text(&demo, width, height);
+        }
+    }
+
+    #[test]
     fn repeat_is_accepted_only_for_problem_navigation() {
         let mut demo = DemoHarness::new().unwrap();
         let now = Instant::now();
 
         assert!(!demo.handle_key(key(KeyCode::Right, KeyEventKind::Repeat), now));
         assert_eq!(demo.selected_problem(), Some(2));
-        assert!(!demo.handle_key(key(KeyCode::Char('h'), KeyEventKind::Repeat), now));
-        assert_eq!(demo.selected_problem(), Some(1));
-
-        let submissions = demo.submissions.clone();
-        let show_help = demo.show_help;
+        let state = demo.app.side_pane_state();
         for code in [
-            KeyCode::Char('4'),
-            KeyCode::Char('x'),
+            KeyCode::Char('1'),
             KeyCode::Char('g'),
             KeyCode::Char(' '),
             KeyCode::Char('v'),
+            KeyCode::Char('s'),
             KeyCode::Char('d'),
             KeyCode::Char('?'),
             KeyCode::Char('q'),
         ] {
             assert!(!demo.handle_key(key(code, KeyEventKind::Repeat), now));
         }
-        assert_eq!(demo.submissions, submissions);
-        assert_eq!(demo.show_help, show_help);
-        assert!(!demo.cross_contest_header);
+        assert_eq!(demo.app.side_pane_state(), state);
         assert!(demo.playback.is_none());
-        assert!(demo.app.debug_enabled());
-        assert!(rendered_text(&demo, 100, 12).contains("SUB │"));
-
-        assert!(!demo.handle_key(key(KeyCode::Right, KeyEventKind::Release), now));
-        assert_eq!(demo.selected_problem(), Some(1));
     }
 }
