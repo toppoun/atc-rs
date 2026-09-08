@@ -25,7 +25,7 @@ use super::detail_scrollbar::{
 };
 use super::mouse::MouseMode;
 use super::submission::{
-    SubmissionDisplayState, SubmissionViewState, TuiSubmissionAttemptState, TuiSubmissionState,
+    SubmissionDisplayState, SubmissionHeaderState, SubmissionTone, SubmissionViewState,
     UserVisibleSubmissionState,
 };
 use super::{
@@ -33,7 +33,6 @@ use super::{
     OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal, RefreshContestModal,
     RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
 };
-use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
 use crate::language::Language;
 
 const SAMPLES_PANE_WIDTH: u16 = 20;
@@ -189,6 +188,59 @@ fn fit_command_palette_row(text: &str, width: usize) -> String {
     fitted.push('…');
     fitted.push_str(&" ".repeat(width.saturating_sub(fitted_width.saturating_add(1))));
     fitted
+}
+
+fn fit_styled_row(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    let text_width = Line::from(spans.clone()).width();
+    if text_width <= width {
+        spans.push(Span::raw(" ".repeat(width - text_width)));
+        return Line::from(spans);
+    }
+
+    if width == 1 {
+        for span in spans {
+            if let Some(grapheme) = span
+                .content
+                .graphemes(true)
+                .find(|grapheme| UnicodeWidthStr::width(*grapheme) == 1)
+            {
+                return Line::from(Span::styled(grapheme.to_string(), span.style));
+            }
+        }
+        return Line::raw(" ");
+    }
+
+    let content_width = width - 1;
+    let mut fitted = Vec::new();
+    let mut fitted_width = 0usize;
+    let mut truncated = false;
+    for span in spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if fitted_width.saturating_add(grapheme_width) > content_width {
+                truncated = true;
+                break;
+            }
+            content.push_str(grapheme);
+            fitted_width = fitted_width.saturating_add(grapheme_width);
+        }
+        if !content.is_empty() {
+            fitted.push(Span::styled(content, span.style));
+        }
+        if truncated {
+            break;
+        }
+    }
+    fitted.push(Span::raw("…"));
+    fitted.push(Span::raw(
+        " ".repeat(width.saturating_sub(fitted_width.saturating_add(1))),
+    ));
+    Line::from(fitted)
 }
 
 fn command_palette_row(marker: &str, label: &str, shortcut: Option<&str>, width: usize) -> String {
@@ -442,10 +494,7 @@ pub(super) fn render_frontend_with_pointer(
         .and_then(|submission| submission.latest.as_ref())
     {
         title_spans.push(Span::raw(" │ "));
-        title_spans.push(Span::styled(
-            submission.label(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        title_spans.extend(submission_header_spans(submission));
     }
     title_spans.push(Span::raw(" "));
     let title = Line::from(title_spans);
@@ -1239,11 +1288,14 @@ fn render_submit_modal(frame: &mut Frame, modal: &SubmitModal) {
             line_width,
         )),
     ]);
-    if let Some(current) = modal.current_submission {
-        lines.push(Line::raw(fit_command_palette_row(
-            &format!("Current submission: {}", current.summary_label()),
+    if let Some(current) = modal.current_submission
+        && let Some(state) = current.effective()
+    {
+        lines.push(padded_submission_status_line(
+            "Current submission: ",
+            state,
             line_width,
-        )));
+        ));
     }
     lines.extend([
         Line::raw(""),
@@ -1712,37 +1764,78 @@ fn submission_problem_status_line(
         let state = submission_view
             .and_then(|view| view.problems.get(index))
             .copied()
-            .flatten();
-        let label = state.map_or_else(|| "·".to_string(), SubmissionDisplayState::compact_label);
-        let mut style = submission_style(state);
+            .flatten()
+            .and_then(SubmissionDisplayState::effective);
+        let tone = state
+            .and_then(|state| state.status_segments().first().map(|segment| segment.tone))
+            .unwrap_or(SubmissionTone::None);
+        let mut problem_style = submission_tone_style(tone);
         if selected == Some(index) {
-            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            problem_style = problem_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         }
-        spans.push(Span::styled(format!("{} {label}", problem.index), style));
+        spans.push(Span::styled(problem.index.clone(), problem_style));
+        spans.push(Span::raw(" "));
+        match state {
+            Some(state) => spans.extend(submission_status_spans(state)),
+            None => spans.push(Span::styled(
+                "·",
+                submission_tone_style(SubmissionTone::None),
+            )),
+        }
     }
 
     Line::from(spans)
 }
 
-fn submission_style(state: Option<SubmissionDisplayState>) -> Style {
-    let Some(state) = state.and_then(SubmissionDisplayState::effective) else {
-        return Style::default().fg(Color::DarkGray);
+fn submission_header_spans(submission: &SubmissionHeaderState) -> Vec<Span<'static>> {
+    let Some(state) = submission.state.effective() else {
+        return Vec::new();
     };
-    match state {
-        UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Unknown) => {
-            Style::default().fg(Color::Red)
+    let mut spans = vec![Span::styled(
+        format!("SUB {}", submission.problem_label),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::raw(" "));
+    spans.extend(submission_status_spans(state));
+    spans
+}
+
+fn submission_status_spans(state: UserVisibleSubmissionState) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, segment) in state.status_segments().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
         }
-        UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Submitting) => {
-            Style::default().fg(Color::Yellow)
-        }
-        UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
-            SubmissionStatus::Finished(Verdict::Accepted),
-        )) => Style::default().fg(Color::Green),
-        UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
-            SubmissionStatus::Finished(_),
-        )) => Style::default().fg(Color::Red),
-        UserVisibleSubmissionState::Current(_) => Style::default().fg(Color::Yellow),
+        spans.push(Span::styled(
+            segment.label,
+            submission_tone_style(segment.tone),
+        ));
     }
+    spans
+}
+
+fn padded_submission_status_line(
+    prefix: &str,
+    state: UserVisibleSubmissionState,
+    width: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(prefix.to_string())];
+    spans.extend(submission_status_spans(state));
+    fit_styled_row(spans, width)
+}
+
+const fn submission_tone_color(tone: SubmissionTone) -> Color {
+    match tone {
+        SubmissionTone::None => Color::DarkGray,
+        SubmissionTone::Active => Color::Yellow,
+        SubmissionTone::Waiting | SubmissionTone::Warning => Color::Yellow,
+        SubmissionTone::Success => Color::Green,
+        SubmissionTone::Failure | SubmissionTone::Uncertain => Color::Red,
+    }
+}
+
+fn submission_tone_style(tone: SubmissionTone) -> Style {
+    Style::default().fg(submission_tone_color(tone))
 }
 
 fn problem_symbol(problem: &ProblemState) -> &'static str {
@@ -2970,6 +3063,32 @@ mod tests {
     }
 
     #[test]
+    fn submission_header_keeps_identity_neutral_and_styles_only_status() {
+        let submission = SubmissionHeaderState {
+            problem_label: "abc474/A".to_string(),
+            state: SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::Accepted,
+                ))),
+                attempt: None,
+            },
+        };
+
+        let spans = submission_header_spans(&submission);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>(),
+            ["SUB abc474/A", " ", "AC"]
+        );
+        assert_eq!(spans[0].style.fg, None);
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].style.fg, Some(Color::Green));
+        assert_eq!(spans[2].style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
     fn submissions_overview_uses_compact_labels_colors_and_selected_style() {
         let mut app = navigation_test_app(7);
         app.toggle_problem_status_mode();
@@ -3019,19 +3138,65 @@ mod tests {
                 .unwrap()
                 .style
         };
-        assert_eq!(style("A AC").fg, Some(Color::Green));
-        assert!(style("A AC").add_modifier.contains(Modifier::BOLD));
-        assert!(style("A AC").add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(style("B WJ").fg, Some(Color::Yellow));
-        assert_eq!(style("C WA").fg, Some(Color::Red));
-        assert_eq!(style("D 14/50 WA").fg, Some(Color::Yellow));
-        assert_eq!(style("E Unknown").fg, Some(Color::Red));
-        assert_eq!(style("F Untracked").fg, Some(Color::Yellow));
-        assert_eq!(style("G ·").fg, Some(Color::DarkGray));
+        assert_eq!(style("A").fg, Some(Color::Green));
+        assert!(style("A").add_modifier.contains(Modifier::BOLD));
+        assert!(style("A").add_modifier.contains(Modifier::UNDERLINED));
+
+        assert_eq!(style("B").fg, Some(Color::Yellow));
+        assert_eq!(style("C").fg, Some(Color::Red));
+        assert_eq!(style("D").fg, Some(Color::Yellow));
+        assert_eq!(style("E").fg, Some(Color::Red));
+        assert_eq!(style("F").fg, Some(Color::Yellow));
+        assert_eq!(style("G").fg, Some(Color::DarkGray));
+
+        for problem in ["B", "C", "D", "E", "F", "G"] {
+            assert_eq!(style(problem).add_modifier, Modifier::empty());
+        }
+
+        assert_eq!(style("AC").fg, Some(Color::Green));
+        assert_eq!(style("WJ").fg, Some(Color::Yellow));
+        assert_eq!(style("WA").fg, Some(Color::Red));
+        assert_eq!(style("14/50").fg, Some(Color::Yellow));
+        assert_eq!(style("Unknown").fg, Some(Color::Red));
+        assert_eq!(style("Untracked").fg, Some(Color::Yellow));
+        assert_eq!(style("·").fg, Some(Color::DarkGray));
+        for status in line.spans.iter().filter(|span| {
+            matches!(
+                span.content.as_ref(),
+                "AC" | "WJ" | "WA" | "14/50" | "Unknown" | "Untracked" | "·"
+            )
+        }) {
+            assert_eq!(status.style.add_modifier, Modifier::empty());
+        }
+        let provisional = line
+            .spans
+            .iter()
+            .position(|span| span.content == "14/50")
+            .unwrap();
+        assert_eq!(line.spans[provisional].style.fg, Some(Color::Yellow));
+        assert_eq!(line.spans[provisional + 1].content, " ");
+        assert_eq!(line.spans[provisional + 2].content, "WA");
+        assert_eq!(line.spans[provisional + 2].style.fg, Some(Color::Red));
     }
 
     #[test]
-    fn submissions_overview_prefers_attempt_and_all_nonfinal_states_are_yellow() {
+    fn submission_palette_maps_every_semantic_tone_to_its_terminal_color() {
+        for (tone, color) in [
+            (SubmissionTone::None, Color::DarkGray),
+            (SubmissionTone::Active, Color::Yellow),
+            (SubmissionTone::Waiting, Color::Yellow),
+            (SubmissionTone::Success, Color::Green),
+            (SubmissionTone::Failure, Color::Red),
+            (SubmissionTone::Warning, Color::Yellow),
+            (SubmissionTone::Uncertain, Color::Red),
+        ] {
+            assert_eq!(submission_tone_color(tone), color);
+            assert_eq!(submission_tone_style(tone).fg, Some(color));
+        }
+    }
+
+    #[test]
+    fn submission_status_spans_use_effective_state_and_semantic_colors() {
         let current_ac = Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
             Verdict::Accepted,
         )));
@@ -3045,28 +3210,55 @@ mod tests {
         };
         assert_eq!(submitting.compact_label(), "Submitting");
         assert_eq!(unknown.compact_label(), "Unknown");
-        assert_eq!(submission_style(Some(submitting)).fg, Some(Color::Yellow));
-        assert_eq!(submission_style(Some(unknown)).fg, Some(Color::Red));
+        assert_eq!(
+            submission_status_spans(submitting.effective().unwrap())[0]
+                .style
+                .fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            submission_status_spans(unknown.effective().unwrap())[0]
+                .style
+                .fg,
+            Some(Color::Red)
+        );
 
-        for current in [
-            TuiSubmissionState::Accepted,
-            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
-            TuiSubmissionState::Status(SubmissionStatus::WaitingForRejudge),
-            TuiSubmissionState::Status(SubmissionStatus::Judging),
-            TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
-                judged: 14,
-                total: 50,
-                provisional: None,
-            }),
-            TuiSubmissionState::TrackingUnavailable,
+        for (current, color) in [
+            (TuiSubmissionState::Accepted, Color::Yellow),
+            (
+                TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+                Color::Yellow,
+            ),
+            (
+                TuiSubmissionState::Status(SubmissionStatus::WaitingForRejudge),
+                Color::Yellow,
+            ),
+            (
+                TuiSubmissionState::Status(SubmissionStatus::Judging),
+                Color::Yellow,
+            ),
+            (
+                TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                    judged: 14,
+                    total: 50,
+                    provisional: None,
+                }),
+                Color::Yellow,
+            ),
+            (TuiSubmissionState::TrackingUnavailable, Color::Yellow),
         ] {
             assert_eq!(
-                submission_style(Some(SubmissionDisplayState {
-                    current: Some(current),
-                    attempt: None,
-                }))
+                submission_status_spans(
+                    SubmissionDisplayState {
+                        current: Some(current),
+                        attempt: None,
+                    }
+                    .effective()
+                    .unwrap(),
+                )[0]
+                .style
                 .fg,
-                Some(Color::Yellow),
+                Some(color),
                 "state={current:?}"
             );
         }
@@ -3081,12 +3273,17 @@ mod tests {
             Verdict::InternalError,
         ] {
             assert_eq!(
-                submission_style(Some(SubmissionDisplayState {
-                    current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                        verdict,
-                    ))),
-                    attempt: None,
-                }))
+                submission_status_spans(
+                    SubmissionDisplayState {
+                        current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                            verdict,
+                        ))),
+                        attempt: None,
+                    }
+                    .effective()
+                    .unwrap(),
+                )[0]
+                .style
                 .fg,
                 Some(Color::Red),
                 "verdict={verdict:?}"
@@ -3844,6 +4041,23 @@ mod tests {
         assert!(rendered.contains("[Enter] Submit"));
         assert!(rendered.contains("[Esc] Cancel"));
         assert!(!rendered.contains("GCC 15"));
+        let current_line = padded_submission_status_line(
+            "Current submission: ",
+            modal.current_submission.unwrap().effective().unwrap(),
+            40,
+        );
+        assert_eq!(current_line.spans[0].content, "Current submission: ");
+        assert_eq!(current_line.spans[0].style, Style::default());
+        assert_eq!(current_line.spans[1].content, "WJ");
+        assert_eq!(current_line.spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(current_line.spans[1].style.add_modifier, Modifier::empty());
+        let current = modal.current_submission.unwrap().effective().unwrap();
+        for width in 0..=24 {
+            assert_eq!(
+                padded_submission_status_line("Current submission: ", current, width).to_string(),
+                fit_command_palette_row("Current submission: WJ", width)
+            );
+        }
 
         modal.current_submission = Some(SubmissionDisplayState {
             current: Some(TuiSubmissionState::Accepted),
@@ -3863,6 +4077,10 @@ mod tests {
         assert!(resubmitting.contains("Current submission: Submitting"));
         assert!(!resubmitting.contains("Current submission: WJ"));
         assert!(!resubmitting.contains("NEW"));
+
+        for (width, height) in [(32, 16), (12, 8), (1, 1), (0, 0)] {
+            let _ = rendered_submit_text(&app(), &modal, width, height);
+        }
     }
 
     #[test]

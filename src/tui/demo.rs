@@ -530,25 +530,45 @@ fn render_help(frame: &mut Frame<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::{Terminal, buffer::Buffer};
 
     use super::*;
     use crate::tui::mouse::MouseMode;
 
-    fn rendered_text(demo: &DemoHarness, width: u16, height: u16) -> String {
+    fn rendered_buffer(demo: &DemoHarness, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut detail_layout = DetailLayout::default();
         terminal
             .draw(|frame| render_demo(frame, demo, &mut detail_layout, MouseMode::Disabled))
             .unwrap();
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn rendered_text(demo: &DemoHarness, width: u16, height: u16) -> String {
+        rendered_buffer(demo, width, height)
             .content()
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn find_cell_sequence(buffer: &Buffer, needle: &str) -> (u16, u16) {
+        for y in 0..buffer.area.height {
+            for start_x in 0..buffer.area.width {
+                let mut candidate = String::new();
+                for x in start_x..buffer.area.width {
+                    candidate.push_str(buffer.cell((x, y)).unwrap().symbol());
+                    if candidate == needle {
+                        return (start_x, y);
+                    }
+                    if !needle.starts_with(&candidate) {
+                        break;
+                    }
+                }
+            }
+        }
+        panic!("could not find {needle:?} in rendered demo buffer");
     }
 
     #[test]
@@ -564,23 +584,30 @@ mod tests {
     #[test]
     fn demo_states_render_the_user_visible_submission_vocabulary() {
         let cases = [
-            (attempt(TuiSubmissionAttemptState::Submitting), "Submitting"),
-            (current(TuiSubmissionState::Accepted), "WJ"),
+            (
+                attempt(TuiSubmissionAttemptState::Submitting),
+                "Submitting",
+                Color::Yellow,
+            ),
+            (current(TuiSubmissionState::Accepted), "WJ", Color::Yellow),
             (
                 current(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForJudge,
                 )),
                 "WJ",
+                Color::Yellow,
             ),
             (
                 current(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForRejudge,
                 )),
                 "WR",
+                Color::Yellow,
             ),
             (
                 current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
                 "Judging",
+                Color::Yellow,
             ),
             (
                 current(TuiSubmissionState::Status(
@@ -591,6 +618,7 @@ mod tests {
                     },
                 )),
                 "1/72",
+                Color::Yellow,
             ),
             (
                 current(TuiSubmissionState::Status(
@@ -601,37 +629,51 @@ mod tests {
                     },
                 )),
                 "55/72 RE",
+                Color::Yellow,
             ),
             (
                 current(TuiSubmissionState::Status(SubmissionStatus::Finished(
                     Verdict::Accepted,
                 ))),
                 "AC",
+                Color::Green,
             ),
             (
                 current(TuiSubmissionState::Status(SubmissionStatus::Finished(
                     Verdict::WrongAnswer,
                 ))),
                 "WA",
+                Color::Red,
             ),
             (
                 current(TuiSubmissionState::Status(SubmissionStatus::Finished(
                     Verdict::RuntimeError,
                 ))),
                 "RE",
+                Color::Red,
             ),
             (
                 current(TuiSubmissionState::TrackingUnavailable),
                 "Untracked",
+                Color::Yellow,
             ),
-            (attempt(TuiSubmissionAttemptState::Unknown), "Unknown"),
+            (
+                attempt(TuiSubmissionAttemptState::Unknown),
+                "Unknown",
+                Color::Red,
+            ),
         ];
 
         let mut demo = DemoHarness::new().unwrap();
         demo.show_help = false;
-        for (state, expected) in cases {
+        for (state, expected, expected_color) in cases {
             demo.set_selected_submission(Some(state));
-            let rendered = rendered_text(&demo, 160, 20);
+            let buffer = rendered_buffer(&demo, 160, 20);
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
             assert!(
                 rendered.contains(&format!("SUB B {expected}")),
                 "state={state:?}\n{rendered}"
@@ -645,7 +687,87 @@ mod tests {
                 !rendered.contains("Accepted"),
                 "state={state:?}\n{rendered}"
             );
+
+            let header = format!("SUB B {expected}");
+            let (header_x, header_y) = find_cell_sequence(&buffer, &header);
+            let status_x = header_x + u16::try_from("SUB B ".chars().count()).unwrap();
+            assert_eq!(
+                buffer.cell((status_x, header_y)).unwrap().fg,
+                expected_color,
+                "state={state:?}"
+            );
+            if expected == "55/72 RE" {
+                let verdict_x = header_x + u16::try_from("SUB B 55/72 ".chars().count()).unwrap();
+                assert_eq!(buffer.cell((verdict_x, header_y)).unwrap().fg, Color::Red);
+            }
         }
+    }
+
+    #[test]
+    fn overview_selection_moves_only_problem_label_modifiers() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+
+        let selected_b = rendered_buffer(&demo, 160, 20);
+        let (row_x, row_y) = find_cell_sequence(&selected_b, "SUB │ A AC   B RE");
+        let offset = |prefix: &str| row_x + u16::try_from(prefix.chars().count()).unwrap();
+        let a_label_x = offset("SUB │ ");
+        let ac_x = offset("SUB │ A ");
+        let b_label_x = offset("SUB │ A AC   ");
+        let re_x = offset("SUB │ A AC   B ");
+        assert!(
+            !selected_b
+                .cell((a_label_x, row_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            selected_b
+                .cell((b_label_x, row_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        let ac_style = selected_b.cell((ac_x, row_y)).unwrap().style();
+        let re_style = selected_b.cell((re_x, row_y)).unwrap().style();
+        assert_eq!(ac_style.fg, Some(Color::Green));
+        assert_eq!(re_style.fg, Some(Color::Red));
+        assert_eq!(ac_style.add_modifier, Modifier::empty());
+        assert_eq!(re_style.add_modifier, Modifier::empty());
+
+        demo.app.select_problem(0);
+        let selected_a = rendered_buffer(&demo, 160, 20);
+        let (row_x, row_y) = find_cell_sequence(&selected_a, "SUB │ A AC   B RE");
+        let offset = |prefix: &str| row_x + u16::try_from(prefix.chars().count()).unwrap();
+        assert!(
+            selected_a
+                .cell((offset("SUB │ "), row_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert!(
+            !selected_a
+                .cell((offset("SUB │ A AC   "), row_y))
+                .unwrap()
+                .modifier
+                .intersects(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+        assert_eq!(
+            selected_a
+                .cell((offset("SUB │ A "), row_y))
+                .unwrap()
+                .style(),
+            ac_style
+        );
+        assert_eq!(
+            selected_a
+                .cell((offset("SUB │ A AC   B "), row_y))
+                .unwrap()
+                .style(),
+            re_style
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use crate::atcoder::AtCoderClient;
-use crate::atcoder::submission_tracking::SubmissionStatus;
+use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
 use crate::commands::submit::{
     PreparedSubmit, SubmissionCompletion, SubmissionEvent, SubmitPlan,
     execute_prepared_with_client, prepare_submit,
@@ -45,21 +45,34 @@ impl TuiSubmissionState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn label(self) -> String {
-        match self {
-            Self::Accepted | Self::Status(SubmissionStatus::WaitingForJudge) => "WJ".to_string(),
-            Self::TrackingUnavailable => "Untracked".to_string(),
-            Self::Status(SubmissionStatus::WaitingForRejudge) => "WR".to_string(),
-            Self::Status(SubmissionStatus::Judging) => "Judging".to_string(),
-            Self::Status(SubmissionStatus::JudgingProgress {
-                judged,
-                total,
-                provisional,
-            }) => provisional.map_or_else(
-                || format!("{judged}/{total}"),
-                |verdict| format!("{judged}/{total} {verdict}"),
-            ),
-            Self::Status(SubmissionStatus::Finished(verdict)) => verdict.to_string(),
+        UserVisibleSubmissionState::Current(self.user_visible()).label()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubmissionTone {
+    None,
+    Active,
+    Waiting,
+    Success,
+    Failure,
+    Warning,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmissionStatusSegment {
+    pub(super) label: String,
+    pub(super) tone: SubmissionTone,
+}
+
+impl SubmissionStatusSegment {
+    fn new(label: impl Into<String>, tone: SubmissionTone) -> Self {
+        Self {
+            label: label.into(),
+            tone,
         }
     }
 }
@@ -71,11 +84,86 @@ pub(super) enum UserVisibleSubmissionState {
 }
 
 impl UserVisibleSubmissionState {
+    #[cfg(test)]
     fn label(self) -> String {
+        self.status_segments()
+            .into_iter()
+            .map(|segment| segment.label)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn status_segments(self) -> Vec<SubmissionStatusSegment> {
         match self {
-            Self::Current(current) => current.label(),
-            Self::Attempt(attempt) => attempt.label().to_string(),
+            Self::Attempt(TuiSubmissionAttemptState::Submitting) => {
+                vec![SubmissionStatusSegment::new(
+                    "Submitting",
+                    SubmissionTone::Active,
+                )]
+            }
+            Self::Attempt(TuiSubmissionAttemptState::Unknown) => {
+                vec![SubmissionStatusSegment::new(
+                    "Unknown",
+                    SubmissionTone::Uncertain,
+                )]
+            }
+            Self::Current(TuiSubmissionState::Accepted)
+            | Self::Current(TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge)) => {
+                vec![SubmissionStatusSegment::new("WJ", SubmissionTone::Waiting)]
+            }
+            Self::Current(TuiSubmissionState::Status(SubmissionStatus::WaitingForRejudge)) => {
+                vec![SubmissionStatusSegment::new("WR", SubmissionTone::Waiting)]
+            }
+            Self::Current(TuiSubmissionState::Status(SubmissionStatus::Judging)) => {
+                vec![SubmissionStatusSegment::new(
+                    "Judging",
+                    SubmissionTone::Active,
+                )]
+            }
+            Self::Current(TuiSubmissionState::Status(SubmissionStatus::JudgingProgress {
+                judged,
+                total,
+                provisional,
+            })) => {
+                let mut segments = vec![SubmissionStatusSegment::new(
+                    format!("{judged}/{total}"),
+                    SubmissionTone::Active,
+                )];
+                if let Some(verdict) = provisional {
+                    segments.push(SubmissionStatusSegment::new(
+                        verdict.to_string(),
+                        verdict_tone(verdict),
+                    ));
+                }
+                segments
+            }
+            Self::Current(TuiSubmissionState::Status(SubmissionStatus::Finished(verdict))) => {
+                vec![SubmissionStatusSegment::new(
+                    verdict.to_string(),
+                    verdict_tone(verdict),
+                )]
+            }
+            Self::Current(TuiSubmissionState::TrackingUnavailable) => {
+                vec![SubmissionStatusSegment::new(
+                    "Untracked",
+                    SubmissionTone::Warning,
+                )]
+            }
         }
+    }
+}
+
+fn verdict_tone(verdict: Verdict) -> SubmissionTone {
+    match verdict {
+        Verdict::Accepted => SubmissionTone::Success,
+        Verdict::WrongAnswer
+        | Verdict::TimeLimitExceeded
+        | Verdict::MemoryLimitExceeded
+        | Verdict::RuntimeError
+        | Verdict::CompilationError
+        | Verdict::QueryLimitExceeded
+        | Verdict::OutputLimitExceeded
+        | Verdict::InternalError => SubmissionTone::Failure,
     }
 }
 
@@ -83,15 +171,6 @@ impl UserVisibleSubmissionState {
 pub(crate) enum TuiSubmissionAttemptState {
     Submitting,
     Unknown,
-}
-
-impl TuiSubmissionAttemptState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Submitting => "Submitting",
-            Self::Unknown => "Unknown",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,15 +189,18 @@ impl SubmissionDisplayState {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn summary_label(self) -> String {
         self.compact_label()
     }
 
+    #[cfg(test)]
     pub(super) fn compact_label(self) -> String {
         self.effective()
             .map_or_else(String::new, UserVisibleSubmissionState::label)
     }
 
+    #[cfg(test)]
     pub(super) fn header_label(self, problem_label: &str) -> String {
         self.effective().map_or_else(String::new, |state| {
             format!("SUB {problem_label} {}", state.label())
@@ -140,6 +222,7 @@ pub(super) struct SubmissionHeaderState {
 }
 
 impl SubmissionHeaderState {
+    #[cfg(test)]
     pub(super) fn label(&self) -> String {
         self.state.header_label(&self.problem_label)
     }
@@ -3350,5 +3433,108 @@ mod tests {
             assert!(!header.contains("Accepted"));
             assert!(!header.contains('·'));
         }
+    }
+
+    #[test]
+    fn user_visible_status_segments_have_semantic_tones() {
+        let segments = |state: SubmissionDisplayState| {
+            state
+                .effective()
+                .unwrap()
+                .status_segments()
+                .into_iter()
+                .map(|segment| (segment.label, segment.tone))
+                .collect::<Vec<_>>()
+        };
+        let current = |state| SubmissionDisplayState {
+            current: Some(state),
+            attempt: None,
+        };
+
+        assert_eq!(
+            segments(SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Submitting),
+            }),
+            [("Submitting".to_string(), SubmissionTone::Active)]
+        );
+        for state in [
+            TuiSubmissionState::Accepted,
+            TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge),
+        ] {
+            assert_eq!(
+                segments(current(state)),
+                [("WJ".to_string(), SubmissionTone::Waiting)]
+            );
+        }
+        assert_eq!(
+            segments(current(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForRejudge,
+            ))),
+            [("WR".to_string(), SubmissionTone::Waiting)]
+        );
+        assert_eq!(
+            segments(current(TuiSubmissionState::Status(
+                SubmissionStatus::Judging,
+            ))),
+            [("Judging".to_string(), SubmissionTone::Active)]
+        );
+        assert_eq!(
+            segments(current(TuiSubmissionState::Status(
+                SubmissionStatus::JudgingProgress {
+                    judged: 14,
+                    total: 72,
+                    provisional: None,
+                },
+            ))),
+            [("14/72".to_string(), SubmissionTone::Active)]
+        );
+        assert_eq!(
+            segments(current(TuiSubmissionState::Status(
+                SubmissionStatus::JudgingProgress {
+                    judged: 55,
+                    total: 72,
+                    provisional: Some(Verdict::RuntimeError),
+                },
+            ))),
+            [
+                ("55/72".to_string(), SubmissionTone::Active),
+                ("RE".to_string(), SubmissionTone::Failure),
+            ]
+        );
+        assert_eq!(
+            segments(current(TuiSubmissionState::Status(
+                SubmissionStatus::Finished(Verdict::Accepted),
+            ))),
+            [("AC".to_string(), SubmissionTone::Success)]
+        );
+        for verdict in [
+            Verdict::WrongAnswer,
+            Verdict::TimeLimitExceeded,
+            Verdict::MemoryLimitExceeded,
+            Verdict::RuntimeError,
+            Verdict::CompilationError,
+            Verdict::QueryLimitExceeded,
+            Verdict::OutputLimitExceeded,
+            Verdict::InternalError,
+        ] {
+            assert_eq!(
+                segments(current(TuiSubmissionState::Status(
+                    SubmissionStatus::Finished(verdict),
+                ))),
+                [(verdict.to_string(), SubmissionTone::Failure)]
+            );
+        }
+        assert_eq!(
+            segments(current(TuiSubmissionState::TrackingUnavailable)),
+            [("Untracked".to_string(), SubmissionTone::Warning)]
+        );
+        assert_eq!(
+            segments(SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Unknown),
+            }),
+            [("Unknown".to_string(), SubmissionTone::Uncertain)]
+        );
     }
 }
