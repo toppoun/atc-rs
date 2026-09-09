@@ -702,6 +702,30 @@ fn submission_full_datetime_label_at_offset(
     ))
 }
 
+fn submission_offset_label(offset: UtcOffset) -> Option<String> {
+    let seconds = offset.whole_seconds();
+    if seconds % 60 != 0 {
+        return None;
+    }
+    let absolute = seconds.checked_abs()?;
+    let hours = absolute.checked_div(60 * 60)?;
+    let minutes = absolute.checked_rem(60 * 60)?.checked_div(60)?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let sign = if seconds < 0 { '-' } else { '+' };
+    Some(format!("{sign}{hours:02}{minutes:02}"))
+}
+
+fn submission_zoned_datetime_label_at_offset(
+    timestamp: OffsetDateTime,
+    offset: UtcOffset,
+) -> Option<String> {
+    let full = submission_full_datetime_label_at_offset(timestamp, offset)?;
+    let offset = submission_offset_label(offset)?;
+    Some(format!("{full} {offset}"))
+}
+
 #[cfg(test)]
 fn submission_time_label(started_at: SystemTime) -> String {
     system_time_to_offset_date_time(started_at)
@@ -712,25 +736,29 @@ fn submission_time_label(started_at: SystemTime) -> String {
         .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string())
 }
 
-fn submission_datetime_labels(entry: &SubmissionHistoryEntry) -> (String, Option<String>) {
+fn submission_datetime_labels(
+    entry: &SubmissionHistoryEntry,
+) -> (String, Option<String>, Option<String>) {
     if let Some(submitted_at) = entry.submitted_at {
         let offset = submitted_at.offset();
         let short = submission_time_label_at_offset(submitted_at, offset)
             .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string());
         let full = submission_full_datetime_label_at_offset(submitted_at, offset);
-        return (short, full);
+        let zoned = submission_zoned_datetime_label_at_offset(submitted_at, offset);
+        return (short, full, zoned);
     }
 
     let Some(timestamp) = system_time_to_offset_date_time(entry.started_at) else {
-        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None);
+        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None, None);
     };
     let Ok(offset) = UtcOffset::local_offset_at(timestamp) else {
-        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None);
+        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None, None);
     };
     let short = submission_time_label_at_offset(timestamp, offset)
         .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string());
     let full = submission_full_datetime_label_at_offset(timestamp, offset);
-    (short, full)
+    let zoned = submission_zoned_datetime_label_at_offset(timestamp, offset);
+    (short, full, zoned)
 }
 
 fn receipt_problem_label(current_contest_id: &str, entry: &SubmissionHistoryEntry) -> String {
@@ -804,10 +832,10 @@ fn submission_receipt_line(
         "│"
     };
     let separator_width = UnicodeWidthStr::width(separator);
-    let meaningful_problem_width = problem_width.min(problem_index_width.max(12));
-    let (short_time_label, full_datetime_label) = submission_datetime_labels(entry);
+    let (short_time_label, full_datetime_label, zoned_datetime_label) =
+        submission_datetime_labels(entry);
     let short_time_width = UnicodeWidthStr::width(short_time_label.as_str());
-    let language_width = UnicodeWidthStr::width(entry.language_label.as_str());
+    let short_language_width = UnicodeWidthStr::width(entry.language_label.as_str());
     let result = match state {
         UserVisibleSubmissionState::Current(super::submission::TuiSubmissionState::Status(
             crate::atcoder::submission_tracking::SubmissionStatus::Finished(result),
@@ -828,7 +856,7 @@ fn submission_receipt_line(
         return clip_styled_row(status_spans, width);
     }
 
-    let base_width = meaningful_problem_width
+    let base_width = problem_width
         .saturating_add(separator_width)
         .saturating_add(status_width);
     let mut optional_width = 0usize;
@@ -856,26 +884,56 @@ fn submission_receipt_line(
     let show_time = include(Some(short_time_width));
     let show_runtime = include(runtime_label.as_deref().map(UnicodeWidthStr::width));
     let show_memory = include(memory_label.as_deref().map(UnicodeWidthStr::width));
-    let show_language = include((!entry.language_label.is_empty()).then_some(language_width));
+    let show_language = include((!entry.language_label.is_empty()).then_some(short_language_width));
     drop(include);
 
     let mut time_label = short_time_label;
+    let mut language_label = entry.language_label.clone();
+    let full_problem_base = problem_width
+        .saturating_add(separator_width)
+        .saturating_add(status_width);
+
+    if show_language
+        && !lower_priority_blocked
+        && let Some(official_label) = entry
+            .official_language_label
+            .as_ref()
+            .filter(|label| !label.is_empty() && *label != &language_label)
+    {
+        let official_width = UnicodeWidthStr::width(official_label.as_str());
+        let upgraded_optional_width = optional_width
+            .saturating_sub(short_language_width)
+            .saturating_add(official_width);
+        if full_problem_base.saturating_add(upgraded_optional_width) <= width {
+            optional_width = upgraded_optional_width;
+            language_label = official_label.clone();
+        } else {
+            lower_priority_blocked = true;
+        }
+    }
+
     if show_time
         && !lower_priority_blocked
         && let Some(full_label) = full_datetime_label
     {
         let full_width = UnicodeWidthStr::width(full_label.as_str());
-        let upgrade_width = full_width.saturating_sub(short_time_width);
-        let full_problem_base = problem_width
-            .saturating_add(separator_width)
-            .saturating_add(status_width);
-        if full_problem_base
-            .saturating_add(optional_width)
-            .saturating_add(upgrade_width)
-            <= width
-        {
-            optional_width = optional_width.saturating_add(upgrade_width);
+        let upgraded_optional_width = optional_width
+            .saturating_sub(short_time_width)
+            .saturating_add(full_width);
+        if full_problem_base.saturating_add(upgraded_optional_width) <= width {
+            optional_width = upgraded_optional_width;
             time_label = full_label;
+
+            if let Some(zoned_label) = zoned_datetime_label {
+                let zoned_width = UnicodeWidthStr::width(zoned_label.as_str());
+                let upgraded_optional_width = optional_width
+                    .saturating_sub(full_width)
+                    .saturating_add(zoned_width);
+                if full_problem_base.saturating_add(upgraded_optional_width) <= width {
+                    optional_width = upgraded_optional_width;
+                    time_label = zoned_label;
+                }
+            }
         }
     }
     let available_problem_width = width.saturating_sub(
@@ -902,7 +960,7 @@ fn submission_receipt_line(
     ));
     if show_language {
         spans.push(Span::raw(separator));
-        spans.push(Span::raw(entry.language_label.clone()));
+        spans.push(Span::raw(language_label));
     }
     spans.push(Span::raw(separator));
     spans.extend(status_spans);
@@ -3014,6 +3072,7 @@ mod tests {
             problem_index: problem_index.to_string(),
             problem_title: Some(format!("Problem {problem_index}")),
             language_label: "C++".to_string(),
+            official_language_label: None,
             started_at: SystemTime::now(),
             submitted_at: None,
             state,
@@ -3829,9 +3888,10 @@ mod tests {
         for state in states {
             let mut entry = submission_history_entry(1, "B", state);
             entry.problem_title = Some("A deliberately long receipt problem title".to_string());
-            entry.language_label = "C++23 (GCC 15.1)".to_string();
+            entry.language_label = "C++".to_string();
+            entry.official_language_label = Some("C++23 (GCC 15.2.0)".to_string());
             entry.submitted_at = Some(official_timestamp());
-            for width in 0..=100 {
+            for width in 0..=240 {
                 let baseline = submission_receipt_line(
                     "abc123",
                     Some(&entry),
@@ -3947,20 +4007,24 @@ mod tests {
                 ))),
                 attempt: None,
             };
-            let entry = submission_history_entry(1, "B", state);
+            let mut entry = submission_history_entry(1, "B", state);
+            entry.official_language_label = Some("C++23 (GCC 15.2.0)".to_string());
+            entry.submitted_at = Some(official_timestamp());
             let baseline =
-                submission_receipt_line("abc123", Some(&entry), 100, submission_animation_phase(0));
+                submission_receipt_line("abc123", Some(&entry), 240, submission_animation_phase(0));
             for phase_index in 1..4 {
                 assert_eq!(
                     submission_receipt_line(
                         "abc123",
                         Some(&entry),
-                        100,
+                        240,
                         submission_animation_phase(phase_index),
                     ),
                     baseline
                 );
             }
+            assert!(baseline.to_string().contains("2026-09-09 09:18:25 +0900"));
+            assert!(baseline.to_string().contains("C++23 (GCC 15.2.0)"));
             assert!(
                 baseline
                     .to_string()
@@ -4016,18 +4080,58 @@ mod tests {
     }
 
     #[test]
+    fn submission_offset_formatting_is_checked_and_always_four_digits() {
+        for (offset, expected) in [
+            (UtcOffset::from_hms(9, 0, 0).unwrap(), "+0900"),
+            (UtcOffset::from_hms(-5, -30, 0).unwrap(), "-0530"),
+            (UtcOffset::UTC, "+0000"),
+        ] {
+            assert_eq!(submission_offset_label(offset).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            submission_offset_label(UtcOffset::from_hms(9, 0, 1).unwrap()),
+            None
+        );
+    }
+
+    #[test]
     fn receipt_uses_field_level_responsiveness_and_cross_contest_fallback() {
         let accepted = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
+                SubmissionResult::with_metrics(Verdict::Accepted, Some(31), Some(33_348)),
             ))),
             attempt: None,
         };
-        let mut entry = submission_history_entry(1, "E", accepted);
-        entry.problem_title = Some("One Time Coupon".to_string());
-        entry.language_label = "C++23".to_string();
-        entry.submitted_at = Some(official_timestamp());
+        let mut entry = submission_history_entry(1, "B", accepted);
+        entry.problem_title = Some("Demo Problem B".to_string());
+        entry.language_label = "C++".to_string();
+        entry.official_language_label = Some("C++23 (GCC 15.2.0)".to_string());
+        let date = Date::from_calendar_date(2026, Month::September, 9).unwrap();
+        let time = Time::from_hms(12, 20, 31).unwrap();
+        entry.submitted_at = Some(
+            PlainDateTime::new(date, time).assume_offset(UtcOffset::from_hms(9, 0, 0).unwrap()),
+        );
 
+        assert_eq!(
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                92,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
+            "2026-09-09 12:20:31 +0900 │ B - Demo Problem B │ C++23 (GCC 15.2.0) │ AC │ 31 ms │ 33348 KiB"
+        );
+        assert_eq!(
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                86,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
+            "2026-09-09 12:20:31 │ B - Demo Problem B │ C++23 (GCC 15.2.0) │ AC │ 31 ms │ 33348 KiB"
+        );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
@@ -4036,57 +4140,67 @@ mod tests {
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "2026-09-09 09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
+            "12:20:31 │ B - Demo Problem B │ C++23 (GCC 15.2.0) │ AC │ 31 ms │ 33348 KiB"
         );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
                 Some(&entry),
-                64,
+                74,
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
+            "12:20:31 │ B - Demo Problem B │ C++ │ AC │ 31 ms │ 33348 KiB"
         );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
                 Some(&entry),
-                56,
+                60,
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "09:18:25 │ E - One Time Coupon │ AC │ 234 ms │ 33348 KiB"
+            "12:20:31 │ B - Demo Problem B │ C++ │ AC │ 31 ms │ 33348 KiB"
         );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
                 Some(&entry),
-                48,
+                54,
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "09:18:25 │ E - One Time Coupon │ AC │ 234 ms"
+            "12:20:31 │ B - Demo Problem B │ AC │ 31 ms │ 33348 KiB"
         );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
                 Some(&entry),
-                36,
+                42,
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "09:18:25 │ E - One Time Coupon │ AC"
+            "12:20:31 │ B - Demo Problem B │ AC │ 31 ms"
         );
         assert_eq!(
             submission_receipt_line(
                 "abc123",
                 Some(&entry),
-                24,
+                34,
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "E - One Time Coupon │ AC"
+            "12:20:31 │ B - Demo Problem B │ AC"
+        );
+        assert_eq!(
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                23,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
+            "B - Demo Problem B │ AC"
         );
 
         assert_eq!(
@@ -4097,7 +4211,7 @@ mod tests {
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "E │ AC"
+            "B │ AC"
         );
         assert_eq!(
             submission_receipt_line(
@@ -4107,10 +4221,10 @@ mod tests {
                 SubmissionAnimationPhase::default(),
             )
             .to_string(),
-            "E│AC"
+            "B│AC"
         );
 
-        entry.key = SubmissionKey::new("abc474", "abc474_e");
+        entry.key = SubmissionKey::new("abc474", "abc474_b");
         entry.problem_title = None;
         entry.submitted_at = None;
         assert!(
@@ -4121,7 +4235,7 @@ mod tests {
                 SubmissionAnimationPhase::default(),
             )
             .to_string()
-            .contains("abc474/E")
+            .contains("abc474/B")
         );
     }
 
@@ -4142,7 +4256,8 @@ mod tests {
             submission_datetime_labels(&entry),
             (
                 "09:18:25".to_string(),
-                Some("2026-09-09 09:18:25".to_string())
+                Some("2026-09-09 09:18:25".to_string()),
+                Some("2026-09-09 09:18:25 +0900".to_string())
             )
         );
         let rendered = submission_receipt_line(
@@ -4152,8 +4267,7 @@ mod tests {
             SubmissionAnimationPhase::default(),
         )
         .to_string();
-        assert!(rendered.starts_with("2026-09-09 09:18:25 │ "));
-        assert!(!rendered.contains("+0900"));
+        assert!(rendered.starts_with("2026-09-09 09:18:25 +0900 │ "));
     }
 
     #[test]
@@ -4286,11 +4400,13 @@ mod tests {
             ))),
             attempt: None,
         };
-        let entry = submission_history_entry(1, "B", state);
+        let mut entry = submission_history_entry(1, "B", state);
+        entry.official_language_label = Some("C++23 (GCC 15.2.0)".to_string());
         let line = submission_history_line(&entry, 40).unwrap().to_string();
         assert_eq!(line.trim_end(), "B  AC");
         assert!(!line.contains("ms"));
         assert!(!line.contains("KiB"));
+        assert!(!line.contains("GCC"));
     }
 
     #[test]
@@ -4468,6 +4584,7 @@ mod tests {
             (120, 5),
             (160, 5),
             (200, 5),
+            (240, 5),
         ] {
             let _ =
                 rendered_frontend_buffer_with_submission_view(&app, &view, false, width, height);

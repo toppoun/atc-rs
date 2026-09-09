@@ -423,6 +423,7 @@ impl DemoHarness {
                         problem_index: "B".to_string(),
                         problem_title: None,
                         language_label: "PyPy".to_string(),
+                        official_language_label: None,
                         started_at: SystemTime::now(),
                         submitted_at: None,
                         state: current(TuiSubmissionState::Status(
@@ -486,6 +487,7 @@ fn demo_history_entry(
         problem_index: problem_index.to_string(),
         problem_title: Some(format!("Demo Problem {problem_index}")),
         language_label: "C++".to_string(),
+        official_language_label: Some("C++23 (GCC 15.2.0)".to_string()),
         started_at: SystemTime::now()
             - Duration::from_secs(6_u64.saturating_sub(generation).saturating_mul(30)),
         submitted_at: Some(demo_submitted_at()),
@@ -737,7 +739,10 @@ mod tests {
         }
         assert!(!lines[0].contains("SUB "));
         assert!(lines.iter().any(|line| {
-            line.contains("B - Demo Problem B") && line.contains("C++") && line.contains("WJ")
+            line.contains("B - Demo Problem B")
+                && line.contains("C++23 (GCC 15.2.0)")
+                && line.contains("+0900")
+                && line.contains("WJ")
         }));
     }
 
@@ -871,6 +876,8 @@ mod tests {
         final_demo.handle_key(key(KeyCode::Char('9'), KeyEventKind::Press), now);
         let accepted = rendered_text(&final_demo, 100, 20);
         assert!(accepted.contains("2026-09-09 09:18:25"));
+        assert!(accepted.contains("2026-09-09 09:18:25 +0900"));
+        assert!(accepted.contains("C++23 (GCC 15.2.0)"));
         assert!(accepted.contains("AC"));
         assert!(accepted.contains("234 ms"));
         assert!(accepted.contains("33348 KiB"));
@@ -879,6 +886,29 @@ mod tests {
         assert!(wrong_answer.contains("WA"));
         assert!(wrong_answer.contains("266 ms"));
         assert!(wrong_answer.contains("297700 KiB"));
+    }
+
+    #[test]
+    fn demo_fixture_exposes_all_receipt_metadata_width_tiers() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        demo.handle_key(key(KeyCode::Char('9'), KeyEventKind::Press), Instant::now());
+
+        let zoned = rendered_lines(&demo, 100, 20)[18].clone();
+        assert!(zoned.contains("2026-09-09 09:18:25 +0900"));
+        assert!(zoned.contains("C++23 (GCC 15.2.0)"));
+        assert!(zoned.contains("234 ms"));
+        assert!(zoned.contains("33348 KiB"));
+
+        let full = rendered_lines(&demo, 89, 20)[18].clone();
+        assert!(full.contains("2026-09-09 09:18:25"));
+        assert!(!full.contains("+0900"));
+        assert!(full.contains("C++23 (GCC 15.2.0)"));
+
+        let short = rendered_lines(&demo, 78, 20)[18].clone();
+        assert!(short.contains("09:18:25"));
+        assert!(!short.contains("2026-09-09"));
+        assert!(short.contains("C++23 (GCC 15.2.0)"));
     }
 
     #[test]

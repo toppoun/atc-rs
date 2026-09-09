@@ -209,6 +209,7 @@ pub(super) struct SubmissionHistoryEntry {
     pub(super) problem_index: String,
     pub(super) problem_title: Option<String>,
     pub(super) language_label: String,
+    pub(super) official_language_label: Option<String>,
     pub(super) started_at: SystemTime,
     pub(super) submitted_at: Option<time::OffsetDateTime>,
     pub(super) state: SubmissionDisplayState,
@@ -322,7 +323,7 @@ impl Default for WorkerProgress {
 }
 
 impl WorkerProgress {
-    fn observe_before_send(&self, event: SubmissionEvent) {
+    fn observe_before_send(&self, event: &SubmissionEvent) {
         let phase = match event {
             SubmissionEvent::Accepted => WorkerProgressPhase::AcceptedKnown,
             SubmissionEvent::Status {
@@ -547,6 +548,26 @@ impl SubmissionHub {
         true
     }
 
+    fn enrich_history_language(
+        &mut self,
+        key: &SubmissionKey,
+        generation: u64,
+        official_language_label: String,
+    ) -> bool {
+        let Some(entry) = self
+            .history
+            .iter_mut()
+            .find(|entry| entry.generation == generation && entry.key == *key)
+        else {
+            return false;
+        };
+        if entry.official_language_label.as_deref() == Some(official_language_label.as_str()) {
+            return false;
+        }
+        entry.official_language_label = Some(official_language_label);
+        true
+    }
+
     fn remove_history(&mut self, key: &SubmissionKey, generation: u64) {
         self.history
             .retain(|entry| entry.generation != generation || entry.key != *key);
@@ -649,6 +670,7 @@ impl SubmissionHub {
             problem_index,
             problem_title: Some(problem_title),
             language_label,
+            official_language_label: None,
             started_at,
             submitted_at: None,
             state: SubmissionDisplayState {
@@ -744,7 +766,9 @@ impl SubmissionHub {
                 true
             }
             WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
-                submitted_at, ..
+                submitted_at,
+                official_language_label,
+                ..
             }) => {
                 if !self
                     .records
@@ -762,6 +786,13 @@ impl SubmissionHub {
                 if let Some(submitted_at) = submitted_at {
                     changed |=
                         self.enrich_history_timestamp(&event.key, event.generation, submitted_at);
+                }
+                if let Some(official_language_label) = official_language_label {
+                    changed |= self.enrich_history_language(
+                        &event.key,
+                        event.generation,
+                        official_language_label,
+                    );
                 }
                 changed
             }
@@ -1171,7 +1202,7 @@ fn run_worker_inner(
         &mut |event| {
             // AcceptedKnown is published only when the shared orchestration reports remote
             // acceptance, and is visible before its channel event can be queued.
-            progress.observe_before_send(event);
+            progress.observe_before_send(&event);
             send(WorkerEventKind::Submission(event)) && cancellation.should_continue()
         },
         cancellation,
@@ -1748,6 +1779,7 @@ mod tests {
             problem_index: "A".to_string(),
             problem_title: Some("Problem A".to_string()),
             language_label: "C++".to_string(),
+            official_language_label: None,
             started_at: SystemTime::now(),
             submitted_at: None,
             state: SubmissionDisplayState {
@@ -2103,6 +2135,7 @@ mod tests {
             problem_index: "A".to_string(),
             problem_title: Some("Problem A".to_string()),
             language_label: "C++".to_string(),
+            official_language_label: None,
             started_at: SystemTime::now(),
             submitted_at: None,
             state: SubmissionDisplayState {
@@ -2342,15 +2375,15 @@ mod tests {
         let progress = WorkerProgress::default();
         assert_eq!(progress.phase(), WorkerProgressPhase::PreAccepted);
 
-        progress.observe_before_send(SubmissionEvent::Accepted);
+        progress.observe_before_send(&SubmissionEvent::Accepted);
         assert_eq!(progress.phase(), WorkerProgressPhase::AcceptedKnown);
-        progress.observe_before_send(SubmissionEvent::Status {
+        progress.observe_before_send(&SubmissionEvent::Status {
             submission_id: SubmissionId::for_test(72),
             status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
         });
         assert_eq!(progress.phase(), WorkerProgressPhase::FinishedKnown);
 
-        progress.observe_before_send(SubmissionEvent::Accepted);
+        progress.observe_before_send(&SubmissionEvent::Accepted);
         assert_eq!(progress.phase(), WorkerProgressPhase::FinishedKnown);
     }
 
@@ -3271,6 +3304,7 @@ mod tests {
         assert_eq!(updated.started_at, first_started_at);
         assert_eq!(updated.problem_title, first_problem_title);
         assert_eq!(updated.language_label, first_language_label);
+        assert_eq!(updated.official_language_label, None);
 
         let second_generation = start_test_submission_at(&mut hub, &key, "E", second_started_at);
         let second = hub.history.last().unwrap();
@@ -3303,9 +3337,14 @@ mod tests {
             WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
                 submission_id: SubmissionId::for_test(101),
                 submitted_at: Some(first_official),
+                official_language_label: Some("C++23 (GCC 15.2.0)".to_string()),
             }),
         )));
         assert_eq!(hub.history[0].submitted_at, Some(first_official));
+        assert_eq!(
+            hub.history[0].official_language_label.as_deref(),
+            Some("C++23 (GCC 15.2.0)")
+        );
 
         let second = start_test_submission(&mut hub, &key, "E");
         assert!(hub.apply_event(event(
@@ -3319,18 +3358,24 @@ mod tests {
             WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
                 submission_id: SubmissionId::for_test(101),
                 submitted_at: Some(official_timestamp(26)),
+                official_language_label: Some("stale language".to_string()),
             }),
         )));
         assert_eq!(hub.history[0].submitted_at, Some(first_official));
         assert_eq!(hub.history[1].generation, second);
         assert_eq!(hub.history[1].submitted_at, None);
+        assert_eq!(
+            hub.history[0].official_language_label.as_deref(),
+            Some("C++23 (GCC 15.2.0)")
+        );
+        assert_eq!(hub.history[1].official_language_label, None);
         hub.request_stop();
     }
 
     #[test]
-    fn older_problem_timestamp_enrichment_keeps_latest_started_receipt_identity() {
+    fn older_cross_contest_metadata_enrichment_keeps_latest_started_receipt_identity() {
         let a = SubmissionKey::new("abc474", "abc474_a");
-        let b = SubmissionKey::new("abc474", "abc474_b");
+        let b = SubmissionKey::new("abc475", "abc475_b");
         let executor = TestExecutor::with_keyed_runs(vec![
             (a.clone(), vec![waiting_test_run()]),
             (b.clone(), vec![waiting_test_run()]),
@@ -3351,12 +3396,18 @@ mod tests {
             WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
                 submission_id: SubmissionId::for_test(201),
                 submitted_at: Some(official),
+                official_language_label: Some("Python (CPython 3.13.7)".to_string()),
             }),
         )));
 
         assert_eq!(hub.history.last().unwrap().generation, b_generation);
         assert_eq!(hub.history.last().unwrap().problem_index, "B");
         assert_eq!(hub.history[0].submitted_at, Some(official));
+        assert_eq!(
+            hub.history[0].official_language_label.as_deref(),
+            Some("Python (CPython 3.13.7)")
+        );
+        assert_eq!(hub.history[1].official_language_label, None);
         hub.request_stop();
     }
 
@@ -3410,6 +3461,7 @@ mod tests {
                 problem_index: "A".to_string(),
                 problem_title: Some("Problem A".to_string()),
                 language_label: "C++".to_string(),
+                official_language_label: None,
                 started_at: SystemTime::now(),
                 submitted_at: None,
                 state: state(Verdict::WrongAnswer),
@@ -3420,6 +3472,7 @@ mod tests {
                 problem_index: "A".to_string(),
                 problem_title: Some("Problem A".to_string()),
                 language_label: "PyPy".to_string(),
+                official_language_label: None,
                 started_at: SystemTime::now(),
                 submitted_at: None,
                 state: state(Verdict::Accepted),

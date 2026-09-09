@@ -141,12 +141,13 @@ impl PreparedSubmit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionEvent {
     Accepted,
     TrackingStarted {
         submission_id: SubmissionId,
         submitted_at: Option<time::OffsetDateTime>,
+        official_language_label: Option<String>,
     },
     Status {
         submission_id: SubmissionId,
@@ -517,6 +518,7 @@ where
     if !emit(SubmissionEvent::TrackingStarted {
         submission_id,
         submitted_at: None,
+        official_language_label: None,
     }) {
         return Ok(SubmissionCompletion::Accepted);
     }
@@ -721,6 +723,7 @@ where
     if !emit(SubmissionEvent::TrackingStarted {
         submission_id,
         submitted_at: discovery.submitted_at,
+        official_language_label: discovery.official_language_label,
     }) {
         diagnostics.observe(SubmissionDiagnostic::Cancelled {
             stage: "after discovery before status polling",
@@ -2004,6 +2007,7 @@ mod tests {
                 Ok(SubmissionDiscovery {
                     submission_id: SubmissionId::for_test(11),
                     submitted_at: Some(time::OffsetDateTime::from_unix_timestamp(1).unwrap()),
+                    official_language_label: Some("C++23 (GCC 15.2.0)".to_string()),
                 })
             },
             |_, submission_id, on_status, observer| {
@@ -2072,7 +2076,9 @@ mod tests {
             Some(SubmissionEvent::TrackingStarted {
                 submission_id,
                 submitted_at: Some(_),
+                official_language_label: Some(language),
             }) if *submission_id == SubmissionId::for_test(11)
+                && language == "C++23 (GCC 15.2.0)"
         ));
         assert!(matches!(
             events.last(),

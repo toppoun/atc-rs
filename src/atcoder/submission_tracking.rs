@@ -119,10 +119,11 @@ pub(crate) enum SubmissionStatus {
     Finished(SubmissionResult),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionDiscovery {
     pub(crate) submission_id: SubmissionId,
     pub(crate) submitted_at: Option<OffsetDateTime>,
+    pub(crate) official_language_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -758,13 +759,25 @@ fn discover_submission_with_transport_until_observed(
     match (candidates.next(), candidates.next()) {
         (Some(id), None) => {
             observer.observe(SubmissionDiagnostic::DiscoveryResolved { submission_id: id });
+            // Display metadata is read only after the existing singleton-union ownership proof.
+            // Neither timestamp nor official language text can create or narrow an ID candidate.
             let submitted_at = discovery_html
                 .iter()
                 .rev()
                 .find_map(|html| parse_submission_timestamp(html, id));
+            let official_language_label = discovery_html.iter().rev().find_map(|html| {
+                parse_submission_language_label(
+                    html,
+                    id,
+                    &baseline.contest_id,
+                    &baseline.task_id,
+                    &baseline.language_id,
+                )
+            });
             Ok(SubmissionDiscovery {
                 submission_id: id,
                 submitted_at,
+                official_language_label,
             })
         }
         (Some(first), Some(second)) => {
@@ -1123,39 +1136,10 @@ fn require_exact_language_link(
     task_id: &str,
     language_id: &str,
 ) -> Result<(), SubmissionTrackingError> {
-    let expected_path = format!("/contests/{contest_id}/submissions/me");
-    let mut matching_links = 0;
-
-    for link in row.select(selector) {
-        let Some(href) = link.value().attr("href") else {
-            continue;
-        };
-        let Ok(url) = reqwest::Url::parse(BASE_URL).and_then(|base| base.join(href)) else {
-            continue;
-        };
-        if url.scheme() != "https"
-            || url.host_str() != Some("atcoder.jp")
-            || url.port().is_some()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.path() != expected_path
-            || url.fragment().is_some()
-        {
-            continue;
-        }
-
-        let pairs: Vec<_> = url.query_pairs().collect();
-        if pairs.len() == 2
-            && pairs
-                .iter()
-                .any(|(key, value)| key == "f.Language" && value.as_ref() == language_id)
-            && pairs
-                .iter()
-                .any(|(key, value)| key == "f.Task" && value.as_ref() == task_id)
-        {
-            matching_links += 1;
-        }
-    }
+    let matching_links = row
+        .select(selector)
+        .filter(|link| language_link_matches(link, contest_id, task_id, language_id))
+        .count();
 
     if matching_links == 1 {
         Ok(())
@@ -1164,6 +1148,40 @@ fn require_exact_language_link(
             "submission language link is missing, ambiguous, or mismatched",
         ))
     }
+}
+
+fn language_link_matches(
+    link: &ElementRef<'_>,
+    contest_id: &str,
+    task_id: &str,
+    language_id: &str,
+) -> bool {
+    let Some(href) = link.value().attr("href") else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(BASE_URL).and_then(|base| base.join(href)) else {
+        return false;
+    };
+    let expected_path = format!("/contests/{contest_id}/submissions/me");
+    if url.scheme() != "https"
+        || url.host_str() != Some("atcoder.jp")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != expected_path
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    pairs.len() == 2
+        && pairs
+            .iter()
+            .any(|(key, value)| key == "f.Language" && value.as_ref() == language_id)
+        && pairs
+            .iter()
+            .any(|(key, value)| key == "f.Task" && value.as_ref() == task_id)
 }
 
 fn parse_submission_id(value: &str) -> Option<SubmissionId> {
@@ -1202,6 +1220,45 @@ fn parse_submission_timestamp(html: &str, submission_id: SubmissionId) -> Option
         return None;
     }
     parse_official_submission_timestamp(&normalized_text(&timestamp))
+}
+
+fn parse_submission_language_label(
+    html: &str,
+    submission_id: SubmissionId,
+    contest_id: &str,
+    task_id: &str,
+    language_id: &str,
+) -> Option<String> {
+    let document = Html::parse_document(html);
+    let table_selector = selector("table.table-bordered.table-striped");
+    let row_selector = selector("tbody tr");
+    let score_selector = selector("td.submission-score");
+    let link_selector = selector("a[href]");
+    let mut matching_rows = document.select(&table_selector).flat_map(|table| {
+        table.select(&row_selector).filter(|row| {
+            let mut cells = row.select(&score_selector);
+            let matches = cells.next().is_some_and(|cell| {
+                cell.value().attr("data-id").and_then(parse_submission_id) == Some(submission_id)
+            });
+            matches && cells.next().is_none()
+        })
+    });
+    let row = matching_rows.next()?;
+    if matching_rows.next().is_some() {
+        return None;
+    }
+
+    let mut language_links = row
+        .select(&link_selector)
+        .filter(|link| language_link_matches(link, contest_id, task_id, language_id));
+    let language_link = language_links.next()?;
+    if language_links.next().is_some() {
+        return None;
+    }
+    let label = language_link.text().collect::<String>();
+    let label = label.trim();
+    // Preserve AtCoder's display label verbatim apart from surrounding whitespace.
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 fn parse_official_submission_timestamp(value: &str) -> Option<OffsetDateTime> {
@@ -1496,6 +1553,19 @@ mod tests {
         row(data_id, detail_href, task_href).replacen(
             "<tr>",
             &format!("<tr><td><time class=\"fixtime fixtime-second\">{timestamp}</time></td>"),
+            1,
+        )
+    }
+
+    fn row_with_language_label(
+        data_id: Option<&str>,
+        detail_href: Option<&str>,
+        task_href: &str,
+        language_label: &str,
+    ) -> String {
+        row(data_id, detail_href, task_href).replacen(
+            ">C++</a>",
+            &format!(">{language_label}</a>"),
             1,
         )
     }
@@ -1795,7 +1865,65 @@ mod tests {
         assert_eq!(submitted_at.minute(), 36);
         assert_eq!(submitted_at.second(), 23);
         assert_eq!(submitted_at.offset(), UtcOffset::from_hms(9, 0, 0).unwrap());
+        assert_eq!(
+            id.official_language_label.as_deref(),
+            Some("C++23 (GCC 15.2.0)")
+        );
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn official_language_is_trimmed_from_the_resolved_submission_row() {
+        let task = "/contests/abc473/tasks/abc473_c";
+        let resolved = row_with_language_label(
+            Some("11"),
+            Some("/contests/abc473/submissions/11"),
+            task,
+            "  C++23 (GCC 15.2.0)  ",
+        );
+        let after = list(&resolved);
+        let mut transport =
+            ScriptedTransport::new([EMPTY_LIST.to_string(), after.clone(), after.clone(), after]);
+        let baseline =
+            capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
+
+        let discovery = discover_submission_with_transport(&mut transport, &baseline).unwrap();
+
+        assert_eq!(discovery.submission_id, SubmissionId(11));
+        assert_eq!(
+            discovery.official_language_label.as_deref(),
+            Some("C++23 (GCC 15.2.0)")
+        );
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn missing_language_text_does_not_fail_id_discovery_or_borrow_another_row() {
+        let task = "/contests/abc473/tasks/abc473_c";
+        let existing = row_with_language_label(
+            Some("10"),
+            Some("/contests/abc473/submissions/10"),
+            task,
+            "Python (CPython 3.13.7)",
+        );
+        let resolved = row_with_language_label(
+            Some("11"),
+            Some("/contests/abc473/submissions/11"),
+            task,
+            "   ",
+        );
+        let baseline_html = list(&existing);
+        let after = list(&format!("{existing}{resolved}"));
+        let mut transport =
+            ScriptedTransport::new([baseline_html, after.clone(), after.clone(), after]);
+        let baseline =
+            capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
+
+        let discovery = discover_submission_with_transport(&mut transport, &baseline).unwrap();
+
+        assert_eq!(discovery.submission_id, SubmissionId(11));
+        assert_eq!(discovery.official_language_label, None);
         transport.assert_complete();
     }
 
