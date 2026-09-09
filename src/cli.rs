@@ -1,16 +1,8 @@
+use crate::branding::ASCII_LOGO;
 use crate::language::{Language, PythonRuntime};
 use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::num::NonZeroU64;
-
-const LOGO: &str = r#"
-
- █████╗ ████████╗ ██████╗
-██╔══██╗╚══██╔══╝██╔════╝
-███████║   ██║   ██║     
-██╔══██║   ██║   ██║     
-██║  ██║   ██║   ╚██████╗
-╚═╝  ╚═╝   ╚═╝    ╚═════╝"#;
 
 const GRAY: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
@@ -326,7 +318,7 @@ fn render_help(command_tree: &ClapCommand, color: bool) -> String {
     let (gray, reset) = if color { (GRAY, RESET) } else { ("", "") };
 
     format!(
-        "{LOGO}
+        "{ASCII_LOGO}
 {gray}Fast AtCoder workflow from your terminal.{reset}
 
 Usage:
@@ -431,6 +423,55 @@ mod tests {
         for run_option in ["--language", "--debug", "--count", "--forever", "--seed"] {
             assert!(!init_help.contains(run_option));
         }
+    }
+
+    #[test]
+    fn plain_top_level_help_output_is_unchanged() {
+        let mut command_tree = <Cli as CommandFactory>::command();
+        command_tree.build();
+        let help = render_help(&command_tree, false);
+        let expected_after_logo = concat!(
+            "\nFast AtCoder workflow from your terminal.\n",
+            "\n",
+            "Usage:\n",
+            "  atc [options] [command]\n",
+            "\n",
+            "Workspace\n",
+            "  init      Initialize an atc workspace\n",
+            "\n",
+            "Configuration\n",
+            "  config    Manage global configuration\n",
+            "\n",
+            "Contest\n",
+            "  new       Create a contest workspace\n",
+            "  contest   Open or create a contest\n",
+            "  refresh   Refresh contest metadata and samples\n",
+            "\n",
+            "Run & Test\n",
+            "  test      Run samples and the saved stress regression\n",
+            "  watch     Watch sources and run tests\n",
+            "  stress    Find counterexamples with stress testing\n",
+            "  submit    Submit a solution to AtCoder\n",
+            "\n",
+            "Files\n",
+            "  create    Create a source file\n",
+            "  template  Manage source templates\n",
+            "\n",
+            "Account\n",
+            "  login     Check AtCoder authentication\n",
+            "\n",
+            "Diagnostics\n",
+            "  doctor    Diagnose the local atc environment\n",
+            "\n",
+            "Help\n",
+            "  help      Print this message or the help of the given subcommand(s)\n",
+            "\n",
+            "Options\n",
+            "  -h, --help       Show help\n",
+            "  -V, --version    Show version\n",
+        );
+
+        assert_eq!(help, format!("{ASCII_LOGO}{expected_after_logo}"));
     }
 
     #[test]

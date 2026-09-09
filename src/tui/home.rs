@@ -1,14 +1,16 @@
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::view::{self, ContestOpenPurpose};
@@ -17,8 +19,19 @@ use super::{
     ShortcutHelpTransition, TerminaSession, command_matches, is_command_palette_open_key,
     is_shortcut_help_key, shortcut_help_transition,
 };
+use crate::branding;
 
 const HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const HOME_ACTIONS: [(&str, &str); 4] = [
+    ("Open Contest", "c"),
+    ("Commands", ":"),
+    ("Shortcuts", "?"),
+    ("Quit", "q"),
+];
+const MENU_WIDTH: u16 = 23;
+const MENU_HEIGHT: u16 = HOME_ACTIONS.len() as u16;
+const SUBTITLE: &str = "AtCoder workspace";
+const WORKSPACE_PREFIX: &str = "Workspace  ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HomeAction {
@@ -280,6 +293,7 @@ pub(crate) enum HomeExit<T> {
 
 pub(crate) fn run<T>(
     terminal: &mut TerminaSession,
+    workspace_root: &Path,
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
     mut start_contest: impl FnMut() -> Result<T, String>,
@@ -297,7 +311,7 @@ pub(crate) fn run<T>(
         }
 
         if dirty {
-            terminal.draw(|frame| render(frame, &state))?;
+            terminal.draw(|frame| render(frame, &state, workspace_root))?;
             terminal.note_redraw_completed();
             terminal.refresh_mouse_after_redraw(false)?;
             terminal.retry_high_res_after_redraw(false)?;
@@ -335,22 +349,224 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn render(frame: &mut Frame<'_>, state: &HomeState<'_>) {
-    let area = centered_rect(frame.area(), 44, 10);
-    let lines = vec![
-        Line::styled("atc", Style::default().add_modifier(Modifier::BOLD)),
-        Line::raw(""),
-        Line::raw("AtCoder workspace"),
-        Line::raw(""),
-        Line::raw("c  Open Contest"),
-        Line::raw(":  Commands"),
-        Line::raw("?  Shortcuts"),
-        Line::raw("q  Quit"),
-    ];
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
-        area,
-    );
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HomeLayout {
+    logo: Option<Rect>,
+    subtitle: Option<Rect>,
+    menu: Rect,
+    workspace: Option<Rect>,
+}
+
+fn logo_size() -> (u16, u16) {
+    let width = branding::ascii_logo_lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    let height = branding::ascii_logo_lines().count();
+    (
+        u16::try_from(width).unwrap_or(u16::MAX),
+        u16::try_from(height).unwrap_or(u16::MAX),
+    )
+}
+
+fn centered_row(area: Rect, y: u16, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        y,
+        width,
+        height,
+    )
+}
+
+fn home_layout(area: Rect) -> HomeLayout {
+    if area.width == 0 || area.height == 0 {
+        return HomeLayout {
+            logo: None,
+            subtitle: None,
+            menu: Rect::new(area.x, area.y, 0, 0),
+            workspace: None,
+        };
+    }
+
+    let show_workspace = area.height >= MENU_HEIGHT.saturating_add(1);
+    let bottom_margin = u16::from(show_workspace && area.height >= MENU_HEIGHT.saturating_add(4));
+    let workspace_y = area
+        .y
+        .saturating_add(area.height)
+        .saturating_sub(1)
+        .saturating_sub(bottom_margin);
+    let body_height = if show_workspace {
+        workspace_y.saturating_sub(area.y)
+    } else {
+        area.height
+    };
+
+    let subtitle_width = u16::try_from(UnicodeWidthStr::width(SUBTITLE)).unwrap_or(u16::MAX);
+    let show_subtitle =
+        area.width >= subtitle_width && body_height >= MENU_HEIGHT.saturating_add(2);
+    let (logo_width, logo_height) = logo_size();
+    let full_content_height = logo_height
+        .saturating_add(1)
+        .saturating_add(1)
+        .saturating_add(1)
+        .saturating_add(MENU_HEIGHT);
+    let show_logo = show_subtitle && area.width >= logo_width && body_height >= full_content_height;
+
+    let content_height = if show_logo {
+        full_content_height
+    } else if show_subtitle {
+        MENU_HEIGHT.saturating_add(2)
+    } else {
+        MENU_HEIGHT.min(body_height)
+    };
+    let content_y = area
+        .y
+        .saturating_add(body_height.saturating_sub(content_height) / 2);
+
+    let (logo, subtitle, menu_y) = if show_logo {
+        (
+            Some(centered_row(area, content_y, logo_width, logo_height)),
+            Some(centered_row(
+                area,
+                content_y.saturating_add(logo_height).saturating_add(1),
+                subtitle_width,
+                1,
+            )),
+            content_y.saturating_add(logo_height).saturating_add(3),
+        )
+    } else if show_subtitle {
+        (
+            None,
+            Some(centered_row(area, content_y, subtitle_width, 1)),
+            content_y.saturating_add(2),
+        )
+    } else {
+        (None, None, content_y)
+    };
+
+    let workspace = show_workspace.then(|| {
+        let margin = u16::from(area.width >= 4);
+        Rect::new(
+            area.x.saturating_add(margin),
+            workspace_y,
+            area.width.saturating_sub(margin.saturating_mul(2)),
+            1,
+        )
+    });
+
+    HomeLayout {
+        logo,
+        subtitle,
+        menu: centered_row(area, menu_y, MENU_WIDTH, MENU_HEIGHT.min(body_height)),
+        workspace,
+    }
+}
+
+fn menu_line(label: &'static str, shortcut: &'static str, width: usize) -> Line<'static> {
+    let shortcut_width = UnicodeWidthStr::width(shortcut);
+    let shortcut_style = Style::default().fg(Color::Yellow);
+    if width <= shortcut_width {
+        return Line::styled(
+            view::clip_text_with_ellipsis(shortcut, width),
+            shortcut_style,
+        );
+    }
+
+    let label_width = width.saturating_sub(shortcut_width).saturating_sub(1);
+    let label = view::clip_text_with_ellipsis(label, label_width);
+    let padding = width
+        .saturating_sub(UnicodeWidthStr::width(label.as_str()))
+        .saturating_sub(shortcut_width);
+    Line::from(vec![
+        Span::raw(label),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(shortcut, shortcut_style),
+    ])
+}
+
+fn truncate_start_with_ellipsis(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let content_width = width - 1;
+    let mut suffix = Vec::new();
+    let mut suffix_width = 0usize;
+    for grapheme in text.graphemes(true).rev() {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if suffix_width.saturating_add(grapheme_width) > content_width {
+            break;
+        }
+        suffix.push(grapheme);
+        suffix_width = suffix_width.saturating_add(grapheme_width);
+    }
+
+    let mut fitted = String::from("…");
+    fitted.extend(suffix.into_iter().rev());
+    fitted
+}
+
+fn workspace_line(workspace_root: &Path, width: usize) -> String {
+    let path = workspace_root.to_string_lossy();
+    let full = format!("{WORKSPACE_PREFIX}{path}");
+    if UnicodeWidthStr::width(full.as_str()) <= width {
+        return full;
+    }
+
+    let prefix_width = UnicodeWidthStr::width(WORKSPACE_PREFIX);
+    if width <= prefix_width {
+        truncate_start_with_ellipsis(&full, width)
+    } else {
+        format!(
+            "{WORKSPACE_PREFIX}{}",
+            truncate_start_with_ellipsis(&path, width - prefix_width)
+        )
+    }
+}
+
+fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
+    let layout = home_layout(frame.area());
+
+    if let Some(area) = layout.logo {
+        let lines = branding::ascii_logo_lines().map(|line| {
+            Line::styled(
+                line,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        frame.render_widget(Paragraph::new(Text::from_iter(lines)), area);
+    }
+    if let Some(area) = layout.subtitle {
+        frame.render_widget(
+            Paragraph::new(SUBTITLE)
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            area,
+        );
+    }
+    if layout.menu.width > 0 && layout.menu.height > 0 {
+        let lines = HOME_ACTIONS
+            .iter()
+            .map(|(label, shortcut)| menu_line(label, shortcut, usize::from(layout.menu.width)));
+        frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
+    }
+    if let Some(area) = layout.workspace {
+        frame.render_widget(
+            Paragraph::new(workspace_line(workspace_root, usize::from(area.width)))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            area,
+        );
+    }
 
     if state.shortcut_help_visible {
         render_shortcuts(frame);
@@ -437,7 +653,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
     use crate::tui::SwitchContestModalState;
@@ -453,6 +669,39 @@ mod tests {
 
     fn state<'a>(resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution) -> HomeState<'a> {
         HomeState::new(resolve, Arc::new(|_, _| Ok(())))
+    }
+
+    fn draw_home(home: &HomeState<'_>, workspace_root: &Path, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, home, workspace_root))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn row_text(buffer: &Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|column| buffer.cell((column, row)).unwrap().symbol())
+            .collect()
+    }
+
+    fn visible_area_text(buffer: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        let mut column = area.x;
+        let end = area.x.saturating_add(area.width);
+        while column < end {
+            let symbol = buffer.cell((column, area.y)).unwrap().symbol();
+            text.push_str(symbol);
+            let symbol_width = u16::try_from(UnicodeWidthStr::width(symbol))
+                .unwrap_or(u16::MAX)
+                .max(1);
+            column = column.saturating_add(symbol_width);
+        }
+        text
     }
 
     #[test]
@@ -683,34 +932,218 @@ mod tests {
     }
 
     #[test]
-    fn renders_minimal_home_and_home_overlays() {
+    fn normal_home_renders_shared_logo_dashboard_and_explicit_workspace() {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
-        let mut home = state(&mut resolve);
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let home = state(&mut resolve);
+        let workspace = Path::new(r"D:\competitive-programming\atcoder");
+        let buffer = draw_home(&home, workspace, 80, 24);
+        let rendered = buffer_text(&buffer);
 
-        terminal.draw(|frame| render(frame, &home)).unwrap();
-        let rendered = terminal.backend().to_string();
-        for expected in [
-            "atc",
-            "AtCoder workspace",
-            "c  Open Contest",
-            ":  Commands",
-            "?  Shortcuts",
-            "q  Quit",
-        ] {
+        for expected in branding::ascii_logo_lines().chain([
+            SUBTITLE,
+            "Open Contest",
+            "Commands",
+            "Shortcuts",
+            "Quit",
+        ]) {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}\n{rendered}"
             );
         }
+        assert!(rendered.contains(r"Workspace  D:\competitive-programming\atcoder"));
+        assert!(
+            !rendered.contains('┌'),
+            "Home unexpectedly has an outer border"
+        );
+        assert!(
+            !rendered.contains('└'),
+            "Home unexpectedly has an outer border"
+        );
+    }
 
+    #[test]
+    fn menu_is_one_centered_block_with_aligned_accent_shortcuts() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let home = state(&mut resolve);
+        let buffer = draw_home(&home, Path::new("workspace"), 80, 24);
+        let layout = home_layout(Rect::new(0, 0, 80, 24));
+
+        assert_eq!(layout.menu.width, MENU_WIDTH);
+        assert_eq!(layout.menu.x, (80 - MENU_WIDTH) / 2);
+        for (offset, (label, shortcut)) in HOME_ACTIONS.iter().enumerate() {
+            let row = layout.menu.y + u16::try_from(offset).unwrap();
+            let text = row_text(&buffer, row);
+            let start = usize::from(layout.menu.x);
+            let end = start + usize::from(layout.menu.width);
+            assert_eq!(
+                &text[start..end],
+                menu_line(label, shortcut, usize::from(MENU_WIDTH)).to_string()
+            );
+
+            let shortcut_column = layout.menu.x + layout.menu.width - 1;
+            let shortcut_cell = buffer.cell((shortcut_column, row)).unwrap();
+            assert_eq!(shortcut_cell.symbol(), *shortcut);
+            assert_eq!(shortcut_cell.fg, Color::Yellow);
+        }
+    }
+
+    #[test]
+    fn workspace_path_comes_from_the_explicit_root_instead_of_process_cwd() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let home = state(&mut resolve);
+        let explicit_root = Path::new("selected-workspace-marker/root");
+        let cwd = std::env::current_dir().unwrap();
+        assert_ne!(explicit_root, cwd);
+
+        let rendered = buffer_text(&draw_home(&home, explicit_root, 120, 24));
+
+        assert!(rendered.contains("Workspace  selected-workspace-marker/root"));
+        assert!(!rendered.contains(cwd.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn long_workspace_path_truncates_from_the_start_and_stays_within_width() {
+        let workspace = Path::new(
+            r"C:\Users\someone\projects\very-long-parent\competitive-programming\atcoder",
+        );
+
+        let fitted = workspace_line(workspace, 40);
+
+        assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 40);
+        assert!(fitted.starts_with(WORKSPACE_PREFIX));
+        assert!(fitted.contains('…'));
+        assert!(fitted.ends_with(r"programming\atcoder"));
+        assert_eq!(workspace_line(workspace, 0), "");
+        assert_eq!(workspace_line(workspace, 1), "…");
+    }
+
+    #[test]
+    fn unicode_workspace_paths_use_the_production_renderer_and_preserve_the_tail() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let home = state(&mut resolve);
+        let width = 30;
+        let height = 8;
+        let workspace_area = home_layout(Rect::new(0, 0, width, height))
+            .workspace
+            .expect("workspace row should fit");
+
+        for (workspace, expected_tail) in [
+            (
+                Path::new(r"C:\Users\ユーザー\very-long-parent\競プロ\atcoder"),
+                r"\競プロ\atcoder",
+            ),
+            (
+                Path::new("/home/ユーザー/very-long-parent/競プロ/atcoder"),
+                "/競プロ/atcoder",
+            ),
+        ] {
+            let buffer = draw_home(&home, workspace, width, height);
+            let rendered = visible_area_text(&buffer, workspace_area)
+                .trim()
+                .to_string();
+
+            assert!(rendered.starts_with("Workspace  …"), "{rendered:?}");
+            assert!(rendered.ends_with(expected_tail), "{rendered:?}");
+            assert!(
+                UnicodeWidthStr::width(rendered.as_str()) <= usize::from(workspace_area.width),
+                "{rendered:?} exceeded {} columns",
+                workspace_area.width
+            );
+            assert!(!rendered.contains('\u{fffd}'), "{rendered:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_and_short_layouts_drop_logo_before_the_core_menu() {
+        let narrow = home_layout(Rect::new(0, 0, 20, 24));
+        assert_eq!(narrow.logo, None);
+        assert_eq!(narrow.menu.height, MENU_HEIGHT);
+        assert!(narrow.workspace.is_some());
+
+        let short = home_layout(Rect::new(0, 0, 80, 12));
+        assert_eq!(short.logo, None);
+        assert_eq!(short.menu.height, MENU_HEIGHT);
+        assert!(short.workspace.is_some());
+
+        let menu_only = home_layout(Rect::new(0, 0, 80, 4));
+        assert_eq!(menu_only.logo, None);
+        assert_eq!(menu_only.subtitle, None);
+        assert_eq!(menu_only.workspace, None);
+        assert_eq!(menu_only.menu.height, MENU_HEIGHT);
+    }
+
+    #[test]
+    fn extreme_home_sizes_do_not_panic() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let home = state(&mut resolve);
+
+        for width in [0, 1, 8, 16, 20, 30, 40, 60, 80, 120, 160] {
+            for height in [0, 1, 4, 8, 12, 16, 24, 40] {
+                let layout = home_layout(Rect::new(0, 0, width, height));
+                assert!(layout.menu.width <= width);
+                assert!(layout.menu.height <= height);
+                let _ = draw_home(&home, Path::new("workspace"), width, height);
+            }
+        }
+
+        assert_eq!(menu_line("Open Contest", "c", 0).width(), 0);
+        assert_eq!(truncate_start_with_ellipsis("workspace", 0), "");
+    }
+
+    #[test]
+    fn zero_sized_test_backends_reach_the_production_home_renderer() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let home = state(&mut resolve);
+
+        for (width, height) in [(0, 0), (0, 8), (8, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut renderer_called = false;
+            terminal
+                .draw(|frame| {
+                    renderer_called = true;
+                    assert_eq!(frame.area(), Rect::new(0, 0, width, height));
+                    render(frame, &home, Path::new("workspace"));
+                })
+                .unwrap();
+
+            assert!(renderer_called, "renderer was skipped for {width}x{height}");
+            assert_eq!(terminal.backend().buffer().area.width, width);
+            assert_eq!(terminal.backend().buffer().area.height, height);
+        }
+    }
+
+    #[test]
+    fn home_modals_still_render_over_the_borderless_dashboard() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+
+        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
+        let shortcuts = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(shortcuts.contains("Shortcuts"));
+        assert!(shortcuts.contains("Esc close"));
+        assert!(shortcuts.contains('┌'));
+
+        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
         home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-        terminal.draw(|frame| render(frame, &home)).unwrap();
-        let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Open Contest"));
-        assert!(rendered.contains("Quit"));
-        assert!(!rendered.contains("Run Tests"));
+        let palette = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(palette.contains("Command Palette"));
+        assert!(palette.contains("Open Contest"));
+        assert!(palette.contains("Quit"));
+        assert!(!palette.contains("Run Tests"));
+
+        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        home.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
+        let open = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(open.contains("Open Contest"));
+        assert!(open.contains("Contest:"));
+        assert!(open.contains('┌'));
     }
 }

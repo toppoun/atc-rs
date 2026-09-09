@@ -7,6 +7,7 @@ mod atcoder;
 #[cfg_attr(not(test), allow(dead_code))]
 mod attempt;
 mod auth;
+mod branding;
 mod cli;
 mod commands;
 mod comparator;

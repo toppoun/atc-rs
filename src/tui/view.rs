@@ -629,7 +629,7 @@ fn responsive_footer_hint_text(
     }
 }
 
-fn clip_text_with_ellipsis(text: &str, width: usize) -> String {
+pub(super) fn clip_text_with_ellipsis(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

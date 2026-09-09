@@ -561,8 +561,12 @@ fn run_root_tui(
             };
             let start_prepared = Arc::clone(&prepared_home_open);
             let runner_config = &config.runner;
+            let workspace_root = app_context
+                .workspace_root()
+                .expect("Workspace Home is reachable only from a workspace context");
             match crate::tui::run_home(
                 &mut terminal,
+                workspace_root,
                 &mut resolve,
                 Arc::clone(&home_open_task),
                 || {
