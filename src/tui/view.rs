@@ -30,7 +30,7 @@ use super::detail_scrollbar::{
 use super::mouse::MouseMode;
 use super::submission::{
     SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone, SubmissionViewState,
-    UserVisibleSubmissionState,
+    TuiSubmissionAttemptState, TuiSubmissionState, UserVisibleSubmissionState,
 };
 use super::{
     CommandPalette, EditorTargetModal, FrontendAction, FrontendActionAvailability,
@@ -38,6 +38,7 @@ use super::{
     RefreshContestModal, RefreshContestModalState, SubmitModal, SwitchContestModal,
     SwitchContestModalState,
 };
+use crate::atcoder::submission_tracking::SubmissionStatus;
 use crate::language::Language;
 
 const SIDE_PANE_WIDTH: u16 = 20;
@@ -57,6 +58,58 @@ const COMMAND_PALETTE_FIXED_HEIGHT: u16 = COMMAND_PALETTE_BORDER_ROWS
 const COMMAND_PALETTE_MAX_VISIBLE_COMMANDS: usize = 10;
 const COMMAND_PALETTE_LABEL_WIDTH: usize = 18;
 const COMMAND_PALETTE_SCROLLBAR_GUTTER_WIDTH: u16 = 2;
+pub(super) const SUBMISSION_ANIMATION_PHASE_DURATION: Duration = Duration::from_millis(350);
+const SUBMISSION_ANIMATION_PHASES: u128 = 4;
+const SUBMISSION_ANIMATION_SUFFIX_WIDTH: usize = 3;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SubmissionAnimationPhase(u8);
+
+impl SubmissionAnimationPhase {
+    pub(super) fn from_elapsed(elapsed: Duration) -> Self {
+        let phase = (elapsed.as_millis() / SUBMISSION_ANIMATION_PHASE_DURATION.as_millis()
+            % SUBMISSION_ANIMATION_PHASES) as u8;
+        Self(phase)
+    }
+
+    #[cfg(test)]
+    const fn suffix(self) -> &'static str {
+        match self.0 {
+            0 => "",
+            1 => ".",
+            2 => "..",
+            _ => "...",
+        }
+    }
+
+    const fn padded_suffix(self) -> &'static str {
+        match self.0 {
+            0 => "   ",
+            1 => ".  ",
+            2 => ".. ",
+            _ => "...",
+        }
+    }
+}
+
+fn submission_state_is_unfinished(state: UserVisibleSubmissionState) -> bool {
+    matches!(
+        state,
+        UserVisibleSubmissionState::Attempt(TuiSubmissionAttemptState::Submitting)
+            | UserVisibleSubmissionState::Current(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge
+                    | SubmissionStatus::WaitingForRejudge
+                    | SubmissionStatus::Judging
+                    | SubmissionStatus::JudgingProgress { .. }
+            ))
+    )
+}
+
+pub(super) fn submission_animation_target(state: SubmissionDisplayState) -> bool {
+    state
+        .effective()
+        .is_some_and(submission_state_is_unfinished)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandPaletteLayout {
@@ -709,6 +762,7 @@ fn submission_receipt_line(
     current_contest_id: &str,
     entry: Option<&SubmissionHistoryEntry>,
     width: usize,
+    animation_phase: SubmissionAnimationPhase,
 ) -> Line<'static> {
     let Some(entry) = entry else {
         return empty_receipt_line(width);
@@ -717,15 +771,29 @@ fn submission_receipt_line(
         return empty_receipt_line(width);
     };
 
-    let status_spans = submission_status_spans(state);
+    let problem_label = receipt_problem_label(current_contest_id, entry);
+    let problem_width = UnicodeWidthStr::width(problem_label.as_str());
+    let problem_index_width = UnicodeWidthStr::width(entry.problem_index.as_str()).max(1);
+    let base_status_spans = submission_status_spans(state);
+    let base_status_width = Line::from(base_status_spans.clone()).width();
+    let reserve_animation_suffix = submission_state_is_unfinished(state)
+        && base_status_width
+            .saturating_add(SUBMISSION_ANIMATION_SUFFIX_WIDTH)
+            .saturating_add(UnicodeWidthStr::width("│"))
+            .saturating_add(problem_index_width)
+            <= width;
+    let mut status_spans = base_status_spans;
+    if reserve_animation_suffix {
+        status_spans.push(Span::styled(
+            animation_phase.padded_suffix(),
+            submission_tone_style(SubmissionTone::Active),
+        ));
+    }
     let status_width = Line::from(status_spans.clone()).width();
     if width <= status_width {
         return clip_styled_row(status_spans, width);
     }
 
-    let problem_label = receipt_problem_label(current_contest_id, entry);
-    let problem_width = UnicodeWidthStr::width(problem_label.as_str());
-    let problem_index_width = UnicodeWidthStr::width(entry.problem_index.as_str()).max(1);
     let separator = if status_width
         .saturating_add(UnicodeWidthStr::width(RECEIPT_SEPARATOR))
         .saturating_add(problem_index_width)
@@ -859,6 +927,7 @@ fn render_footer(
     app: &WatchApp,
     submission_view: Option<&SubmissionViewState>,
     workspace_available: bool,
+    submission_animation_phase: SubmissionAnimationPhase,
 ) {
     let block = Block::default().borders(Borders::TOP);
     let content_width = usize::from(block.inner(area).width);
@@ -873,6 +942,7 @@ fn render_footer(
             app.contest_id(),
             submission_view.and_then(|view| view.history.last()),
             content_width,
+            submission_animation_phase,
         )
     };
     frame.render_widget(Paragraph::new(line).block(block), area);
@@ -887,6 +957,7 @@ pub(super) struct FrontendOverlays<'a> {
     pub(super) submission_view: Option<&'a SubmissionViewState>,
     pub(super) editor_target_modal: Option<&'a EditorTargetModal>,
     pub(super) command_palette: Option<&'a CommandPalette>,
+    pub(super) submission_animation_phase: SubmissionAnimationPhase,
 }
 
 #[cfg(test)]
@@ -1259,6 +1330,7 @@ pub(super) fn render_frontend_with_pointer(
         app,
         overlays.submission_view,
         workspace_available,
+        overlays.submission_animation_phase,
     );
 
     if let Some(modal) = overlays.refresh_modal {
@@ -2761,6 +2833,10 @@ mod tests {
     use std::path::PathBuf;
     use time::{Date, Month, PlainDateTime, Time};
 
+    fn submission_animation_phase(index: u64) -> SubmissionAnimationPhase {
+        SubmissionAnimationPhase::from_elapsed(Duration::from_millis(350 * index))
+    }
+
     fn app() -> WatchApp {
         WatchApp::new(
             &Contest {
@@ -3135,6 +3211,7 @@ mod tests {
                         submission_view: None,
                         editor_target_modal: None,
                         command_palette: palette,
+                        submission_animation_phase: SubmissionAnimationPhase::default(),
                     },
                 );
             })
@@ -3149,6 +3226,24 @@ mod tests {
         width: u16,
         height: u16,
     ) -> ratatui::buffer::Buffer {
+        rendered_frontend_buffer_with_submission_view_at_phase(
+            app,
+            submission_view,
+            workspace_available,
+            width,
+            height,
+            SubmissionAnimationPhase::default(),
+        )
+    }
+
+    fn rendered_frontend_buffer_with_submission_view_at_phase(
+        app: &WatchApp,
+        submission_view: &SubmissionViewState,
+        workspace_available: bool,
+        width: u16,
+        height: u16,
+        submission_animation_phase: SubmissionAnimationPhase,
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut detail_layout = DetailLayout::default();
@@ -3162,6 +3257,7 @@ mod tests {
                     workspace_available,
                     FrontendOverlays {
                         submission_view: Some(submission_view),
+                        submission_animation_phase,
                         ..FrontendOverlays::default()
                     },
                 );
@@ -3594,6 +3690,286 @@ mod tests {
     }
 
     #[test]
+    fn submission_animation_phase_cycles_every_350ms() {
+        assert_eq!(
+            SUBMISSION_ANIMATION_PHASE_DURATION,
+            Duration::from_millis(350)
+        );
+        assert_eq!(
+            (0..=4)
+                .map(|index| submission_animation_phase(index).suffix())
+                .collect::<Vec<_>>(),
+            ["", ".", "..", "...", ""]
+        );
+        for (millis, expected) in [
+            (0, ""),
+            (349, ""),
+            (350, "."),
+            (699, "."),
+            (700, ".."),
+            (1049, ".."),
+            (1050, "..."),
+            (1399, "..."),
+            (1400, ""),
+        ] {
+            assert_eq!(
+                SubmissionAnimationPhase::from_elapsed(Duration::from_millis(millis)).suffix(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn submission_animation_selects_every_unfinished_effective_state_only() {
+        let current = |status| SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(status)),
+            attempt: None,
+        };
+        let unfinished = [
+            SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Submitting),
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Accepted),
+                attempt: None,
+            },
+            current(SubmissionStatus::WaitingForJudge),
+            current(SubmissionStatus::WaitingForRejudge),
+            current(SubmissionStatus::Judging),
+            current(SubmissionStatus::JudgingProgress {
+                judged: 16,
+                total: 77,
+                provisional: None,
+            }),
+            current(SubmissionStatus::JudgingProgress {
+                judged: 55,
+                total: 72,
+                provisional: Some(Verdict::RuntimeError),
+            }),
+        ];
+        for state in unfinished {
+            assert!(submission_animation_target(state), "state={state:?}");
+        }
+
+        let final_states = [
+            SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Unknown),
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::TrackingUnavailable),
+                attempt: None,
+            },
+        ];
+        for state in final_states {
+            assert!(!submission_animation_target(state), "state={state:?}");
+        }
+        for verdict in [
+            Verdict::Accepted,
+            Verdict::WrongAnswer,
+            Verdict::RuntimeError,
+            Verdict::TimeLimitExceeded,
+            Verdict::MemoryLimitExceeded,
+            Verdict::CompilationError,
+            Verdict::InternalError,
+            Verdict::QueryLimitExceeded,
+            Verdict::OutputLimitExceeded,
+        ] {
+            let state = current(SubmissionStatus::Finished(SubmissionResult::new(verdict)));
+            assert!(!submission_animation_target(state), "verdict={verdict:?}");
+        }
+    }
+
+    #[test]
+    fn receipt_animation_reserves_fixed_geometry_before_optional_metadata() {
+        let states = [
+            SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Submitting),
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForRejudge,
+                )),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Judging)),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 16,
+                        total: 77,
+                        provisional: None,
+                    },
+                )),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 55,
+                        total: 72,
+                        provisional: Some(Verdict::RuntimeError),
+                    },
+                )),
+                attempt: None,
+            },
+        ];
+
+        for state in states {
+            let mut entry = submission_history_entry(1, "B", state);
+            entry.problem_title = Some("A deliberately long receipt problem title".to_string());
+            entry.language_label = "C++23 (GCC 15.1)".to_string();
+            entry.submitted_at = Some(official_timestamp());
+            for width in 0..=100 {
+                let baseline = submission_receipt_line(
+                    "abc123",
+                    Some(&entry),
+                    width,
+                    submission_animation_phase(0),
+                );
+                for phase_index in 1..=3 {
+                    let animated = submission_receipt_line(
+                        "abc123",
+                        Some(&entry),
+                        width,
+                        submission_animation_phase(phase_index),
+                    );
+                    assert_eq!(
+                        animated.width(),
+                        baseline.width(),
+                        "state={state:?} width={width}"
+                    );
+                    assert_eq!(
+                        animated.spans.len(),
+                        baseline.spans.len(),
+                        "state={state:?} width={width}"
+                    );
+                    for (before, after) in baseline.spans.iter().zip(&animated.spans) {
+                        assert_eq!(
+                            UnicodeWidthStr::width(before.content.as_ref()),
+                            UnicodeWidthStr::width(after.content.as_ref()),
+                            "state={state:?} width={width} before={before:?} after={after:?}"
+                        );
+                        assert_eq!(before.style, after.style);
+                        if before.content != after.content {
+                            assert_eq!(before.content, "   ");
+                            assert_eq!(
+                                after.content,
+                                submission_animation_phase(phase_index).padded_suffix()
+                            );
+                        }
+                    }
+                    let separator_columns = |line: &Line<'_>| {
+                        line.to_string()
+                            .char_indices()
+                            .filter_map(|(column, character)| (character == '│').then_some(column))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(separator_columns(&animated), separator_columns(&baseline));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_animation_keeps_provisional_verdict_and_dots_semantically_colored() {
+        let state = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::JudgingProgress {
+                    judged: 55,
+                    total: 72,
+                    provisional: Some(Verdict::RuntimeError),
+                },
+            )),
+            attempt: None,
+        };
+        let entry = submission_history_entry(1, "B", state);
+        let line =
+            submission_receipt_line("abc123", Some(&entry), 80, submission_animation_phase(3));
+        assert!(line.to_string().ends_with("55/72 RE..."));
+        let style = |label: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == label)
+                .unwrap()
+                .style
+        };
+        assert_eq!(style("55/72").fg, Some(Color::Yellow));
+        assert_eq!(style("RE").fg, Some(Color::Red));
+        assert_eq!(style("...").fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn receipt_animation_narrow_fallback_preserves_problem_and_base_status() {
+        let state = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let entry = submission_history_entry(1, "B", state);
+        for phase_index in 0..4 {
+            assert_eq!(
+                submission_receipt_line(
+                    "abc123",
+                    Some(&entry),
+                    4,
+                    submission_animation_phase(phase_index),
+                )
+                .to_string(),
+                "B│WJ"
+            );
+        }
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 7, submission_animation_phase(3),)
+                .to_string(),
+            "B│WJ..."
+        );
+    }
+
+    #[test]
+    fn final_receipt_with_metrics_is_identical_in_every_animation_phase() {
+        for verdict in [Verdict::Accepted, Verdict::RuntimeError] {
+            let state = SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    SubmissionResult::with_metrics(verdict, Some(234), Some(33_348)),
+                ))),
+                attempt: None,
+            };
+            let entry = submission_history_entry(1, "B", state);
+            let baseline =
+                submission_receipt_line("abc123", Some(&entry), 100, submission_animation_phase(0));
+            for phase_index in 1..4 {
+                assert_eq!(
+                    submission_receipt_line(
+                        "abc123",
+                        Some(&entry),
+                        100,
+                        submission_animation_phase(phase_index),
+                    ),
+                    baseline
+                );
+            }
+            assert!(
+                baseline
+                    .to_string()
+                    .ends_with(&format!("{verdict} │ 234 ms │ 33348 KiB"))
+            );
+        }
+    }
+
+    #[test]
     fn submission_time_formatting_is_fallible_across_system_and_offset_boundaries() {
         let epoch = system_time_to_offset_date_time(std::time::UNIX_EPOCH)
             .expect("the Unix epoch is representable by time");
@@ -3653,36 +4029,84 @@ mod tests {
         entry.submitted_at = Some(official_timestamp());
 
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 75).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                75,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "2026-09-09 09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 64).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                64,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 56).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                56,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "09:18:25 │ E - One Time Coupon │ AC │ 234 ms │ 33348 KiB"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 48).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                48,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "09:18:25 │ E - One Time Coupon │ AC │ 234 ms"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 36).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                36,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "09:18:25 │ E - One Time Coupon │ AC"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 24).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                24,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "E - One Time Coupon │ AC"
         );
 
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 6).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                6,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "E │ AC"
         );
         assert_eq!(
-            submission_receipt_line("abc123", Some(&entry), 5).to_string(),
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                5,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string(),
             "E│AC"
         );
 
@@ -3690,9 +4114,14 @@ mod tests {
         entry.problem_title = None;
         entry.submitted_at = None;
         assert!(
-            submission_receipt_line("abc123", Some(&entry), 40)
-                .to_string()
-                .contains("abc474/E")
+            submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                40,
+                SubmissionAnimationPhase::default(),
+            )
+            .to_string()
+            .contains("abc474/E")
         );
     }
 
@@ -3716,7 +4145,13 @@ mod tests {
                 Some("2026-09-09 09:18:25".to_string())
             )
         );
-        let rendered = submission_receipt_line("abc123", Some(&entry), 100).to_string();
+        let rendered = submission_receipt_line(
+            "abc123",
+            Some(&entry),
+            100,
+            SubmissionAnimationPhase::default(),
+        )
+        .to_string();
         assert!(rendered.starts_with("2026-09-09 09:18:25 │ "));
         assert!(!rendered.contains("+0900"));
     }
@@ -3734,8 +4169,13 @@ mod tests {
             attempt: None,
         };
         let entry = submission_history_entry(1, "C", progress);
-        let line = submission_receipt_line("abc123", Some(&entry), 24);
-        assert!(line.to_string().ends_with(" │ 7/15 RE"));
+        let line = submission_receipt_line(
+            "abc123",
+            Some(&entry),
+            32,
+            SubmissionAnimationPhase::default(),
+        );
+        assert!(line.to_string().ends_with(" │ 7/15 RE   "));
         let style = |label: &str| {
             line.spans
                 .iter()
@@ -3761,7 +4201,16 @@ mod tests {
                 },
                 ..submission_history_entry(2, "B", progress)
             };
-            let line = submission_receipt_line("abc123", Some(&entry), 28);
+            let line = submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                28,
+                SubmissionAnimationPhase::default(),
+            );
+            let expected = match attempt {
+                TuiSubmissionAttemptState::Submitting => format!("{expected}   "),
+                TuiSubmissionAttemptState::Unknown => expected.to_string(),
+            };
             assert!(line.to_string().ends_with(&format!(" │ {expected}")));
             assert!(!line.to_string().contains("AC"));
         }
@@ -3814,7 +4263,12 @@ mod tests {
 
         for state in states {
             let entry = submission_history_entry(1, "B", state);
-            let line = submission_receipt_line("abc123", Some(&entry), 120);
+            let line = submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                120,
+                SubmissionAnimationPhase::default(),
+            );
             let problem = line
                 .spans
                 .iter()
@@ -3853,7 +4307,12 @@ mod tests {
         );
         entry.problem_title = Some("日本語👩‍💻問題e\u{301}の長いタイトル".to_string());
         for width in 0..=80 {
-            let line = submission_receipt_line("abc123", Some(&entry), width);
+            let line = submission_receipt_line(
+                "abc123",
+                Some(&entry),
+                width,
+                SubmissionAnimationPhase::default(),
+            );
             assert!(line.width() <= width);
             let text = line.to_string();
             assert!(!text.starts_with('│'));
@@ -3896,6 +4355,92 @@ mod tests {
     }
 
     #[test]
+    fn receipt_is_the_only_surface_changed_by_submission_animation_phase() {
+        let mut app = app();
+        app.toggle_side_pane_mode();
+        app.toggle_side_pane();
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            problems: vec![Some(waiting)],
+            history: vec![submission_history_entry(1, "B", waiting)],
+        };
+        let phase_zero = rendered_frontend_buffer_with_submission_view_at_phase(
+            &app,
+            &view,
+            false,
+            80,
+            20,
+            submission_animation_phase(0),
+        );
+        let phase_three = rendered_frontend_buffer_with_submission_view_at_phase(
+            &app,
+            &view,
+            false,
+            80,
+            20,
+            submission_animation_phase(3),
+        );
+
+        for row in 0..20 {
+            let before = buffer_row_text(&phase_zero, 0, row, 80);
+            let after = buffer_row_text(&phase_three, 0, row, 80);
+            if row == 18 {
+                assert!(before.contains("WJ   "));
+                assert!(after.contains("WJ..."));
+            } else {
+                assert_eq!(after, before, "non-footer row {row} changed");
+            }
+        }
+        let static_surfaces = buffer_symbols(&phase_three);
+        assert!(static_surfaces.contains("SUB │ A"));
+        assert!(static_surfaces.contains("B  WJ"));
+        assert!(!static_surfaces.contains("B  WJ..."));
+    }
+
+    #[test]
+    fn shortcut_help_replaces_and_suppresses_the_animated_receipt() {
+        let mut app = app();
+        app.show_shortcut_help();
+        let waiting = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let view = SubmissionViewState {
+            problems: vec![Some(waiting)],
+            history: vec![submission_history_entry(1, "B", waiting)],
+        };
+        let phase_zero = rendered_frontend_buffer_with_submission_view_at_phase(
+            &app,
+            &view,
+            false,
+            100,
+            20,
+            submission_animation_phase(0),
+        );
+        let phase_three = rendered_frontend_buffer_with_submission_view_at_phase(
+            &app,
+            &view,
+            false,
+            100,
+            20,
+            submission_animation_phase(3),
+        );
+        assert_eq!(phase_three, phase_zero);
+        let footer = buffer_row_text(&phase_three, 1, 18, 98);
+        assert!(footer.contains(": commands"));
+        assert!(footer.contains("q quit"));
+        assert!(!footer.contains("WJ"));
+        assert!(!footer.contains("..."));
+    }
+
+    #[test]
     fn footer_extreme_narrow_sizes_are_underflow_safe() {
         let app = app();
         let waiting = SubmissionDisplayState {
@@ -3927,7 +4472,13 @@ mod tests {
             let _ =
                 rendered_frontend_buffer_with_submission_view(&app, &view, false, width, height);
             assert!(
-                submission_receipt_line("abc123", view.history.last(), usize::from(width)).width()
+                submission_receipt_line(
+                    "abc123",
+                    view.history.last(),
+                    usize::from(width),
+                    SubmissionAnimationPhase::default(),
+                )
+                .width()
                     <= usize::from(width)
             );
         }

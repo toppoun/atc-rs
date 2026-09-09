@@ -291,6 +291,23 @@ fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::Sub
     submission::SubmissionViewState { problems, history }
 }
 
+fn submission_animation_visible(
+    shortcut_help_visible: bool,
+    latest_state: Option<submission::SubmissionDisplayState>,
+) -> bool {
+    !shortcut_help_visible && latest_state.is_some_and(view::submission_animation_target)
+}
+
+fn submission_animation_redraw_needed(
+    shortcut_help_visible: bool,
+    latest_state: Option<submission::SubmissionDisplayState>,
+    rendered_phase: Option<view::SubmissionAnimationPhase>,
+    current_phase: view::SubmissionAnimationPhase,
+) -> bool {
+    submission_animation_visible(shortcut_help_visible, latest_state)
+        && rendered_phase != Some(current_phase)
+}
+
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Escape
 }
@@ -3142,6 +3159,8 @@ where
     );
 
     let mut dirty = true;
+    let submission_animation_epoch = Instant::now();
+    let mut rendered_submission_animation_phase = None;
 
     let mut render_info = view::RenderInfo::default();
     let mut detail_layout = detail_layout::DetailLayout::default();
@@ -3219,6 +3238,19 @@ where
             dirty = true;
         }
 
+        let submission_animation_phase = view::SubmissionAnimationPhase::from_elapsed(
+            Instant::now().saturating_duration_since(submission_animation_epoch),
+        );
+        let latest_submission_state = submissions.history().last().map(|entry| entry.state);
+        if submission_animation_redraw_needed(
+            app.shortcut_help_visible(),
+            latest_submission_state,
+            rendered_submission_animation_phase,
+            submission_animation_phase,
+        ) {
+            dirty = true;
+        }
+
         if dirty {
             let mut next_render_info = view::RenderInfo::default();
             let render_mouse_mode = terminal.mouse_mode();
@@ -3242,6 +3274,7 @@ where
                         submission_view: Some(&submission_view),
                         editor_target_modal: editor_targets.modal(),
                         command_palette: command_palette.is_active().then_some(&command_palette),
+                        submission_animation_phase,
                     },
                 );
             })?;
@@ -3263,6 +3296,11 @@ where
             }
 
             dirty = false;
+            rendered_submission_animation_phase = submission_animation_visible(
+                app.shortcut_help_visible(),
+                submission_view.history.last().map(|entry| entry.state),
+            )
+            .then_some(submission_animation_phase);
             terminal.note_redraw_completed();
             let resize_pending = resize_event_count(&terminal_events) != 0;
             terminal.refresh_mouse_after_redraw(resize_pending)?;
@@ -5220,6 +5258,75 @@ mod tests {
                 panic!("expected run command, got User Input retirement")
             }
         }
+    }
+
+    #[test]
+    fn submission_animation_redraw_tracks_latest_unfinished_phase_and_help_visibility() {
+        let unfinished = submission::SubmissionDisplayState {
+            current: Some(submission::TuiSubmissionState::Status(
+                crate::atcoder::submission_tracking::SubmissionStatus::JudgingProgress {
+                    judged: 16,
+                    total: 77,
+                    provisional: None,
+                },
+            )),
+            attempt: None,
+        };
+        let final_state = submission::SubmissionDisplayState {
+            current: Some(submission::TuiSubmissionState::Status(
+                crate::atcoder::submission_tracking::SubmissionStatus::Finished(
+                    crate::atcoder::submission_tracking::SubmissionResult::new(
+                        crate::atcoder::submission_tracking::Verdict::Accepted,
+                    ),
+                ),
+            )),
+            attempt: None,
+        };
+        let phase_zero = view::SubmissionAnimationPhase::from_elapsed(Duration::ZERO);
+        let phase_one = view::SubmissionAnimationPhase::from_elapsed(Duration::from_millis(350));
+
+        assert!(submission_animation_visible(false, Some(unfinished)));
+        assert!(!submission_animation_redraw_needed(
+            false,
+            Some(unfinished),
+            Some(phase_zero),
+            phase_zero,
+        ));
+        assert!(submission_animation_redraw_needed(
+            false,
+            Some(unfinished),
+            Some(phase_zero),
+            phase_one,
+        ));
+        assert!(!submission_animation_redraw_needed(
+            false,
+            Some(final_state),
+            Some(phase_zero),
+            phase_one,
+        ));
+        assert!(!submission_animation_redraw_needed(
+            true,
+            Some(unfinished),
+            Some(phase_zero),
+            phase_one,
+        ));
+        assert!(!submission_animation_redraw_needed(
+            false,
+            None,
+            Some(phase_zero),
+            phase_one,
+        ));
+
+        let older_unfinished_latest_final = [unfinished, final_state];
+        assert!(!submission_animation_visible(
+            false,
+            older_unfinished_latest_final.last().copied(),
+        ));
+        let older_final_latest_unfinished = [final_state, unfinished];
+        assert!(submission_animation_visible(
+            false,
+            older_final_latest_unfinished.last().copied(),
+        ));
     }
 
     fn received_run(receiver: &Receiver<RunWorkerCommand>) -> RunRequest {

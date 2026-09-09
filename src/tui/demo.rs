@@ -461,6 +461,15 @@ impl DemoHarness {
         }
         false
     }
+
+    fn wants_animation_redraw(&self) -> bool {
+        !self.app.shortcut_help_visible()
+            && self
+                .submissions
+                .history
+                .last()
+                .is_some_and(|entry| view::submission_animation_target(entry.state))
+    }
 }
 
 fn demo_history_entry(
@@ -510,17 +519,36 @@ fn run_loop(terminal: &mut TerminaSession) -> io::Result<()> {
     let mut demo = DemoHarness::new()?;
     let mut detail_layout = DetailLayout::default();
     let mut dirty = true;
+    let submission_animation_epoch = Instant::now();
+    let mut rendered_submission_animation_phase = None;
 
     loop {
         let now = Instant::now();
         dirty |= demo.advance_scenario(now);
+        let submission_animation_phase = view::SubmissionAnimationPhase::from_elapsed(
+            now.saturating_duration_since(submission_animation_epoch),
+        );
+        if demo.wants_animation_redraw()
+            && rendered_submission_animation_phase != Some(submission_animation_phase)
+        {
+            dirty = true;
+        }
 
         if dirty {
             let render_mouse_mode = terminal.mouse_mode();
             terminal.draw(|frame| {
-                render_demo(frame, &demo, &mut detail_layout, render_mouse_mode);
+                render_demo(
+                    frame,
+                    &demo,
+                    &mut detail_layout,
+                    render_mouse_mode,
+                    submission_animation_phase,
+                );
             })?;
             dirty = false;
+            rendered_submission_animation_phase = demo
+                .wants_animation_redraw()
+                .then_some(submission_animation_phase);
             terminal.note_redraw_completed();
             terminal.refresh_mouse_after_redraw(false)?;
             terminal.retry_high_res_after_redraw(false)?;
@@ -559,6 +587,7 @@ fn render_demo(
     demo: &DemoHarness,
     detail_layout: &mut DetailLayout,
     mouse_mode: super::mouse::MouseMode,
+    submission_animation_phase: view::SubmissionAnimationPhase,
 ) {
     view::render_frontend_with_pointer(
         frame,
@@ -570,6 +599,7 @@ fn render_demo(
         false,
         view::FrontendOverlays {
             submission_view: Some(&demo.submissions),
+            submission_animation_phase,
             ..view::FrontendOverlays::default()
         },
     );
@@ -632,11 +662,37 @@ mod tests {
     use super::*;
     use crate::tui::mouse::MouseMode;
 
+    fn submission_animation_phase(index: u64) -> view::SubmissionAnimationPhase {
+        view::SubmissionAnimationPhase::from_elapsed(Duration::from_millis(350 * index))
+    }
+
     fn rendered_lines(demo: &DemoHarness, width: u16, height: u16) -> Vec<String> {
+        rendered_lines_at_phase(
+            demo,
+            width,
+            height,
+            view::SubmissionAnimationPhase::default(),
+        )
+    }
+
+    fn rendered_lines_at_phase(
+        demo: &DemoHarness,
+        width: u16,
+        height: u16,
+        submission_animation_phase: view::SubmissionAnimationPhase,
+    ) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut detail_layout = DetailLayout::default();
         terminal
-            .draw(|frame| render_demo(frame, demo, &mut detail_layout, MouseMode::Disabled))
+            .draw(|frame| {
+                render_demo(
+                    frame,
+                    demo,
+                    &mut detail_layout,
+                    MouseMode::Disabled,
+                    submission_animation_phase,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -683,6 +739,84 @@ mod tests {
         assert!(lines.iter().any(|line| {
             line.contains("B - Demo Problem B") && line.contains("C++") && line.contains("WJ")
         }));
+    }
+
+    #[test]
+    fn demo_animates_all_unfinished_receipts_and_keeps_final_receipts_static() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        let unfinished = [
+            (attempt(TuiSubmissionAttemptState::Submitting), "Submitting"),
+            (current(TuiSubmissionState::Accepted), "WJ"),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                "WJ",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForRejudge,
+                )),
+                "WR",
+            ),
+            (
+                current(TuiSubmissionState::Status(SubmissionStatus::Judging)),
+                "Judging",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 16,
+                        total: 77,
+                        provisional: None,
+                    },
+                )),
+                "16/77",
+            ),
+            (
+                current(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 55,
+                        total: 72,
+                        provisional: Some(Verdict::RuntimeError),
+                    },
+                )),
+                "55/72 RE",
+            ),
+        ];
+        for (state, label) in unfinished {
+            demo.set_selected_submission(Some(state));
+            assert!(demo.wants_animation_redraw(), "state={state:?}");
+            let phase_zero = rendered_lines_at_phase(&demo, 160, 20, submission_animation_phase(0));
+            let phase_three =
+                rendered_lines_at_phase(&demo, 160, 20, submission_animation_phase(3));
+            assert!(phase_zero[18].contains(&format!("{label}   ")));
+            assert!(phase_three[18].contains(&format!("{label}...")));
+            for row in 0..20 {
+                if row != 18 {
+                    assert_eq!(phase_three[row], phase_zero[row]);
+                }
+            }
+        }
+
+        for verdict in [Verdict::Accepted, Verdict::RuntimeError] {
+            let state = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                SubmissionResult::with_metrics(verdict, Some(234), Some(33_348)),
+            )));
+            demo.set_selected_submission(Some(state));
+            assert!(!demo.wants_animation_redraw());
+            assert_eq!(
+                rendered_lines_at_phase(&demo, 160, 20, submission_animation_phase(3)),
+                rendered_lines_at_phase(&demo, 160, 20, submission_animation_phase(0)),
+            );
+        }
+
+        demo.set_selected_submission(Some(current(TuiSubmissionState::Status(
+            SubmissionStatus::WaitingForJudge,
+        ))));
+        demo.app.show_shortcut_help();
+        assert!(!demo.wants_animation_redraw());
     }
 
     #[test]
