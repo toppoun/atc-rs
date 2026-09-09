@@ -20,7 +20,7 @@ const RESET: &str = "\x1b[0m";
 #[command(name = "atc", version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 impl Cli {
@@ -330,7 +330,7 @@ fn render_help(command_tree: &ClapCommand, color: bool) -> String {
 {gray}Fast AtCoder workflow from your terminal.{reset}
 
 Usage:
-  {command_name} [options] <command>
+  {command_name} [options] [command]
 
 {}
 
@@ -369,6 +369,13 @@ mod tests {
     use clap::{ColorChoice, error::ErrorKind};
 
     #[test]
+    fn no_subcommand_parses_as_workspace_home_dispatch() {
+        let cli = Cli::try_parse_from(["atc"]).expect("no subcommand should select Home");
+
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
     fn custom_help_matches_visible_top_level_commands_and_option_scope() {
         let mut command_tree = <Cli as CommandFactory>::command();
         command_tree.build();
@@ -394,7 +401,7 @@ mod tests {
             );
         }
 
-        assert!(help.contains("  atc [options] <command>"));
+        assert!(help.contains("  atc [options] [command]"));
         assert!(!help.contains("  atc <command> [options]"));
         assert!(help.contains("test      Run samples and the saved stress regression"));
         assert!(help.contains("init      Initialize an atc workspace"));
@@ -430,7 +437,7 @@ mod tests {
     fn parses_doctor_without_additional_arguments_or_flags() {
         let cli = Cli::try_parse_from(["atc", "doctor"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Diagnostics(DiagnosticsCommand::Doctor)
         ));
 
@@ -448,7 +455,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc", "init"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Workspace(WorkspaceCommand::Init)
         ));
         assert!(Cli::try_parse_from(["atc", "init", "extra"]).is_err());
@@ -459,7 +466,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc", "config", "init"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Configuration(ConfigurationCommand::Config {
                 command: ConfigCommand::Init,
             })
@@ -538,12 +545,6 @@ mod tests {
                 false,
             ),
             (
-                &["atc"][..],
-                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
-                2,
-                true,
-            ),
-            (
                 &["atc", "unknown"][..],
                 ErrorKind::InvalidSubcommand,
                 2,
@@ -597,7 +598,7 @@ mod tests {
     fn parses_new_contest_and_optional_language() {
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::New {
                 contest,
                 language: None,
@@ -606,7 +607,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "-l", "python"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::New {
                 contest,
                 language: Some(Language::Python),
@@ -615,7 +616,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["atc-rs", "new", "abc466", "--language", "cpp"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::New {
                 contest,
                 language: Some(Language::Cpp),
@@ -629,7 +630,7 @@ mod tests {
             Cli::try_parse_from(["atc", "refresh"]).expect("refresh without override should parse");
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: false,
@@ -640,7 +641,7 @@ mod tests {
             .expect("refresh with override should parse");
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: false,
@@ -651,7 +652,7 @@ mod tests {
             .expect("forced refresh should parse");
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
@@ -662,7 +663,7 @@ mod tests {
             .expect("forced refresh without an override should parse");
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: true,
@@ -673,7 +674,7 @@ mod tests {
             .expect("long forced refresh options should parse");
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
@@ -697,7 +698,7 @@ mod tests {
             let cli = Cli::try_parse_from(["atc-rs", "test", problem]).unwrap();
 
             assert!(matches!(
-                cli.command,
+                cli.command.unwrap(),
                 Command::RunTest(RunTestCommand::Test {
                     problem: parsed,
                     contest: None,
@@ -710,7 +711,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-l", "python"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: None,
@@ -722,7 +723,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "--debug"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: None,
@@ -736,7 +737,7 @@ mod tests {
     fn parses_submit_problem_and_optional_language() {
         let cli = Cli::try_parse_from(["atc", "submit", "A"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Submit {
                 problem,
                 contest: None,
@@ -748,7 +749,7 @@ mod tests {
         for (argument, expected) in [("cpp", Language::Cpp), ("python", Language::Python)] {
             let cli = Cli::try_parse_from(["atc", "submit", "A", "-l", argument]).unwrap();
             assert!(matches!(
-                cli.command,
+                cli.command.unwrap(),
                 Command::RunTest(RunTestCommand::Submit {
                     problem,
                     contest: None,
@@ -764,7 +765,7 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(["atc", "submit", "A", "--runtime", argument]).unwrap();
             assert!(matches!(
-                cli.command,
+                cli.command.unwrap(),
                 Command::RunTest(RunTestCommand::Submit {
                     problem,
                     contest: None,
@@ -807,7 +808,7 @@ mod tests {
     #[test]
     fn parses_stress_options() {
         let cli = Cli::try_parse_from(["atc-rs", "stress", "A"]).unwrap();
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(args.command.is_none());
@@ -825,7 +826,7 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(args.command.is_none());
@@ -846,7 +847,7 @@ mod tests {
         assert!(Cli::try_parse_from(["atc-rs", "stress", "A", "--count", "0"]).is_err());
 
         let cli = Cli::try_parse_from(["atc-rs", "stress", "A", "--forever"]).unwrap();
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(args.run.forever);
@@ -856,7 +857,7 @@ mod tests {
     #[test]
     fn parses_stress_init_and_reserves_init_as_the_first_token() {
         let cli = Cli::try_parse_from(["atc", "stress", "init", "A"]).unwrap();
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(args.run.problem.is_none());
@@ -870,7 +871,7 @@ mod tests {
 
         let cli =
             Cli::try_parse_from(["atc", "stress", "init", "a", "--contest", "abc466"]).unwrap();
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(matches!(
@@ -939,7 +940,7 @@ mod tests {
     #[test]
     fn stress_help_modes_are_unambiguous_without_reserving_help() {
         let cli = Cli::try_parse_from(["atc", "stress", "help"]).unwrap();
-        let Command::RunTest(RunTestCommand::Stress(args)) = cli.command else {
+        let Some(Command::RunTest(RunTestCommand::Stress(args))) = cli.command else {
             panic!("expected stress command");
         };
         assert!(args.command.is_none());
@@ -963,7 +964,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "create", "A"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Files(FileCommand::Create {
                 name,
                 language: None,
@@ -973,7 +974,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "create", "main", "-l", "python"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Files(FileCommand::Create {
                 name,
                 language: Some(Language::Python),
@@ -987,7 +988,7 @@ mod tests {
     fn parses_template_init_with_optional_canonical_language() {
         let cli = Cli::try_parse_from(["atc", "template", "init"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Files(FileCommand::Template {
                 command: TemplateCommand::Init { language: None },
             })
@@ -996,7 +997,7 @@ mod tests {
         for (argument, expected) in [("cpp", Language::Cpp), ("python", Language::Python)] {
             let cli = Cli::try_parse_from(["atc", "template", "init", argument]).unwrap();
             assert!(matches!(
-                cli.command,
+                cli.command.unwrap(),
                 Command::Files(FileCommand::Template {
                     command: TemplateCommand::Init {
                         language: Some(language),
@@ -1063,7 +1064,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "watch"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Watch {
                 plain: false,
                 contest: None,
@@ -1073,7 +1074,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Watch {
                 plain: true,
                 contest: None,
@@ -1083,7 +1084,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "watch", "-c", "abc466"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Watch {
                 plain: false,
                 contest: Some(contest),
@@ -1093,7 +1094,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "watch", "--plain", "-c", "abc466"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Watch {
                 plain: true,
                 contest: Some(contest),
@@ -1106,7 +1107,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "test", "A", "-c", "abc466"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::RunTest(RunTestCommand::Test {
                 problem,
                 contest: Some(contest),
@@ -1121,7 +1122,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "contest", "abc466"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Contest { contest_id })
                 if contest_id == "abc466"
         ));
@@ -1129,7 +1130,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "c", "abc471"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Contest(ContestCommand::Contest { contest_id })
                 if contest_id == "abc471"
         ));
@@ -1140,7 +1141,7 @@ mod tests {
         let cli = Cli::try_parse_from(["atc-rs", "login"]).unwrap();
 
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Account(AccountCommand::Login)
         ));
 

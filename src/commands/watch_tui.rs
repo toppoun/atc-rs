@@ -419,6 +419,32 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     watch_tui_at(&destination, cli_contest, app_context)
 }
 
+pub(crate) fn workspace_home() -> Result<(), AppError> {
+    let cwd = std::env::current_dir()?;
+    workspace_home_at_with(&cwd, |app_context, initial_location| {
+        let config = Config::load()?;
+        run_root_tui(app_context, config, initial_location)
+    })
+}
+
+fn workspace_home_at_with<T>(
+    launch_root: &Path,
+    start_root: impl FnOnce(AppContext, RootLocation) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let app_context = AppContext::from_launch_root(launch_root)?;
+    if !matches!(app_context, AppContext::Workspace { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Workspace Home requires a valid .atc-workspace.toml in the exact current directory: {}",
+                launch_root.display()
+            ),
+        )
+        .into());
+    }
+    start_root(app_context, RootLocation::WorkspaceHome)
+}
+
 pub(super) fn watch_tui_at(
     destination: &Path,
     expected_contest_id: Option<&str>,
@@ -429,17 +455,82 @@ pub(super) fn watch_tui_at(
     // workerが使うrunner設定。
     // thread開始前に読み込んでおく。
     let config = Config::load()?;
-    let mut session = Some(ContestSession::start(initial_input, &config.runner)?);
+    let session = ContestSession::start(initial_input, &config.runner)?;
+
+    run_root_tui(app_context, config, RootLocation::Contest(session))
+}
+
+enum RootLocation {
+    WorkspaceHome,
+    Contest(ContestSession),
+}
+
+fn resolve_contest_open(
+    app_context: &AppContext,
+    prepared: &Arc<Mutex<Option<PreparedWatchInput>>>,
+    contest_id: &str,
+) -> crate::tui::ContestSwitchResolution {
+    let Some(root) = app_context.workspace_root() else {
+        return crate::tui::ContestSwitchResolution::rejected(
+            None,
+            "contest switching is unavailable outside a workspace".to_string(),
+        );
+    };
+
+    match PreparedWatchInput::resolve_for_switch(root, contest_id) {
+        Ok(SwitchTargetPreparation::Existing(input)) => {
+            let destination = input.destination.clone();
+            if let Ok(mut pending) = prepared.lock() {
+                *pending = Some(input);
+            }
+            crate::tui::ContestSwitchResolution::accepted(destination)
+        }
+        Ok(SwitchTargetPreparation::Missing { destination }) => {
+            if let Ok(mut pending) = prepared.lock() {
+                *pending = None;
+            }
+            crate::tui::ContestSwitchResolution::missing(destination)
+        }
+        Ok(SwitchTargetPreparation::RepairRequired { destination }) => {
+            if let Ok(mut pending) = prepared.lock() {
+                *pending = None;
+            }
+            crate::tui::ContestSwitchResolution::repair_required(destination)
+        }
+        Err(SwitchPreparationError { destination, error }) => {
+            if let Ok(mut pending) = prepared.lock() {
+                *pending = None;
+            }
+            crate::tui::ContestSwitchResolution::rejected(destination, error.to_string())
+        }
+    }
+}
+
+fn take_prepared_open(
+    prepared: &Arc<Mutex<Option<PreparedWatchInput>>>,
+) -> Result<PreparedWatchInput, String> {
+    prepared
+        .lock()
+        .map_err(|_| "prepared contest open state is poisoned".to_string())?
+        .take()
+        .ok_or_else(|| "contest open did not retain its validated prepared contest".to_string())
+}
+
+fn run_root_tui(
+    app_context: AppContext,
+    config: Config,
+    mut location: RootLocation,
+) -> Result<(), AppError> {
     let mut submissions = crate::tui::SubmissionHub::new();
 
     let mut terminal = match crate::tui::TerminaSession::start() {
         Ok(terminal) => terminal,
 
         Err(error) => {
-            let session_result = session
-                .take()
-                .expect("initial contest session must exist")
-                .shutdown();
+            let session_result = match location {
+                RootLocation::WorkspaceHome => Ok(()),
+                RootLocation::Contest(session) => session.shutdown(),
+            };
 
             return combine_primary_and_cleanup_results(
                 Err(error),
@@ -451,10 +542,45 @@ pub(super) fn watch_tui_at(
 
     let mut preferences = crate::tui::FrontendPreferences::default();
     let prepared_switch = Arc::new(Mutex::new(None));
+    let prepared_home_open = Arc::new(Mutex::new(None));
     let prepared_refresh = Arc::new(Mutex::new(None));
-    let switch_task = contest_switch_task(&app_context, Arc::clone(&prepared_switch));
+    let switch_task = contest_open_task(&app_context, Arc::clone(&prepared_switch));
+    let home_open_task = contest_open_task(&app_context, Arc::clone(&prepared_home_open));
     let mut refresh_frontend_state = None;
     let result = loop {
+        if matches!(location, RootLocation::WorkspaceHome) {
+            match prepared_home_open.lock() {
+                Ok(mut pending) => *pending = None,
+                Err(_) => {
+                    break Err(io::Error::other("prepared contest open state is poisoned"));
+                }
+            }
+            let resolver_prepared = Arc::clone(&prepared_home_open);
+            let mut resolve = |contest_id: &str| {
+                resolve_contest_open(&app_context, &resolver_prepared, contest_id)
+            };
+            let start_prepared = Arc::clone(&prepared_home_open);
+            let runner_config = &config.runner;
+            match crate::tui::run_home(
+                &mut terminal,
+                &mut resolve,
+                Arc::clone(&home_open_task),
+                || {
+                    let prepared = take_prepared_open(&start_prepared)?;
+                    ContestSession::start(prepared, runner_config)
+                        .map_err(|error| error.to_string())
+                },
+            ) {
+                Err(error) => break Err(error),
+                Ok(crate::tui::HomeExit::Quit) => break Ok(()),
+                Ok(crate::tui::HomeExit::Contest(session)) => {
+                    location = RootLocation::Contest(session);
+                    refresh_frontend_state = None;
+                    continue;
+                }
+            }
+        }
+
         match prepared_switch.lock() {
             Ok(mut pending) => *pending = None,
             Err(_) => {
@@ -469,9 +595,9 @@ pub(super) fn watch_tui_at(
                 break Err(io::Error::other("prepared refresh state is poisoned"));
             }
         }
-        let active_session = session
-            .as_mut()
-            .expect("an active contest session must exist while the frontend is running");
+        let RootLocation::Contest(active_session) = &mut location else {
+            unreachable!("Workspace Home is handled before the contest frontend")
+        };
         let refresh_task = contest_refresh_task(
             active_session.input.destination.clone(),
             active_session.input.contest.contest_id.clone(),
@@ -481,45 +607,7 @@ pub(super) fn watch_tui_at(
         let resolver_prepared = Arc::clone(&prepared_switch);
         let frontend = crate::tui::SessionFrontend::new(
             refresh_frontend_state.take(),
-            |contest_id: &str| {
-                let Some(root) = app_context.workspace_root() else {
-                    return crate::tui::ContestSwitchResolution::rejected(
-                        None,
-                        "contest switching is unavailable outside a workspace".to_string(),
-                    );
-                };
-
-                match PreparedWatchInput::resolve_for_switch(root, contest_id) {
-                    Ok(SwitchTargetPreparation::Existing(prepared)) => {
-                        let destination = prepared.destination.clone();
-                        if let Ok(mut pending) = resolver_prepared.lock() {
-                            *pending = Some(prepared);
-                        }
-                        crate::tui::ContestSwitchResolution::accepted(destination)
-                    }
-                    Ok(SwitchTargetPreparation::Missing { destination }) => {
-                        if let Ok(mut pending) = resolver_prepared.lock() {
-                            *pending = None;
-                        }
-                        crate::tui::ContestSwitchResolution::missing(destination)
-                    }
-                    Ok(SwitchTargetPreparation::RepairRequired { destination }) => {
-                        if let Ok(mut pending) = resolver_prepared.lock() {
-                            *pending = None;
-                        }
-                        crate::tui::ContestSwitchResolution::repair_required(destination)
-                    }
-                    Err(SwitchPreparationError { destination, error }) => {
-                        if let Ok(mut pending) = resolver_prepared.lock() {
-                            *pending = None;
-                        }
-                        crate::tui::ContestSwitchResolution::rejected(
-                            destination,
-                            error.to_string(),
-                        )
-                    }
-                }
-            },
+            |contest_id: &str| resolve_contest_open(&app_context, &resolver_prepared, contest_id),
             Arc::clone(&switch_task),
             refresh_task,
             refresh_check,
@@ -552,16 +640,18 @@ pub(super) fn watch_tui_at(
                         ));
                     }
                 };
-                let old_session = session
-                    .take()
-                    .expect("the old contest session must still exist before switching");
+                let RootLocation::Contest(old_session) =
+                    std::mem::replace(&mut location, RootLocation::WorkspaceHome)
+                else {
+                    unreachable!("contest switch requires the active contest session")
+                };
                 if let Err(error) = old_session.shutdown() {
                     break Err(error);
                 }
 
                 match ContestSession::start(prepared, &config.runner) {
                     Ok(new_session) => {
-                        session = Some(new_session);
+                        location = RootLocation::Contest(new_session);
                         refresh_frontend_state = None;
                     }
                     Err(error) => break Err(error),
@@ -583,9 +673,9 @@ pub(super) fn watch_tui_at(
                 };
                 let refresh_destination = prepared.destination().to_path_buf();
                 let refresh_contest_id = prepared.contest_id().to_string();
-                let active_session = session
-                    .as_ref()
-                    .expect("the old contest session must still exist before refresh");
+                let RootLocation::Contest(active_session) = &location else {
+                    unreachable!("contest refresh requires the active contest session")
+                };
                 if active_session.input.destination != refresh_destination
                     || active_session.input.contest.contest_id != refresh_contest_id
                 {
@@ -595,9 +685,11 @@ pub(super) fn watch_tui_at(
                     ));
                 }
 
-                let old_session = session
-                    .take()
-                    .expect("the old contest session must still exist before refresh");
+                let RootLocation::Contest(old_session) =
+                    std::mem::replace(&mut location, RootLocation::WorkspaceHome)
+                else {
+                    unreachable!("contest refresh requires the active contest session")
+                };
                 let rebuilt = rebuild_contest_session_after_refresh(
                     old_session,
                     prepared,
@@ -618,7 +710,7 @@ pub(super) fn watch_tui_at(
                 );
                 match rebuilt {
                     Ok(rebuilt) => {
-                        session = Some(rebuilt.session);
+                        location = RootLocation::Contest(rebuilt.session);
                         refresh_frontend_state = Some(rebuilt.frontend_state);
                     }
                     Err(error) => break Err(error),
@@ -628,7 +720,7 @@ pub(super) fn watch_tui_at(
     };
 
     // sample/stress実行中だった場合、runnerまでcancelを先に伝える。
-    if let Some(session) = session.as_ref() {
+    if let RootLocation::Contest(session) = &location {
         session.request_stop();
     }
     // Submission workers outlive contest sessions, but the whole-TUI exit owns their stop.
@@ -638,9 +730,9 @@ pub(super) fn watch_tui_at(
     let mouse_trace_line = terminal.mouse_trace_line();
     let cleanup = run_tui_cleanup(
         || submissions.shutdown(),
-        || match session.take() {
-            Some(session) => session.shutdown(),
-            None => Ok(()),
+        || match std::mem::replace(&mut location, RootLocation::WorkspaceHome) {
+            RootLocation::Contest(session) => session.shutdown(),
+            RootLocation::WorkspaceHome => Ok(()),
         },
         || terminal.restore(),
     );
@@ -785,7 +877,7 @@ impl PreparedWatchInput {
     }
 }
 
-fn contest_switch_task(
+fn contest_open_task(
     app_context: &AppContext,
     prepared_switch: Arc<Mutex<Option<PreparedWatchInput>>>,
 ) -> crate::tui::ContestSwitchTask {
@@ -1352,6 +1444,98 @@ mod tests {
             "version = 1\npaths = []\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn exact_workspace_root_dispatches_home_after_validation() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let started = std::cell::Cell::new(false);
+
+        let context = workspace_home_at_with(root.path(), |context, location| {
+            started.set(true);
+            assert!(matches!(location, RootLocation::WorkspaceHome));
+            Ok(context)
+        })
+        .unwrap();
+
+        assert!(started.get());
+        assert_eq!(
+            context,
+            AppContext::Workspace {
+                root: root.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn missing_exact_workspace_rejects_home_before_root_or_terminal_start() {
+        let root = tempfile::tempdir().unwrap();
+        let started = std::cell::Cell::new(false);
+
+        let error = workspace_home_at_with(root.path(), |_, _| {
+            started.set(true);
+            Ok(())
+        })
+        .expect_err("standalone launch must not enter the root TUI");
+
+        assert!(!started.get());
+        assert!(error.to_string().contains("exact current directory"));
+    }
+
+    #[test]
+    fn parent_workspace_is_not_searched_for_home_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let started = std::cell::Cell::new(false);
+
+        let error = workspace_home_at_with(&child, |_, _| {
+            started.set(true);
+            Ok(())
+        })
+        .expect_err("a parent marker must not authorize child-directory Home");
+
+        assert!(!started.get());
+        assert!(error.to_string().contains("exact current directory"));
+    }
+
+    #[test]
+    fn invalid_exact_workspace_marker_fails_before_root_or_terminal_start() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".atc-workspace.toml"), "invalid").unwrap();
+        let started = std::cell::Cell::new(false);
+
+        let error = workspace_home_at_with(root.path(), |_, _| {
+            started.set(true);
+            Ok(())
+        })
+        .expect_err("invalid exact marker must remain a hard validation error");
+
+        assert!(!started.get());
+        assert!(error.to_string().contains("workspace config"));
+    }
+
+    #[test]
+    fn neutral_open_resolution_retains_prepared_watch_input_for_home_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let destination = root.path().join("abc473");
+        save_healthy_contest(&destination, "abc473");
+        let context = AppContext::from_launch_root(root.path()).unwrap();
+        let prepared = Arc::new(Mutex::new(None));
+
+        let resolution = resolve_contest_open(&context, &prepared, "abc473");
+        assert_eq!(
+            resolution.destination.as_deref(),
+            Some(destination.as_path())
+        );
+        assert!(resolution.error.is_none());
+
+        let prepared = take_prepared_open(&prepared).expect("healthy Home target must be retained");
+        assert_eq!(prepared.destination, destination);
+        assert_eq!(prepared.contest.contest_id, "abc473");
     }
 
     fn repair_request(contest_id: &str, destination: PathBuf) -> crate::tui::ContestSwitchRequest {

@@ -1394,7 +1394,7 @@ pub(super) fn render_frontend_with_pointer(
     if let Some(modal) = overlays.refresh_modal {
         render_refresh_contest_modal(frame, modal);
     } else if let Some(modal) = overlays.switch_modal {
-        render_switch_contest_modal(frame, modal);
+        render_contest_open_modal(frame, modal, ContestOpenPurpose::Switch);
     } else if let Some(modal) = overlays.source_modal {
         render_open_source_modal(frame, app, modal);
     } else if let Some(modal) = overlays.submit_modal {
@@ -2066,7 +2066,17 @@ fn render_command_palette(
     );
 }
 
-fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContestOpenPurpose {
+    Open,
+    Switch,
+}
+
+pub(super) fn render_contest_open_modal(
+    frame: &mut Frame,
+    modal: &SwitchContestModal,
+    purpose: ContestOpenPurpose,
+) {
     let frame_area = frame.area();
     let width = frame_area.width.min(76);
     let height = frame_area.height.min(16);
@@ -2106,15 +2116,26 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
                 ));
             }
             lines.push(Line::raw(""));
-            let action = match modal.target {
-                Some(super::ContestSwitchTarget::Missing) => {
+            let action = match (purpose, modal.target) {
+                (ContestOpenPurpose::Open, Some(super::ContestSwitchTarget::Missing)) => {
+                    "[Enter] Create & Open   [Esc] Cancel"
+                }
+                (ContestOpenPurpose::Open, Some(super::ContestSwitchTarget::RepairRequired)) => {
+                    "[Enter] Repair & Open   [Esc] Cancel"
+                }
+                (ContestOpenPurpose::Open, Some(super::ContestSwitchTarget::Existing)) => {
+                    "[Enter] Open   [Esc] Cancel"
+                }
+                (ContestOpenPurpose::Switch, Some(super::ContestSwitchTarget::Missing)) => {
                     "[Enter] Create & Switch   [Esc] Cancel"
                 }
-                Some(super::ContestSwitchTarget::RepairRequired) => {
+                (ContestOpenPurpose::Switch, Some(super::ContestSwitchTarget::RepairRequired)) => {
                     "[Enter] Repair & Switch   [Esc] Cancel"
                 }
-                Some(super::ContestSwitchTarget::Existing) => "[Enter] Switch   [Esc] Cancel",
-                None => "[Esc] Cancel",
+                (ContestOpenPurpose::Switch, Some(super::ContestSwitchTarget::Existing)) => {
+                    "[Enter] Switch   [Esc] Cancel"
+                }
+                (_, None) => "[Esc] Cancel",
             };
             lines.push(Line::raw(action));
         }
@@ -2139,9 +2160,18 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
         }
         SwitchContestModalState::Failed => {
             lines.push(Line::raw(""));
-            let failure = match modal.mutation {
-                Some(super::ContestSwitchMutation::Repair) => "Repair & Switch failed:",
-                _ => "Create & Switch failed:",
+            let failure = match (purpose, modal.mutation) {
+                (ContestOpenPurpose::Open, Some(super::ContestSwitchMutation::Repair)) => {
+                    "Repair & Open failed:"
+                }
+                (ContestOpenPurpose::Open, Some(super::ContestSwitchMutation::Create)) => {
+                    "Create & Open failed:"
+                }
+                (ContestOpenPurpose::Open, None) => "Open failed:",
+                (ContestOpenPurpose::Switch, Some(super::ContestSwitchMutation::Repair)) => {
+                    "Repair & Switch failed:"
+                }
+                (ContestOpenPurpose::Switch, _) => "Create & Switch failed:",
             };
             lines.push(Line::styled(failure, Style::default().fg(Color::Red)));
             if let Some(error) = modal.error.as_deref() {
@@ -2155,12 +2185,12 @@ fn render_switch_contest_modal(frame: &mut Frame, modal: &SwitchContestModal) {
         }
     }
     let text = Text::from(lines);
+    let title = match purpose {
+        ContestOpenPurpose::Open => " Open Contest ",
+        ContestOpenPurpose::Switch => " Switch Contest ",
+    };
     let modal = Paragraph::new(text)
-        .block(
-            Block::default()
-                .title(" Switch Contest ")
-                .borders(Borders::ALL),
-        )
+        .block(Block::default().title(title).borders(Borders::ALL))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, area);

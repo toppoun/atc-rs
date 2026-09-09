@@ -5,6 +5,7 @@ mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
+mod home;
 pub mod message;
 mod mouse;
 pub mod reporter;
@@ -36,6 +37,7 @@ pub(crate) use detail_layout::{
     DetailAnalysisResult as SessionDetailAnalysisResult,
 };
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
+pub(crate) use home::{HomeExit, run as run_home};
 use message::{Message, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
@@ -1656,12 +1658,12 @@ struct ActiveContestOperation {
     handle: JoinHandle<()>,
 }
 
-struct ContestSwitchOperation {
+struct ContestOpenOperation {
     task: ContestSwitchTask,
     active: Option<ActiveContestOperation>,
 }
 
-impl ContestSwitchOperation {
+impl ContestOpenOperation {
     fn new(task: ContestSwitchTask) -> Self {
         Self { task, active: None }
     }
@@ -1730,7 +1732,7 @@ impl ContestSwitchOperation {
     }
 }
 
-impl Drop for ContestSwitchOperation {
+impl Drop for ContestOpenOperation {
     fn drop(&mut self) {
         let _ = self.join_active();
     }
@@ -1754,47 +1756,33 @@ enum ContestSwitchKeyResult {
     SwitchRequested,
 }
 
-struct ContestSwitchController<'a> {
-    workspace_available: bool,
-    current_destination: &'a Path,
-    modal: Option<SwitchContestModal>,
-    resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
-    same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
-    operation: ContestSwitchOperation,
-    switch_requested: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContestOpenKeyResult {
+    NotHandled,
+    Handled,
+    OpenRequested,
 }
 
-impl<'a> ContestSwitchController<'a> {
-    fn new(
-        context: &AppContext,
-        current_destination: &'a Path,
-        resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
-        switch_task: ContestSwitchTask,
-    ) -> Self {
-        Self::new_with_identity_check(
-            context,
-            current_destination,
-            resolve,
-            switch_task,
-            existing_destinations_have_same_identity,
-        )
-    }
+/// Contest-independent ID input, resolution, create/repair, progress, and failure flow.
+/// Contest switching adds active-contest policy in the thin wrapper below; Workspace Home uses
+/// this controller directly and therefore never needs a synthetic current contest.
+struct ContestOpenController<'a> {
+    modal: Option<SwitchContestModal>,
+    resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+    operation: ContestOpenOperation,
+    open_requested: bool,
+}
 
-    fn new_with_identity_check(
-        context: &AppContext,
-        current_destination: &'a Path,
+impl<'a> ContestOpenController<'a> {
+    fn new(
         resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
-        switch_task: ContestSwitchTask,
-        same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
+        task: ContestSwitchTask,
     ) -> Self {
         Self {
-            workspace_available: context.workspace_root().is_some(),
-            current_destination,
             modal: None,
             resolve,
-            same_existing_destination,
-            operation: ContestSwitchOperation::new(switch_task),
-            switch_requested: false,
+            operation: ContestOpenOperation::new(task),
+            open_requested: false,
         }
     }
 
@@ -1807,7 +1795,7 @@ impl<'a> ContestSwitchController<'a> {
     }
 
     fn open(&mut self) -> bool {
-        if !self.workspace_available || self.modal_active() {
+        if self.modal_active() {
             return false;
         }
         self.modal = Some(SwitchContestModal::default());
@@ -1820,38 +1808,14 @@ impl<'a> ContestSwitchController<'a> {
             .is_some_and(|modal| !modal.state.is_running())
     }
 
-    fn normalize_resolution(
-        &self,
-        mut resolution: ContestSwitchResolution,
-    ) -> ContestSwitchResolution {
-        if resolution.target == Some(ContestSwitchTarget::RepairRequired)
-            && let Some(destination) = resolution.destination.as_deref()
-        {
-            match (self.same_existing_destination)(destination, self.current_destination) {
-                Ok(true) => {
-                    resolution.target = None;
-                    resolution.error = Some(
-                        "Cannot repair the active contest from Switch Contest yet.".to_string(),
-                    );
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    resolution.target = None;
-                    resolution.error = Some(format!(
-                        "Cannot determine whether the repair target is the active contest: {error}"
-                    ));
-                }
-            }
-        }
-        resolution
-    }
-
-    fn refresh_resolution(&mut self) {
+    fn refresh_resolution(
+        &mut self,
+        normalize: &mut dyn FnMut(ContestSwitchResolution) -> ContestSwitchResolution,
+    ) {
         let Some(contest_id) = self.modal.as_ref().map(|modal| modal.contest_id.clone()) else {
             return;
         };
-        let resolution = (self.resolve)(&contest_id);
-        let resolution = self.normalize_resolution(resolution);
+        let resolution = normalize((self.resolve)(&contest_id));
         let modal = self.modal.as_mut().expect("modal must still exist");
         modal.mutation = None;
         Self::apply_resolution(modal, resolution);
@@ -1863,7 +1827,10 @@ impl<'a> ContestSwitchController<'a> {
         modal.target = resolution.target;
     }
 
-    fn refresh_resolution_for_confirmation(&mut self) -> bool {
+    fn refresh_resolution_for_confirmation(
+        &mut self,
+        normalize: &mut dyn FnMut(ContestSwitchResolution) -> ContestSwitchResolution,
+    ) -> bool {
         let Some(modal) = self.modal.as_ref() else {
             return false;
         };
@@ -1873,8 +1840,7 @@ impl<'a> ContestSwitchController<'a> {
         let displayed_target = modal.target;
         let retrying = modal.state == SwitchContestModalState::Failed;
 
-        let resolution = (self.resolve)(&contest_id);
-        let resolution = self.normalize_resolution(resolution);
+        let resolution = normalize((self.resolve)(&contest_id));
         let unchanged = displayed_destination == resolution.destination
             && displayed_target == resolution.target
             && (retrying || displayed_error == resolution.error);
@@ -1908,139 +1874,135 @@ impl<'a> ContestSwitchController<'a> {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> ContestSwitchKeyResult {
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        normalize: &mut dyn FnMut(ContestSwitchResolution) -> ContestSwitchResolution,
+        is_current_destination: &mut dyn FnMut(&Path) -> bool,
+    ) -> ContestOpenKeyResult {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return if self.modal_active() {
-                ContestSwitchKeyResult::Handled
+                ContestOpenKeyResult::Handled
             } else {
-                ContestSwitchKeyResult::NotHandled
+                ContestOpenKeyResult::NotHandled
             };
         }
 
-        if self.modal_active() {
-            if self
-                .modal
-                .as_ref()
-                .is_some_and(|modal| modal.state.is_running())
-            {
-                return ContestSwitchKeyResult::Handled;
-            }
-            if self
-                .modal
-                .as_ref()
-                .is_some_and(|modal| modal.state == SwitchContestModalState::Failed)
-                && !matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Escape | KeyCode::Backspace | KeyCode::Char(_)
-                )
-            {
-                return ContestSwitchKeyResult::Handled;
-            }
+        if !self.modal_active() {
+            return ContestOpenKeyResult::NotHandled;
+        }
+        if self
+            .modal
+            .as_ref()
+            .is_some_and(|modal| modal.state.is_running())
+        {
+            return ContestOpenKeyResult::Handled;
+        }
+        if self
+            .modal
+            .as_ref()
+            .is_some_and(|modal| modal.state == SwitchContestModalState::Failed)
+            && !matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Escape | KeyCode::Backspace | KeyCode::Char(_)
+            )
+        {
+            return ContestOpenKeyResult::Handled;
+        }
 
-            match key.code {
-                KeyCode::Escape if key.kind == KeyEventKind::Press => {
+        match key.code {
+            KeyCode::Escape if key.kind == KeyEventKind::Press => {
+                self.modal = None;
+            }
+            KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                if !self.refresh_resolution_for_confirmation(normalize) {
+                    return ContestOpenKeyResult::Handled;
+                }
+                let accepted_destination = self.modal.as_ref().and_then(|modal| {
+                    modal
+                        .target
+                        .filter(|_| modal.error.is_none())
+                        .and(modal.destination.as_deref())
+                });
+                if accepted_destination.is_some_and(is_current_destination) {
                     self.modal = None;
-                }
-                KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                    if !self.refresh_resolution_for_confirmation() {
-                        return ContestSwitchKeyResult::Handled;
-                    }
-                    let accepted_destination = self.modal.as_ref().and_then(|modal| {
-                        modal
-                            .target
-                            .filter(|_| modal.error.is_none())
-                            .and(modal.destination.as_deref())
-                    });
-                    if accepted_destination == Some(self.current_destination) {
-                        self.modal = None;
-                    } else if accepted_destination.is_some() {
-                        match self.modal.as_ref().and_then(|modal| modal.target) {
-                            Some(ContestSwitchTarget::Existing) => {
-                                self.switch_requested = true;
-                                return ContestSwitchKeyResult::SwitchRequested;
-                            }
-                            Some(ContestSwitchTarget::Missing) => {
-                                let modal = self.modal.as_ref().expect("modal must exist");
-                                let request = ContestSwitchRequest {
-                                    mutation: ContestSwitchMutation::Create,
-                                    contest_id: modal.contest_id.clone(),
-                                    destination: modal
-                                        .destination
-                                        .clone()
-                                        .expect("missing target must have a destination"),
-                                };
-                                match self.operation.start(request) {
-                                    Ok(()) => {
-                                        let modal = self.modal.as_mut().expect("modal must exist");
-                                        modal.state = SwitchContestModalState::Creating;
-                                        modal.error = None;
-                                        modal.mutation = Some(ContestSwitchMutation::Create);
-                                    }
-                                    Err(error) => {
-                                        let modal = self.modal.as_mut().expect("modal must exist");
-                                        modal.state = SwitchContestModalState::Failed;
-                                        modal.error = Some(error.to_string());
-                                        modal.mutation = Some(ContestSwitchMutation::Create);
-                                    }
-                                }
-                            }
-                            Some(ContestSwitchTarget::RepairRequired) => {
-                                let modal = self.modal.as_ref().expect("modal must exist");
-                                let request = ContestSwitchRequest {
-                                    mutation: ContestSwitchMutation::Repair,
-                                    contest_id: modal.contest_id.clone(),
-                                    destination: modal
-                                        .destination
-                                        .clone()
-                                        .expect("repair target must have a destination"),
-                                };
-                                match self.operation.start(request) {
-                                    Ok(()) => {
-                                        let modal = self.modal.as_mut().expect("modal must exist");
-                                        modal.state = SwitchContestModalState::Repairing;
-                                        modal.error = None;
-                                        modal.mutation = Some(ContestSwitchMutation::Repair);
-                                    }
-                                    Err(error) => {
-                                        let modal = self.modal.as_mut().expect("modal must exist");
-                                        modal.state = SwitchContestModalState::Failed;
-                                        modal.error = Some(error.to_string());
-                                        modal.mutation = Some(ContestSwitchMutation::Repair);
-                                    }
-                                }
-                            }
-                            None => {}
+                } else if accepted_destination.is_some() {
+                    match self.modal.as_ref().and_then(|modal| modal.target) {
+                        Some(ContestSwitchTarget::Existing) => {
+                            self.open_requested = true;
+                            return ContestOpenKeyResult::OpenRequested;
                         }
+                        Some(ContestSwitchTarget::Missing) => {
+                            let modal = self.modal.as_ref().expect("modal must exist");
+                            let request = ContestSwitchRequest {
+                                mutation: ContestSwitchMutation::Create,
+                                contest_id: modal.contest_id.clone(),
+                                destination: modal
+                                    .destination
+                                    .clone()
+                                    .expect("missing target must have a destination"),
+                            };
+                            match self.operation.start(request) {
+                                Ok(()) => {
+                                    let modal = self.modal.as_mut().expect("modal must exist");
+                                    modal.state = SwitchContestModalState::Creating;
+                                    modal.error = None;
+                                    modal.mutation = Some(ContestSwitchMutation::Create);
+                                }
+                                Err(error) => {
+                                    let modal = self.modal.as_mut().expect("modal must exist");
+                                    modal.state = SwitchContestModalState::Failed;
+                                    modal.error = Some(error.to_string());
+                                    modal.mutation = Some(ContestSwitchMutation::Create);
+                                }
+                            }
+                        }
+                        Some(ContestSwitchTarget::RepairRequired) => {
+                            let modal = self.modal.as_ref().expect("modal must exist");
+                            let request = ContestSwitchRequest {
+                                mutation: ContestSwitchMutation::Repair,
+                                contest_id: modal.contest_id.clone(),
+                                destination: modal
+                                    .destination
+                                    .clone()
+                                    .expect("repair target must have a destination"),
+                            };
+                            match self.operation.start(request) {
+                                Ok(()) => {
+                                    let modal = self.modal.as_mut().expect("modal must exist");
+                                    modal.state = SwitchContestModalState::Repairing;
+                                    modal.error = None;
+                                    modal.mutation = Some(ContestSwitchMutation::Repair);
+                                }
+                                Err(error) => {
+                                    let modal = self.modal.as_mut().expect("modal must exist");
+                                    modal.state = SwitchContestModalState::Failed;
+                                    modal.error = Some(error.to_string());
+                                    modal.mutation = Some(ContestSwitchMutation::Repair);
+                                }
+                            }
+                        }
+                        None => {}
                     }
                 }
-                KeyCode::Backspace => {
-                    self.resume_editing();
-                    self.remove_last_grapheme();
-                    self.refresh_resolution();
-                }
-                KeyCode::Char(character)
-                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-                {
-                    self.resume_editing();
-                    if let Some(modal) = self.modal.as_mut() {
-                        modal.contest_id.push(character);
-                    }
-                    self.refresh_resolution();
-                }
-                _ => {}
             }
-            return ContestSwitchKeyResult::Handled;
-        }
-
-        if FrontendAction::from_shortcut(key) == Some(FrontendAction::SwitchContest) {
-            if self.open() {
-                ContestSwitchKeyResult::Handled
-            } else {
-                ContestSwitchKeyResult::NotHandled
+            KeyCode::Backspace => {
+                self.resume_editing();
+                self.remove_last_grapheme();
+                self.refresh_resolution(normalize);
             }
-        } else {
-            ContestSwitchKeyResult::NotHandled
+            KeyCode::Char(character)
+                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
+            {
+                self.resume_editing();
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.contest_id.push(character);
+                }
+                self.refresh_resolution(normalize);
+            }
+            _ => {}
         }
+        ContestOpenKeyResult::Handled
     }
 
     fn handle_operation_messages(&mut self) -> bool {
@@ -2056,20 +2018,182 @@ impl<'a> ContestSwitchController<'a> {
                     }
                 }
                 Some(ContestOperationMessage::Finished(Ok(()))) => {
-                    self.switch_requested = true;
+                    self.open_requested = true;
                     changed = true;
                     break;
                 }
                 Some(ContestOperationMessage::Finished(Err(error))) => {
-                    if let Some(modal) = self.modal.as_mut() {
-                        modal.state = SwitchContestModalState::Failed;
-                        modal.error = Some(error);
-                    }
+                    self.fail_open(error);
                     changed = true;
                     break;
                 }
                 None => break,
             }
+        }
+        changed
+    }
+
+    fn fail_open(&mut self, error: String) {
+        self.open_requested = false;
+        if let Some(modal) = self.modal.as_mut() {
+            modal.state = SwitchContestModalState::Failed;
+            modal.error = Some(error);
+        }
+    }
+}
+
+struct ContestSwitchController<'a> {
+    workspace_available: bool,
+    current_destination: &'a Path,
+    same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
+    open_contest: ContestOpenController<'a>,
+    switch_requested: bool,
+}
+
+impl<'a> std::ops::Deref for ContestSwitchController<'a> {
+    type Target = ContestOpenController<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.open_contest
+    }
+}
+
+impl std::ops::DerefMut for ContestSwitchController<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.open_contest
+    }
+}
+
+impl<'a> ContestSwitchController<'a> {
+    fn new(
+        context: &AppContext,
+        current_destination: &'a Path,
+        resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+        switch_task: ContestSwitchTask,
+    ) -> Self {
+        Self::new_with_identity_check(
+            context,
+            current_destination,
+            resolve,
+            switch_task,
+            existing_destinations_have_same_identity,
+        )
+    }
+
+    fn new_with_identity_check(
+        context: &AppContext,
+        current_destination: &'a Path,
+        resolve: &'a mut dyn FnMut(&str) -> ContestSwitchResolution,
+        switch_task: ContestSwitchTask,
+        same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
+    ) -> Self {
+        Self {
+            workspace_available: context.workspace_root().is_some(),
+            current_destination,
+            same_existing_destination,
+            open_contest: ContestOpenController::new(resolve, switch_task),
+            switch_requested: false,
+        }
+    }
+
+    fn modal(&self) -> Option<&SwitchContestModal> {
+        self.open_contest.modal()
+    }
+
+    fn modal_active(&self) -> bool {
+        self.open_contest.modal_active()
+    }
+
+    fn open(&mut self) -> bool {
+        if !self.workspace_available {
+            return false;
+        }
+        self.open_contest.open()
+    }
+
+    fn escape_dismisses_modal(&self) -> bool {
+        self.open_contest.escape_dismisses_modal()
+    }
+
+    fn normalize_resolution_for_switch(
+        mut resolution: ContestSwitchResolution,
+        current_destination: &Path,
+        same_existing_destination: fn(&Path, &Path) -> io::Result<bool>,
+    ) -> ContestSwitchResolution {
+        if resolution.target == Some(ContestSwitchTarget::RepairRequired)
+            && let Some(destination) = resolution.destination.as_deref()
+        {
+            match same_existing_destination(destination, current_destination) {
+                Ok(true) => {
+                    resolution.target = None;
+                    resolution.error = Some(
+                        "Cannot repair the active contest from Switch Contest yet.".to_string(),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    resolution.target = None;
+                    resolution.error = Some(format!(
+                        "Cannot determine whether the repair target is the active contest: {error}"
+                    ));
+                }
+            }
+        }
+        resolution
+    }
+
+    #[cfg(test)]
+    fn refresh_resolution(&mut self) {
+        let current_destination = self.current_destination;
+        let same_existing_destination = self.same_existing_destination;
+        let mut normalize = |resolution| {
+            Self::normalize_resolution_for_switch(
+                resolution,
+                current_destination,
+                same_existing_destination,
+            )
+        };
+        self.open_contest.refresh_resolution(&mut normalize);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ContestSwitchKeyResult {
+        if !self.modal_active() {
+            return if FrontendAction::from_shortcut(key) == Some(FrontendAction::SwitchContest)
+                && self.open()
+            {
+                ContestSwitchKeyResult::Handled
+            } else {
+                ContestSwitchKeyResult::NotHandled
+            };
+        }
+
+        let current_destination = self.current_destination;
+        let same_existing_destination = self.same_existing_destination;
+        let mut normalize = |resolution| {
+            Self::normalize_resolution_for_switch(
+                resolution,
+                current_destination,
+                same_existing_destination,
+            )
+        };
+        let mut is_current = |destination: &Path| destination == current_destination;
+        match self
+            .open_contest
+            .handle_key(key, &mut normalize, &mut is_current)
+        {
+            ContestOpenKeyResult::NotHandled => ContestSwitchKeyResult::NotHandled,
+            ContestOpenKeyResult::Handled => ContestSwitchKeyResult::Handled,
+            ContestOpenKeyResult::OpenRequested => {
+                self.switch_requested = true;
+                ContestSwitchKeyResult::SwitchRequested
+            }
+        }
+    }
+
+    fn handle_operation_messages(&mut self) -> bool {
+        let changed = self.open_contest.handle_operation_messages();
+        if self.open_contest.open_requested {
+            self.switch_requested = true;
         }
         changed
     }
@@ -10144,7 +10268,7 @@ mod tests {
             task_release.lock().unwrap().recv().unwrap();
             Ok(())
         });
-        let mut operation = ContestSwitchOperation::new(task);
+        let mut operation = ContestOpenOperation::new(task);
         operation
             .start(ContestSwitchRequest {
                 mutation: ContestSwitchMutation::Repair,

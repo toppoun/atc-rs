@@ -102,40 +102,44 @@ fn run() -> Result<ExitCode, AppError> {
     let mut reporter = TerminalReporter::default();
 
     match cli.command {
-        cli::Command::Workspace(cli::WorkspaceCommand::Init) => {
+        None => {
+            commands::workspace_home()?;
+        }
+
+        Some(cli::Command::Workspace(cli::WorkspaceCommand::Init)) => {
             commands::init(&mut reporter)?;
         }
 
-        cli::Command::Configuration(cli::ConfigurationCommand::Config {
+        Some(cli::Command::Configuration(cli::ConfigurationCommand::Config {
             command: cli::ConfigCommand::Init,
-        }) => {
+        })) => {
             commands::config_init(&mut reporter)?;
         }
 
-        cli::Command::Contest(cli::ContestCommand::New { contest, language }) => {
+        Some(cli::Command::Contest(cli::ContestCommand::New { contest, language })) => {
             commands::new(&contest, language, &mut reporter)?;
         }
 
-        cli::Command::Contest(cli::ContestCommand::Refresh { contest, force }) => {
+        Some(cli::Command::Contest(cli::ContestCommand::Refresh { contest, force })) => {
             commands::refresh(contest, force, &mut reporter)?;
         }
 
-        cli::Command::Contest(cli::ContestCommand::Contest { contest_id }) => {
+        Some(cli::Command::Contest(cli::ContestCommand::Contest { contest_id })) => {
             commands::contest(&contest_id, &mut reporter)?;
         }
 
-        cli::Command::RunTest(cli::RunTestCommand::Test {
+        Some(cli::Command::RunTest(cli::RunTestCommand::Test {
             problem,
             contest,
             language,
             debug,
-        }) => {
+        })) => {
             return run_verdict_command(&mut reporter, |reporter| {
                 commands::test(&problem, contest.as_deref(), language, debug, reporter)
             });
         }
 
-        cli::Command::RunTest(cli::RunTestCommand::Watch { plain, contest }) => {
+        Some(cli::Command::RunTest(cli::RunTestCommand::Watch { plain, contest })) => {
             if plain {
                 commands::watch(contest.as_deref(), &mut reporter)?;
             } else {
@@ -143,7 +147,7 @@ fn run() -> Result<ExitCode, AppError> {
             }
         }
 
-        cli::Command::RunTest(cli::RunTestCommand::Stress(args)) => match args.command {
+        Some(cli::Command::RunTest(cli::RunTestCommand::Stress(args))) => match args.command {
             Some(cli::StressSubcommand::Init(init)) => {
                 commands::stress_init(&init.problem, init.contest.as_deref(), &mut reporter)?;
             }
@@ -167,30 +171,30 @@ fn run() -> Result<ExitCode, AppError> {
             }
         },
 
-        cli::Command::RunTest(cli::RunTestCommand::Submit {
+        Some(cli::Command::RunTest(cli::RunTestCommand::Submit {
             problem,
             contest,
             language,
             runtime,
-        }) => {
+        })) => {
             commands::submit(&problem, contest.as_deref(), language, runtime)?;
         }
 
-        cli::Command::Files(cli::FileCommand::Create { name, language }) => {
+        Some(cli::Command::Files(cli::FileCommand::Create { name, language })) => {
             commands::create(&name, language, &mut reporter)?;
         }
 
-        cli::Command::Files(cli::FileCommand::Template {
+        Some(cli::Command::Files(cli::FileCommand::Template {
             command: cli::TemplateCommand::Init { language },
-        }) => {
+        })) => {
             commands::template_init(language, &mut reporter)?;
         }
 
-        cli::Command::Account(cli::AccountCommand::Login) => {
+        Some(cli::Command::Account(cli::AccountCommand::Login)) => {
             commands::login()?;
         }
 
-        cli::Command::Diagnostics(cli::DiagnosticsCommand::Doctor) => {
+        Some(cli::Command::Diagnostics(cli::DiagnosticsCommand::Doctor)) => {
             if !commands::doctor(&mut reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
