@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::thread;
 use std::time::Duration;
+use time::{Date, Month, OffsetDateTime, PlainDateTime, Time, UtcOffset};
 
 const DISCOVERY_ATTEMPTS: usize = 3;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
@@ -77,6 +78,35 @@ impl fmt::Display for Verdict {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmissionResult {
+    pub(crate) verdict: Verdict,
+    pub(crate) execution_time_ms: Option<u64>,
+    pub(crate) memory_kib: Option<u64>,
+}
+
+impl SubmissionResult {
+    pub(crate) const fn new(verdict: Verdict) -> Self {
+        Self {
+            verdict,
+            execution_time_ms: None,
+            memory_kib: None,
+        }
+    }
+
+    pub(crate) const fn with_metrics(
+        verdict: Verdict,
+        execution_time_ms: Option<u64>,
+        memory_kib: Option<u64>,
+    ) -> Self {
+        Self {
+            verdict,
+            execution_time_ms,
+            memory_kib,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStatus {
     WaitingForJudge,
     WaitingForRejudge,
@@ -86,7 +116,13 @@ pub(crate) enum SubmissionStatus {
         total: u32,
         provisional: Option<Verdict>,
     },
-    Finished(Verdict),
+    Finished(SubmissionResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmissionDiscovery {
+    pub(crate) submission_id: SubmissionId,
+    pub(crate) submitted_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,29 +421,29 @@ impl AtCoderClient {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn discover_submission_id(
+    pub(crate) fn discover_submission(
         &self,
         baseline: &SubmissionBaseline,
-    ) -> Result<SubmissionId, SubmissionTrackingError> {
-        self.discover_submission_id_until(baseline, &|| true)
+    ) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
+        self.discover_submission_until(baseline, &|| true)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn discover_submission_id_until(
+    pub(crate) fn discover_submission_until(
         &self,
         baseline: &SubmissionBaseline,
         should_continue: &dyn Fn() -> bool,
-    ) -> Result<SubmissionId, SubmissionTrackingError> {
+    ) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
         let mut observer = NoopSubmissionDiagnosticObserver;
-        self.discover_submission_id_until_observed(baseline, should_continue, &mut observer)
+        self.discover_submission_until_observed(baseline, should_continue, &mut observer)
     }
 
-    pub(crate) fn discover_submission_id_until_observed(
+    pub(crate) fn discover_submission_until_observed(
         &self,
         baseline: &SubmissionBaseline,
         should_continue: &dyn Fn() -> bool,
         observer: &mut dyn SubmissionDiagnosticObserver,
-    ) -> Result<SubmissionId, SubmissionTrackingError> {
+    ) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
         match &self.source {
             Source::Http(http) => discover_submission_with_transport_until_observed(
                 &mut HttpTrackingTransport { http },
@@ -623,7 +659,7 @@ fn capture_baseline_with_transport_until_observed(
 fn discover_submission_with_transport(
     transport: &mut impl TrackingTransport,
     baseline: &SubmissionBaseline,
-) -> Result<SubmissionId, SubmissionTrackingError> {
+) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
     discover_submission_with_transport_until(transport, baseline, &|| true)
 }
 
@@ -632,7 +668,7 @@ fn discover_submission_with_transport_until(
     transport: &mut impl TrackingTransport,
     baseline: &SubmissionBaseline,
     should_continue: &dyn Fn() -> bool,
-) -> Result<SubmissionId, SubmissionTrackingError> {
+) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
     let mut observer = NoopSubmissionDiagnosticObserver;
     discover_submission_with_transport_until_observed(
         transport,
@@ -647,8 +683,9 @@ fn discover_submission_with_transport_until_observed(
     baseline: &SubmissionBaseline,
     should_continue: &dyn Fn() -> bool,
     observer: &mut dyn SubmissionDiagnosticObserver,
-) -> Result<SubmissionId, SubmissionTrackingError> {
+) -> Result<SubmissionDiscovery, SubmissionTrackingError> {
     let mut observed_new_ids = BTreeSet::new();
+    let mut discovery_html = Vec::with_capacity(DISCOVERY_ATTEMPTS);
 
     for attempt in 0..DISCOVERY_ATTEMPTS {
         let attempt_number = attempt + 1;
@@ -689,6 +726,7 @@ fn discover_submission_with_transport_until_observed(
                 return Err(error);
             }
         };
+        discovery_html.push(html);
         let new_ids = ids
             .difference(&baseline.ids)
             .copied()
@@ -720,7 +758,14 @@ fn discover_submission_with_transport_until_observed(
     match (candidates.next(), candidates.next()) {
         (Some(id), None) => {
             observer.observe(SubmissionDiagnostic::DiscoveryResolved { submission_id: id });
-            Ok(id)
+            let submitted_at = discovery_html
+                .iter()
+                .rev()
+                .find_map(|html| parse_submission_timestamp(html, id));
+            Ok(SubmissionDiscovery {
+                submission_id: id,
+                submitted_at,
+            })
         }
         (Some(first), Some(second)) => {
             let observed = std::iter::once(first)
@@ -1132,6 +1177,69 @@ fn parse_submission_id(value: &str) -> Option<SubmissionId> {
     Some(SubmissionId(number))
 }
 
+fn parse_submission_timestamp(html: &str, submission_id: SubmissionId) -> Option<OffsetDateTime> {
+    let document = Html::parse_document(html);
+    let table_selector = selector("table.table-bordered.table-striped");
+    let row_selector = selector("tbody tr");
+    let score_selector = selector("td.submission-score");
+    let timestamp_selector = selector("time.fixtime-second");
+    let mut matching_rows = document.select(&table_selector).flat_map(|table| {
+        table.select(&row_selector).filter(|row| {
+            let mut cells = row.select(&score_selector);
+            let matches = cells.next().is_some_and(|cell| {
+                cell.value().attr("data-id").and_then(parse_submission_id) == Some(submission_id)
+            });
+            matches && cells.next().is_none()
+        })
+    });
+    let row = matching_rows.next()?;
+    if matching_rows.next().is_some() {
+        return None;
+    }
+    let mut timestamps = row.select(&timestamp_selector);
+    let timestamp = timestamps.next()?;
+    if timestamps.next().is_some() {
+        return None;
+    }
+    parse_official_submission_timestamp(&normalized_text(&timestamp))
+}
+
+fn parse_official_submission_timestamp(value: &str) -> Option<OffsetDateTime> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b' '
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !matches!(bytes[19], b'+' | b'-')
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let digits = bytes.get(range)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        digits.iter().try_fold(0_u32, |value, digit| {
+            value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+        })
+    };
+    let year = i32::try_from(number(0..4)?).ok()?;
+    let month = Month::try_from(u8::try_from(number(5..7)?).ok()?).ok()?;
+    let day = u8::try_from(number(8..10)?).ok()?;
+    let hour = u8::try_from(number(11..13)?).ok()?;
+    let minute = u8::try_from(number(14..16)?).ok()?;
+    let second = u8::try_from(number(17..19)?).ok()?;
+    let offset_hour = i8::try_from(number(20..22)?).ok()?;
+    let offset_minute = i8::try_from(number(22..24)?).ok()?;
+    let sign = if bytes[19] == b'-' { -1 } else { 1 };
+    let date = Date::from_calendar_date(year, month, day).ok()?;
+    let time = Time::from_hms(hour, minute, second).ok()?;
+    let offset = UtcOffset::from_hms(sign * offset_hour, sign * offset_minute, 0).ok()?;
+    Some(PlainDateTime::new(date, time).assume_offset(offset))
+}
+
 #[derive(Deserialize)]
 struct StatusEnvelope {
     #[serde(rename = "Result")]
@@ -1173,7 +1281,26 @@ fn parse_status_html(fragment: &str) -> Result<SubmissionStatus, SubmissionTrack
     if cells.next().is_some() {
         return Err(SubmissionTrackingError::MultipleStatusCells);
     }
-    parse_status_text(&normalized_text(&cell))
+    let status = parse_status_text(&normalized_text(&cell))?;
+    let SubmissionStatus::Finished(result) = status else {
+        return Ok(status);
+    };
+    let metric_selector = selector("td.text-right");
+    let metric_values = document
+        .select(&metric_selector)
+        .map(|cell| normalized_text(&cell))
+        .collect::<Vec<_>>();
+    let execution_time_ms = metric_values
+        .iter()
+        .find_map(|value| parse_metric(value, "ms"));
+    let memory_kib = metric_values
+        .iter()
+        .find_map(|value| parse_metric(value, "KiB"));
+    Ok(SubmissionStatus::Finished(SubmissionResult::with_metrics(
+        result.verdict,
+        execution_time_ms,
+        memory_kib,
+    )))
 }
 
 fn parse_status_text(value: &str) -> Result<SubmissionStatus, SubmissionTrackingError> {
@@ -1185,7 +1312,7 @@ fn parse_status_text(value: &str) -> Result<SubmissionStatus, SubmissionTracking
     }
 
     if let Some(verdict) = Verdict::parse(value) {
-        return Ok(SubmissionStatus::Finished(verdict));
+        return Ok(SubmissionStatus::Finished(SubmissionResult::new(verdict)));
     }
 
     let mut fields = value.split_ascii_whitespace();
@@ -1216,6 +1343,18 @@ fn parse_status_text(value: &str) -> Result<SubmissionStatus, SubmissionTracking
         total,
         provisional,
     })
+}
+
+fn parse_metric(value: &str, expected_unit: &str) -> Option<u64> {
+    let mut fields = value.split_ascii_whitespace();
+    let amount = fields.next()?;
+    if fields.next()? != expected_unit || fields.next().is_some() {
+        return None;
+    }
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    amount.parse().ok()
 }
 
 fn parse_ascii_u32(value: &str) -> Option<u32> {
@@ -1346,6 +1485,19 @@ mod tests {
         let language_href =
             format!("/contests/{contest_id}/submissions/me?f.Language=6017&amp;f.Task={task_id}");
         row_with_links(data_id, detail_href, Some(task_href), Some(&language_href))
+    }
+
+    fn row_with_timestamp(
+        data_id: Option<&str>,
+        detail_href: Option<&str>,
+        task_href: &str,
+        timestamp: &str,
+    ) -> String {
+        row(data_id, detail_href, task_href).replacen(
+            "<tr>",
+            &format!("<tr><td><time class=\"fixtime fixtime-second\">{timestamp}</time></td>"),
+            1,
+        )
     }
 
     fn list(rows: &str) -> String {
@@ -1618,7 +1770,7 @@ mod tests {
             capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
         let id = discover_submission_with_transport(&mut transport, &baseline).unwrap();
 
-        assert_eq!(id, SubmissionId(78777606));
+        assert_eq!(id.submission_id, SubmissionId(78777606));
         assert_eq!(transport.paths.len(), 4);
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
         transport.assert_complete();
@@ -1632,8 +1784,61 @@ mod tests {
             capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
         let id = discover_submission_with_transport(&mut transport, &baseline).unwrap();
 
-        assert_eq!(id, SubmissionId(78777605));
+        assert_eq!(id.submission_id, SubmissionId(78777605));
+        let submitted_at = id
+            .submitted_at
+            .expect("the measured row has an official time");
+        assert_eq!(submitted_at.year(), 2026);
+        assert_eq!(u8::from(submitted_at.month()), 9);
+        assert_eq!(submitted_at.day(), 7);
+        assert_eq!(submitted_at.hour(), 20);
+        assert_eq!(submitted_at.minute(), 36);
+        assert_eq!(submitted_at.second(), 23);
+        assert_eq!(submitted_at.offset(), UtcOffset::from_hms(9, 0, 0).unwrap());
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn malformed_official_timestamp_does_not_fail_id_discovery() {
+        let malformed = SINGLE_LIST.replace("2026-09-07 20:36:23+0900", "future format");
+        let mut transport = ScriptedTransport::new([
+            EMPTY_LIST.to_string(),
+            malformed.clone(),
+            malformed.clone(),
+            malformed,
+        ]);
+        let baseline =
+            capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
+
+        let discovery = discover_submission_with_transport(&mut transport, &baseline).unwrap();
+
+        assert_eq!(discovery.submission_id, SubmissionId(78777605));
+        assert_eq!(discovery.submitted_at, None);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn resolved_id_never_adopts_another_rows_timestamp() {
+        let task = "/contests/abc473/tasks/abc473_c";
+        let existing = row_with_timestamp(
+            Some("10"),
+            Some("/contests/abc473/submissions/10"),
+            task,
+            "2026-09-07 20:36:22+0900",
+        );
+        let new = row(Some("11"), Some("/contests/abc473/submissions/11"), task);
+        let baseline_html = list(&existing);
+        let after = list(&format!("{existing}{new}"));
+        let mut transport =
+            ScriptedTransport::new([baseline_html, after.clone(), after.clone(), after]);
+        let baseline =
+            capture_baseline_with_transport(&mut transport, "abc473", "abc473_c", "6017").unwrap();
+
+        let discovery = discover_submission_with_transport(&mut transport, &baseline).unwrap();
+
+        assert_eq!(discovery.submission_id, SubmissionId(11));
+        assert_eq!(discovery.submitted_at, None);
         transport.assert_complete();
     }
 
@@ -1646,7 +1851,7 @@ mod tests {
         let id = discover_submission_with_transport(&mut transport, &baseline).unwrap();
 
         assert!(baseline.ids.is_empty());
-        assert_eq!(id, SubmissionId(78777605));
+        assert_eq!(id.submission_id, SubmissionId(78777605));
         assert_eq!(transport.waits, [DISCOVERY_INTERVAL; 2]);
         transport.assert_complete();
     }
@@ -1753,7 +1958,7 @@ mod tests {
         watch_submission_with_transport_until_observed(
             &mut transport,
             "abc473",
-            id,
+            id.submission_id,
             &mut |status| {
                 ui_statuses.push(*status);
                 true
@@ -1763,7 +1968,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(id, SubmissionId(78777605));
+        assert_eq!(id.submission_id, SubmissionId(78777605));
         let attempts = observer
             .events
             .iter()
@@ -2169,8 +2374,22 @@ mod tests {
                     provisional: Some(Verdict::WrongAnswer),
                 },
             ),
-            (STATUS_AC, SubmissionStatus::Finished(Verdict::Accepted)),
-            (STATUS_WA, SubmissionStatus::Finished(Verdict::WrongAnswer)),
+            (
+                STATUS_AC,
+                SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::Accepted,
+                    Some(234),
+                    Some(33_348),
+                )),
+            ),
+            (
+                STATUS_WA,
+                SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::WrongAnswer,
+                    Some(266),
+                    Some(297_700),
+                )),
+            ),
         ];
 
         for (json, expected) in cases {
@@ -2198,6 +2417,77 @@ mod tests {
                 parse_status_text(text),
                 Ok(SubmissionStatus::Finished(_))
             ));
+        }
+    }
+
+    #[test]
+    fn judging_colspan_statuses_do_not_require_final_metric_cells() {
+        for (text, judged, total, provisional) in [
+            ("16/77", 16, 77, None),
+            ("48/77", 48, 77, None),
+            ("55/72 RE", 55, 72, Some(Verdict::RuntimeError)),
+        ] {
+            assert_eq!(
+                parse_status_html(&format!(
+                    "<td colspan='3' class='text-center waiting-judge'><span>{text}</span></td>"
+                ))
+                .unwrap(),
+                SubmissionStatus::JudgingProgress {
+                    judged,
+                    total,
+                    provisional,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn final_runtime_and_memory_parse_for_failure_verdicts() {
+        for verdict in ["WA", "RE"] {
+            assert_eq!(
+                parse_status_html(&format!(
+                    "<td class='text-center'><span>{verdict}</span></td>\
+                     <td class='text-right'>234 ms</td>\
+                     <td class='text-right'>33348 KiB</td>"
+                ))
+                .unwrap(),
+                SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::parse(verdict).unwrap(),
+                    Some(234),
+                    Some(33_348),
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_final_metrics_are_independently_best_effort() {
+        let cases = [
+            ("future runtime", "33348 KiB", None, Some(33_348)),
+            ("234 ms", "future memory", Some(234), None),
+            ("234 us", "33348 KB", None, None),
+            (
+                "18446744073709551616 ms",
+                "18446744073709551616 KiB",
+                None,
+                None,
+            ),
+        ];
+        for (runtime, memory, execution_time_ms, memory_kib) in cases {
+            assert_eq!(
+                parse_status_html(&format!(
+                    "<td class='text-center'><span>AC</span></td>\
+                     <td class='text-right'>{runtime}</td>\
+                     <td class='text-right'>{memory}</td>"
+                ))
+                .unwrap(),
+                SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::Accepted,
+                    execution_time_ms,
+                    memory_kib,
+                )),
+                "runtime={runtime:?} memory={memory:?}"
+            );
         }
     }
 
@@ -2316,7 +2606,7 @@ mod tests {
         }"#;
         assert_eq!(
             parse_status_response(SubmissionId(1), json).unwrap(),
-            SubmissionStatus::Finished(Verdict::Accepted)
+            SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted))
         );
     }
 
@@ -2345,7 +2635,11 @@ mod tests {
                     total: 36,
                     provisional: Some(Verdict::WrongAnswer),
                 },
-                SubmissionStatus::Finished(Verdict::WrongAnswer),
+                SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::WrongAnswer,
+                    Some(266),
+                    Some(297_700),
+                )),
             ]
         );
         assert_eq!(transport.waits, [STATUS_POLL_INTERVAL; 3]);

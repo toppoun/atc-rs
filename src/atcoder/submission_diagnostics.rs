@@ -412,7 +412,7 @@ fn status_text(status: SubmissionStatus) -> String {
             || format!("{judged}/{total}"),
             |verdict| format!("{judged}/{total} {verdict}"),
         ),
-        SubmissionStatus::Finished(verdict) => verdict.to_string(),
+        SubmissionStatus::Finished(result) => result.verdict.to_string(),
     }
 }
 
@@ -433,7 +433,8 @@ fn safe_field(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::atcoder::submission_tracking::{
-        RawCaptureKind, SubmissionDiagnostic, SubmissionTrackingErrorKind, Verdict,
+        RawCaptureKind, SubmissionDiagnostic, SubmissionResult, SubmissionTrackingErrorKind,
+        Verdict,
     };
 
     fn diagnostics(directory: &Path, raw_enabled: bool) -> AttemptDiagnostics {
@@ -510,7 +511,10 @@ mod tests {
                     provisional: None,
                 },
             ),
-            (3, SubmissionStatus::Finished(Verdict::Accepted)),
+            (
+                3,
+                SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
+            ),
         ] {
             diagnostics.observe(SubmissionDiagnostic::StatusObserved {
                 attempt: attempt_number,
@@ -588,7 +592,7 @@ mod tests {
         diagnostics.observe(SubmissionDiagnostic::StatusObserved {
             attempt: 1,
             submission_id: SubmissionId::for_test(42),
-            status: SubmissionStatus::Finished(Verdict::Accepted),
+            status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
         });
         diagnostics.arm_safe_flush();
         diagnostics.finish("finished");

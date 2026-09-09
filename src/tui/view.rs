@@ -633,6 +633,23 @@ fn submission_time_label_at_offset(timestamp: OffsetDateTime, offset: UtcOffset)
     ))
 }
 
+fn submission_full_datetime_label_at_offset(
+    timestamp: OffsetDateTime,
+    offset: UtcOffset,
+) -> Option<String> {
+    let local = timestamp.checked_to_offset(offset)?;
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day(),
+        local.hour(),
+        local.minute(),
+        local.second()
+    ))
+}
+
+#[cfg(test)]
 fn submission_time_label(started_at: SystemTime) -> String {
     system_time_to_offset_date_time(started_at)
         .and_then(|timestamp| {
@@ -640,6 +657,27 @@ fn submission_time_label(started_at: SystemTime) -> String {
             submission_time_label_at_offset(timestamp, offset)
         })
         .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string())
+}
+
+fn submission_datetime_labels(entry: &SubmissionHistoryEntry) -> (String, Option<String>) {
+    if let Some(submitted_at) = entry.submitted_at {
+        let offset = submitted_at.offset();
+        let short = submission_time_label_at_offset(submitted_at, offset)
+            .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string());
+        let full = submission_full_datetime_label_at_offset(submitted_at, offset);
+        return (short, full);
+    }
+
+    let Some(timestamp) = system_time_to_offset_date_time(entry.started_at) else {
+        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None);
+    };
+    let Ok(offset) = UtcOffset::local_offset_at(timestamp) else {
+        return (SUBMISSION_TIME_UNAVAILABLE.to_string(), None);
+    };
+    let short = submission_time_label_at_offset(timestamp, offset)
+        .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string());
+    let full = submission_full_datetime_label_at_offset(timestamp, offset);
+    (short, full)
 }
 
 fn receipt_problem_label(current_contest_id: &str, entry: &SubmissionHistoryEntry) -> String {
@@ -699,45 +737,85 @@ fn submission_receipt_line(
     };
     let separator_width = UnicodeWidthStr::width(separator);
     let meaningful_problem_width = problem_width.min(problem_index_width.max(12));
-    let time_label = submission_time_label(entry.started_at);
-    let time_width = UnicodeWidthStr::width(time_label.as_str());
+    let (short_time_label, full_datetime_label) = submission_datetime_labels(entry);
+    let short_time_width = UnicodeWidthStr::width(short_time_label.as_str());
     let language_width = UnicodeWidthStr::width(entry.language_label.as_str());
+    let result = match state {
+        UserVisibleSubmissionState::Current(super::submission::TuiSubmissionState::Status(
+            crate::atcoder::submission_tracking::SubmissionStatus::Finished(result),
+        )) => Some(result),
+        _ => None,
+    };
+    let runtime_label = result
+        .and_then(|result| result.execution_time_ms)
+        .map(|milliseconds| format!("{milliseconds} ms"));
+    let memory_label = result
+        .and_then(|result| result.memory_kib)
+        .map(|kibibytes| format!("{kibibytes} KiB"));
 
-    let mandatory_width = separator_width.saturating_add(status_width);
-    if width <= mandatory_width {
+    let mandatory_width = separator_width
+        .saturating_add(status_width)
+        .saturating_add(problem_index_width);
+    if width < mandatory_width {
         return clip_styled_row(status_spans, width);
     }
 
-    let show_time = time_width
+    let base_width = meaningful_problem_width
         .saturating_add(separator_width)
-        .saturating_add(mandatory_width)
-        .saturating_add(meaningful_problem_width)
-        <= width;
-    let width_with_time = if show_time {
-        time_width.saturating_add(separator_width)
-    } else {
-        0
+        .saturating_add(status_width);
+    let mut optional_width = 0usize;
+    let mut lower_priority_blocked = false;
+    let mut include = |field_width: Option<usize>| {
+        let Some(field_width) = field_width else {
+            return false;
+        };
+        if lower_priority_blocked {
+            return false;
+        }
+        let added_width = separator_width.saturating_add(field_width);
+        if base_width
+            .saturating_add(optional_width)
+            .saturating_add(added_width)
+            <= width
+        {
+            optional_width = optional_width.saturating_add(added_width);
+            true
+        } else {
+            lower_priority_blocked = true;
+            false
+        }
     };
-    let show_language = show_time
-        && width_with_time
-            .saturating_add(problem_width)
-            .saturating_add(separator_width)
-            .saturating_add(language_width)
-            .saturating_add(mandatory_width)
-            <= width;
-    let optional_width = width_with_time.saturating_add(if show_language {
-        language_width.saturating_add(separator_width)
-    } else {
-        0
-    });
-    let available_problem_width =
-        width.saturating_sub(optional_width.saturating_add(mandatory_width));
+    let show_time = include(Some(short_time_width));
+    let show_runtime = include(runtime_label.as_deref().map(UnicodeWidthStr::width));
+    let show_memory = include(memory_label.as_deref().map(UnicodeWidthStr::width));
+    let show_language = include((!entry.language_label.is_empty()).then_some(language_width));
+    drop(include);
 
-    let primary_tone = state
-        .status_segments()
-        .first()
-        .map(|segment| segment.tone)
-        .unwrap_or(SubmissionTone::None);
+    let mut time_label = short_time_label;
+    if show_time
+        && !lower_priority_blocked
+        && let Some(full_label) = full_datetime_label
+    {
+        let full_width = UnicodeWidthStr::width(full_label.as_str());
+        let upgrade_width = full_width.saturating_sub(short_time_width);
+        let full_problem_base = problem_width
+            .saturating_add(separator_width)
+            .saturating_add(status_width);
+        if full_problem_base
+            .saturating_add(optional_width)
+            .saturating_add(upgrade_width)
+            <= width
+        {
+            optional_width = optional_width.saturating_add(upgrade_width);
+            time_label = full_label;
+        }
+    }
+    let available_problem_width = width.saturating_sub(
+        optional_width
+            .saturating_add(separator_width)
+            .saturating_add(status_width),
+    );
+
     let mut spans = Vec::new();
     if show_time {
         spans.push(Span::raw(time_label));
@@ -750,7 +828,9 @@ fn submission_receipt_line(
     };
     spans.push(Span::styled(
         displayed_problem,
-        submission_tone_style(primary_tone).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
     ));
     if show_language {
         spans.push(Span::raw(separator));
@@ -758,6 +838,18 @@ fn submission_receipt_line(
     }
     spans.push(Span::raw(separator));
     spans.extend(status_spans);
+    if show_runtime {
+        spans.push(Span::raw(separator));
+        spans.push(Span::raw(
+            runtime_label.expect("a selected runtime field must have a label"),
+        ));
+    }
+    if show_memory {
+        spans.push(Span::raw(separator));
+        spans.push(Span::raw(
+            memory_label.expect("a selected memory field must have a label"),
+        ));
+    }
     clip_styled_row(spans, width)
 }
 
@@ -2652,7 +2744,7 @@ fn compact_elapsed_label(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
+    use crate::atcoder::submission_tracking::{SubmissionResult, SubmissionStatus, Verdict};
     use crate::language::Language;
     use crate::model::{Contest, Problem};
     use crate::stress::CandidateFailureKind;
@@ -2667,6 +2759,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::path::PathBuf;
+    use time::{Date, Month, PlainDateTime, Time};
 
     fn app() -> WatchApp {
         WatchApp::new(
@@ -2846,8 +2939,15 @@ mod tests {
             problem_title: Some(format!("Problem {problem_index}")),
             language_label: "C++".to_string(),
             started_at: SystemTime::now(),
+            submitted_at: None,
             state,
         }
+    }
+
+    fn official_timestamp() -> OffsetDateTime {
+        let date = Date::from_calendar_date(2026, Month::September, 9).unwrap();
+        let time = Time::from_hms(9, 18, 25).unwrap();
+        PlainDateTime::new(date, time).assume_offset(UtcOffset::from_hms(9, 0, 0).unwrap())
     }
 
     fn rendered_frontend_text_with_palette(
@@ -3543,27 +3643,39 @@ mod tests {
     fn receipt_uses_field_level_responsiveness_and_cross_contest_fallback() {
         let accepted = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
             ))),
             attempt: None,
         };
         let mut entry = submission_history_entry(1, "E", accepted);
         entry.problem_title = Some("One Time Coupon".to_string());
         entry.language_label = "C++23".to_string();
-        let time = submission_time_label(entry.started_at);
+        entry.submitted_at = Some(official_timestamp());
 
-        let wide = submission_receipt_line("abc123", Some(&entry), 100).to_string();
-        assert_eq!(wide, format!("{time} │ E - One Time Coupon │ C++23 │ AC"));
-
-        let medium = submission_receipt_line("abc123", Some(&entry), 34).to_string();
-        assert!(medium.starts_with(&format!("{time} │ E - ")));
-        assert!(medium.ends_with(" │ AC"));
-        assert!(!medium.contains("C++23"));
-
-        let narrow = submission_receipt_line("abc123", Some(&entry), 22).to_string();
-        assert!(narrow.starts_with("E - One Time"));
-        assert!(narrow.ends_with(" │ AC"));
-        assert!(!narrow.contains(&time));
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 75).to_string(),
+            "2026-09-09 09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 64).to_string(),
+            "09:18:25 │ E - One Time Coupon │ C++23 │ AC │ 234 ms │ 33348 KiB"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 56).to_string(),
+            "09:18:25 │ E - One Time Coupon │ AC │ 234 ms │ 33348 KiB"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 48).to_string(),
+            "09:18:25 │ E - One Time Coupon │ AC │ 234 ms"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 36).to_string(),
+            "09:18:25 │ E - One Time Coupon │ AC"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 24).to_string(),
+            "E - One Time Coupon │ AC"
+        );
 
         assert_eq!(
             submission_receipt_line("abc123", Some(&entry), 6).to_string(),
@@ -3576,11 +3688,37 @@ mod tests {
 
         entry.key = SubmissionKey::new("abc474", "abc474_e");
         entry.problem_title = None;
+        entry.submitted_at = None;
         assert!(
             submission_receipt_line("abc123", Some(&entry), 40)
                 .to_string()
                 .contains("abc474/E")
         );
+    }
+
+    #[test]
+    fn receipt_prefers_official_wall_clock_and_falls_back_to_local_start() {
+        let state = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(
+                SubmissionStatus::WaitingForJudge,
+            )),
+            attempt: None,
+        };
+        let mut entry = submission_history_entry(1, "B", state);
+        let local_short = submission_time_label(entry.started_at);
+        assert_eq!(submission_datetime_labels(&entry).0, local_short);
+
+        entry.submitted_at = Some(official_timestamp());
+        assert_eq!(
+            submission_datetime_labels(&entry),
+            (
+                "09:18:25".to_string(),
+                Some("2026-09-09 09:18:25".to_string())
+            )
+        );
+        let rendered = submission_receipt_line("abc123", Some(&entry), 100).to_string();
+        assert!(rendered.starts_with("2026-09-09 09:18:25 │ "));
+        assert!(!rendered.contains("+0900"));
     }
 
     #[test]
@@ -3607,8 +3745,11 @@ mod tests {
         };
         assert_eq!(style("7/15").fg, Some(Color::Yellow));
         assert_eq!(style("RE").fg, Some(Color::Red));
+        assert_eq!(style("C - Problem C").fg, Some(Color::White));
 
-        let accepted = TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted));
+        let accepted = TuiSubmissionState::Status(SubmissionStatus::Finished(
+            SubmissionResult::new(Verdict::Accepted),
+        ));
         for (attempt, expected) in [
             (TuiSubmissionAttemptState::Submitting, "Submitting"),
             (TuiSubmissionAttemptState::Unknown, "Unknown"),
@@ -3627,13 +3768,85 @@ mod tests {
     }
 
     #[test]
+    fn receipt_problem_is_white_for_every_semantic_status() {
+        let states = [
+            SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Submitting),
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::WaitingForJudge,
+                )),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(
+                    SubmissionStatus::JudgingProgress {
+                        judged: 55,
+                        total: 72,
+                        provisional: Some(Verdict::RuntimeError),
+                    },
+                )),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    SubmissionResult::new(Verdict::Accepted),
+                ))),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    SubmissionResult::new(Verdict::WrongAnswer),
+                ))),
+                attempt: None,
+            },
+            SubmissionDisplayState {
+                current: None,
+                attempt: Some(TuiSubmissionAttemptState::Unknown),
+            },
+            SubmissionDisplayState {
+                current: Some(TuiSubmissionState::TrackingUnavailable),
+                attempt: None,
+            },
+        ];
+
+        for state in states {
+            let entry = submission_history_entry(1, "B", state);
+            let line = submission_receipt_line("abc123", Some(&entry), 120);
+            let problem = line
+                .spans
+                .iter()
+                .find(|span| span.content == "B - Problem B")
+                .expect("wide receipts must retain the complete problem field");
+            assert_eq!(problem.style.fg, Some(Color::White), "state={state:?}");
+        }
+    }
+
+    #[test]
+    fn side_pane_history_keeps_compact_status_without_metrics() {
+        let state = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
+            ))),
+            attempt: None,
+        };
+        let entry = submission_history_entry(1, "B", state);
+        let line = submission_history_line(&entry, 40).unwrap().to_string();
+        assert_eq!(line.trim_end(), "B  AC");
+        assert!(!line.contains("ms"));
+        assert!(!line.contains("KiB"));
+    }
+
+    #[test]
     fn receipt_clips_unicode_problem_without_separator_garbage() {
         let mut entry = submission_history_entry(
             1,
             "E",
             SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 attempt: None,
             },
@@ -3709,6 +3922,7 @@ mod tests {
             (100, 5),
             (120, 5),
             (160, 5),
+            (200, 5),
         ] {
             let _ =
                 rendered_frontend_buffer_with_submission_view(&app, &view, false, width, height);
@@ -3744,7 +3958,7 @@ mod tests {
             },
             SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 attempt: Some(TuiSubmissionAttemptState::Unknown),
             },
@@ -3774,7 +3988,7 @@ mod tests {
         };
         let accepted = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::new(Verdict::Accepted),
             ))),
             attempt: None,
         };
@@ -3818,7 +4032,7 @@ mod tests {
         let attempt = SubmissionHistoryEntry {
             state: SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 attempt: Some(TuiSubmissionAttemptState::Unknown),
             },
@@ -3909,13 +4123,13 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![
                 current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 current(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForJudge,
                 )),
                 current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::WrongAnswer,
+                    SubmissionResult::new(Verdict::WrongAnswer),
                 ))),
                 current(TuiSubmissionState::Status(
                     SubmissionStatus::JudgingProgress {
@@ -3981,7 +4195,7 @@ mod tests {
     #[test]
     fn submission_status_spans_use_effective_state_and_semantic_colors() {
         let current_ac = Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-            Verdict::Accepted,
+            SubmissionResult::new(Verdict::Accepted),
         )));
         let submitting = SubmissionDisplayState {
             current: current_ac,
@@ -4059,7 +4273,7 @@ mod tests {
                 submission_status_spans(
                     SubmissionDisplayState {
                         current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                            verdict,
+                            SubmissionResult::new(verdict),
                         ))),
                         attempt: None,
                     }

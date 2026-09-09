@@ -2,8 +2,8 @@ use super::test::find_problem;
 use crate::atcoder;
 use crate::atcoder::submission_diagnostics::AttemptDiagnostics;
 use crate::atcoder::submission_tracking::{
-    SubmissionDiagnostic, SubmissionDiagnosticObserver, SubmissionId, SubmissionStatus,
-    SubmissionTrackingError,
+    SubmissionDiagnostic, SubmissionDiagnosticObserver, SubmissionDiscovery, SubmissionId,
+    SubmissionStatus, SubmissionTrackingError,
 };
 use crate::atcoder::submit::{SubmitError, SubmitExecutionOutcome, SubmitOutcome, SubmitRequest};
 use crate::config::Config;
@@ -47,7 +47,7 @@ pub(crate) fn submit(
         &atcoder,
         |event| match event {
             SubmissionEvent::Accepted => true,
-            SubmissionEvent::TrackingStarted { submission_id } => {
+            SubmissionEvent::TrackingStarted { submission_id, .. } => {
                 output_available = writeln!(stdout.lock(), "Submitted: #{submission_id}").is_ok();
                 output_available
             }
@@ -146,6 +146,7 @@ pub(crate) enum SubmissionEvent {
     Accepted,
     TrackingStarted {
         submission_id: SubmissionId,
+        submitted_at: Option<time::OffsetDateTime>,
     },
     Status {
         submission_id: SubmissionId,
@@ -513,7 +514,10 @@ where
         }
     };
 
-    if !emit(SubmissionEvent::TrackingStarted { submission_id }) {
+    if !emit(SubmissionEvent::TrackingStarted {
+        submission_id,
+        submitted_at: None,
+    }) {
         return Ok(SubmissionCompletion::Accepted);
     }
 
@@ -562,7 +566,7 @@ pub(crate) fn execute_prepared_with_client(
             )
         },
         |baseline, observer| {
-            atcoder.discover_submission_id_until_observed(baseline, should_continue, observer)
+            atcoder.discover_submission_until_observed(baseline, should_continue, observer)
         },
         |contest_id, submission_id, on_status, observer| {
             atcoder.watch_submission_until_observed(
@@ -598,7 +602,7 @@ where
     D: FnOnce(
         &B,
         &mut dyn SubmissionDiagnosticObserver,
-    ) -> Result<SubmissionId, SubmissionTrackingError>,
+    ) -> Result<SubmissionDiscovery, SubmissionTrackingError>,
     P: FnOnce(
         &str,
         SubmissionId,
@@ -698,8 +702,8 @@ where
         }
     };
 
-    let submission_id = match discover_submission(&baseline, diagnostics) {
-        Ok(submission_id) => submission_id,
+    let discovery = match discover_submission(&baseline, diagnostics) {
+        Ok(discovery) => discovery,
         Err(SubmissionTrackingError::Cancelled) => {
             diagnostics.finish("cancelled_during_discovery");
             return Ok(SubmissionCompletion::Accepted);
@@ -712,8 +716,12 @@ where
             return Ok(SubmissionCompletion::Accepted);
         }
     };
+    let submission_id = discovery.submission_id;
 
-    if !emit(SubmissionEvent::TrackingStarted { submission_id }) {
+    if !emit(SubmissionEvent::TrackingStarted {
+        submission_id,
+        submitted_at: discovery.submitted_at,
+    }) {
         diagnostics.observe(SubmissionDiagnostic::Cancelled {
             stage: "after discovery before status polling",
         });
@@ -783,7 +791,7 @@ where
         },
         |event| match event {
             SubmissionEvent::Accepted => true,
-            SubmissionEvent::TrackingStarted { submission_id } => {
+            SubmissionEvent::TrackingStarted { submission_id, .. } => {
                 output_available = writeln!(output, "Submitted: #{submission_id}").is_ok();
                 output_available
             }
@@ -825,7 +833,7 @@ fn render_submission_status(output: &mut impl Write, status: &SubmissionStatus) 
             }
             writeln!(output)
         }
-        SubmissionStatus::Finished(verdict) => writeln!(output, "{verdict}"),
+        SubmissionStatus::Finished(result) => writeln!(output, "{}", result.verdict),
     }
 }
 
@@ -898,7 +906,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submission_tracking::{SubmissionTrackingErrorKind, Verdict};
+    use crate::atcoder::submission_tracking::{
+        SubmissionResult, SubmissionTrackingErrorKind, Verdict,
+    };
     use crate::atcoder::submit::{SubmitError, SubmitPageError};
     use crate::config::Config;
     use crate::model::Contest;
@@ -1638,7 +1648,7 @@ mod tests {
                         total: 36,
                         provisional: Some(Verdict::WrongAnswer),
                     },
-                    SubmissionStatus::Finished(Verdict::WrongAnswer),
+                    SubmissionStatus::Finished(SubmissionResult::new(Verdict::WrongAnswer)),
                 ] {
                     assert!(on_status(&status));
                 }
@@ -1991,7 +2001,10 @@ mod tests {
                 observer.observe(SubmissionDiagnostic::DiscoveryResolved {
                     submission_id: SubmissionId::for_test(11),
                 });
-                Ok(SubmissionId::for_test(11))
+                Ok(SubmissionDiscovery {
+                    submission_id: SubmissionId::for_test(11),
+                    submitted_at: Some(time::OffsetDateTime::from_unix_timestamp(1).unwrap()),
+                })
             },
             |_, submission_id, on_status, observer| {
                 for (attempt, status) in [
@@ -2004,7 +2017,14 @@ mod tests {
                             provisional: None,
                         },
                     ),
-                    (3, SubmissionStatus::Finished(Verdict::Accepted)),
+                    (
+                        3,
+                        SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                            Verdict::Accepted,
+                            Some(234),
+                            Some(33_348),
+                        )),
+                    ),
                 ] {
                     observer.observe(SubmissionDiagnostic::StatusObserved {
                         attempt,
@@ -2048,9 +2068,21 @@ mod tests {
         assert!(flushes.load(Ordering::SeqCst) >= 2);
         assert!(matches!(events.first(), Some(SubmissionEvent::Accepted)));
         assert!(matches!(
+            events.get(1),
+            Some(SubmissionEvent::TrackingStarted {
+                submission_id,
+                submitted_at: Some(_),
+            }) if *submission_id == SubmissionId::for_test(11)
+        ));
+        assert!(matches!(
             events.last(),
             Some(SubmissionEvent::Status {
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult {
+                    verdict: Verdict::Accepted,
+                    execution_time_ms: Some(234),
+                    memory_kib: Some(33_348),
+                    ..
+                }),
                 ..
             })
         ));
@@ -2282,7 +2314,10 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(SubmissionEvent::Status {
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult {
+                    verdict: Verdict::Accepted,
+                    ..
+                }),
                 ..
             })
         ));

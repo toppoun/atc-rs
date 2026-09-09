@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use time::{Date, Month, OffsetDateTime, PlainDateTime, Time, UtcOffset};
 
 use super::app::WatchApp;
 use super::detail_layout::DetailLayout;
@@ -21,7 +22,7 @@ use super::submission::{
 };
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::{ShortcutHelpKeyResult, TerminaSession, handle_shortcut_help_key, view};
-use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
+use crate::atcoder::submission_tracking::{SubmissionResult, SubmissionStatus, Verdict};
 use crate::language::Language;
 use crate::model::{Contest, Problem};
 
@@ -58,7 +59,7 @@ const SCENARIO: [SubmissionDisplayState; 8] = [
         },
     )),
     current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-        Verdict::RuntimeError,
+        SubmissionResult::with_metrics(Verdict::RuntimeError, Some(31), Some(33_348)),
     ))),
 ];
 
@@ -136,16 +137,16 @@ impl DemoHarness {
         app.toggle_side_pane_mode();
 
         let ac = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-            Verdict::Accepted,
+            SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
         )));
         let re = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-            Verdict::RuntimeError,
+            SubmissionResult::with_metrics(Verdict::RuntimeError, Some(31), Some(33_348)),
         )));
         let waiting = current(TuiSubmissionState::Status(
             SubmissionStatus::WaitingForJudge,
         ));
         let wa = current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-            Verdict::WrongAnswer,
+            SubmissionResult::with_metrics(Verdict::WrongAnswer, Some(266), Some(297_700)),
         )));
         let progress_re = current(TuiSubmissionState::Status(
             SubmissionStatus::JudgingProgress {
@@ -231,7 +232,9 @@ impl DemoHarness {
             TuiSubmissionAttemptState::Submitting,
         );
         let unknown = composite(
-            TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+            TuiSubmissionState::Status(SubmissionStatus::Finished(SubmissionResult::new(
+                Verdict::Accepted,
+            ))),
             TuiSubmissionAttemptState::Unknown,
         );
         let state = match self.submissions.problems.get(problem).copied().flatten() {
@@ -348,17 +351,35 @@ impl DemoHarness {
                     }),
                 ))),
                 KeyCode::Char('9') => self.set_selected_submission(Some(current(
-                    TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+                    TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
+                    )),
                 ))),
-                KeyCode::Char('0') => self.set_selected_submission(Some(current(
-                    TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::WrongAnswer)),
-                ))),
-                KeyCode::Char('r') => self.set_selected_submission(Some(current(
-                    TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::RuntimeError)),
-                ))),
+                KeyCode::Char('0') => {
+                    self.set_selected_submission(Some(current(TuiSubmissionState::Status(
+                        SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                            Verdict::WrongAnswer,
+                            Some(266),
+                            Some(297_700),
+                        )),
+                    ))))
+                }
+                KeyCode::Char('r') => {
+                    self.set_selected_submission(Some(current(TuiSubmissionState::Status(
+                        SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                            Verdict::RuntimeError,
+                            Some(31),
+                            Some(33_348),
+                        )),
+                    ))))
+                }
                 KeyCode::Char('t') => {
                     self.set_selected_submission(Some(current(TuiSubmissionState::Status(
-                        SubmissionStatus::Finished(Verdict::TimeLimitExceeded),
+                        SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                            Verdict::TimeLimitExceeded,
+                            Some(2_001),
+                            Some(4_096),
+                        )),
                     ))))
                 }
                 KeyCode::Char('n') => {
@@ -403,6 +424,7 @@ impl DemoHarness {
                         problem_title: None,
                         language_label: "PyPy".to_string(),
                         started_at: SystemTime::now(),
+                        submitted_at: None,
                         state: current(TuiSubmissionState::Status(
                             SubmissionStatus::WaitingForJudge,
                         )),
@@ -457,8 +479,17 @@ fn demo_history_entry(
         language_label: "C++".to_string(),
         started_at: SystemTime::now()
             - Duration::from_secs(6_u64.saturating_sub(generation).saturating_mul(30)),
+        submitted_at: Some(demo_submitted_at()),
         state,
     }
+}
+
+fn demo_submitted_at() -> OffsetDateTime {
+    let date = Date::from_calendar_date(2026, Month::September, 9)
+        .expect("the fixed demo submission date must be valid");
+    let time = Time::from_hms(9, 18, 25).expect("the fixed demo submission time must be valid");
+    let offset = UtcOffset::from_hms(9, 0, 0).expect("the fixed demo offset must be valid");
+    PlainDateTime::new(date, time).assume_offset(offset)
 }
 
 pub(crate) fn run() -> io::Result<()> {
@@ -704,9 +735,16 @@ mod tests {
         let mut final_demo = DemoHarness::new().unwrap();
         final_demo.show_help = false;
         final_demo.handle_key(key(KeyCode::Char('9'), KeyEventKind::Press), now);
-        assert!(rendered_text(&final_demo, 100, 20).contains("AC"));
+        let accepted = rendered_text(&final_demo, 100, 20);
+        assert!(accepted.contains("2026-09-09 09:18:25"));
+        assert!(accepted.contains("AC"));
+        assert!(accepted.contains("234 ms"));
+        assert!(accepted.contains("33348 KiB"));
         final_demo.handle_key(key(KeyCode::Char('0'), KeyEventKind::Press), now);
-        assert!(rendered_text(&final_demo, 100, 20).contains("WA"));
+        let wrong_answer = rendered_text(&final_demo, 100, 20);
+        assert!(wrong_answer.contains("WA"));
+        assert!(wrong_answer.contains("266 ms"));
+        assert!(wrong_answer.contains("297700 KiB"));
     }
 
     #[test]
@@ -739,7 +777,7 @@ mod tests {
         assert_eq!(
             current_entry.state,
             current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348))
             )))
         );
         let receipt = rendered_text(&demo, 100, 20);

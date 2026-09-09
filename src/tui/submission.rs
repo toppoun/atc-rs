@@ -138,10 +138,10 @@ impl UserVisibleSubmissionState {
                 }
                 segments
             }
-            Self::Current(TuiSubmissionState::Status(SubmissionStatus::Finished(verdict))) => {
+            Self::Current(TuiSubmissionState::Status(SubmissionStatus::Finished(result))) => {
                 vec![SubmissionStatusSegment::new(
-                    verdict.to_string(),
-                    verdict_tone(verdict),
+                    result.verdict.to_string(),
+                    verdict_tone(result.verdict),
                 )]
             }
             Self::Current(TuiSubmissionState::TrackingUnavailable) => {
@@ -210,6 +210,7 @@ pub(super) struct SubmissionHistoryEntry {
     pub(super) problem_title: Option<String>,
     pub(super) language_label: String,
     pub(super) started_at: SystemTime,
+    pub(super) submitted_at: Option<time::OffsetDateTime>,
     pub(super) state: SubmissionDisplayState,
 }
 
@@ -526,6 +527,26 @@ impl SubmissionHub {
         }
     }
 
+    fn enrich_history_timestamp(
+        &mut self,
+        key: &SubmissionKey,
+        generation: u64,
+        submitted_at: time::OffsetDateTime,
+    ) -> bool {
+        let Some(entry) = self
+            .history
+            .iter_mut()
+            .find(|entry| entry.generation == generation && entry.key == *key)
+        else {
+            return false;
+        };
+        if entry.submitted_at == Some(submitted_at) {
+            return false;
+        }
+        entry.submitted_at = Some(submitted_at);
+        true
+    }
+
     fn remove_history(&mut self, key: &SubmissionKey, generation: u64) {
         self.history
             .retain(|entry| entry.generation != generation || entry.key != *key);
@@ -629,6 +650,7 @@ impl SubmissionHub {
             problem_title: Some(problem_title),
             language_label,
             started_at,
+            submitted_at: None,
             state: SubmissionDisplayState {
                 current: None,
                 attempt: Some(TuiSubmissionAttemptState::Submitting),
@@ -721,13 +743,28 @@ impl SubmissionHub {
                 }
                 true
             }
-            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted { .. }) => self
-                .update_current(
-                    event.key,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
+                submitted_at, ..
+            }) => {
+                if !self
+                    .records
+                    .get(&event.key)
+                    .is_some_and(|record| record.generation == Some(event.generation))
+                {
+                    return false;
+                }
+                let mut changed = self.update_current(
+                    event.key.clone(),
                     event.generation,
                     TuiSubmissionState::Accepted,
                     true,
-                ),
+                );
+                if let Some(submitted_at) = submitted_at {
+                    changed |=
+                        self.enrich_history_timestamp(&event.key, event.generation, submitted_at);
+                }
+                changed
+            }
             WorkerEventKind::Submission(SubmissionEvent::Status { status, .. }) => self
                 .update_current(
                     event.key,
@@ -1180,11 +1217,12 @@ fn submit_start_error_message(error: AppError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atcoder::submission_tracking::{SubmissionId, Verdict};
+    use crate::atcoder::submission_tracking::{SubmissionId, SubmissionResult, Verdict};
     use crate::language::{Language, PythonRuntime};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
+    use time::{Date, Month, PlainDateTime, Time, UtcOffset};
 
     type TestRun = Box<
         dyn FnOnce(
@@ -1240,6 +1278,12 @@ mod tests {
 
     fn key() -> SubmissionKey {
         SubmissionKey::new("adt_easy_20260826_1", "abc430_a")
+    }
+
+    fn official_timestamp(second: u8) -> time::OffsetDateTime {
+        let date = Date::from_calendar_date(2026, Month::September, 9).unwrap();
+        let time = Time::from_hms(9, 18, second).unwrap();
+        PlainDateTime::new(date, time).assume_offset(UtcOffset::from_hms(9, 0, 0).unwrap())
     }
 
     fn event(key: &SubmissionKey, generation: u64, kind: WorkerEventKind) -> WorkerEvent {
@@ -1373,7 +1417,9 @@ mod tests {
             stopped.fetch_add(1, Ordering::AcqRel);
             let _ = emit(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::TimeLimitExceeded),
+                status: SubmissionStatus::Finished(SubmissionResult::new(
+                    Verdict::TimeLimitExceeded,
+                )),
             });
             Ok(SubmissionCompletion::Accepted)
         })
@@ -1691,7 +1737,7 @@ mod tests {
             SubmissionRecord {
                 generation: Some(41),
                 state: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 ..SubmissionRecord::default()
             },
@@ -1703,9 +1749,10 @@ mod tests {
             problem_title: Some("Problem A".to_string()),
             language_label: "C++".to_string(),
             started_at: SystemTime::now(),
+            submitted_at: None,
             state: SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 attempt: None,
             },
@@ -1724,7 +1771,7 @@ mod tests {
         assert_eq!(
             hub.state(&key),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
         assert_eq!(hub.history.len(), 1);
@@ -1801,7 +1848,7 @@ mod tests {
                 assert!(emit(SubmissionEvent::Accepted));
                 assert!(emit(SubmissionEvent::Status {
                     submission_id: SubmissionId::for_test(7),
-                    status: SubmissionStatus::Finished(Verdict::Accepted),
+                    status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
                 }));
                 panic!("intentional test panic after Finished")
             })],
@@ -1815,7 +1862,7 @@ mod tests {
                 && hub.records.get(&key).is_some_and(|record| {
                     record.state
                         == Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                            Verdict::Accepted,
+                            SubmissionResult::new(Verdict::Accepted),
                         )))
                 })
         });
@@ -1823,7 +1870,7 @@ mod tests {
         assert_eq!(
             hub.state(&key),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
     }
@@ -1909,7 +1956,7 @@ mod tests {
                 assert!(emit(SubmissionEvent::Accepted));
                 assert!(emit(SubmissionEvent::Status {
                     submission_id: SubmissionId::for_test(70),
-                    status: SubmissionStatus::Finished(Verdict::Accepted),
+                    status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
                 }));
                 panic!("intentional panic after Finished behind backlog")
             })],
@@ -1926,7 +1973,7 @@ mod tests {
                     record.generation == Some(generation)
                         && record.state
                             == Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                                Verdict::Accepted,
+                                SubmissionResult::new(Verdict::Accepted),
                             )))
                 })
         });
@@ -1935,7 +1982,7 @@ mod tests {
         assert_eq!(
             hub.state(&target),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
     }
@@ -1995,7 +2042,7 @@ mod tests {
                 assert!(emit(SubmissionEvent::Accepted));
                 assert!(emit(SubmissionEvent::Status {
                     submission_id: SubmissionId::for_test(71),
-                    status: SubmissionStatus::Finished(Verdict::Accepted),
+                    status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
                 }));
                 panic_then_repanic_outside_catch()
             })],
@@ -2020,7 +2067,7 @@ mod tests {
         assert_eq!(
             hub.state(&target),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
     }
@@ -2057,6 +2104,7 @@ mod tests {
             problem_title: Some("Problem A".to_string()),
             language_label: "C++".to_string(),
             started_at: SystemTime::now(),
+            submitted_at: None,
             state: SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForJudge,
@@ -2160,7 +2208,7 @@ mod tests {
                 release_rx.recv().unwrap();
                 let _ = emit(SubmissionEvent::Status {
                     submission_id: SubmissionId::for_test(9),
-                    status: SubmissionStatus::Finished(Verdict::Accepted),
+                    status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
                 });
                 Ok(SubmissionCompletion::Accepted)
             })],
@@ -2178,7 +2226,7 @@ mod tests {
         wait_for_hub(&mut hub, "abc473 AC while switched", |hub| {
             hub.state(&abc473)
                 == display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 )))
         });
 
@@ -2186,7 +2234,7 @@ mod tests {
         assert_eq!(
             hub.state(&abc473),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
     }
@@ -2204,7 +2252,10 @@ mod tests {
         for (key, (id, status)) in keys.iter().cloned().zip([
             (11, SubmissionStatus::WaitingForJudge),
             (12, SubmissionStatus::WaitingForRejudge),
-            (13, SubmissionStatus::Finished(Verdict::WrongAnswer)),
+            (
+                13,
+                SubmissionStatus::Finished(SubmissionResult::new(Verdict::WrongAnswer)),
+            ),
         ]) {
             let calls = Arc::clone(&calls);
             let barrier = Arc::clone(&barrier);
@@ -2253,7 +2304,7 @@ mod tests {
         assert_eq!(
             hub.state(&keys[2]),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::WrongAnswer
+                SubmissionResult::new(Verdict::WrongAnswer)
             )))
         );
     }
@@ -2295,7 +2346,7 @@ mod tests {
         assert_eq!(progress.phase(), WorkerProgressPhase::AcceptedKnown);
         progress.observe_before_send(SubmissionEvent::Status {
             submission_id: SubmissionId::for_test(72),
-            status: SubmissionStatus::Finished(Verdict::Accepted),
+            status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
         });
         assert_eq!(progress.phase(), WorkerProgressPhase::FinishedKnown);
 
@@ -2398,7 +2449,9 @@ mod tests {
             4,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::TimeLimitExceeded),
+                status: SubmissionStatus::Finished(SubmissionResult::new(
+                    Verdict::TimeLimitExceeded
+                )),
             })
         )));
         assert_eq!(
@@ -2488,7 +2541,7 @@ mod tests {
                 SubmissionRecord {
                     generation: Some(1),
                     state: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                        Verdict::Accepted,
+                        SubmissionResult::new(Verdict::Accepted),
                     ))),
                     ..SubmissionRecord::default()
                 },
@@ -2504,7 +2557,7 @@ mod tests {
             assert_eq!(
                 hub.records[&a].state,
                 Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted
+                    SubmissionResult::new(Verdict::Accepted)
                 )))
             );
         }
@@ -2681,20 +2734,20 @@ mod tests {
             1,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             })
         )));
         assert_eq!(
             hub.records[&key].state,
             Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
         assert_eq!(
             hub.state(&key),
             display_attempt(
                 Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted
+                    SubmissionResult::new(Verdict::Accepted)
                 ))),
                 TuiSubmissionAttemptState::Unknown,
             )
@@ -2784,7 +2837,7 @@ mod tests {
         for state in [
             None,
             Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted,
+                SubmissionResult::new(Verdict::Accepted),
             ))),
             Some(TuiSubmissionState::TrackingUnavailable),
             Some(TuiSubmissionState::Status(
@@ -2882,7 +2935,7 @@ mod tests {
             SubmissionRecord {
                 generation: Some(1),
                 state: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                    Verdict::Accepted,
+                    SubmissionResult::new(Verdict::Accepted),
                 ))),
                 ..SubmissionRecord::default()
             },
@@ -2895,7 +2948,7 @@ mod tests {
         assert_eq!(
             hub.state(&abc473_c),
             display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                Verdict::Accepted
+                SubmissionResult::new(Verdict::Accepted)
             )))
         );
         assert!(tracking_cancellation.should_continue());
@@ -2960,7 +3013,7 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             }),
         )));
         let second = start_test_submission(hub, key, "B");
@@ -3010,7 +3063,7 @@ mod tests {
             (
                 WorkerEventKind::Submission(SubmissionEvent::Status {
                     submission_id: SubmissionId::for_test(1),
-                    status: SubmissionStatus::Finished(Verdict::Accepted),
+                    status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
                 }),
                 "AC",
             ),
@@ -3040,7 +3093,7 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::WrongAnswer),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::WrongAnswer)),
             }),
         )));
 
@@ -3060,7 +3113,7 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::RuntimeError),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::RuntimeError)),
             }),
         )));
         assert_eq!(
@@ -3132,11 +3185,26 @@ mod tests {
             a_generation,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::Accepted,
+                    Some(234),
+                    Some(33_348),
+                )),
             }),
         )));
         assert_eq!(hub.history.last().unwrap().generation, b_generation);
         assert_eq!(latest_started_label(&hub).unwrap().2, "Submitting");
+        assert_eq!(
+            hub.history
+                .iter()
+                .find(|entry| entry.generation == a_generation)
+                .unwrap()
+                .state
+                .current,
+            Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                SubmissionResult::with_metrics(Verdict::Accepted, Some(234), Some(33_348)),
+            )))
+        );
 
         assert!(hub.apply_event(event(
             &b,
@@ -3148,7 +3216,7 @@ mod tests {
             b_generation,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(2),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             }),
         )));
         assert_eq!(
@@ -3196,7 +3264,7 @@ mod tests {
             first_generation,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             }),
         )));
         let updated = hub.history.last().unwrap();
@@ -3212,6 +3280,83 @@ mod tests {
         assert_eq!(second.started_at, second_started_at);
         assert_eq!(second.problem_title.as_deref(), Some("Problem E"));
         assert_eq!(second.language_label, "C++");
+        hub.request_stop();
+    }
+
+    #[test]
+    fn tracking_started_enriches_only_the_matching_history_generation() {
+        let key = SubmissionKey::new("abc474", "abc474_e");
+        let executor =
+            TestExecutor::for_key(key.clone(), vec![waiting_test_run(), waiting_test_run()]);
+        let mut hub = SubmissionHub::with_executor(executor);
+        let first = start_test_submission(&mut hub, &key, "E");
+        assert_eq!(hub.history[0].submitted_at, None);
+        assert!(hub.apply_event(event(
+            &key,
+            first,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        let first_official = official_timestamp(25);
+        assert!(hub.apply_event(event(
+            &key,
+            first,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
+                submission_id: SubmissionId::for_test(101),
+                submitted_at: Some(first_official),
+            }),
+        )));
+        assert_eq!(hub.history[0].submitted_at, Some(first_official));
+
+        let second = start_test_submission(&mut hub, &key, "E");
+        assert!(hub.apply_event(event(
+            &key,
+            second,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        assert!(!hub.apply_event(event(
+            &key,
+            first,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
+                submission_id: SubmissionId::for_test(101),
+                submitted_at: Some(official_timestamp(26)),
+            }),
+        )));
+        assert_eq!(hub.history[0].submitted_at, Some(first_official));
+        assert_eq!(hub.history[1].generation, second);
+        assert_eq!(hub.history[1].submitted_at, None);
+        hub.request_stop();
+    }
+
+    #[test]
+    fn older_problem_timestamp_enrichment_keeps_latest_started_receipt_identity() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc474", "abc474_b");
+        let executor = TestExecutor::with_keyed_runs(vec![
+            (a.clone(), vec![waiting_test_run()]),
+            (b.clone(), vec![waiting_test_run()]),
+        ]);
+        let mut hub = SubmissionHub::with_executor(executor);
+        let a_generation = start_test_submission(&mut hub, &a, "A");
+        assert!(hub.apply_event(event(
+            &a,
+            a_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        let b_generation = start_test_submission(&mut hub, &b, "B");
+        let official = official_timestamp(25);
+
+        assert!(hub.apply_event(event(
+            &a,
+            a_generation,
+            WorkerEventKind::Submission(SubmissionEvent::TrackingStarted {
+                submission_id: SubmissionId::for_test(201),
+                submitted_at: Some(official),
+            }),
+        )));
+
+        assert_eq!(hub.history.last().unwrap().generation, b_generation);
+        assert_eq!(hub.history.last().unwrap().problem_index, "B");
+        assert_eq!(hub.history[0].submitted_at, Some(official));
         hub.request_stop();
     }
 
@@ -3253,7 +3398,7 @@ mod tests {
         };
         let state = |verdict| SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                verdict,
+                SubmissionResult::new(verdict),
             ))),
             attempt: None,
         };
@@ -3266,6 +3411,7 @@ mod tests {
                 problem_title: Some("Problem A".to_string()),
                 language_label: "C++".to_string(),
                 started_at: SystemTime::now(),
+                submitted_at: None,
                 state: state(Verdict::WrongAnswer),
             },
             SubmissionHistoryEntry {
@@ -3275,6 +3421,7 @@ mod tests {
                 problem_title: Some("Problem A".to_string()),
                 language_label: "PyPy".to_string(),
                 started_at: SystemTime::now(),
+                submitted_at: None,
                 state: state(Verdict::Accepted),
             },
         ]);
@@ -3393,7 +3540,7 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::Accepted),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             }),
         )));
         let second = start_test_submission(&mut hub, &key, "B");
@@ -3403,7 +3550,7 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::WrongAnswer),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::WrongAnswer)),
             }),
         )));
         assert_eq!(
@@ -3428,7 +3575,11 @@ mod tests {
             first,
             WorkerEventKind::Submission(SubmissionEvent::Status {
                 submission_id: SubmissionId::for_test(1),
-                status: SubmissionStatus::Finished(Verdict::RuntimeError),
+                status: SubmissionStatus::Finished(SubmissionResult::with_metrics(
+                    Verdict::RuntimeError,
+                    Some(31),
+                    Some(33_348),
+                )),
             }),
         )));
         assert_eq!(
@@ -3438,6 +3589,7 @@ mod tests {
                 ("B".to_string(), "WA".to_string()),
             ]
         );
+        assert_eq!(hub.history.last().unwrap().state.compact_label(), "WJ");
         hub.request_stop();
     }
 
@@ -3470,11 +3622,15 @@ mod tests {
                 "14/50 WA",
             ),
             (
-                TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted)),
+                TuiSubmissionState::Status(SubmissionStatus::Finished(SubmissionResult::new(
+                    Verdict::Accepted,
+                ))),
                 "AC",
             ),
             (
-                TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::WrongAnswer)),
+                TuiSubmissionState::Status(SubmissionStatus::Finished(SubmissionResult::new(
+                    Verdict::WrongAnswer,
+                ))),
                 "WA",
             ),
             (TuiSubmissionState::TrackingUnavailable, "Untracked"),
@@ -3544,7 +3700,7 @@ mod tests {
             (
                 SubmissionDisplayState {
                     current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
-                        Verdict::Accepted,
+                        SubmissionResult::new(Verdict::Accepted),
                     ))),
                     attempt: Some(TuiSubmissionAttemptState::Unknown),
                 },
@@ -3627,7 +3783,7 @@ mod tests {
         );
         assert_eq!(
             segments(current(TuiSubmissionState::Status(
-                SubmissionStatus::Finished(Verdict::Accepted),
+                SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
             ))),
             [("AC".to_string(), SubmissionTone::Success)]
         );
@@ -3643,7 +3799,7 @@ mod tests {
         ] {
             assert_eq!(
                 segments(current(TuiSubmissionState::Status(
-                    SubmissionStatus::Finished(verdict),
+                    SubmissionStatus::Finished(SubmissionResult::new(verdict)),
                 ))),
                 [(verdict.to_string(), SubmissionTone::Failure)]
             );
