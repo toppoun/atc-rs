@@ -287,15 +287,8 @@ fn submission_view_state(app: &WatchApp, hub: &SubmissionHub) -> submission::Sub
             ))
         })
         .collect();
-    let history = hub.history_for_contest(app.contest_id()).cloned().collect();
-    let latest_started = hub
-        .latest_started()
-        .map(submission::LatestStartedSubmission::from);
-    submission::SubmissionViewState {
-        problems,
-        history,
-        latest_started,
-    }
+    let history = hub.history().to_vec();
+    submission::SubmissionViewState { problems, history }
 }
 
 fn editor_modal_escape_closes(key: KeyEvent) -> bool {
@@ -575,8 +568,8 @@ impl SubmitController {
     }
 
     fn handle_key(&mut self, key: KeyEvent, app: &WatchApp, hub: &mut SubmissionHub) -> bool {
-        self.handle_key_with_start(key, app, |key, problem_index, plan| {
-            hub.start(key, problem_index, plan)
+        self.handle_key_with_start(key, app, |key, problem_index, problem_title, plan| {
+            hub.start(key, problem_index, problem_title, plan)
         })
     }
 
@@ -586,6 +579,7 @@ impl SubmitController {
         app: &WatchApp,
         start: impl FnOnce(
             submission::SubmissionKey,
+            String,
             String,
             crate::commands::submit::SubmitPlan,
         ) -> Result<u64, String>,
@@ -632,6 +626,7 @@ impl SubmitController {
         start: impl FnOnce(
             submission::SubmissionKey,
             String,
+            String,
             crate::commands::submit::SubmitPlan,
         ) -> Result<u64, String>,
     ) -> bool {
@@ -658,7 +653,12 @@ impl SubmitController {
             candidate.language,
             modal.python_runtime,
         );
-        match start(modal.key.clone(), problem.index.clone(), plan) {
+        match start(
+            modal.key.clone(),
+            problem.index.clone(),
+            problem.title.clone(),
+            plan,
+        ) {
             Ok(generation) => {
                 modal.starting_generation = Some(generation);
                 modal.error = None;
@@ -3435,6 +3435,54 @@ fn contains_quit_event(events: &VecDeque<TerminalEvent>) -> bool {
     events.iter().any(is_quit_event)
 }
 
+struct GlobalQuitVirtualUiState {
+    contest_modal_active: bool,
+    refresh_modal_state: Option<RefreshContestModalState>,
+    source_modal_active: bool,
+    editor_target_modal_active: bool,
+}
+
+fn apply_frontend_action_to_global_quit_state(
+    state: &mut GlobalQuitVirtualUiState,
+    action: FrontendAction,
+    app: &WatchApp,
+    workspace_available: bool,
+) -> bool {
+    if !action.availability(app, workspace_available).is_available() {
+        return false;
+    }
+
+    match action {
+        FrontendAction::RefreshContest => {
+            state.refresh_modal_state = Some(RefreshContestModalState::Running)
+        }
+        FrontendAction::SwitchContest => state.contest_modal_active = true,
+        FrontendAction::OpenSource => {
+            state.editor_target_modal_active = false;
+            state.source_modal_active = true;
+        }
+        FrontendAction::Submit => {
+            state.source_modal_active = false;
+            state.editor_target_modal_active = true;
+        }
+        FrontendAction::OpenSettings
+        | FrontendAction::OpenWorkspaceSettings
+        | FrontendAction::OpenTemplate => {
+            state.source_modal_active = false;
+            state.editor_target_modal_active = true;
+        }
+        FrontendAction::RunTests
+        | FrontendAction::ToggleDebug
+        | FrontendAction::ToggleSamples
+        | FrontendAction::ToggleSubmissions
+        | FrontendAction::StartStress
+        | FrontendAction::StopStress
+        | FrontendAction::InitializeStress => {}
+    }
+
+    true
+}
+
 fn contains_global_quit_event(
     events: &VecDeque<TerminalEvent>,
     app: &WatchApp,
@@ -3444,12 +3492,15 @@ fn contains_global_quit_event(
     open_source: &OpenSourceController,
     editor_target_modal_active: bool,
 ) -> bool {
-    let mut contest_modal_active = contest_switch.modal_active();
-    let mut refresh_modal_state = refresh_modal_state;
-    let mut source_modal_active = open_source.modal_active();
-    let mut editor_target_modal_active = editor_target_modal_active;
+    let mut virtual_ui = GlobalQuitVirtualUiState {
+        contest_modal_active: contest_switch.modal_active(),
+        refresh_modal_state,
+        source_modal_active: open_source.modal_active(),
+        editor_target_modal_active,
+    };
     let mut command_palette = command_palette.clone();
     let mut user_input_editor_active = app.user_input_editor_active();
+    let mut shortcut_help_visible = app.shortcut_help_visible();
     let mut pointer_seen = false;
 
     for event in events {
@@ -3461,41 +3512,55 @@ fn contains_global_quit_event(
             continue;
         };
 
-        if let Some(state) = refresh_modal_state {
+        // Keep the read-only batch simulation in lockstep with ordered dispatch: help consumes
+        // Escape and repeated `?`, while a different key is dispatched after dismissing help.
+        match shortcut_help_transition(shortcut_help_visible, *key) {
+            ShortcutHelpTransition::PassThrough => {}
+            ShortcutHelpTransition::KeepAndConsume => continue,
+            ShortcutHelpTransition::DismissAndConsume => {
+                shortcut_help_visible = false;
+                continue;
+            }
+            ShortcutHelpTransition::DismissAndPassThrough => {
+                shortcut_help_visible = false;
+            }
+        }
+
+        if let Some(state) = virtual_ui.refresh_modal_state {
             if state == RefreshContestModalState::Failed
                 && key.kind == KeyEventKind::Press
                 && key.code == KeyCode::Escape
             {
-                refresh_modal_state = None;
+                virtual_ui.refresh_modal_state = None;
             } else if state == RefreshContestModalState::Failed
                 && key.kind == KeyEventKind::Press
                 && key.code == KeyCode::Enter
             {
-                refresh_modal_state = Some(RefreshContestModalState::Running);
+                virtual_ui.refresh_modal_state = Some(RefreshContestModalState::Running);
             }
             continue;
         }
 
-        if contest_modal_active {
+        if virtual_ui.contest_modal_active {
             if key.kind == KeyEventKind::Press
                 && key.code == KeyCode::Escape
                 && contest_switch.escape_dismisses_modal()
             {
-                contest_modal_active = false;
+                virtual_ui.contest_modal_active = false;
             }
             continue;
         }
 
-        if source_modal_active {
+        if virtual_ui.source_modal_active {
             if editor_modal_escape_closes(*key) {
-                source_modal_active = false;
+                virtual_ui.source_modal_active = false;
             }
             continue;
         }
 
-        if editor_target_modal_active {
+        if virtual_ui.editor_target_modal_active {
             if editor_modal_escape_closes(*key) {
-                editor_target_modal_active = false;
+                virtual_ui.editor_target_modal_active = false;
             }
             continue;
         }
@@ -3503,29 +3568,14 @@ fn contains_global_quit_event(
         if command_palette.is_active() {
             if let CommandPaletteKeyResult::ExecuteRequested(action) =
                 command_palette.handle_key(*key)
-                && action
-                    .availability(app, contest_switch.workspace_available)
-                    .is_available()
+                && apply_frontend_action_to_global_quit_state(
+                    &mut virtual_ui,
+                    action,
+                    app,
+                    contest_switch.workspace_available,
+                )
             {
                 command_palette.close();
-                match action {
-                    FrontendAction::RefreshContest => {
-                        refresh_modal_state = Some(RefreshContestModalState::Running)
-                    }
-                    FrontendAction::SwitchContest => contest_modal_active = true,
-                    FrontendAction::OpenSource => source_modal_active = true,
-                    FrontendAction::Submit => editor_target_modal_active = true,
-                    FrontendAction::OpenSettings
-                    | FrontendAction::OpenWorkspaceSettings
-                    | FrontendAction::OpenTemplate => editor_target_modal_active = true,
-                    FrontendAction::RunTests
-                    | FrontendAction::ToggleDebug
-                    | FrontendAction::ToggleSamples
-                    | FrontendAction::ToggleSubmissions
-                    | FrontendAction::StartStress
-                    | FrontendAction::StopStress
-                    | FrontendAction::InitializeStress => {}
-                }
             }
             continue;
         }
@@ -3552,15 +3602,23 @@ fn contains_global_quit_event(
             continue;
         }
 
+        if is_shortcut_help_key(*key) {
+            shortcut_help_visible = true;
+            continue;
+        }
+
         if is_command_palette_open_key(*key) {
             command_palette.open();
             continue;
         }
 
-        if FrontendAction::from_shortcut(*key) == Some(FrontendAction::SwitchContest)
-            && contest_switch.workspace_available
-        {
-            contest_modal_active = true;
+        if let Some(action) = FrontendAction::from_shortcut(*key) {
+            apply_frontend_action_to_global_quit_state(
+                &mut virtual_ui,
+                action,
+                app,
+                contest_switch.workspace_available,
+            );
             continue;
         }
 
@@ -3578,6 +3636,59 @@ fn is_command_palette_open_key(key: KeyEvent) -> bool {
         && !key.modifiers.control
         && !key.modifiers.alt
         && !key.modifiers.super_key
+}
+
+fn is_shortcut_help_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('?')
+        && !key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.super_key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutHelpTransition {
+    PassThrough,
+    KeepAndConsume,
+    DismissAndConsume,
+    DismissAndPassThrough,
+}
+
+fn shortcut_help_transition(visible: bool, key: KeyEvent) -> ShortcutHelpTransition {
+    if !visible || !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return ShortcutHelpTransition::PassThrough;
+    }
+    if is_shortcut_help_key(key) {
+        return ShortcutHelpTransition::KeepAndConsume;
+    }
+    if key.code == KeyCode::Escape {
+        ShortcutHelpTransition::DismissAndConsume
+    } else {
+        ShortcutHelpTransition::DismissAndPassThrough
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutHelpKeyResult {
+    Continue,
+    Dismissed,
+    Consumed { changed: bool },
+}
+
+fn handle_shortcut_help_key(app: &mut WatchApp, key: KeyEvent) -> ShortcutHelpKeyResult {
+    match shortcut_help_transition(app.shortcut_help_visible(), key) {
+        ShortcutHelpTransition::PassThrough => ShortcutHelpKeyResult::Continue,
+        ShortcutHelpTransition::KeepAndConsume => {
+            ShortcutHelpKeyResult::Consumed { changed: false }
+        }
+        ShortcutHelpTransition::DismissAndConsume => {
+            app.dismiss_shortcut_help();
+            ShortcutHelpKeyResult::Consumed { changed: true }
+        }
+        ShortcutHelpTransition::DismissAndPassThrough => {
+            app.dismiss_shortcut_help();
+            ShortcutHelpKeyResult::Dismissed
+        }
+    }
 }
 
 fn is_quit_event(terminal_event: &TerminalEvent) -> bool {
@@ -3738,6 +3849,36 @@ fn handle_terminal_events_with_mouse_mode(
 }
 
 fn handle_terminal_event_with_mouse_mode(
+    app: &mut WatchApp,
+    detail_layout: &mut detail_layout::DetailLayout,
+    detail_scrollbar_drag: &mut DetailScrollbarDragState,
+    terminal_event: TerminalEvent,
+    render_info: &view::RenderInfo,
+    mouse_mode: MouseMode,
+    input: &mut FrontendInputContext<'_, '_, '_, '_, '_>,
+) -> io::Result<bool> {
+    let shortcut_help_changed = if let TerminalEvent::Key(key) = terminal_event {
+        match handle_shortcut_help_key(app, key) {
+            ShortcutHelpKeyResult::Continue => false,
+            ShortcutHelpKeyResult::Dismissed => true,
+            ShortcutHelpKeyResult::Consumed { changed } => return Ok(changed),
+        }
+    } else {
+        false
+    };
+
+    Ok(handle_terminal_event_after_shortcut_help(
+        app,
+        detail_layout,
+        detail_scrollbar_drag,
+        terminal_event,
+        render_info,
+        mouse_mode,
+        input,
+    )? | shortcut_help_changed)
+}
+
+fn handle_terminal_event_after_shortcut_help(
     app: &mut WatchApp,
     detail_layout: &mut detail_layout::DetailLayout,
     detail_scrollbar_drag: &mut DetailScrollbarDragState,
@@ -4014,6 +4155,11 @@ fn handle_key_event_after_delete_disarm(
         let changed = handle_user_input_editor_key(app, key, input.terminal.current_destination);
         flush_user_input_run_requests(app, input.terminal.run_tx)?;
         return Ok(changed);
+    }
+
+    if key.kind == KeyEventKind::Press && is_shortcut_help_key(key) {
+        app.show_shortcut_help();
+        return Ok(true);
     }
 
     if key.code == KeyCode::Char('q') && key.kind == KeyEventKind::Press {
@@ -5143,6 +5289,186 @@ mod tests {
         )
     }
 
+    #[test]
+    fn shortcut_help_is_one_shot_without_consuming_the_next_action() {
+        let (run_tx, _run_rx) = mpsc::channel();
+        let info = view::RenderInfo::default();
+        let mut app = app();
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('?'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert!(app.shortcut_help_visible());
+
+        for kind in [
+            KeyEventKind::Repeat,
+            KeyEventKind::Press,
+            KeyEventKind::Release,
+        ] {
+            let mut events = VecDeque::from([TerminalEvent::Key(key(KeyCode::Char('?'), kind))]);
+            assert!(!handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+            assert!(app.shortcut_help_visible());
+        }
+
+        let side_pane_before = app.side_pane_enabled();
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('s'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert!(!app.shortcut_help_visible());
+        assert_ne!(app.side_pane_enabled(), side_pane_before);
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('?'),
+            KeyEventKind::Press,
+        ))]);
+        handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap();
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Escape,
+            KeyEventKind::Press,
+        ))]);
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert!(!app.shortcut_help_visible());
+        assert!(!app.should_quit());
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('?'),
+            KeyEventKind::Press,
+        ))]);
+        handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap();
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Escape,
+            KeyEventKind::Repeat,
+        ))]);
+        assert!(handle_terminal_events(&mut app, &info, &mut events, &run_tx).unwrap());
+        assert!(!app.shortcut_help_visible());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn global_quit_pre_scan_obeys_shortcut_help_before_editor_semantics() {
+        let mut editor_app = app();
+        assert!(editor_app.begin_new_user_input().unwrap());
+        editor_app.show_shortcut_help();
+        let escape_then_q = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Escape, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_plain_global_quit_event(
+            &escape_then_q,
+            &editor_app
+        ));
+        let repeated_help_then_escape_q = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Char('?'), KeyEventKind::Repeat)),
+            TerminalEvent::Key(key(KeyCode::Escape, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        assert!(!contains_plain_global_quit_event(
+            &repeated_help_then_escape_q,
+            &editor_app
+        ));
+
+        let mut root_app = app();
+        root_app.show_shortcut_help();
+        let q = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('q'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(contains_plain_global_quit_event(&q, &root_app));
+    }
+
+    #[test]
+    fn global_quit_pre_scan_tracks_submit_shortcut_modal_transition() {
+        let submit_then_q = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Char('t'), KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_plain_global_quit_event(&submit_then_q, &app()));
+
+        let mut help_app = app();
+        help_app.show_shortcut_help();
+        assert!(!contains_plain_global_quit_event(&submit_then_q, &help_app));
+
+        let unavailable_app = app_with_problems(&[]);
+        assert!(contains_plain_global_quit_event(
+            &submit_then_q,
+            &unavailable_app
+        ));
+    }
+
+    #[test]
+    fn global_quit_pre_scan_uses_submit_transition_from_command_palette() {
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "submit".to_string();
+        assert_eq!(palette.selected_action(), Some(FrontendAction::Submit));
+        let submit_then_q = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_global_quit_event_with_palette(
+            &submit_then_q,
+            &app(),
+            &palette,
+        ));
+    }
+
+    #[test]
+    fn shortcut_help_then_submit_opens_the_existing_submit_modal() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut app = app();
+        let mut hub = SubmissionHub::new();
+        let mut submit_controller =
+            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('?'),
+            KeyEventKind::Press,
+        ))]);
+        handle_terminal_events(&mut app, &view::RenderInfo::default(), &mut events, &run_tx)
+            .unwrap();
+        assert!(app.shortcut_help_visible());
+
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('t'),
+            KeyEventKind::Press,
+        ))]);
+        assert!(
+            super::handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut detail_layout::DetailLayout::default(),
+                &mut DetailScrollbarDragState::default(),
+                &view::RenderInfo::default(),
+                &mut events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, Some(temp.path()), None),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    command_palette: None,
+                    open_source: None,
+                    submit: Some(SubmitInputContext {
+                        controller: &mut submit_controller,
+                        hub: &mut hub,
+                    }),
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(!app.shortcut_help_visible());
+        assert!(submit_controller.modal_active());
+    }
+
     #[derive(Debug)]
     struct RecordingSourceEditor {
         mode: EditorLaunchMode,
@@ -6017,7 +6343,7 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _, _| panic!("a source-less modal must not reach submission orchestration"),
+            |_, _, _, _| panic!("a source-less modal must not reach submission orchestration"),
         ));
         assert!(
             controller
@@ -6068,13 +6394,13 @@ mod tests {
         assert!(!controller.handle_key_with_start(
             key(KeyCode::Char('t'), KeyEventKind::Press),
             &app,
-            |_, _, _| panic!("a second t must not confirm submission"),
+            |_, _, _, _| panic!("a second t must not confirm submission"),
         ));
 
         assert!(controller.handle_key_with_start(
             key(KeyCode::Down, KeyEventKind::Press),
             &app,
-            |_, _, _| panic!("navigation must not submit"),
+            |_, _, _, _| panic!("navigation must not submit"),
         ));
         assert_eq!(
             controller.modal().unwrap().policy_label().as_deref(),
@@ -6083,13 +6409,13 @@ mod tests {
         assert!(!controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Repeat),
             &app,
-            |_, _, _| panic!("key repeat must not submit"),
+            |_, _, _, _| panic!("key repeat must not submit"),
         ));
         let calls = Cell::new(0);
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _, _| {
+            |_, _, _, _| {
                 calls.set(calls.get() + 1);
                 Ok(7)
             },
@@ -6099,13 +6425,13 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, _, _| panic!("a second Enter press must not start another worker"),
+            |_, _, _, _| panic!("a second Enter press must not start another worker"),
         ));
         assert_eq!(calls.get(), 1);
         assert!(controller.handle_key_with_start(
             key(KeyCode::Escape, KeyEventKind::Press),
             &app,
-            |_, _, _| panic!("Escape must not submit"),
+            |_, _, _, _| panic!("Escape must not submit"),
         ));
         assert!(!controller.modal_active());
     }
@@ -6153,8 +6479,9 @@ mod tests {
         assert!(controller.handle_key_with_start(
             key(KeyCode::Enter, KeyEventKind::Press),
             &app,
-            |_, problem_index, plan| {
+            |_, problem_index, problem_title, plan| {
                 assert_eq!(problem_index, "A");
+                assert_eq!(problem_title, "Problem 0");
                 let prepared = crate::commands::submit::prepare_submit(plan).unwrap();
                 assert_eq!(prepared.test_source_snapshot(), confirmed_snapshot);
                 Ok(9)
@@ -12053,6 +12380,14 @@ mod tests {
     }
 
     fn contains_plain_global_quit_event(events: &VecDeque<TerminalEvent>, app: &WatchApp) -> bool {
+        contains_global_quit_event_with_palette(events, app, &CommandPalette::default())
+    }
+
+    fn contains_global_quit_event_with_palette(
+        events: &VecDeque<TerminalEvent>,
+        app: &WatchApp,
+        command_palette: &CommandPalette,
+    ) -> bool {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("abc123");
         let context = workspace_context(root.path());
@@ -12070,7 +12405,7 @@ mod tests {
             app,
             &contest_switch,
             None,
-            &CommandPalette::default(),
+            command_palette,
             &open_source,
             false,
         )

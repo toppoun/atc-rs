@@ -5,7 +5,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,11 +16,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::app::WatchApp;
 use super::detail_layout::DetailLayout;
 use super::submission::{
-    LatestStartedSubmission, SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey,
-    SubmissionViewState, TuiSubmissionAttemptState, TuiSubmissionState,
+    SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey, SubmissionViewState,
+    TuiSubmissionAttemptState, TuiSubmissionState,
 };
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
-use super::{TerminaSession, view};
+use super::{ShortcutHelpKeyResult, TerminaSession, handle_shortcut_help_key, view};
 use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
 use crate::language::Language;
 use crate::model::{Contest, Problem};
@@ -159,17 +159,12 @@ impl DemoHarness {
             submissions: SubmissionViewState {
                 problems: vec![Some(ac), Some(waiting), Some(progress_re), None, None],
                 history: vec![
-                    demo_history_entry(5, "B", waiting),
-                    demo_history_entry(4, "B", wa),
-                    demo_history_entry(3, "B", re),
-                    demo_history_entry(2, "A", ac),
                     demo_history_entry(1, "C", progress_re),
+                    demo_history_entry(2, "A", ac),
+                    demo_history_entry(3, "B", re),
+                    demo_history_entry(4, "B", wa),
+                    demo_history_entry(5, "B", waiting),
                 ],
-                latest_started: Some(LatestStartedSubmission {
-                    contest_id: "awc0151".to_string(),
-                    problem_index: "B".to_string(),
-                    state: waiting,
-                }),
             },
             show_help: true,
             playback: None,
@@ -192,26 +187,18 @@ impl DemoHarness {
             return;
         };
         *slot = state;
-        let problem_index = self.app.problems()[problem].index.clone();
+        let problem = &self.app.problems()[problem];
+        let problem_index = problem.index.clone();
+        let key = SubmissionKey::new(self.app.contest_id(), problem.task_id.clone());
         if let Some(state) = state {
             if let Some(entry) = self
                 .submissions
                 .history
                 .iter_mut()
-                .find(|entry| entry.problem_index == problem_index)
+                .rev()
+                .find(|entry| entry.key == key)
             {
                 entry.state = state;
-                if self
-                    .submissions
-                    .latest_started
-                    .as_ref()
-                    .is_some_and(|latest| {
-                        latest.contest_id == entry.key.contest_id
-                            && latest.problem_index == entry.problem_index
-                    })
-                {
-                    self.submissions.latest_started = Some(LatestStartedSubmission::from(&*entry));
-                }
             } else {
                 let generation = self
                     .submissions
@@ -222,8 +209,7 @@ impl DemoHarness {
                     .unwrap_or(0)
                     .saturating_add(1);
                 let entry = demo_history_entry(generation, &problem_index, state);
-                self.submissions.latest_started = Some(LatestStartedSubmission::from(&entry));
-                self.submissions.history.insert(0, entry);
+                self.submissions.history.push(entry);
             }
         }
     }
@@ -264,11 +250,6 @@ impl DemoHarness {
             return;
         };
         self.set_problem_submission(problem, Some(SCENARIO[0]));
-        self.submissions.latest_started = Some(LatestStartedSubmission {
-            contest_id: self.app.contest_id().to_string(),
-            problem_index: self.app.problems()[problem].index.clone(),
-            state: SCENARIO[0],
-        });
         self.playback = Some(ScenarioPlayback {
             problem,
             next_step: 1,
@@ -313,10 +294,21 @@ impl DemoHarness {
             return false;
         }
 
+        match handle_shortcut_help_key(&mut self.app, key) {
+            ShortcutHelpKeyResult::Continue => {}
+            ShortcutHelpKeyResult::Dismissed => {}
+            ShortcutHelpKeyResult::Consumed { .. } => return false,
+        }
+        if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('?') {
+            self.show_help = false;
+            self.app.show_shortcut_help();
+            return false;
+        }
+
         if key.kind == KeyEventKind::Press {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Escape => return true,
-                KeyCode::Char('?') => self.show_help = !self.show_help,
+                KeyCode::Char('H') => self.show_help = !self.show_help,
                 KeyCode::Char('v') => self.app.toggle_side_pane_mode(),
                 KeyCode::Char('s') => self.app.toggle_side_pane(),
                 KeyCode::Char('d') => self.app.toggle_debug(),
@@ -326,7 +318,6 @@ impl DemoHarness {
                 KeyCode::Char('1') => {
                     self.set_selected_submission(None);
                     self.submissions.history.clear();
-                    self.submissions.latest_started = None;
                 }
                 KeyCode::Char('2') => self
                     .set_selected_submission(Some(attempt(TuiSubmissionAttemptState::Submitting))),
@@ -380,22 +371,38 @@ impl DemoHarness {
                 }
                 KeyCode::Char('x') => self.cycle_composite(),
                 KeyCode::Char('p') => {
-                    self.submissions.latest_started = Some(LatestStartedSubmission {
-                        contest_id: "awc0151".to_string(),
-                        problem_index: "C".to_string(),
-                        state: current(TuiSubmissionState::Status(
+                    let generation = self
+                        .submissions
+                        .history
+                        .last()
+                        .map(|entry| entry.generation.saturating_add(1))
+                        .unwrap_or(1);
+                    self.submissions.history.push(demo_history_entry(
+                        generation,
+                        "C",
+                        current(TuiSubmissionState::Status(
                             SubmissionStatus::JudgingProgress {
                                 judged: 7,
                                 total: 15,
                                 provisional: Some(Verdict::RuntimeError),
                             },
                         )),
-                    });
+                    ));
                 }
                 KeyCode::Char('o') => {
-                    self.submissions.latest_started = Some(LatestStartedSubmission {
-                        contest_id: "abc474".to_string(),
+                    let generation = self
+                        .submissions
+                        .history
+                        .last()
+                        .map(|entry| entry.generation.saturating_add(1))
+                        .unwrap_or(1);
+                    self.submissions.history.push(SubmissionHistoryEntry {
+                        generation,
+                        key: SubmissionKey::new("abc474", "abc474_b"),
                         problem_index: "B".to_string(),
+                        problem_title: None,
+                        language_label: "PyPy".to_string(),
+                        started_at: SystemTime::now(),
                         state: current(TuiSubmissionState::Status(
                             SubmissionStatus::WaitingForJudge,
                         )),
@@ -446,6 +453,10 @@ fn demo_history_entry(
             format!("awc0151_{}", problem_index.to_ascii_lowercase()),
         ),
         problem_index: problem_index.to_string(),
+        problem_title: Some(format!("Demo Problem {problem_index}")),
+        language_label: "C++".to_string(),
+        started_at: SystemTime::now()
+            - Duration::from_secs(6_u64.saturating_sub(generation).saturating_mul(30)),
         state,
     }
 }
@@ -556,7 +567,7 @@ fn render_help(frame: &mut Frame<'_>) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  ? hide"),
+        Span::raw("  H hide"),
     ]);
     let help = Text::from(vec![
         Line::raw("a-e / left-right / h-l problem   v samples/submissions   s side pane   d debug"),
@@ -567,7 +578,7 @@ fn render_help(frame: &mut Frame<'_>) {
             "8 55/72 RE  9 AC  0 WA  r RE  t TLE  n Untracked  u Unknown  x current+attempt  g reset fixture",
         ),
         Line::raw(
-            "p footer C 7/15 RE  o footer abc474/B WJ  Space play/stop  q / Esc / Ctrl-C quit",
+            "p receipt C 7/15 RE  o receipt abc474/B WJ  ? shortcuts  Space play/stop  q / Esc quit",
         ),
     ]);
     frame.render_widget(Clear, area);
@@ -639,7 +650,7 @@ mod tests {
         }
         assert!(!lines[0].contains("SUB "));
         assert!(lines.iter().any(|line| {
-            line.contains("B  WJ") && line.contains('│') && line.contains(": commands")
+            line.contains("B - Demo Problem B") && line.contains("C++") && line.contains("WJ")
         }));
     }
 
@@ -669,7 +680,8 @@ mod tests {
 
         demo.handle_key(key(KeyCode::Char('1'), KeyEventKind::Press), now);
         assert!(rendered_text(&demo, 100, 20).contains("No submissions"));
-        assert!(rendered_text(&demo, 100, 20).contains("SUB ·"));
+        assert!(rendered_text(&demo, 100, 20).contains("? shortcuts"));
+        assert!(rendered_text(&demo, 100, 20).contains(": commands"));
         demo.handle_key(key(KeyCode::Char('s'), KeyEventKind::Press), now);
         assert!(!demo.app.side_pane_enabled());
     }
@@ -681,10 +693,91 @@ mod tests {
         let now = Instant::now();
 
         demo.handle_key(key(KeyCode::Char('p'), KeyEventKind::Press), now);
-        assert!(rendered_text(&demo, 100, 20).contains("C  7/15 RE"));
+        assert!(rendered_text(&demo, 100, 20).contains("C - Demo Problem C"));
+        assert!(rendered_text(&demo, 100, 20).contains("7/15 RE"));
 
         demo.handle_key(key(KeyCode::Char('o'), KeyEventKind::Press), now);
-        assert!(rendered_text(&demo, 100, 20).contains("abc474/B  WJ"));
+        assert!(rendered_text(&demo, 100, 20).contains("abc474/B"));
+        assert!(rendered_text(&demo, 100, 20).contains("PyPy"));
+        assert!(rendered_text(&demo, 100, 20).contains("WJ"));
+
+        let mut final_demo = DemoHarness::new().unwrap();
+        final_demo.show_help = false;
+        final_demo.handle_key(key(KeyCode::Char('9'), KeyEventKind::Press), now);
+        assert!(rendered_text(&final_demo, 100, 20).contains("AC"));
+        final_demo.handle_key(key(KeyCode::Char('0'), KeyEventKind::Press), now);
+        assert!(rendered_text(&final_demo, 100, 20).contains("WA"));
+    }
+
+    #[test]
+    fn current_problem_update_does_not_mutate_cross_contest_same_index() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        let now = Instant::now();
+        demo.handle_key(key(KeyCode::Char('o'), KeyEventKind::Press), now);
+        let cross = demo.submissions.history.last().unwrap();
+        let cross_generation = cross.generation;
+        let cross_state = cross.state;
+
+        demo.handle_key(key(KeyCode::Char('9'), KeyEventKind::Press), now);
+
+        let cross = demo
+            .submissions
+            .history
+            .iter()
+            .find(|entry| entry.generation == cross_generation)
+            .unwrap();
+        assert_eq!(cross.key, SubmissionKey::new("abc474", "abc474_b"));
+        assert_eq!(cross.state, cross_state);
+        let current_entry = demo
+            .submissions
+            .history
+            .iter()
+            .rev()
+            .find(|entry| entry.key == SubmissionKey::new("awc0151", "awc0151_b"))
+            .unwrap();
+        assert_eq!(
+            current_entry.state,
+            current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                Verdict::Accepted,
+            )))
+        );
+        let receipt = rendered_text(&demo, 100, 20);
+        assert!(receipt.contains("abc474/B"));
+        assert!(receipt.contains("WJ"));
+    }
+
+    #[test]
+    fn demo_shortcut_help_is_one_shot_and_preserves_following_actions() {
+        let mut demo = DemoHarness::new().unwrap();
+        demo.show_help = false;
+        let now = Instant::now();
+
+        assert!(!demo.app.shortcut_help_visible());
+        assert!(!demo.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press), now));
+        assert!(demo.app.shortcut_help_visible());
+        let help = rendered_text(&demo, 100, 20);
+        for label in [": commands", "t submit", "q quit", "s pane", "v view"] {
+            assert!(help.contains(label), "missing help label {label:?}");
+        }
+
+        assert!(!demo.handle_key(key(KeyCode::Char('?'), KeyEventKind::Repeat), now));
+        assert!(!demo.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press), now));
+        assert!(demo.app.shortcut_help_visible());
+
+        assert!(!demo.handle_key(key(KeyCode::Char('t'), KeyEventKind::Press), now));
+        assert!(!demo.app.shortcut_help_visible());
+        assert!(rendered_text(&demo, 100, 20).contains("TLE"));
+
+        demo.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press), now);
+        let pane = demo.app.side_pane_enabled();
+        demo.handle_key(key(KeyCode::Char('s'), KeyEventKind::Press), now);
+        assert!(!demo.app.shortcut_help_visible());
+        assert_ne!(demo.app.side_pane_enabled(), pane);
+
+        demo.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press), now);
+        assert!(!demo.handle_key(key(KeyCode::Escape, KeyEventKind::Press), now));
+        assert!(!demo.app.shortcut_help_visible());
     }
 
     #[test]
@@ -699,14 +792,11 @@ mod tests {
             assert!(demo.advance_scenario(now));
             assert_eq!(demo.submissions.problems[1], Some(*expected));
             assert_eq!(demo.submissions.history.len(), history_len);
-            assert_eq!(
-                demo.submissions.latest_started.as_ref().unwrap().state,
-                *expected
-            );
+            assert_eq!(demo.submissions.history.last().unwrap().state, *expected);
         }
         assert!(demo.playback.is_none());
         assert_eq!(
-            demo.submissions.history[0].state,
+            demo.submissions.history.last().unwrap().state,
             SCENARIO.last().copied().unwrap()
         );
     }

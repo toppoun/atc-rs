@@ -107,6 +107,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "termina",
+ "time",
  "toml",
  "unicode-segmentation",
  "unicode-width",

@@ -659,6 +659,7 @@ pub struct WatchApp {
     should_quit: bool,
     debug: bool,
     side_pane: SidePaneState,
+    shortcut_help_visible: bool,
 
     contest_id: String,
     problems: Vec<ProblemState>,
@@ -1005,6 +1006,7 @@ impl WatchApp {
             should_quit: false,
             debug: false,
             side_pane: SidePaneState::default(),
+            shortcut_help_visible: false,
             contest_id: contest.contest_id.clone(),
             problems,
             selected_problem: 0,
@@ -1024,6 +1026,19 @@ impl WatchApp {
     pub fn debug_enabled(&self) -> bool {
         self.debug
     }
+
+    pub(super) fn shortcut_help_visible(&self) -> bool {
+        self.shortcut_help_visible
+    }
+
+    pub(super) fn show_shortcut_help(&mut self) {
+        self.shortcut_help_visible = true;
+    }
+
+    pub(super) fn dismiss_shortcut_help(&mut self) {
+        self.shortcut_help_visible = false;
+    }
+
     pub(super) fn side_pane_state(&self) -> SidePaneState {
         self.side_pane
     }

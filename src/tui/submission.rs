@@ -4,6 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::SystemTime;
 
 use crate::atcoder::AtCoderClient;
 use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
@@ -206,31 +207,16 @@ pub(super) struct SubmissionHistoryEntry {
     pub(super) generation: u64,
     pub(super) key: SubmissionKey,
     pub(super) problem_index: String,
+    pub(super) problem_title: Option<String>,
+    pub(super) language_label: String,
+    pub(super) started_at: SystemTime,
     pub(super) state: SubmissionDisplayState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LatestStartedSubmission {
-    pub(super) contest_id: String,
-    pub(super) problem_index: String,
-    pub(super) state: SubmissionDisplayState,
-}
-
-impl From<&SubmissionHistoryEntry> for LatestStartedSubmission {
-    fn from(entry: &SubmissionHistoryEntry) -> Self {
-        Self {
-            contest_id: entry.key.contest_id.clone(),
-            problem_index: entry.problem_index.clone(),
-            state: entry.state,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SubmissionViewState {
     pub(super) problems: Vec<Option<SubmissionDisplayState>>,
     pub(super) history: Vec<SubmissionHistoryEntry>,
-    pub(super) latest_started: Option<LatestStartedSubmission>,
 }
 
 #[derive(Debug, Default)]
@@ -510,6 +496,7 @@ impl SubmissionHub {
         self.records.get(key)?.display_state()
     }
 
+    #[cfg(test)]
     pub(super) fn history_for_contest<'a>(
         &'a self,
         contest_id: &'a str,
@@ -520,8 +507,8 @@ impl SubmissionHub {
             .filter(move |entry| entry.key.contest_id == contest_id)
     }
 
-    pub(super) fn latest_started(&self) -> Option<&SubmissionHistoryEntry> {
-        self.history.last()
+    pub(super) fn history(&self) -> &[SubmissionHistoryEntry] {
+        &self.history
     }
 
     fn update_history(
@@ -579,12 +566,26 @@ impl SubmissionHub {
         &mut self,
         key: SubmissionKey,
         problem_index: String,
+        problem_title: String,
         plan: SubmitPlan,
+    ) -> Result<u64, String> {
+        self.start_with_timestamp(key, problem_index, problem_title, plan, SystemTime::now())
+    }
+
+    fn start_with_timestamp(
+        &mut self,
+        key: SubmissionKey,
+        problem_index: String,
+        problem_title: String,
+        plan: SubmitPlan,
+        started_at: SystemTime,
     ) -> Result<u64, String> {
         if self.stopping {
             return Err("Submission is unavailable while the TUI is stopping.".to_string());
         }
         self.ensure_start_allowed(&key).map_err(str::to_owned)?;
+
+        let language_label = plan.receipt_language_label().to_string();
 
         // This synchronous read is the Enter-time ownership boundary. The worker receives only
         // the owned bytes and never rereads the source from disk.
@@ -625,6 +626,9 @@ impl SubmissionHub {
             generation,
             key: key.clone(),
             problem_index,
+            problem_title: Some(problem_title),
+            language_label,
+            started_at,
             state: SubmissionDisplayState {
                 current: None,
                 attempt: Some(TuiSubmissionAttemptState::Submitting),
@@ -1285,6 +1289,15 @@ mod tests {
         key: &SubmissionKey,
         problem_index: &str,
     ) -> u64 {
+        start_test_submission_at(hub, key, problem_index, SystemTime::now())
+    }
+
+    fn start_test_submission_at(
+        hub: &mut SubmissionHub,
+        key: &SubmissionKey,
+        problem_index: &str,
+        started_at: SystemTime,
+    ) -> u64 {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(format!("{problem_index}.cpp"));
         std::fs::write(&path, "int main() {}\r\n").unwrap();
@@ -1296,8 +1309,14 @@ mod tests {
             Language::Cpp,
             PythonRuntime::CPython,
         );
-        hub.start(key.clone(), problem_index.to_string(), plan)
-            .unwrap()
+        hub.start_with_timestamp(
+            key.clone(),
+            problem_index.to_string(),
+            format!("Problem {problem_index}"),
+            plan,
+            started_at,
+        )
+        .unwrap()
     }
 
     fn wait_for_hub(
@@ -1648,7 +1667,10 @@ mod tests {
             Language::Cpp,
             PythonRuntime::CPython,
         );
-        assert!(hub.start(key.clone(), "A".to_string(), plan).is_err());
+        assert!(
+            hub.start(key.clone(), "A".to_string(), "Problem A".to_string(), plan,)
+                .is_err()
+        );
         assert_eq!(post_count.load(Ordering::Acquire), 1);
         hub.request_stop();
     }
@@ -1678,6 +1700,9 @@ mod tests {
             generation: 41,
             key: key.clone(),
             problem_index: "A".to_string(),
+            problem_title: Some("Problem A".to_string()),
+            language_label: "C++".to_string(),
+            started_at: SystemTime::now(),
             state: SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
                     Verdict::Accepted,
@@ -2029,6 +2054,9 @@ mod tests {
             generation: 1,
             key: target.clone(),
             problem_index: "A".to_string(),
+            problem_title: Some("Problem A".to_string()),
+            language_label: "C++".to_string(),
+            started_at: SystemTime::now(),
             state: SubmissionDisplayState {
                 current: Some(TuiSubmissionState::Status(
                     SubmissionStatus::WaitingForJudge,
@@ -2707,7 +2735,10 @@ mod tests {
             PythonRuntime::CPython,
         );
 
-        assert!(hub.start(key.clone(), "A".to_string(), plan).is_err());
+        assert!(
+            hub.start(key.clone(), "A".to_string(), "Problem A".to_string(), plan,)
+                .is_err()
+        );
         assert!(old_cancellation.should_continue());
         assert!(hub.history.is_empty());
         assert_eq!(
@@ -2908,7 +2939,7 @@ mod tests {
     }
 
     fn latest_started_label(hub: &SubmissionHub) -> Option<(String, String, String)> {
-        hub.latest_started().map(|entry| {
+        hub.history.last().map(|entry| {
             (
                 entry.key.contest_id.clone(),
                 entry.problem_index.clone(),
@@ -3104,7 +3135,7 @@ mod tests {
                 status: SubmissionStatus::Finished(Verdict::Accepted),
             }),
         )));
-        assert_eq!(hub.latest_started().unwrap().generation, b_generation);
+        assert_eq!(hub.history.last().unwrap().generation, b_generation);
         assert_eq!(latest_started_label(&hub).unwrap().2, "Submitting");
 
         assert!(hub.apply_event(event(
@@ -3124,10 +3155,10 @@ mod tests {
             latest_started_label(&hub),
             Some(("abc474".to_string(), "B".to_string(), "AC".to_string()))
         );
-        assert_eq!(hub.latest_started().unwrap().generation, b_generation);
+        assert_eq!(hub.history.last().unwrap().generation, b_generation);
 
         let d_generation = start_test_submission(&mut hub, &d, "D");
-        assert_eq!(hub.latest_started().unwrap().generation, d_generation);
+        assert_eq!(hub.history.last().unwrap().generation, d_generation);
         assert_eq!(
             latest_started_label(&hub),
             Some((
@@ -3136,6 +3167,51 @@ mod tests {
                 "Submitting".to_string()
             ))
         );
+        hub.request_stop();
+    }
+
+    #[test]
+    fn history_metadata_is_snapshotted_once_per_submission_start() {
+        let key = SubmissionKey::new("abc474", "abc474_e");
+        let executor =
+            TestExecutor::for_key(key.clone(), vec![waiting_test_run(), waiting_test_run()]);
+        let mut hub = SubmissionHub::with_executor(executor);
+        let first_started_at = std::time::UNIX_EPOCH + Duration::from_secs(2);
+        let second_started_at = std::time::UNIX_EPOCH + Duration::from_secs(1);
+        let first_generation = start_test_submission_at(&mut hub, &key, "E", first_started_at);
+        let first = hub.history.last().unwrap();
+        let first_problem_title = first.problem_title.clone();
+        let first_language_label = first.language_label.clone();
+
+        assert_eq!(first.started_at, first_started_at);
+        assert_eq!(first_problem_title.as_deref(), Some("Problem E"));
+        assert_eq!(first_language_label, "C++");
+        assert!(hub.apply_event(event(
+            &key,
+            first_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Accepted),
+        )));
+        assert!(hub.apply_event(event(
+            &key,
+            first_generation,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::Finished(Verdict::Accepted),
+            }),
+        )));
+        let updated = hub.history.last().unwrap();
+        assert_eq!(updated.started_at, first_started_at);
+        assert_eq!(updated.problem_title, first_problem_title);
+        assert_eq!(updated.language_label, first_language_label);
+
+        let second_generation = start_test_submission_at(&mut hub, &key, "E", second_started_at);
+        let second = hub.history.last().unwrap();
+        assert_ne!(second_generation, first_generation);
+        assert_eq!(hub.history.len(), 2);
+        assert_eq!(hub.history[0].started_at, first_started_at);
+        assert_eq!(second.started_at, second_started_at);
+        assert_eq!(second.problem_title.as_deref(), Some("Problem E"));
+        assert_eq!(second.language_label, "C++");
         hub.request_stop();
     }
 
@@ -3164,7 +3240,7 @@ mod tests {
     }
 
     #[test]
-    fn view_snapshot_filters_history_without_discarding_other_contests() {
+    fn view_snapshot_keeps_global_append_order_for_receipt_projection() {
         let contest = |contest_id: &str| crate::model::Contest {
             contest_id: contest_id.to_string(),
             problems: vec![crate::model::Problem {
@@ -3187,33 +3263,36 @@ mod tests {
                 generation: 1,
                 key: SubmissionKey::new("abc474", "abc474_a"),
                 problem_index: "A".to_string(),
+                problem_title: Some("Problem A".to_string()),
+                language_label: "C++".to_string(),
+                started_at: SystemTime::now(),
                 state: state(Verdict::WrongAnswer),
             },
             SubmissionHistoryEntry {
                 generation: 2,
                 key: SubmissionKey::new("abc475", "abc475_a"),
                 problem_index: "A".to_string(),
+                problem_title: Some("Problem A".to_string()),
+                language_label: "PyPy".to_string(),
+                started_at: SystemTime::now(),
                 state: state(Verdict::Accepted),
             },
         ]);
 
         let abc475 = super::super::app::WatchApp::new(&contest("abc475"), vec![1]).unwrap();
         let abc475_view = super::super::submission_view_state(&abc475, &hub);
-        assert_eq!(abc475_view.history.len(), 1);
-        assert_eq!(abc475_view.history[0].generation, 2);
-        assert_eq!(abc475_view.history[0].state.compact_label(), "AC");
+        assert_eq!(abc475_view.history.len(), 2);
+        assert_eq!(abc475_view.history.last().unwrap().generation, 2);
         assert_eq!(
-            abc475_view.latest_started.as_ref().unwrap().contest_id,
-            "abc475"
+            abc475_view.history.last().unwrap().state.compact_label(),
+            "AC"
         );
 
         let abc474 = super::super::app::WatchApp::new(&contest("abc474"), vec![1]).unwrap();
         let abc474_view = super::super::submission_view_state(&abc474, &hub);
-        assert_eq!(abc474_view.history.len(), 1);
-        assert_eq!(abc474_view.history[0].generation, 1);
-        assert_eq!(abc474_view.history[0].state.compact_label(), "WA");
-        let latest = abc474_view.latest_started.as_ref().unwrap();
-        assert_eq!(latest.contest_id, "abc475");
+        assert_eq!(abc474_view.history.len(), 2);
+        let latest = abc474_view.history.last().unwrap();
+        assert_eq!(latest.key.contest_id, "abc475");
         assert_eq!(latest.problem_index, "A");
         assert_eq!(latest.state.compact_label(), "AC");
         assert_eq!(hub.history.len(), 2);

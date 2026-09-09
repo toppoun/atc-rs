@@ -1,4 +1,7 @@
-use std::{ops::Range, time::Duration};
+use std::{
+    ops::Range,
+    time::{Duration, SystemTime},
+};
 
 use ratatui::{
     Frame,
@@ -7,6 +10,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use time::{OffsetDateTime, UtcOffset};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -25,8 +29,8 @@ use super::detail_scrollbar::{
 };
 use super::mouse::MouseMode;
 use super::submission::{
-    LatestStartedSubmission, SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone,
-    SubmissionViewState, UserVisibleSubmissionState,
+    SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone, SubmissionViewState,
+    UserVisibleSubmissionState,
 };
 use super::{
     CommandPalette, EditorTargetModal, FrontendAction, FrontendActionAvailability,
@@ -41,7 +45,8 @@ const MIN_DETAIL_WIDTH: u16 = 30;
 const MIN_SIDE_PANE_LAYOUT_WIDTH: u16 = SIDE_PANE_WIDTH + MIN_DETAIL_WIDTH;
 const COMMANDS_HINT: &str = ": commands";
 const FOOTER_HINT_GAP: &str = "   ";
-const MIN_COMMAND_FOOTER_WIDTH: u16 = COMMANDS_HINT.len() as u16;
+const RECEIPT_SEPARATOR: &str = " │ ";
+const SUBMISSION_TIME_UNAVAILABLE: &str = "--:--:--";
 const COMMAND_PALETTE_WIDTH: u16 = 76;
 const COMMAND_PALETTE_BORDER_ROWS: u16 = 2;
 const COMMAND_PALETTE_COMMAND_ROW_OFFSET: u16 = 2;
@@ -571,64 +576,188 @@ fn responsive_footer_hint_text(
     }
 }
 
-fn footer_areas(area: Rect) -> (Option<Rect>, Rect) {
-    let split_width = SIDE_PANE_WIDTH.saturating_add(MIN_COMMAND_FOOTER_WIDTH);
-    if area.width < split_width {
-        return (None, area);
+fn clip_text_with_ellipsis(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return text
+            .graphemes(true)
+            .find(|grapheme| UnicodeWidthStr::width(*grapheme) == 1)
+            .unwrap_or(" ")
+            .to_string();
     }
 
-    let current = Rect::new(area.x, area.y, SIDE_PANE_WIDTH, area.height);
-    let commands = Rect::new(
-        area.x.saturating_add(SIDE_PANE_WIDTH),
-        area.y,
-        area.width.saturating_sub(SIDE_PANE_WIDTH),
-        area.height,
-    );
-    (Some(current), commands)
+    let content_width = width - 1;
+    let mut clipped = String::new();
+    let mut clipped_width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if clipped_width.saturating_add(grapheme_width) > content_width {
+            break;
+        }
+        clipped.push_str(grapheme);
+        clipped_width = clipped_width.saturating_add(grapheme_width);
+    }
+    clipped.push('…');
+    clipped
 }
 
-fn empty_current_submission_line(width: usize) -> Line<'static> {
-    clip_styled_row(
-        vec![
-            Span::raw("SUB "),
-            Span::styled("·", submission_tone_style(SubmissionTone::None)),
-        ],
-        width,
-    )
+fn system_time_to_offset_date_time(started_at: SystemTime) -> Option<OffsetDateTime> {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    let unix_nanos = match started_at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i128::from(duration.as_secs())
+            .checked_mul(NANOS_PER_SECOND)?
+            .checked_add(i128::from(duration.subsec_nanos()))?,
+        Err(error) => {
+            let duration = error.duration();
+            i128::from(duration.as_secs())
+                .checked_mul(NANOS_PER_SECOND)?
+                .checked_add(i128::from(duration.subsec_nanos()))?
+                .checked_neg()?
+        }
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(unix_nanos).ok()
 }
 
-fn current_submission_line(
+fn submission_time_label_at_offset(timestamp: OffsetDateTime, offset: UtcOffset) -> Option<String> {
+    let local = timestamp.checked_to_offset(offset)?;
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        local.hour(),
+        local.minute(),
+        local.second()
+    ))
+}
+
+fn submission_time_label(started_at: SystemTime) -> String {
+    system_time_to_offset_date_time(started_at)
+        .and_then(|timestamp| {
+            let offset = UtcOffset::local_offset_at(timestamp).ok()?;
+            submission_time_label_at_offset(timestamp, offset)
+        })
+        .unwrap_or_else(|| SUBMISSION_TIME_UNAVAILABLE.to_string())
+}
+
+fn receipt_problem_label(current_contest_id: &str, entry: &SubmissionHistoryEntry) -> String {
+    match entry
+        .problem_title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+    {
+        Some(title) => format!("{} - {title}", entry.problem_index),
+        None if entry.key.contest_id == current_contest_id => entry.problem_index.clone(),
+        None => format!("{}/{}", entry.key.contest_id, entry.problem_index),
+    }
+}
+
+fn empty_receipt_line(width: usize) -> Line<'static> {
+    const FULL: &str = "No submissions yet │ ? shortcuts │ : commands";
+    const DISCOVERY: &str = "? shortcuts │ : commands";
+    const COMPACT: &str = "? │ :";
+    const PLAIN: &str = "? :";
+    const MINIMAL: &str = "?";
+    let text = [FULL, DISCOVERY, COMPACT, PLAIN, MINIMAL, ""]
+        .into_iter()
+        .find(|candidate| UnicodeWidthStr::width(*candidate) <= width)
+        .unwrap_or("");
+    Line::styled(text, submission_tone_style(SubmissionTone::None))
+}
+
+fn submission_receipt_line(
     current_contest_id: &str,
-    latest_started: Option<&LatestStartedSubmission>,
+    entry: Option<&SubmissionHistoryEntry>,
     width: usize,
 ) -> Line<'static> {
-    let Some(latest_started) = latest_started else {
-        return empty_current_submission_line(width);
+    let Some(entry) = entry else {
+        return empty_receipt_line(width);
     };
-    let Some(state) = latest_started.state.effective() else {
-        return empty_current_submission_line(width);
+    let Some(state) = entry.state.effective() else {
+        return empty_receipt_line(width);
     };
+
+    let status_spans = submission_status_spans(state);
+    let status_width = Line::from(status_spans.clone()).width();
+    if width <= status_width {
+        return clip_styled_row(status_spans, width);
+    }
+
+    let problem_label = receipt_problem_label(current_contest_id, entry);
+    let problem_width = UnicodeWidthStr::width(problem_label.as_str());
+    let problem_index_width = UnicodeWidthStr::width(entry.problem_index.as_str()).max(1);
+    let separator = if status_width
+        .saturating_add(UnicodeWidthStr::width(RECEIPT_SEPARATOR))
+        .saturating_add(problem_index_width)
+        <= width
+    {
+        RECEIPT_SEPARATOR
+    } else {
+        "│"
+    };
+    let separator_width = UnicodeWidthStr::width(separator);
+    let meaningful_problem_width = problem_width.min(problem_index_width.max(12));
+    let time_label = submission_time_label(entry.started_at);
+    let time_width = UnicodeWidthStr::width(time_label.as_str());
+    let language_width = UnicodeWidthStr::width(entry.language_label.as_str());
+
+    let mandatory_width = separator_width.saturating_add(status_width);
+    if width <= mandatory_width {
+        return clip_styled_row(status_spans, width);
+    }
+
+    let show_time = time_width
+        .saturating_add(separator_width)
+        .saturating_add(mandatory_width)
+        .saturating_add(meaningful_problem_width)
+        <= width;
+    let width_with_time = if show_time {
+        time_width.saturating_add(separator_width)
+    } else {
+        0
+    };
+    let show_language = show_time
+        && width_with_time
+            .saturating_add(problem_width)
+            .saturating_add(separator_width)
+            .saturating_add(language_width)
+            .saturating_add(mandatory_width)
+            <= width;
+    let optional_width = width_with_time.saturating_add(if show_language {
+        language_width.saturating_add(separator_width)
+    } else {
+        0
+    });
+    let available_problem_width =
+        width.saturating_sub(optional_width.saturating_add(mandatory_width));
+
     let primary_tone = state
         .status_segments()
         .first()
         .map(|segment| segment.tone)
         .unwrap_or(SubmissionTone::None);
-    let problem_label = if latest_started.contest_id == current_contest_id {
-        latest_started.problem_index.clone()
+    let mut spans = Vec::new();
+    if show_time {
+        spans.push(Span::raw(time_label));
+        spans.push(Span::raw(separator));
+    }
+    let displayed_problem = if available_problem_width <= problem_index_width.saturating_add(1) {
+        clip_text_with_ellipsis(&entry.problem_index, available_problem_width)
     } else {
-        format!(
-            "{}/{}",
-            latest_started.contest_id, latest_started.problem_index
-        )
+        clip_text_with_ellipsis(&problem_label, available_problem_width)
     };
-    let mut spans = vec![
-        Span::styled(
-            problem_label,
-            submission_tone_style(primary_tone).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-    ];
-    spans.extend(submission_status_spans(state));
+    spans.push(Span::styled(
+        displayed_problem,
+        submission_tone_style(primary_tone).add_modifier(Modifier::BOLD),
+    ));
+    if show_language {
+        spans.push(Span::raw(separator));
+        spans.push(Span::raw(entry.language_label.clone()));
+    }
+    spans.push(Span::raw(separator));
+    spans.extend(status_spans);
     clip_styled_row(spans, width)
 }
 
@@ -639,22 +768,22 @@ fn render_footer(
     submission_view: Option<&SubmissionViewState>,
     workspace_available: bool,
 ) {
-    let (current_area, commands_area) = footer_areas(area);
-    if let Some(current_area) = current_area {
-        let block = Block::default().borders(Borders::TOP | Borders::RIGHT);
-        let content_width = usize::from(block.inner(current_area).width);
-        let line = current_submission_line(
-            app.contest_id(),
-            submission_view.and_then(|view| view.latest_started.as_ref()),
-            content_width,
-        );
-        frame.render_widget(Paragraph::new(line).block(block), current_area);
-    }
-
     let block = Block::default().borders(Borders::TOP);
-    let content_width = usize::from(block.inner(commands_area).width);
-    let text = responsive_footer_hint_text(app, workspace_available, content_width);
-    frame.render_widget(Paragraph::new(text).block(block), commands_area);
+    let content_width = usize::from(block.inner(area).width);
+    let line = if app.shortcut_help_visible() {
+        Line::raw(responsive_footer_hint_text(
+            app,
+            workspace_available,
+            content_width,
+        ))
+    } else {
+        submission_receipt_line(
+            app.contest_id(),
+            submission_view.and_then(|view| view.history.last()),
+            content_width,
+        )
+    };
+    frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -859,7 +988,8 @@ pub(super) fn render_frontend_with_pointer(
                 new_input_area = (action.height > 0).then_some(action);
             }
             SidePaneMode::Submissions => {
-                let text = submissions_content(overlays.submission_view, pane_body);
+                let text =
+                    submissions_content(overlays.submission_view, app.contest_id(), pane_body);
                 frame.render_widget(Paragraph::new(text), pane_body);
             }
         }
@@ -2106,7 +2236,11 @@ fn submission_tone_style(tone: SubmissionTone) -> Style {
     Style::default().fg(submission_tone_color(tone))
 }
 
-fn submissions_content(submission_view: Option<&SubmissionViewState>, body: Rect) -> Text<'static> {
+fn submissions_content(
+    submission_view: Option<&SubmissionViewState>,
+    contest_id: &str,
+    body: Rect,
+) -> Text<'static> {
     let width = usize::from(body.width.saturating_sub(1));
     let height = usize::from(body.height);
     let Some(view) = submission_view else {
@@ -2118,6 +2252,8 @@ fn submissions_content(submission_view: Option<&SubmissionViewState>, body: Rect
     let lines = view
         .history
         .iter()
+        .rev()
+        .filter(|entry| entry.key.contest_id == contest_id)
         .take(height)
         .filter_map(|entry| submission_history_line(entry, width))
         .collect::<Vec<_>>();
@@ -2525,8 +2661,8 @@ mod tests {
     use crate::tui::message::{StressEvent, TestEvent};
     use crate::tui::mouse::{PixelCoordinateOrigin, TerminalPixelMetrics};
     use crate::tui::submission::{
-        LatestStartedSubmission, SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey,
-        TuiSubmissionAttemptState, TuiSubmissionState,
+        SubmissionDisplayState, SubmissionHistoryEntry, SubmissionKey, TuiSubmissionAttemptState,
+        TuiSubmissionState,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
@@ -2671,7 +2807,6 @@ mod tests {
             let entry = submission_history_entry(1, "A", state);
             SubmissionViewState {
                 problems: vec![Some(state)],
-                latest_started: Some(LatestStartedSubmission::from(&entry)),
                 history: vec![entry],
             }
         });
@@ -2708,18 +2843,9 @@ mod tests {
                 format!("abc123_{}", problem_index.to_ascii_lowercase()),
             ),
             problem_index: problem_index.to_string(),
-            state,
-        }
-    }
-
-    fn latest_started_submission(
-        contest_id: &str,
-        problem_index: &str,
-        state: SubmissionDisplayState,
-    ) -> LatestStartedSubmission {
-        LatestStartedSubmission {
-            contest_id: contest_id.to_string(),
-            problem_index: problem_index.to_string(),
+            problem_title: Some(format!("Problem {problem_index}")),
+            language_label: "C++".to_string(),
+            started_at: SystemTime::now(),
             state,
         }
     }
@@ -3309,7 +3435,7 @@ mod tests {
             .collect::<Vec<_>>();
         for width in 0..=130 {
             let packed = responsive_footer_hint_text(&app, false, width);
-            if width < usize::from(MIN_COMMAND_FOOTER_WIDTH) {
+            if width < UnicodeWidthStr::width(COMMANDS_HINT) {
                 assert_eq!(packed, COMMANDS_HINT);
                 continue;
             }
@@ -3336,31 +3462,129 @@ mod tests {
     }
 
     #[test]
-    fn current_submission_footer_formats_empty_same_contest_and_cross_contest_states() {
-        let empty = current_submission_line("abc123", None, 19);
-        assert_eq!(empty.to_string(), "SUB ·");
-        assert_eq!(empty.spans[0].style.fg, None);
-        assert_eq!(empty.spans[1].style.fg, Some(Color::DarkGray));
-
-        let waiting = SubmissionDisplayState {
-            current: Some(TuiSubmissionState::Status(
-                SubmissionStatus::WaitingForJudge,
-            )),
-            attempt: None,
-        };
-        let same = latest_started_submission("abc123", "B", waiting);
-        let same = current_submission_line("abc123", Some(&same), 19);
-        assert_eq!(same.to_string(), "B  WJ");
-        assert_eq!(same.spans[0].style.fg, Some(Color::Yellow));
-        assert_eq!(same.spans[2].style.fg, Some(Color::Yellow));
-
-        let cross = latest_started_submission("abc474", "B", waiting);
-        let cross = current_submission_line("abc123", Some(&cross), 19);
-        assert_eq!(cross.to_string(), "abc474/B  WJ");
+    fn empty_receipt_preserves_shortcut_and_command_discovery() {
+        assert_eq!(
+            empty_receipt_line(80).to_string(),
+            "No submissions yet │ ? shortcuts │ : commands"
+        );
+        assert_eq!(
+            empty_receipt_line(30).to_string(),
+            "? shortcuts │ : commands"
+        );
+        assert_eq!(empty_receipt_line(8).to_string(), "? │ :");
+        assert_eq!(empty_receipt_line(4).to_string(), "? :");
+        assert_eq!(empty_receipt_line(2).to_string(), "?");
+        assert_eq!(empty_receipt_line(1).to_string(), "?");
+        assert_eq!(empty_receipt_line(0).to_string(), "");
+        let complete_candidates = [
+            "No submissions yet │ ? shortcuts │ : commands",
+            "? shortcuts │ : commands",
+            "? │ :",
+            "? :",
+            "?",
+            "",
+        ];
+        for width in 0..=80 {
+            let line = empty_receipt_line(width);
+            let text = line.to_string();
+            assert!(line.width() <= width);
+            assert!(complete_candidates.contains(&text.as_str()));
+            assert!(!text.contains('…'));
+        }
     }
 
     #[test]
-    fn current_submission_footer_reuses_multicolor_and_attempt_precedence() {
+    fn submission_time_formatting_is_fallible_across_system_and_offset_boundaries() {
+        let epoch = system_time_to_offset_date_time(std::time::UNIX_EPOCH)
+            .expect("the Unix epoch is representable by time");
+        assert_eq!(
+            submission_time_label_at_offset(epoch, UtcOffset::UTC).as_deref(),
+            Some("00:00:00")
+        );
+
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before the Unix epoch is representable by SystemTime");
+        assert_ne!(
+            submission_time_label(before_epoch),
+            SUBMISSION_TIME_UNAVAILABLE
+        );
+        let before_epoch = system_time_to_offset_date_time(before_epoch)
+            .expect("one second before the Unix epoch is representable by time");
+        assert_eq!(
+            submission_time_label_at_offset(before_epoch, UtcOffset::UTC).as_deref(),
+            Some("23:59:59")
+        );
+
+        let beyond_time_range = std::time::UNIX_EPOCH
+            .checked_add(Duration::from_secs(253_402_300_800))
+            .expect("year 10000 is representable by SystemTime");
+        assert_eq!(
+            submission_time_label(beyond_time_range),
+            SUBMISSION_TIME_UNAVAILABLE
+        );
+
+        let maximum = time::PlainDateTime::MAX.assume_utc();
+        let positive_offset =
+            UtcOffset::from_hms(23, 59, 59).expect("the maximum positive UTC offset is valid");
+        assert_eq!(
+            submission_time_label_at_offset(maximum, positive_offset),
+            None
+        );
+
+        let normal = submission_time_label(SystemTime::now());
+        assert_ne!(normal, SUBMISSION_TIME_UNAVAILABLE);
+        assert_eq!(normal.len(), SUBMISSION_TIME_UNAVAILABLE.len());
+        assert_eq!(normal.as_bytes()[2], b':');
+        assert_eq!(normal.as_bytes()[5], b':');
+    }
+
+    #[test]
+    fn receipt_uses_field_level_responsiveness_and_cross_contest_fallback() {
+        let accepted = SubmissionDisplayState {
+            current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                Verdict::Accepted,
+            ))),
+            attempt: None,
+        };
+        let mut entry = submission_history_entry(1, "E", accepted);
+        entry.problem_title = Some("One Time Coupon".to_string());
+        entry.language_label = "C++23".to_string();
+        let time = submission_time_label(entry.started_at);
+
+        let wide = submission_receipt_line("abc123", Some(&entry), 100).to_string();
+        assert_eq!(wide, format!("{time} │ E - One Time Coupon │ C++23 │ AC"));
+
+        let medium = submission_receipt_line("abc123", Some(&entry), 34).to_string();
+        assert!(medium.starts_with(&format!("{time} │ E - ")));
+        assert!(medium.ends_with(" │ AC"));
+        assert!(!medium.contains("C++23"));
+
+        let narrow = submission_receipt_line("abc123", Some(&entry), 22).to_string();
+        assert!(narrow.starts_with("E - One Time"));
+        assert!(narrow.ends_with(" │ AC"));
+        assert!(!narrow.contains(&time));
+
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 6).to_string(),
+            "E │ AC"
+        );
+        assert_eq!(
+            submission_receipt_line("abc123", Some(&entry), 5).to_string(),
+            "E│AC"
+        );
+
+        entry.key = SubmissionKey::new("abc474", "abc474_e");
+        entry.problem_title = None;
+        assert!(
+            submission_receipt_line("abc123", Some(&entry), 40)
+                .to_string()
+                .contains("abc474/E")
+        );
+    }
+
+    #[test]
+    fn receipt_reuses_multicolor_status_and_attempt_precedence() {
         let progress = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(
                 SubmissionStatus::JudgingProgress {
@@ -3371,9 +3595,9 @@ mod tests {
             )),
             attempt: None,
         };
-        let latest = latest_started_submission("abc123", "C", progress);
-        let line = current_submission_line("abc123", Some(&latest), 19);
-        assert_eq!(line.to_string(), "C  7/15 RE");
+        let entry = submission_history_entry(1, "C", progress);
+        let line = submission_receipt_line("abc123", Some(&entry), 24);
+        assert!(line.to_string().ends_with(" │ 7/15 RE"));
         let style = |label: &str| {
             line.spans
                 .iter()
@@ -3381,60 +3605,52 @@ mod tests {
                 .unwrap()
                 .style
         };
-        assert_eq!(style("C").fg, Some(Color::Yellow));
         assert_eq!(style("7/15").fg, Some(Color::Yellow));
         assert_eq!(style("RE").fg, Some(Color::Red));
 
         let accepted = TuiSubmissionState::Status(SubmissionStatus::Finished(Verdict::Accepted));
-        for (attempt, expected, color) in [
-            (
-                TuiSubmissionAttemptState::Submitting,
-                "B  Submitting",
-                Color::Yellow,
-            ),
-            (TuiSubmissionAttemptState::Unknown, "B  Unknown", Color::Red),
+        for (attempt, expected) in [
+            (TuiSubmissionAttemptState::Submitting, "Submitting"),
+            (TuiSubmissionAttemptState::Unknown, "Unknown"),
         ] {
-            let latest = latest_started_submission(
-                "abc123",
-                "B",
-                SubmissionDisplayState {
+            let entry = SubmissionHistoryEntry {
+                state: SubmissionDisplayState {
                     current: Some(accepted),
                     attempt: Some(attempt),
                 },
-            );
-            let line = current_submission_line("abc123", Some(&latest), 19);
-            assert_eq!(line.to_string(), expected);
+                ..submission_history_entry(2, "B", progress)
+            };
+            let line = submission_receipt_line("abc123", Some(&entry), 28);
+            assert!(line.to_string().ends_with(&format!(" │ {expected}")));
             assert!(!line.to_string().contains("AC"));
-            assert_eq!(line.spans[0].style.fg, Some(color));
-            assert_eq!(line.spans[2].style.fg, Some(color));
         }
     }
 
     #[test]
-    fn current_submission_footer_clips_graphemes_and_styles_inside_fixed_width() {
-        let latest = latest_started_submission(
-            "very-long-contest-id",
-            "日本語問題",
+    fn receipt_clips_unicode_problem_without_separator_garbage() {
+        let mut entry = submission_history_entry(
+            1,
+            "E",
             SubmissionDisplayState {
-                current: Some(TuiSubmissionState::Status(
-                    SubmissionStatus::JudgingProgress {
-                        judged: 123,
-                        total: 456,
-                        provisional: Some(Verdict::RuntimeError),
-                    },
-                )),
+                current: Some(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                    Verdict::Accepted,
+                ))),
                 attempt: None,
             },
         );
-        for width in 0..=usize::from(SIDE_PANE_WIDTH) {
-            let line = current_submission_line("abc123", Some(&latest), width);
+        entry.problem_title = Some("日本語👩‍💻問題e\u{301}の長いタイトル".to_string());
+        for width in 0..=80 {
+            let line = submission_receipt_line("abc123", Some(&entry), width);
             assert!(line.width() <= width);
-            assert!(!line.to_string().contains('…'));
+            let text = line.to_string();
+            assert!(!text.starts_with('│'));
+            assert!(!text.ends_with('│'));
+            assert!(!text.contains("│ │"));
         }
     }
 
     #[test]
-    fn footer_boundary_aligns_with_side_pane_and_survives_pane_toggle() {
+    fn footer_uses_full_width_without_changing_side_pane_geometry() {
         let mut app = app();
         let waiting = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(
@@ -3445,26 +3661,29 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![Some(waiting)],
             history: vec![submission_history_entry(1, "B", waiting)],
-            latest_started: Some(latest_started_submission("abc123", "B", waiting)),
         };
 
+        let mut footer_rows = Vec::new();
         for side_pane_open in [false, true] {
             if side_pane_open {
                 app.toggle_side_pane();
             }
             let buffer = rendered_frontend_buffer_with_submission_view(&app, &view, false, 80, 20);
-            assert!(buffer_row_text(&buffer, 1, 18, 19).starts_with("B  WJ"));
-            assert_eq!(buffer.cell((20, 18)).unwrap().symbol(), "│");
-            assert_eq!(buffer.cell((21, 18)).unwrap().symbol(), ":");
+            let footer = buffer_row_text(&buffer, 1, 18, 78);
+            assert!(footer.contains("B - Problem B"));
+            assert!(footer.contains("C++"));
+            assert!(footer.contains("WJ"));
+            footer_rows.push(footer);
             if side_pane_open {
                 assert_eq!(buffer.cell((20, 5)).unwrap().symbol(), "│");
                 assert!(buffer_symbols(&buffer).contains("+ New Input"));
             }
         }
+        assert_eq!(footer_rows[0], footer_rows[1]);
     }
 
     #[test]
-    fn footer_extreme_narrow_fallback_and_boundaries_are_underflow_safe() {
+    fn footer_extreme_narrow_sizes_are_underflow_safe() {
         let app = app();
         let waiting = SubmissionDisplayState {
             current: Some(TuiSubmissionState::Status(
@@ -3475,34 +3694,29 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![Some(waiting)],
             history: vec![submission_history_entry(1, "B", waiting)],
-            latest_started: Some(latest_started_submission("abc123", "B", waiting)),
         };
 
-        for width in [0, 1, 8, 16, 19, 20, 21, 29, 30, 31, 40, 80, 120] {
-            let area = Rect::new(7, 3, width, 2);
-            let (current, commands) = footer_areas(area);
-            if width < SIDE_PANE_WIDTH + MIN_COMMAND_FOOTER_WIDTH {
-                assert!(current.is_none());
-                assert_eq!(commands, area);
-            } else {
-                assert_eq!(current.unwrap(), Rect::new(7, 3, SIDE_PANE_WIDTH, 2));
-                assert_eq!(commands.x, 7 + SIDE_PANE_WIDTH);
-                assert_eq!(commands.width, width - SIDE_PANE_WIDTH);
-            }
-
-            let height = if width == 0 { 0 } else { 5 };
+        for (width, height) in [
+            (0, 0),
+            (1, 1),
+            (8, 3),
+            (16, 5),
+            (20, 5),
+            (30, 5),
+            (40, 5),
+            (60, 5),
+            (80, 5),
+            (100, 5),
+            (120, 5),
+            (160, 5),
+        ] {
             let _ =
                 rendered_frontend_buffer_with_submission_view(&app, &view, false, width, height);
+            assert!(
+                submission_receipt_line("abc123", view.history.last(), usize::from(width)).width()
+                    <= usize::from(width)
+            );
         }
-
-        let below = rendered_frontend_buffer_with_submission_view(&app, &view, false, 31, 8);
-        assert_eq!(below.cell((1, 6)).unwrap().symbol(), ":");
-        assert!(!buffer_row_text(&below, 1, 6, 29).contains("B  WJ"));
-
-        let exact = rendered_frontend_buffer_with_submission_view(&app, &view, false, 32, 8);
-        assert!(buffer_row_text(&exact, 1, 6, 19).starts_with("B  WJ"));
-        assert_eq!(exact.cell((20, 6)).unwrap().symbol(), "│");
-        assert_eq!(exact.cell((21, 6)).unwrap().symbol(), ":");
     }
 
     #[test]
@@ -3567,13 +3781,12 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![Some(accepted), Some(progress)],
             history: vec![
-                submission_history_entry(2, "B", progress),
                 submission_history_entry(1, "A", accepted),
+                submission_history_entry(2, "B", progress),
             ],
-            latest_started: None,
         };
 
-        let text = submissions_content(Some(&view), Rect::new(0, 0, SIDE_PANE_WIDTH, 2));
+        let text = submissions_content(Some(&view), "abc123", Rect::new(0, 0, SIDE_PANE_WIDTH, 2));
         assert_eq!(text.lines.len(), 2);
         assert!(text.lines[0].to_string().starts_with("B  7/15 RE"));
         assert!(text.lines[1].to_string().starts_with("A  AC"));
@@ -3596,7 +3809,8 @@ mod tests {
                 .contains(Modifier::BOLD)
         );
 
-        let clipped = submissions_content(Some(&view), Rect::new(0, 0, SIDE_PANE_WIDTH, 1));
+        let clipped =
+            submissions_content(Some(&view), "abc123", Rect::new(0, 0, SIDE_PANE_WIDTH, 1));
         assert_eq!(clipped.lines.len(), 1);
         assert!(clipped.lines[0].to_string().starts_with("B  7/15 RE"));
         assert!(!clipped.lines[0].to_string().contains("AC"));
@@ -3615,7 +3829,7 @@ mod tests {
         assert!(!attempt_line.to_string().contains("AC"));
 
         for width in 0..=SIDE_PANE_WIDTH {
-            let _ = submissions_content(Some(&view), Rect::new(0, 0, width, 2));
+            let _ = submissions_content(Some(&view), "abc123", Rect::new(0, 0, width, 2));
         }
     }
 
@@ -3627,7 +3841,6 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![None],
             history: Vec::new(),
-            latest_started: None,
         };
         let render = |app: &WatchApp, width, height| {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -3719,7 +3932,6 @@ mod tests {
                 None,
             ],
             history: Vec::new(),
-            latest_started: None,
         };
 
         let line = problem_status_line(&app, Some(&view));
@@ -3893,7 +4105,6 @@ mod tests {
         let view = SubmissionViewState {
             problems: vec![Some(state); 7],
             history: Vec::new(),
-            latest_started: None,
         };
 
         for width in [1, 2, 8, 16, 28, 50, 80] {
@@ -4493,11 +4704,12 @@ mod tests {
 
     #[test]
     fn workspace_footer_and_switch_modal_render_destination_and_error() {
-        let app = app();
+        let mut app = app();
         assert!(
             !rendered_frontend_text_with_palette(&app, false, None, None, 180, 20)
                 .contains("c contest")
         );
+        app.show_shortcut_help();
         assert!(
             rendered_frontend_text_with_palette(&app, true, None, None, 180, 20)
                 .contains("c contest")

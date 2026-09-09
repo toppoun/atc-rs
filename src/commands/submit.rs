@@ -111,6 +111,14 @@ impl SubmitPlan {
             target,
         }
     }
+
+    pub(crate) fn receipt_language_label(&self) -> &'static str {
+        match self.target {
+            SubmissionTarget::Cpp => "C++",
+            SubmissionTarget::Python(PythonRuntime::CPython) => "Python",
+            SubmissionTarget::Python(PythonRuntime::PyPy) => "PyPy",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -974,6 +982,25 @@ mod tests {
             },
         )?;
         Ok(selected.get().expect("submitter should receive a request"))
+    }
+
+    #[test]
+    fn receipt_language_labels_are_user_facing() {
+        let label = |language, runtime| {
+            SubmitPlan::for_selected_source(
+                "abc123".to_string(),
+                "abc123_a".to_string(),
+                "A".to_string(),
+                PathBuf::from("main"),
+                language,
+                runtime,
+            )
+            .receipt_language_label()
+        };
+
+        assert_eq!(label(Language::Cpp, PythonRuntime::CPython), "C++");
+        assert_eq!(label(Language::Python, PythonRuntime::CPython), "Python");
+        assert_eq!(label(Language::Python, PythonRuntime::PyPy), "PyPy");
     }
 
     #[test]
