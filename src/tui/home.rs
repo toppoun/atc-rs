@@ -609,6 +609,8 @@ fn render_palette(frame: &mut Frame<'_>, palette: &HomeCommandPalette) {
             Constraint::Length(2),
         ])
         .split(inner);
+    let list_area = view::command_palette_list_area(rows[1], None);
+    let list_width = usize::from(list_area.width);
     let lines = if commands.is_empty() {
         vec![Line::styled(
             "  No matching commands",
@@ -619,15 +621,14 @@ fn render_palette(frame: &mut Frame<'_>, palette: &HomeCommandPalette) {
             .iter()
             .enumerate()
             .map(|(index, command)| {
-                let marker = if index == palette.selected { ">" } else { " " };
-                let style = if index == palette.selected {
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                Line::styled(
-                    format!("{marker} {:<18} {}", command.label(), command.shortcut()),
-                    style,
+                let selected = index == palette.selected;
+                view::command_palette_line(
+                    if selected { ">" } else { " " },
+                    command.label(),
+                    Some(command.shortcut()),
+                    list_width,
+                    Style::default(),
+                    selected,
                 )
             })
             .collect()
@@ -641,7 +642,7 @@ fn render_palette(frame: &mut Frame<'_>, palette: &HomeCommandPalette) {
         area,
     );
     frame.render_widget(Paragraph::new(format!("> {}", palette.query)), rows[0]);
-    frame.render_widget(Paragraph::new(Text::from(lines)), rows[1]);
+    frame.render_widget(Paragraph::new(Text::from(lines)), list_area);
     frame.render_widget(
         Paragraph::new("[↑↓] Select   [Enter] Run   [Esc] Cancel"),
         rows[2],
@@ -1145,5 +1146,96 @@ mod tests {
         assert!(open.contains("Open Contest"));
         assert!(open.contains("Contest:"));
         assert!(open.contains('┌'));
+    }
+
+    #[test]
+    fn home_palette_selected_row_fills_the_shared_usable_width() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
+
+        let width = 80;
+        let height = 24;
+        let buffer = draw_home(&home, Path::new("workspace"), width, height);
+        let command_count = home.palette.filtered_commands().len();
+        let palette_height = 7u16.saturating_add(u16::try_from(command_count).unwrap());
+        let area = centered_rect(Rect::new(0, 0, width, height), 52, palette_height);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let reversed = buffer
+            .content()
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.modifier.contains(Modifier::REVERSED))
+            .map(|(index, _)| {
+                let index = u16::try_from(index).unwrap();
+                (index % width, index / width)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(reversed.len(), usize::from(inner.width));
+        let selected_row = reversed.first().unwrap().1;
+        assert_eq!(
+            reversed,
+            (inner.x..inner.right())
+                .map(|column| (column, selected_row))
+                .collect::<Vec<_>>()
+        );
+        for column in inner.x..inner.right() {
+            assert!(
+                buffer
+                    .cell((column, selected_row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert!(
+                !buffer
+                    .cell((column, selected_row.saturating_add(1)))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+        assert!(
+            !buffer
+                .cell((area.right().saturating_sub(1), selected_row))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        home.handle_key(key(KeyCode::Down, KeyEventKind::Press));
+        let moved = draw_home(&home, Path::new("workspace"), width, height);
+        for column in inner.x..inner.right() {
+            assert!(
+                !moved
+                    .cell((column, selected_row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            assert!(
+                moved
+                    .cell((column, selected_row.saturating_add(1)))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::BOLD | Modifier::REVERSED)
+            );
+        }
+    }
+
+    #[test]
+    fn home_palette_shared_rows_survive_narrow_and_zero_sized_frames() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
+
+        for width in [0, 1, 2, 8, 16, 30, 52, 80] {
+            for height in [0, 1, 4, 8, 12, 24] {
+                let _ = draw_home(&home, Path::new("workspace"), width, height);
+            }
+        }
     }
 }

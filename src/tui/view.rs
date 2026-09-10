@@ -178,15 +178,8 @@ fn command_palette_layout(frame_area: Rect, total: usize, selected: usize) -> Co
             command_area.height,
         )
     });
-    let list_width = command_area
-        .width
-        .saturating_sub(scrollbar_gutter.map_or(0, |gutter| gutter.width));
-    let list_area = Rect::new(
-        command_area.x,
-        command_area.y,
-        list_width,
-        command_area.height,
-    );
+    let list_area = command_palette_list_area(command_area, scrollbar_gutter);
+    let list_width = list_area.width;
     let status_row = COMMAND_PALETTE_COMMAND_ROW_OFFSET
         .saturating_add(u16::try_from(command_capacity).unwrap_or(u16::MAX));
 
@@ -204,6 +197,20 @@ fn command_palette_layout(frame_area: Rect, total: usize, selected: usize) -> Co
         show_scrollbar,
         list_width: usize::from(list_width),
     }
+}
+
+pub(super) fn command_palette_list_area(
+    command_area: Rect,
+    scrollbar_gutter: Option<Rect>,
+) -> Rect {
+    Rect::new(
+        command_area.x,
+        command_area.y,
+        command_area
+            .width
+            .saturating_sub(scrollbar_gutter.map_or(0, |gutter| gutter.width)),
+        command_area.height,
+    )
 }
 
 fn clipped_rect(area: Rect, row_offset: u16, height: u16) -> Rect {
@@ -344,6 +351,22 @@ fn command_palette_row(marker: &str, label: &str, shortcut: Option<&str>, width:
         format!("{marker} {label}")
     };
     fit_command_palette_row(&base, width)
+}
+
+pub(super) fn command_palette_line(
+    marker: &str,
+    label: &str,
+    shortcut: Option<&str>,
+    width: usize,
+    base_style: Style,
+    selected: bool,
+) -> Line<'static> {
+    let style = if selected {
+        base_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        base_style
+    };
+    Line::styled(command_palette_row(marker, label, shortcut, width), style)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2017,17 +2040,19 @@ fn render_command_palette(
             let action = actions[index];
             let availability = action.availability(app, workspace_available);
             let marker = if palette.is_selected(index) { ">" } else { " " };
-            let row =
-                command_palette_row(marker, action.label(), action.shortcut(), layout.list_width);
 
-            let mut style = match availability {
+            let style = match availability {
                 FrontendActionAvailability::Available => Style::default(),
                 FrontendActionAvailability::Unavailable(_) => Style::default().fg(Color::DarkGray),
             };
-            if palette.is_selected(index) {
-                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
-            }
-            lines.push(Line::styled(row, style));
+            lines.push(command_palette_line(
+                marker,
+                action.label(),
+                action.shortcut(),
+                layout.list_width,
+                style,
+                palette.is_selected(index),
+            ));
         }
         frame.render_widget(Paragraph::new(Text::from(lines)), layout.list_area);
 
@@ -5607,11 +5632,50 @@ mod tests {
         assert!(no_shortcut.contains("Stop Stress"));
         assert!(!no_shortcut.contains("None"));
 
+        let unicode = command_palette_line(
+            ">",
+            "競プロを開く",
+            Some("界"),
+            30,
+            Style::default().fg(Color::DarkGray),
+            true,
+        );
+        assert_eq!(unicode.width(), 30);
+        assert!(unicode.to_string().contains("競プロを開く"));
+        assert!(unicode.to_string().contains("界"));
+        assert_eq!(unicode.style.fg, Some(Color::DarkGray));
+        assert!(unicode.style.add_modifier.contains(Modifier::BOLD));
+        assert!(unicode.style.add_modifier.contains(Modifier::REVERSED));
+
+        for width in 0..=20 {
+            let row = command_palette_line(
+                ">",
+                "競プロを開く",
+                Some("界"),
+                width,
+                Style::default(),
+                width % 2 == 0,
+            );
+            assert_eq!(row.width(), width);
+        }
+
         for width in 0..=12 {
             let fitted =
                 fit_command_palette_row("  Unavailable: stress initialization not required", width);
             assert_eq!(UnicodeWidthStr::width(fitted.as_str()), width);
         }
+    }
+
+    #[test]
+    fn command_palette_list_area_reserves_the_scrollbar_gutter() {
+        let command_area = Rect::new(4, 5, 20, 6);
+        let gutter = Rect::new(22, 5, 2, 6);
+
+        assert_eq!(
+            command_palette_list_area(command_area, Some(gutter)),
+            Rect::new(4, 5, 18, 6)
+        );
+        assert_eq!(command_palette_list_area(command_area, None), command_area);
     }
 
     #[test]
