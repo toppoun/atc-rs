@@ -291,7 +291,7 @@ pub(crate) enum HomeExit<T> {
     Contest(T),
 }
 
-pub(super) trait HomeTerminal {
+pub(crate) trait HomeTerminal {
     fn draw_home(&mut self, render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()>;
     fn finish_home_redraw(&mut self) -> io::Result<()>;
     fn note_home_resize(&mut self);
@@ -323,25 +323,7 @@ impl HomeTerminal for TerminaSession {
     }
 }
 
-pub(crate) fn run<T>(
-    terminal: &mut TerminaSession,
-    workspace_root: &Path,
-    submissions: &mut SubmissionHub,
-    resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
-    task: ContestSwitchTask,
-    start_contest: impl FnMut() -> Result<T, String>,
-) -> io::Result<HomeExit<T>> {
-    run_with_terminal(
-        terminal,
-        workspace_root,
-        submissions,
-        resolve,
-        task,
-        start_contest,
-    )
-}
-
-pub(super) fn run_with_terminal<T>(
+pub(crate) fn run_with_terminal<T>(
     terminal: &mut impl HomeTerminal,
     workspace_root: &Path,
     submissions: &mut SubmissionHub,

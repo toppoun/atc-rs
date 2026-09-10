@@ -6,6 +6,8 @@ use crate::workspace;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -467,18 +469,147 @@ enum RootLocation {
     ContestShutdown,
 }
 
+/// Mandatory state for one workspace TUI lifetime.
+///
+/// The existing direct `atc c` compatibility path may start in a standalone contest, but only a
+/// workspace context can enter Workspace Home.
+struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
+    app_context: AppContext,
+    config: Config,
+    submissions: S,
+    location: RootLocation,
+}
+
+impl WorkspaceRuntime {
+    fn new(app_context: AppContext, config: Config, location: RootLocation) -> Self {
+        assert!(
+            matches!(&app_context, AppContext::Workspace { .. })
+                || matches!(&location, RootLocation::Contest(_)),
+            "a standalone root runtime requires an active direct contest"
+        );
+        assert!(
+            !matches!(&location, RootLocation::WorkspaceHome)
+                || matches!(&app_context, AppContext::Workspace { .. }),
+            "Workspace Home requires a workspace application context"
+        );
+        Self {
+            app_context,
+            config,
+            submissions: crate::tui::SubmissionHub::new(),
+            location,
+        }
+    }
+}
+
+impl<S> WorkspaceRuntime<S> {
+    fn request_stop_active_contest(&self) {
+        if let RootLocation::Contest(session) = &self.location {
+            session.request_stop();
+        }
+    }
+
+    fn shutdown_active_contest(&mut self) -> io::Result<()> {
+        match std::mem::replace(&mut self.location, RootLocation::WorkspaceHome) {
+            RootLocation::Contest(session) => session.shutdown(),
+            RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
+        }
+    }
+}
+
+trait WorkspaceSubmissionLifetime {
+    fn hub(&mut self) -> &mut crate::tui::SubmissionHub;
+    fn request_stop(&mut self);
+    fn shutdown(&mut self) -> io::Result<()>;
+}
+
+impl WorkspaceSubmissionLifetime for crate::tui::SubmissionHub {
+    fn hub(&mut self) -> &mut crate::tui::SubmissionHub {
+        self
+    }
+
+    fn request_stop(&mut self) {
+        crate::tui::SubmissionHub::request_stop(self);
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        crate::tui::SubmissionHub::shutdown(self)
+    }
+}
+
+trait RootTerminalLifetime {
+    fn mouse_mode_label(&self) -> &'static str;
+    fn mouse_trace_line(&self) -> Option<String>;
+    fn restore(&mut self) -> io::Result<()>;
+}
+
+impl RootTerminalLifetime for crate::tui::TerminaSession {
+    fn mouse_mode_label(&self) -> &'static str {
+        crate::tui::TerminaSession::mouse_mode_label(self)
+    }
+
+    fn mouse_trace_line(&self) -> Option<String> {
+        crate::tui::TerminaSession::mouse_trace_line(self)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        crate::tui::TerminaSession::restore(self)
+    }
+}
+
+trait WorkspaceTerminal: RootTerminalLifetime + crate::tui::HomeTerminal {
+    fn run_contest_frontend<R>(
+        &mut self,
+        session: &mut ContestSession,
+        app_context: &AppContext,
+        config: &Config,
+        preferences: &mut crate::tui::FrontendPreferences,
+        submissions: &mut crate::tui::SubmissionHub,
+        frontend: crate::tui::SessionFrontend<R>,
+    ) -> io::Result<crate::tui::SessionExit>
+    where
+        R: FnMut(&str) -> crate::tui::ContestSwitchResolution;
+}
+
+impl WorkspaceTerminal for crate::tui::TerminaSession {
+    fn run_contest_frontend<R>(
+        &mut self,
+        session: &mut ContestSession,
+        app_context: &AppContext,
+        config: &Config,
+        preferences: &mut crate::tui::FrontendPreferences,
+        submissions: &mut crate::tui::SubmissionHub,
+        frontend: crate::tui::SessionFrontend<R>,
+    ) -> io::Result<crate::tui::SessionExit>
+    where
+        R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
+    {
+        session.run_frontend(
+            self,
+            app_context,
+            config,
+            preferences,
+            submissions,
+            frontend,
+        )
+    }
+}
+
 trait RootLifetimeOperations {
     fn request_stop_submissions(&mut self);
     fn shutdown_submissions(&mut self) -> io::Result<()>;
     fn restore_terminal(&mut self) -> io::Result<()>;
 }
 
-struct LiveRootLifetime<'a> {
-    submissions: &'a mut crate::tui::SubmissionHub,
-    terminal: &'a mut crate::tui::TerminaSession,
+struct LiveRootLifetime<'a, S, T> {
+    submissions: &'a mut S,
+    terminal: &'a mut T,
 }
 
-impl RootLifetimeOperations for LiveRootLifetime<'_> {
+impl<S, T> RootLifetimeOperations for LiveRootLifetime<'_, S, T>
+where
+    S: WorkspaceSubmissionLifetime,
+    T: RootTerminalLifetime,
+{
     fn request_stop_submissions(&mut self) {
         self.submissions.request_stop();
     }
@@ -582,19 +713,36 @@ fn take_prepared_open(
 fn run_root_tui(
     app_context: AppContext,
     config: Config,
-    mut location: RootLocation,
+    location: RootLocation,
 ) -> Result<(), AppError> {
-    let mut submissions = crate::tui::SubmissionHub::new();
+    let mut runtime = WorkspaceRuntime::new(app_context, config, location);
+    let mut preferences = crate::tui::FrontendPreferences::default();
+    run_root_application(
+        &mut runtime,
+        &mut preferences,
+        crate::tui::TerminaSession::start,
+    )
+}
 
-    let mut terminal = match crate::tui::TerminaSession::start() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceExit {
+    Quit,
+}
+
+fn run_root_application<S, T>(
+    runtime: &mut WorkspaceRuntime<S>,
+    preferences: &mut crate::tui::FrontendPreferences,
+    start_terminal: impl FnOnce() -> io::Result<T>,
+) -> Result<(), AppError>
+where
+    S: WorkspaceSubmissionLifetime,
+    T: WorkspaceTerminal,
+{
+    let mut terminal = match start_terminal() {
         Ok(terminal) => terminal,
 
         Err(error) => {
-            let session_result = match location {
-                RootLocation::WorkspaceHome => Ok(()),
-                RootLocation::Contest(session) => session.shutdown(),
-                RootLocation::ContestShutdown => Ok(()),
-            };
+            let session_result = runtime.shutdown_active_contest();
 
             return combine_primary_and_cleanup_results(
                 Err(error),
@@ -604,226 +752,24 @@ fn run_root_tui(
         }
     };
 
-    let mut preferences = crate::tui::FrontendPreferences::default();
-    let prepared_switch = Arc::new(Mutex::new(None));
-    let prepared_home_open = Arc::new(Mutex::new(None));
-    let prepared_refresh = Arc::new(Mutex::new(None));
-    let switch_task = contest_open_task(&app_context, Arc::clone(&prepared_switch));
-    let home_open_task = contest_open_task(&app_context, Arc::clone(&prepared_home_open));
-    let mut refresh_frontend_state = None;
-    let result = loop {
-        if matches!(location, RootLocation::WorkspaceHome) {
-            match prepared_home_open.lock() {
-                Ok(mut pending) => *pending = None,
-                Err(_) => {
-                    break Err(io::Error::other("prepared contest open state is poisoned"));
-                }
-            }
-            let resolver_prepared = Arc::clone(&prepared_home_open);
-            let mut resolve = |contest_id: &str| {
-                resolve_contest_open(&app_context, &resolver_prepared, contest_id)
-            };
-            let start_prepared = Arc::clone(&prepared_home_open);
-            let runner_config = &config.runner;
-            let workspace_root = app_context
-                .workspace_root()
-                .expect("Workspace Home is reachable only from a workspace context");
-            match crate::tui::run_home(
-                &mut terminal,
-                workspace_root,
-                &mut submissions,
-                &mut resolve,
-                Arc::clone(&home_open_task),
-                || {
-                    let prepared = take_prepared_open(&start_prepared)?;
-                    ContestSession::start(prepared, runner_config)
-                        .map_err(|error| error.to_string())
-                },
-            ) {
-                Err(error) => break Err(error),
-                Ok(crate::tui::HomeExit::Quit) => break Ok(()),
-                Ok(crate::tui::HomeExit::Contest(session)) => {
-                    location = RootLocation::Contest(session);
-                    refresh_frontend_state = None;
-                    continue;
-                }
-            }
-        }
-
-        match prepared_switch.lock() {
-            Ok(mut pending) => *pending = None,
-            Err(_) => {
-                break Err(io::Error::other(
-                    "prepared contest switch state is poisoned",
-                ));
-            }
-        }
-        match prepared_refresh.lock() {
-            Ok(mut pending) => *pending = None,
-            Err(_) => {
-                break Err(io::Error::other("prepared refresh state is poisoned"));
-            }
-        }
-        let RootLocation::Contest(active_session) = &mut location else {
-            unreachable!("Workspace Home is handled before the contest frontend")
-        };
-        let refresh_task = contest_refresh_task(
-            active_session.input.destination.clone(),
-            active_session.input.contest.contest_id.clone(),
-            Arc::clone(&prepared_refresh),
-        );
-        let refresh_check = prepared_refresh_check(Arc::clone(&prepared_refresh));
-        let resolver_prepared = Arc::clone(&prepared_switch);
-        let frontend = crate::tui::SessionFrontend::new(
-            refresh_frontend_state.take(),
-            |contest_id: &str| resolve_contest_open(&app_context, &resolver_prepared, contest_id),
-            Arc::clone(&switch_task),
-            refresh_task,
-            refresh_check,
-        );
-        let frontend_result = active_session.run_frontend(
-            &mut terminal,
-            &app_context,
-            &config,
-            &mut preferences,
-            &mut submissions,
-            frontend,
-        );
-
-        let frontend_exit = match frontend_result {
-            Err(error) => break Err(error),
-            Ok(exit) => exit,
-        };
-        let root_exit = {
-            let mut root_lifetime = LiveRootLifetime {
-                submissions: &mut submissions,
-                terminal: &mut terminal,
-            };
-            match orchestrate_contest_frontend_exit(
-                frontend_exit,
-                &mut location,
-                &mut refresh_frontend_state,
-                &mut root_lifetime,
-                ContestSession::shutdown,
-            ) {
-                Ok(root_exit) => root_exit,
-                Err(error) => break Err(error),
-            }
-        };
-
-        // None means Return Home was fully applied above. There is intentionally no caller-side
-        // Return arm; falling through starts the next root iteration in the fresh Home state.
-        if let Some(root_exit) = root_exit {
-            match root_exit {
-                ContestRootExit::Quit => break Ok(()),
-                ContestRootExit::SwitchContest => {
-                    let prepared = match prepared_switch.lock() {
-                        Ok(mut pending) => match pending.take() {
-                            Some(prepared) => prepared,
-                            None => {
-                                break Err(io::Error::other(
-                                    "a switch exit did not retain its validated prepared contest",
-                                ));
-                            }
-                        },
-                        Err(_) => {
-                            break Err(io::Error::other(
-                                "prepared contest switch state is poisoned",
-                            ));
-                        }
-                    };
-                    let RootLocation::Contest(old_session) =
-                        std::mem::replace(&mut location, RootLocation::WorkspaceHome)
-                    else {
-                        unreachable!("contest switch requires the active contest session")
-                    };
-                    if let Err(error) = old_session.shutdown() {
-                        break Err(error);
-                    }
-
-                    match ContestSession::start(prepared, &config.runner) {
-                        Ok(new_session) => {
-                            location = RootLocation::Contest(new_session);
-                            refresh_frontend_state = None;
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
-                ContestRootExit::RefreshContest(resume) => {
-                    let prepared = match prepared_refresh.lock() {
-                        Ok(mut pending) => match pending.take() {
-                            Some(prepared) => prepared,
-                            None => {
-                                break Err(io::Error::other(
-                                    "a refresh exit did not retain its prepared refresh",
-                                ));
-                            }
-                        },
-                        Err(_) => {
-                            break Err(io::Error::other("prepared refresh state is poisoned"));
-                        }
-                    };
-                    let refresh_destination = prepared.destination().to_path_buf();
-                    let refresh_contest_id = prepared.contest_id().to_string();
-                    let RootLocation::Contest(active_session) = &location else {
-                        unreachable!("contest refresh requires the active contest session")
-                    };
-                    if active_session.input.destination != refresh_destination
-                        || active_session.input.contest.contest_id != refresh_contest_id
-                    {
-                        break Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "prepared refresh target does not match the active contest session",
-                        ));
-                    }
-
-                    let RootLocation::Contest(old_session) =
-                        std::mem::replace(&mut location, RootLocation::WorkspaceHome)
-                    else {
-                        unreachable!("contest refresh requires the active contest session")
-                    };
-                    let rebuilt = rebuild_contest_session_after_refresh(
-                        old_session,
-                        prepared,
-                        &refresh_destination,
-                        &refresh_contest_id,
-                        resume,
-                        RefreshRebuildHooks {
-                            shutdown: ContestSession::shutdown,
-                            apply: |prepared| {
-                                let mut reporter = RefreshApplyReporter;
-                                super::refresh::apply_refresh(prepared, &mut reporter)
-                            },
-                            load: |destination, contest_id| {
-                                PreparedWatchInput::load(destination, Some(contest_id))
-                            },
-                            start: |input| ContestSession::start(input, &config.runner),
-                        },
-                    );
-                    match rebuilt {
-                        Ok(rebuilt) => {
-                            location = RootLocation::Contest(rebuilt.session);
-                            refresh_frontend_state = Some(rebuilt.frontend_state);
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
-            }
-        }
-    };
+    let result =
+        run_workspace_runtime(runtime, &mut terminal, preferences).map(|WorkspaceExit::Quit| ());
 
     // sample/stress実行中だった場合、runnerまでcancelを先に伝える。
-    if let RootLocation::Contest(session) = &location {
-        session.request_stop();
-    }
+    runtime.request_stop_active_contest();
     let mouse_mode_label = terminal.mouse_mode_label();
     let mouse_trace_line = terminal.mouse_trace_line();
+    let WorkspaceRuntime {
+        submissions,
+        location,
+        ..
+    } = runtime;
     let mut root_lifetime = LiveRootLifetime {
-        submissions: &mut submissions,
+        submissions,
         terminal: &mut terminal,
     };
     let cleanup = run_tui_cleanup(&mut root_lifetime, || {
-        match std::mem::replace(&mut location, RootLocation::WorkspaceHome) {
+        match std::mem::replace(location, RootLocation::WorkspaceHome) {
             RootLocation::Contest(session) => session.shutdown(),
             RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
         }
@@ -847,6 +793,227 @@ fn run_root_tui(
         ],
     )
     .map_err(AppError::from)
+}
+
+fn run_workspace_runtime<S, T>(
+    runtime: &mut WorkspaceRuntime<S>,
+    terminal: &mut T,
+    preferences: &mut crate::tui::FrontendPreferences,
+) -> io::Result<WorkspaceExit>
+where
+    S: WorkspaceSubmissionLifetime,
+    T: WorkspaceTerminal,
+{
+    let app_context = &runtime.app_context;
+    let config = &runtime.config;
+    let submissions = &mut runtime.submissions;
+    let location = &mut runtime.location;
+    let prepared_switch = Arc::new(Mutex::new(None));
+    let prepared_home_open = Arc::new(Mutex::new(None));
+    let prepared_refresh = Arc::new(Mutex::new(None));
+    let switch_task = contest_open_task(app_context, Arc::clone(&prepared_switch));
+    let home_open_task = contest_open_task(app_context, Arc::clone(&prepared_home_open));
+    let mut refresh_frontend_state = None;
+    loop {
+        if matches!(&*location, RootLocation::WorkspaceHome) {
+            match prepared_home_open.lock() {
+                Ok(mut pending) => *pending = None,
+                Err(_) => {
+                    break Err(io::Error::other("prepared contest open state is poisoned"));
+                }
+            }
+            let resolver_prepared = Arc::clone(&prepared_home_open);
+            let mut resolve = |contest_id: &str| {
+                resolve_contest_open(app_context, &resolver_prepared, contest_id)
+            };
+            let start_prepared = Arc::clone(&prepared_home_open);
+            let runner_config = &config.runner;
+            let workspace_root = app_context
+                .workspace_root()
+                .expect("Workspace Home is reachable only from a workspace context");
+            match crate::tui::run_home_with_terminal(
+                terminal,
+                workspace_root,
+                submissions.hub(),
+                &mut resolve,
+                Arc::clone(&home_open_task),
+                || {
+                    let prepared = take_prepared_open(&start_prepared)?;
+                    ContestSession::start(prepared, runner_config)
+                        .map_err(|error| error.to_string())
+                },
+            ) {
+                Err(error) => break Err(error),
+                Ok(crate::tui::HomeExit::Quit) => break Ok(WorkspaceExit::Quit),
+                Ok(crate::tui::HomeExit::Contest(session)) => {
+                    *location = RootLocation::Contest(session);
+                    refresh_frontend_state = None;
+                    continue;
+                }
+            }
+        }
+
+        match prepared_switch.lock() {
+            Ok(mut pending) => *pending = None,
+            Err(_) => {
+                break Err(io::Error::other(
+                    "prepared contest switch state is poisoned",
+                ));
+            }
+        }
+        match prepared_refresh.lock() {
+            Ok(mut pending) => *pending = None,
+            Err(_) => {
+                break Err(io::Error::other("prepared refresh state is poisoned"));
+            }
+        }
+        let RootLocation::Contest(active_session) = &mut *location else {
+            unreachable!("Workspace Home is handled before the contest frontend")
+        };
+        let refresh_task = contest_refresh_task(
+            active_session.input.destination.clone(),
+            active_session.input.contest.contest_id.clone(),
+            Arc::clone(&prepared_refresh),
+        );
+        let refresh_check = prepared_refresh_check(Arc::clone(&prepared_refresh));
+        let resolver_prepared = Arc::clone(&prepared_switch);
+        let frontend = crate::tui::SessionFrontend::new(
+            refresh_frontend_state.take(),
+            |contest_id: &str| resolve_contest_open(app_context, &resolver_prepared, contest_id),
+            Arc::clone(&switch_task),
+            refresh_task,
+            refresh_check,
+        );
+        let frontend_result = terminal.run_contest_frontend(
+            active_session,
+            app_context,
+            config,
+            preferences,
+            submissions.hub(),
+            frontend,
+        );
+
+        let frontend_exit = match frontend_result {
+            Err(error) => break Err(error),
+            Ok(exit) => exit,
+        };
+        let root_exit = {
+            let mut root_lifetime = LiveRootLifetime {
+                submissions: &mut *submissions,
+                terminal: &mut *terminal,
+            };
+            match orchestrate_contest_frontend_exit(
+                frontend_exit,
+                location,
+                &mut refresh_frontend_state,
+                &mut root_lifetime,
+                ContestSession::shutdown,
+            ) {
+                Ok(root_exit) => root_exit,
+                Err(error) => break Err(error),
+            }
+        };
+
+        // None means Return Home was fully applied above. There is intentionally no caller-side
+        // Return arm; falling through starts the next root iteration in the fresh Home state.
+        if let Some(root_exit) = root_exit {
+            match root_exit {
+                ContestRootExit::Quit => break Ok(WorkspaceExit::Quit),
+                ContestRootExit::SwitchContest => {
+                    let prepared = match prepared_switch.lock() {
+                        Ok(mut pending) => match pending.take() {
+                            Some(prepared) => prepared,
+                            None => {
+                                break Err(io::Error::other(
+                                    "a switch exit did not retain its validated prepared contest",
+                                ));
+                            }
+                        },
+                        Err(_) => {
+                            break Err(io::Error::other(
+                                "prepared contest switch state is poisoned",
+                            ));
+                        }
+                    };
+                    let RootLocation::Contest(old_session) =
+                        std::mem::replace(location, RootLocation::WorkspaceHome)
+                    else {
+                        unreachable!("contest switch requires the active contest session")
+                    };
+                    if let Err(error) = old_session.shutdown() {
+                        break Err(error);
+                    }
+
+                    match ContestSession::start(prepared, &config.runner) {
+                        Ok(new_session) => {
+                            *location = RootLocation::Contest(new_session);
+                            refresh_frontend_state = None;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                ContestRootExit::RefreshContest(resume) => {
+                    let prepared = match prepared_refresh.lock() {
+                        Ok(mut pending) => match pending.take() {
+                            Some(prepared) => prepared,
+                            None => {
+                                break Err(io::Error::other(
+                                    "a refresh exit did not retain its prepared refresh",
+                                ));
+                            }
+                        },
+                        Err(_) => {
+                            break Err(io::Error::other("prepared refresh state is poisoned"));
+                        }
+                    };
+                    let refresh_destination = prepared.destination().to_path_buf();
+                    let refresh_contest_id = prepared.contest_id().to_string();
+                    let RootLocation::Contest(active_session) = &*location else {
+                        unreachable!("contest refresh requires the active contest session")
+                    };
+                    if active_session.input.destination != refresh_destination
+                        || active_session.input.contest.contest_id != refresh_contest_id
+                    {
+                        break Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "prepared refresh target does not match the active contest session",
+                        ));
+                    }
+
+                    let RootLocation::Contest(old_session) =
+                        std::mem::replace(location, RootLocation::WorkspaceHome)
+                    else {
+                        unreachable!("contest refresh requires the active contest session")
+                    };
+                    let rebuilt = rebuild_contest_session_after_refresh(
+                        old_session,
+                        prepared,
+                        &refresh_destination,
+                        &refresh_contest_id,
+                        resume,
+                        RefreshRebuildHooks {
+                            shutdown: ContestSession::shutdown,
+                            apply: |prepared| {
+                                let mut reporter = RefreshApplyReporter;
+                                super::refresh::apply_refresh(prepared, &mut reporter)
+                            },
+                            load: |destination, contest_id| {
+                                PreparedWatchInput::load(destination, Some(contest_id))
+                            },
+                            start: |input| ContestSession::start(input, &config.runner),
+                        },
+                    );
+                    match rebuilt {
+                        Ok(rebuilt) => {
+                            *location = RootLocation::Contest(rebuilt.session);
+                            refresh_frontend_state = Some(rebuilt.frontend_state);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1232,6 +1399,8 @@ struct ContestSession {
     run_tx: mpsc::Sender<crate::tui::message::RunWorkerCommand>,
     detail_analysis_tx: mpsc::Sender<crate::tui::SessionDetailAnalysisCommand>,
     detail_analysis_rx: mpsc::Receiver<crate::tui::SessionDetailAnalysisResult>,
+    #[cfg(test)]
+    shutdown_probe: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1325,6 +1494,8 @@ impl ContestSession {
             run_tx,
             detail_analysis_tx,
             detail_analysis_rx,
+            #[cfg(test)]
+            shutdown_probe: None,
         })
     }
 
@@ -1377,7 +1548,16 @@ impl ContestSession {
         }
     }
 
+    #[cfg(test)]
+    fn set_shutdown_probe(&mut self, probe: Arc<AtomicUsize>) {
+        self.shutdown_probe = Some(probe);
+    }
+
     fn shutdown(mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = self.shutdown_probe.take() {
+            probe.fetch_add(1, Ordering::Relaxed);
+        }
         self.request_stop();
         // `self` retains every channel endpoint until all three joins below have completed.
         combine_primary_and_cleanup_results(
@@ -1521,6 +1701,122 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RootApplicationProbe {
+        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        terminal_starts: std::rc::Rc<std::cell::Cell<usize>>,
+        terminal_restores: std::rc::Rc<std::cell::Cell<usize>>,
+        submission_stops: std::rc::Rc<std::cell::Cell<usize>>,
+        submission_shutdowns: std::rc::Rc<std::cell::Cell<usize>>,
+        contest_frontend_dispatches: std::rc::Rc<std::cell::Cell<usize>>,
+        home_draws: std::rc::Rc<std::cell::Cell<usize>>,
+        home_reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    struct SubmissionLifetimeSpy {
+        hub: crate::tui::SubmissionHub,
+        probe: RootApplicationProbe,
+    }
+
+    impl WorkspaceSubmissionLifetime for SubmissionLifetimeSpy {
+        fn hub(&mut self) -> &mut crate::tui::SubmissionHub {
+            &mut self.hub
+        }
+
+        fn request_stop(&mut self) {
+            self.probe.events.borrow_mut().push("submission stop");
+            self.probe
+                .submission_stops
+                .set(self.probe.submission_stops.get() + 1);
+            self.hub.request_stop();
+        }
+
+        fn shutdown(&mut self) -> io::Result<()> {
+            self.probe.events.borrow_mut().push("submission shutdown");
+            self.probe
+                .submission_shutdowns
+                .set(self.probe.submission_shutdowns.get() + 1);
+            self.hub.shutdown()
+        }
+    }
+
+    struct RootTerminalSpy {
+        home_quit_available: bool,
+        expect_standalone_contest: bool,
+        probe: RootApplicationProbe,
+    }
+
+    impl RootTerminalLifetime for RootTerminalSpy {
+        fn mouse_mode_label(&self) -> &'static str {
+            "test"
+        }
+
+        fn mouse_trace_line(&self) -> Option<String> {
+            None
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.probe.events.borrow_mut().push("terminal restore");
+            self.probe
+                .terminal_restores
+                .set(self.probe.terminal_restores.get() + 1);
+            Ok(())
+        }
+    }
+
+    impl crate::tui::HomeTerminal for RootTerminalSpy {
+        fn draw_home(
+            &mut self,
+            _render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> io::Result<()> {
+            self.probe.home_draws.set(self.probe.home_draws.get() + 1);
+            Ok(())
+        }
+
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_home_resize(&mut self) {}
+
+        fn poll_home(&mut self, _wait: Duration) -> io::Result<bool> {
+            Ok(self.home_quit_available)
+        }
+
+        fn read_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            if !self.home_quit_available {
+                return Err(io::Error::other("scripted Home input exhausted"));
+            }
+            self.home_quit_available = false;
+            self.probe.home_reads.set(self.probe.home_reads.get() + 1);
+            Ok(crate::tui::test_key_press('q'))
+        }
+    }
+
+    impl WorkspaceTerminal for RootTerminalSpy {
+        fn run_contest_frontend<R>(
+            &mut self,
+            session: &mut ContestSession,
+            app_context: &AppContext,
+            _config: &Config,
+            _preferences: &mut crate::tui::FrontendPreferences,
+            _submissions: &mut crate::tui::SubmissionHub,
+            _frontend: crate::tui::SessionFrontend<R>,
+        ) -> io::Result<crate::tui::SessionExit>
+        where
+            R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
+        {
+            if self.expect_standalone_contest {
+                assert!(matches!(app_context, AppContext::Standalone { .. }));
+                assert_eq!(session.input.contest.contest_id, "abc123");
+            }
+            self.probe
+                .contest_frontend_dispatches
+                .set(self.probe.contest_frontend_dispatches.get() + 1);
+            Ok(crate::tui::SessionExit::Quit)
+        }
+    }
+
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
         match PreparedWatchInput::resolve_for_switch(root, contest_id) {
             Ok(_) => panic!("contest switch unexpectedly succeeded"),
@@ -1582,6 +1878,122 @@ mod tests {
                 root: root.path().to_path_buf()
             }
         );
+    }
+
+    #[test]
+    fn production_root_boundary_owns_one_terminal_around_workspace_home_and_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let probe = RootApplicationProbe::default();
+
+        workspace_home_at_with(root.path(), |app_context, location| {
+            let mut runtime = WorkspaceRuntime {
+                app_context,
+                config: Config::default(),
+                submissions: SubmissionLifetimeSpy {
+                    hub: crate::tui::SubmissionHub::new(),
+                    probe: probe.clone(),
+                },
+                location,
+            };
+            let mut preferences = crate::tui::FrontendPreferences::default();
+
+            run_root_application(&mut runtime, &mut preferences, || {
+                probe.events.borrow_mut().push("terminal start");
+                probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                Ok(RootTerminalSpy {
+                    home_quit_available: true,
+                    expect_standalone_contest: false,
+                    probe: probe.clone(),
+                })
+            })
+        })
+        .unwrap();
+
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert_eq!(probe.submission_stops.get(), 1);
+        assert_eq!(probe.submission_shutdowns.get(), 1);
+        assert_eq!(probe.contest_frontend_dispatches.get(), 0);
+        assert_eq!(probe.home_draws.get(), 1);
+        assert_eq!(probe.home_reads.get(), 1);
+        assert_eq!(
+            *probe.events.borrow(),
+            [
+                "terminal start",
+                "submission stop",
+                "submission shutdown",
+                "terminal restore"
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_runtime_constructor_accepts_standalone_direct_contest() {
+        let destination = tempfile::tempdir().unwrap();
+        save_healthy_contest(destination.path(), "abc123");
+        let input = PreparedWatchInput::load(destination.path(), Some("abc123")).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let context = AppContext::Standalone {
+            launch_root: destination.path().to_path_buf(),
+        };
+        let mut runtime = WorkspaceRuntime::new(
+            context.clone(),
+            Config::default(),
+            RootLocation::Contest(session),
+        );
+
+        assert_eq!(runtime.app_context, context);
+        assert!(matches!(runtime.location, RootLocation::Contest(_)));
+
+        runtime.shutdown_active_contest().unwrap();
+    }
+
+    #[test]
+    fn workspace_runtime_keeps_standalone_direct_contest_compatibility() {
+        let destination = tempfile::tempdir().unwrap();
+        save_healthy_contest(destination.path(), "abc123");
+        let input = PreparedWatchInput::load(destination.path(), Some("abc123")).unwrap();
+        let mut session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let contest_shutdowns = Arc::new(AtomicUsize::new(0));
+        session.set_shutdown_probe(Arc::clone(&contest_shutdowns));
+        let context = AppContext::Standalone {
+            launch_root: destination.path().to_path_buf(),
+        };
+        let probe = RootApplicationProbe::default();
+        let mut runtime = WorkspaceRuntime {
+            app_context: context.clone(),
+            config: Config::default(),
+            submissions: SubmissionLifetimeSpy {
+                hub: crate::tui::SubmissionHub::new(),
+                probe: probe.clone(),
+            },
+            location: RootLocation::Contest(session),
+        };
+        let mut preferences = crate::tui::FrontendPreferences::default();
+
+        assert_eq!(runtime.app_context, context);
+        assert!(matches!(runtime.location, RootLocation::Contest(_)));
+        run_root_application(&mut runtime, &mut preferences, || {
+            probe.events.borrow_mut().push("terminal start");
+            probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+            Ok(RootTerminalSpy {
+                home_quit_available: true,
+                expect_standalone_contest: true,
+                probe: probe.clone(),
+            })
+        })
+        .unwrap();
+
+        assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+        assert_eq!(probe.home_draws.get(), 0);
+        assert_eq!(probe.home_reads.get(), 0);
+        assert_eq!(probe.contest_frontend_dispatches.get(), 1);
+        assert_eq!(contest_shutdowns.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert_eq!(probe.submission_stops.get(), 1);
+        assert_eq!(probe.submission_shutdowns.get(), 1);
     }
 
     #[test]
@@ -2926,6 +3338,7 @@ mod tests {
             run_tx,
             detail_analysis_tx,
             detail_analysis_rx,
+            shutdown_probe: None,
         };
         session
             .run_tx

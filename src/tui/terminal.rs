@@ -2179,7 +2179,7 @@ impl Drop for TerminaSession {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum TerminalEvent {
+pub(crate) enum TerminalEvent {
     Key(KeyEvent),
     Paste(String),
     Pointer(PointerEvent),
@@ -2188,13 +2188,13 @@ pub(super) enum TerminalEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TerminalSize {
+pub(crate) struct TerminalSize {
     pub(super) columns: u16,
     pub(super) rows: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct KeyEvent {
+pub(crate) struct KeyEvent {
     pub(super) code: KeyCode,
     pub(super) kind: KeyEventKind,
     pub(super) modifiers: Modifiers,
@@ -2231,8 +2231,17 @@ pub(super) struct Modifiers {
     pub(super) super_key: bool,
 }
 
+#[cfg(test)]
+pub(crate) fn test_key_press(character: char) -> TerminalEvent {
+    TerminalEvent::Key(KeyEvent {
+        code: KeyCode::Char(character),
+        kind: KeyEventKind::Press,
+        modifiers: Modifiers::default(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PointerEvent {
+pub(crate) struct PointerEvent {
     pub(super) kind: PointerKind,
     pub(super) position: PointerPosition,
     pub(super) modifiers: Modifiers,

@@ -37,16 +37,16 @@ pub(crate) use detail_layout::{
     DetailAnalysisResult as SessionDetailAnalysisResult,
 };
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
-pub(crate) use home::{HomeExit, run as run_home};
+pub(crate) use home::{HomeExit, HomeTerminal, run_with_terminal as run_home_with_terminal};
 use message::{Message, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
 pub(crate) use submission::SubmissionHub;
-pub(crate) use terminal::TerminaSession;
-use terminal::{
-    KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind, TerminalEvent,
-};
+#[cfg(test)]
+pub(crate) use terminal::test_key_press;
+use terminal::{KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind};
+pub(crate) use terminal::{TerminaSession, TerminalEvent};
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 const MAX_CONTEST_PROGRESS_HISTORY: usize = 256;
