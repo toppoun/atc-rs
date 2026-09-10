@@ -797,6 +797,7 @@ fn dispatch(
             terminal: TerminalInputContext::new(tx, Some(destination), None),
             contest_switch: None,
             contest_refresh: None,
+            return_home_requested: None,
             command_palette: None,
             open_source: None,
             submit: None,

@@ -16,8 +16,8 @@ use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::view::{self, ContestOpenPurpose};
 use super::{
     ContestOpenController, ContestOpenKeyResult, ContestSwitchResolution, ContestSwitchTask,
-    ShortcutHelpTransition, TerminaSession, command_matches, is_command_palette_open_key,
-    is_shortcut_help_key, shortcut_help_transition,
+    ShortcutHelpTransition, SubmissionHub, TerminaSession, command_matches,
+    is_command_palette_open_key, is_shortcut_help_key, shortcut_help_transition,
 };
 use crate::branding;
 
@@ -291,9 +291,60 @@ pub(crate) enum HomeExit<T> {
     Contest(T),
 }
 
+pub(super) trait HomeTerminal {
+    fn draw_home(&mut self, render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()>;
+    fn finish_home_redraw(&mut self) -> io::Result<()>;
+    fn note_home_resize(&mut self);
+    fn poll_home(&mut self, wait: Duration) -> io::Result<bool>;
+    fn read_home(&mut self) -> io::Result<TerminalEvent>;
+}
+
+impl HomeTerminal for TerminaSession {
+    fn draw_home(&mut self, render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()> {
+        self.draw(|frame| render(frame))
+    }
+
+    fn finish_home_redraw(&mut self) -> io::Result<()> {
+        self.note_redraw_completed();
+        self.refresh_mouse_after_redraw(false)?;
+        self.retry_high_res_after_redraw(false)
+    }
+
+    fn note_home_resize(&mut self) {
+        self.note_resize_dispatched();
+    }
+
+    fn poll_home(&mut self, wait: Duration) -> io::Result<bool> {
+        self.poll(wait)
+    }
+
+    fn read_home(&mut self) -> io::Result<TerminalEvent> {
+        self.read()
+    }
+}
+
 pub(crate) fn run<T>(
     terminal: &mut TerminaSession,
     workspace_root: &Path,
+    submissions: &mut SubmissionHub,
+    resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
+    task: ContestSwitchTask,
+    start_contest: impl FnMut() -> Result<T, String>,
+) -> io::Result<HomeExit<T>> {
+    run_with_terminal(
+        terminal,
+        workspace_root,
+        submissions,
+        resolve,
+        task,
+        start_contest,
+    )
+}
+
+pub(super) fn run_with_terminal<T>(
+    terminal: &mut impl HomeTerminal,
+    workspace_root: &Path,
+    submissions: &mut SubmissionHub,
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
     mut start_contest: impl FnMut() -> Result<T, String>,
@@ -302,6 +353,8 @@ pub(crate) fn run<T>(
     let mut dirty = true;
 
     loop {
+        // Submission-only changes stay invisible on Home, so intentionally ignore dirtiness.
+        let _ = submissions.handle_events();
         dirty |= state.handle_operation_messages();
         if state.open_requested() {
             if let Some(contest) = state.start_requested_contest(&mut start_contest) {
@@ -311,17 +364,15 @@ pub(crate) fn run<T>(
         }
 
         if dirty {
-            terminal.draw(|frame| render(frame, &state, workspace_root))?;
-            terminal.note_redraw_completed();
-            terminal.refresh_mouse_after_redraw(false)?;
-            terminal.retry_high_res_after_redraw(false)?;
+            terminal.draw_home(&mut |frame| render(frame, &state, workspace_root))?;
+            terminal.finish_home_redraw()?;
             dirty = false;
         }
 
-        if !terminal.poll(HOME_POLL_INTERVAL)? {
+        if !terminal.poll_home(HOME_POLL_INTERVAL)? {
             continue;
         }
-        match terminal.read()? {
+        match terminal.read_home()? {
             TerminalEvent::Key(key) => match state.handle_key(key) {
                 HomeAction::None => dirty = true,
                 HomeAction::OpenContest => {
@@ -330,7 +381,7 @@ pub(crate) fn run<T>(
                 HomeAction::Quit => return Ok(HomeExit::Quit),
             },
             TerminalEvent::Resize(_) => {
-                terminal.note_resize_dispatched();
+                terminal.note_home_resize();
                 dirty = true;
             }
             TerminalEvent::Paste(_) | TerminalEvent::Pointer(_) | TerminalEvent::Ignored => {}

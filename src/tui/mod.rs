@@ -93,10 +93,11 @@ pub(super) enum FrontendAction {
     InitializeStress,
     RefreshContest,
     SwitchContest,
+    ReturnToWorkspaceHome,
 }
 
 impl FrontendAction {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::RunTests,
         Self::Submit,
         Self::OpenSource,
@@ -111,6 +112,7 @@ impl FrontendAction {
         Self::InitializeStress,
         Self::RefreshContest,
         Self::SwitchContest,
+        Self::ReturnToWorkspaceHome,
     ];
 
     pub(super) const fn label(self) -> &'static str {
@@ -129,6 +131,7 @@ impl FrontendAction {
             Self::InitializeStress => "Initialize Stress",
             Self::RefreshContest => "Refresh Contest",
             Self::SwitchContest => "Switch Contest",
+            Self::ReturnToWorkspaceHome => "Back to Workspace Home",
         }
     }
 
@@ -146,6 +149,7 @@ impl FrontendAction {
             Self::InitializeStress => Some("i"),
             Self::RefreshContest => None,
             Self::SwitchContest => Some("c"),
+            Self::ReturnToWorkspaceHome => None,
         }
     }
 
@@ -191,7 +195,9 @@ impl FrontendAction {
             Self::StopStress if app.active_stress_identity().is_none() => {
                 FrontendActionAvailability::Unavailable("stress is not running")
             }
-            Self::OpenWorkspaceSettings | Self::SwitchContest if !workspace_available => {
+            Self::OpenWorkspaceSettings | Self::SwitchContest | Self::ReturnToWorkspaceHome
+                if !workspace_available =>
+            {
                 FrontendActionAvailability::Unavailable("not in a workspace")
             }
             Self::RunTests
@@ -207,7 +213,8 @@ impl FrontendAction {
             | Self::StopStress
             | Self::InitializeStress
             | Self::RefreshContest
-            | Self::SwitchContest => FrontendActionAvailability::Available,
+            | Self::SwitchContest
+            | Self::ReturnToWorkspaceHome => FrontendActionAvailability::Available,
         }
     }
 
@@ -1362,6 +1369,7 @@ pub(crate) enum SessionExit {
     Quit,
     SwitchContest,
     RefreshContest(RefreshResumeState),
+    ReturnToWorkspaceHome,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2603,6 +2611,7 @@ struct FrontendInputContext<'run, 'controller, 'resolver, 'palette, 'editor> {
     terminal: TerminalInputContext<'run>,
     contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
     contest_refresh: Option<&'controller mut RefreshContestController>,
+    return_home_requested: Option<&'controller mut bool>,
     command_palette: Option<&'palette mut CommandPalette>,
     open_source: Option<OpenSourceInputContext<'palette>>,
     submit: Option<SubmitInputContext<'palette>>,
@@ -3268,6 +3277,7 @@ where
         initial_refresh_error,
     );
     let mut command_palette = CommandPalette::default();
+    let mut return_home_requested = false;
     let mut open_source = OpenSourceController::new(current_destination, config.defaults.language);
     let mut submit = SubmitController::new(
         current_destination,
@@ -3478,6 +3488,7 @@ where
                 ),
                 contest_switch: Some(&mut contest_switch),
                 contest_refresh: Some(&mut contest_refresh),
+                return_home_requested: Some(&mut return_home_requested),
                 command_palette: Some(&mut command_palette),
                 open_source: Some(OpenSourceInputContext {
                     controller: &mut open_source,
@@ -3496,6 +3507,9 @@ where
         )? {
             dirty = true;
         }
+        if return_home_requested {
+            break;
+        }
         if contest_switch.switch_requested {
             break;
         }
@@ -3509,7 +3523,9 @@ where
     }
 
     preferences.capture(&app);
-    if contest_refresh.refresh_requested {
+    if return_home_requested {
+        Ok(SessionExit::ReturnToWorkspaceHome)
+    } else if contest_refresh.refresh_requested {
         Ok(SessionExit::RefreshContest(RefreshResumeState::capture(
             &app,
             current_destination,
@@ -3602,6 +3618,7 @@ struct GlobalQuitVirtualUiState {
     refresh_modal_state: Option<RefreshContestModalState>,
     source_modal_active: bool,
     editor_target_modal_active: bool,
+    return_home_requested: bool,
 }
 
 fn apply_frontend_action_to_global_quit_state(
@@ -3619,6 +3636,7 @@ fn apply_frontend_action_to_global_quit_state(
             state.refresh_modal_state = Some(RefreshContestModalState::Running)
         }
         FrontendAction::SwitchContest => state.contest_modal_active = true,
+        FrontendAction::ReturnToWorkspaceHome => state.return_home_requested = true,
         FrontendAction::OpenSource => {
             state.editor_target_modal_active = false;
             state.source_modal_active = true;
@@ -3659,6 +3677,7 @@ fn contains_global_quit_event(
         refresh_modal_state,
         source_modal_active: open_source.modal_active(),
         editor_target_modal_active,
+        return_home_requested: false,
     };
     let mut command_palette = command_palette.clone();
     let mut user_input_editor_active = app.user_input_editor_active();
@@ -3739,6 +3758,9 @@ fn contains_global_quit_event(
             {
                 command_palette.close();
             }
+            if virtual_ui.return_home_requested {
+                return false;
+            }
             continue;
         }
 
@@ -3781,6 +3803,9 @@ fn contains_global_quit_event(
                 app,
                 contest_switch.workspace_available,
             );
+            if virtual_ui.return_home_requested {
+                return false;
+            }
             continue;
         }
 
@@ -3895,6 +3920,7 @@ fn handle_terminal_events(
             terminal: TerminalInputContext::new(run_tx, None, None),
             contest_switch: None,
             contest_refresh: None,
+            return_home_requested: None,
             command_palette: None,
             open_source: None,
             submit: None,
@@ -3978,6 +4004,13 @@ fn handle_terminal_events_with_mouse_mode(
             .contest_switch
             .as_ref()
             .is_some_and(|contest_switch| contest_switch.switch_requested)
+        {
+            break;
+        }
+        if input
+            .return_home_requested
+            .as_ref()
+            .is_some_and(|requested| **requested)
         {
             break;
         }
@@ -4155,6 +4188,7 @@ fn handle_terminal_event_after_shortcut_help(
                     FrontendActionControllers {
                         contest_switch: input.contest_switch.as_deref_mut(),
                         contest_refresh: input.contest_refresh.as_deref_mut(),
+                        return_home_requested: input.return_home_requested.as_deref_mut(),
                         open_source: input
                             .open_source
                             .as_mut()
@@ -4273,6 +4307,7 @@ fn handle_key_event_with_stress_context(
             terminal: TerminalInputContext::new(run_tx, current_destination, stress_setup),
             contest_switch: None,
             contest_refresh: None,
+            return_home_requested: None,
             command_palette: None,
             open_source: None,
             submit: None,
@@ -4345,6 +4380,7 @@ fn handle_key_event_after_delete_disarm(
             FrontendActionControllers {
                 contest_switch: input.contest_switch.as_deref_mut(),
                 contest_refresh: input.contest_refresh.as_deref_mut(),
+                return_home_requested: input.return_home_requested.as_deref_mut(),
                 open_source: input
                     .open_source
                     .as_mut()
@@ -4759,6 +4795,7 @@ fn handle_user_input_editor_key(
 struct FrontendActionControllers<'controller, 'resolver, 'modal, 'submission> {
     contest_switch: Option<&'controller mut ContestSwitchController<'resolver>>,
     contest_refresh: Option<&'controller mut RefreshContestController>,
+    return_home_requested: Option<&'controller mut bool>,
     open_source: Option<&'modal mut OpenSourceController>,
     submit: Option<&'modal mut SubmitInputContext<'submission>>,
     editor_targets: Option<&'modal mut EditorTargetController>,
@@ -4773,6 +4810,7 @@ fn execute_frontend_action(
     let FrontendActionControllers {
         contest_switch,
         contest_refresh,
+        return_home_requested,
         open_source,
         submit,
         editor_targets,
@@ -4880,6 +4918,12 @@ fn execute_frontend_action(
         }
         FrontendAction::SwitchContest => {
             Ok(contest_switch.is_some_and(|controller| controller.open()))
+        }
+        FrontendAction::ReturnToWorkspaceHome => {
+            Ok(return_home_requested.is_some_and(|requested| {
+                *requested = true;
+                true
+            }))
         }
     }
 }
@@ -5511,6 +5555,7 @@ mod tests {
                 terminal: TerminalInputContext::new(run_tx, None, stress_setup),
                 contest_switch,
                 contest_refresh: None,
+                return_home_requested: None,
                 command_palette: Some(command_palette),
                 open_source: None,
                 submit: None,
@@ -5651,6 +5696,139 @@ mod tests {
     }
 
     #[test]
+    fn return_home_stops_global_quit_pre_scan_before_later_q() {
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "home".to_string();
+        assert_eq!(
+            palette.selected_action(),
+            Some(FrontendAction::ReturnToWorkspaceHome)
+        );
+        let return_then_q = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(!contains_global_quit_event_with_palette(
+            &return_then_q,
+            &app(),
+            &palette,
+        ));
+    }
+
+    #[test]
+    fn return_home_stops_dispatch_before_later_q_in_the_same_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let context = workspace_context(root.path());
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".into());
+        let mut contest_switch = ContestSwitchController::new(
+            &context,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "back".to_string();
+        let mut return_home_requested = false;
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+
+        assert!(
+            super::handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut detail_layout::DetailLayout::default(),
+                &mut DetailScrollbarDragState::default(),
+                &view::RenderInfo::default(),
+                &mut events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, None, None),
+                    contest_switch: Some(&mut contest_switch),
+                    contest_refresh: None,
+                    return_home_requested: Some(&mut return_home_requested),
+                    command_palette: Some(&mut palette),
+                    open_source: None,
+                    submit: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(return_home_requested);
+        assert!(!app.should_quit());
+        assert_eq!(
+            events,
+            [TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press
+            ))]
+        );
+    }
+
+    #[test]
+    fn unavailable_return_home_and_palette_escape_do_not_request_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("abc123");
+        let standalone = AppContext::Standalone {
+            launch_root: current.clone(),
+        };
+        let mut resolve = |_: &str| ContestSwitchResolution::rejected(None, "invalid".into());
+        let mut contest_switch = ContestSwitchController::new(
+            &standalone,
+            &current,
+            &mut resolve,
+            successful_create_task(),
+        );
+        let mut palette = CommandPalette::default();
+        palette.open();
+        palette.query = "home".to_string();
+        let mut return_home_requested = false;
+        let mut app = app();
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut enter =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+
+        assert!(
+            !super::handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut detail_layout::DetailLayout::default(),
+                &mut DetailScrollbarDragState::default(),
+                &view::RenderInfo::default(),
+                &mut enter,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, None, None),
+                    contest_switch: Some(&mut contest_switch),
+                    contest_refresh: None,
+                    return_home_requested: Some(&mut return_home_requested),
+                    command_palette: Some(&mut palette),
+                    open_source: None,
+                    submit: None,
+                    editor_targets: None,
+                    editor: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(!return_home_requested);
+        assert!(palette.is_active());
+
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
+            CommandPaletteKeyResult::Handled(true)
+        );
+        assert!(!return_home_requested);
+        assert!(!palette.is_active());
+    }
+
+    #[test]
     fn shortcut_help_then_submit_opens_the_existing_submit_modal() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
@@ -5684,6 +5862,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, Some(temp.path()), None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: Some(SubmitInputContext {
@@ -5837,6 +6016,7 @@ mod tests {
                 terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch: None,
                 contest_refresh: None,
+                return_home_requested: None,
                 command_palette,
                 open_source: Some(OpenSourceInputContext {
                     controller,
@@ -5891,6 +6071,7 @@ mod tests {
                 terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch,
                 contest_refresh: None,
+                return_home_requested: None,
                 command_palette,
                 open_source: None,
                 submit: None,
@@ -6002,6 +6183,7 @@ mod tests {
                 terminal: TerminalInputContext::new(&run_tx, None, None),
                 contest_switch: None,
                 contest_refresh: Some(refresh),
+                return_home_requested: None,
                 command_palette: palette,
                 open_source: None,
                 submit: None,
@@ -6098,7 +6280,10 @@ mod tests {
                 "open settings",
                 vec!["Open Settings", "Open Workspace Settings"],
             ),
-            ("workspace", vec!["Open Workspace Settings"]),
+            (
+                "workspace",
+                vec!["Open Workspace Settings", "Back to Workspace Home"],
+            ),
             ("template", vec!["Open Template"]),
             ("Sw", vec!["Switch Contest"]),
             ("sW cOn", vec!["Switch Contest"]),
@@ -6128,7 +6313,7 @@ mod tests {
         palette.handle_key(key(KeyCode::Up, KeyEventKind::Press));
         assert_eq!(
             palette.selected_action(),
-            Some(FrontendAction::SwitchContest)
+            Some(FrontendAction::ReturnToWorkspaceHome)
         );
 
         palette.open();
@@ -6205,6 +6390,7 @@ mod tests {
                         | FrontendAction::OpenTemplate
                         | FrontendAction::StopStress
                         | FrontendAction::RefreshContest
+                        | FrontendAction::ReturnToWorkspaceHome
                 ));
             }
 
@@ -6227,6 +6413,7 @@ mod tests {
         assert_eq!(FrontendAction::OpenWorkspaceSettings.shortcut(), None);
         assert_eq!(FrontendAction::OpenTemplate.shortcut(), None);
         assert_eq!(FrontendAction::RefreshContest.shortcut(), None);
+        assert_eq!(FrontendAction::ReturnToWorkspaceHome.shortcut(), None);
     }
 
     #[test]
@@ -6324,6 +6511,7 @@ mod tests {
                 FrontendAction::InitializeStress,
                 FrontendAction::RefreshContest,
                 FrontendAction::SwitchContest,
+                FrontendAction::ReturnToWorkspaceHome,
             ]
         );
         assert_eq!(palette_labels("refresh"), ["Refresh Contest"]);
@@ -6332,6 +6520,9 @@ mod tests {
             palette_labels("contest"),
             ["Refresh Contest", "Switch Contest"]
         );
+        assert_eq!(palette_labels("home"), ["Back to Workspace Home"]);
+        assert_eq!(palette_labels("back"), ["Back to Workspace Home"]);
+        assert_eq!(palette_labels("workspace home"), ["Back to Workspace Home"]);
 
         let empty_contest = Contest {
             contest_id: "empty".to_string(),
@@ -6371,6 +6562,14 @@ mod tests {
         );
         assert_eq!(
             FrontendAction::OpenWorkspaceSettings.availability(&app, true),
+            FrontendActionAvailability::Available
+        );
+        assert_eq!(
+            FrontendAction::ReturnToWorkspaceHome.availability(&app, false),
+            FrontendActionAvailability::Unavailable("not in a workspace")
+        );
+        assert_eq!(
+            FrontendAction::ReturnToWorkspaceHome.availability(&app, true),
             FrontendActionAvailability::Available
         );
         let mut controller = OpenSourceController::new(temp.path(), Language::Cpp);
@@ -8486,6 +8685,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, None, None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: Some(&mut palette),
                     open_source: None,
                     submit: None,
@@ -11987,6 +12187,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, Some(destination), None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,
@@ -13756,6 +13957,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, Some(&destination), None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,
@@ -13809,6 +14011,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, Some(&destination), None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,
@@ -14039,6 +14242,7 @@ mod tests {
                     ),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,
@@ -14100,6 +14304,7 @@ mod tests {
                     ),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,
@@ -14992,6 +15197,7 @@ mod tests {
                     terminal: TerminalInputContext::new(&run_tx, None, None),
                     contest_switch: None,
                     contest_refresh: None,
+                    return_home_requested: None,
                     command_palette: None,
                     open_source: None,
                     submit: None,

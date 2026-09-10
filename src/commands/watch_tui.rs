@@ -101,15 +101,15 @@ struct TuiCleanupResults {
 }
 
 fn run_tui_cleanup(
-    shutdown_submission_workers: impl FnOnce() -> io::Result<()>,
+    root_lifetime: &mut impl RootLifetimeOperations,
     shutdown_contest_session: impl FnOnce() -> io::Result<()>,
-    restore_terminal: impl FnOnce() -> io::Result<()>,
 ) -> TuiCleanupResults {
     // Keep the terminal managed until every background producer has stopped. Each operation is
     // evaluated independently so an earlier cleanup error can never skip terminal restoration.
-    let submission_workers = shutdown_submission_workers();
+    root_lifetime.request_stop_submissions();
+    let submission_workers = root_lifetime.shutdown_submissions();
     let contest_session = shutdown_contest_session();
-    let terminal_restore = restore_terminal();
+    let terminal_restore = root_lifetime.restore_terminal();
     TuiCleanupResults {
         submission_workers,
         contest_session,
@@ -463,6 +463,69 @@ pub(super) fn watch_tui_at(
 enum RootLocation {
     WorkspaceHome,
     Contest(ContestSession),
+    /// A contest session has been removed for consuming shutdown, but Home is not committed yet.
+    ContestShutdown,
+}
+
+trait RootLifetimeOperations {
+    fn request_stop_submissions(&mut self);
+    fn shutdown_submissions(&mut self) -> io::Result<()>;
+    fn restore_terminal(&mut self) -> io::Result<()>;
+}
+
+struct LiveRootLifetime<'a> {
+    submissions: &'a mut crate::tui::SubmissionHub,
+    terminal: &'a mut crate::tui::TerminaSession,
+}
+
+impl RootLifetimeOperations for LiveRootLifetime<'_> {
+    fn request_stop_submissions(&mut self) {
+        self.submissions.request_stop();
+    }
+
+    fn shutdown_submissions(&mut self) -> io::Result<()> {
+        self.submissions.shutdown()
+    }
+
+    fn restore_terminal(&mut self) -> io::Result<()> {
+        self.terminal.restore()
+    }
+}
+
+#[derive(Debug)]
+enum ContestRootExit {
+    Quit,
+    SwitchContest,
+    RefreshContest(crate::tui::RefreshResumeState),
+}
+
+fn orchestrate_contest_frontend_exit(
+    exit: crate::tui::SessionExit,
+    location: &mut RootLocation,
+    refresh_frontend_state: &mut Option<crate::tui::RefreshFrontendState>,
+    _root_lifetime: &mut impl RootLifetimeOperations,
+    shutdown_contest: impl FnOnce(ContestSession) -> io::Result<()>,
+) -> io::Result<Option<ContestRootExit>> {
+    // Keep all root-owned lifetime controls in this boundary. Return Home deliberately uses none
+    // of them; tests inject spies here so an accidental stop, shutdown, or restore is observable.
+    match exit {
+        crate::tui::SessionExit::ReturnToWorkspaceHome => {
+            let RootLocation::Contest(old_session) =
+                std::mem::replace(location, RootLocation::ContestShutdown)
+            else {
+                unreachable!("returning Home requires the active contest session")
+            };
+            shutdown_contest(old_session)?;
+            *location = RootLocation::WorkspaceHome;
+            *refresh_frontend_state = None;
+            Ok(None)
+        }
+        crate::tui::SessionExit::Quit => Ok(Some(ContestRootExit::Quit)),
+        crate::tui::SessionExit::SwitchContest => Ok(Some(ContestRootExit::SwitchContest)),
+        crate::tui::SessionExit::RefreshContest(resume) => {
+            Ok(Some(ContestRootExit::RefreshContest(resume)))
+        }
+    }
 }
 
 fn resolve_contest_open(
@@ -530,6 +593,7 @@ fn run_root_tui(
             let session_result = match location {
                 RootLocation::WorkspaceHome => Ok(()),
                 RootLocation::Contest(session) => session.shutdown(),
+                RootLocation::ContestShutdown => Ok(()),
             };
 
             return combine_primary_and_cleanup_results(
@@ -567,6 +631,7 @@ fn run_root_tui(
             match crate::tui::run_home(
                 &mut terminal,
                 workspace_root,
+                &mut submissions,
                 &mut resolve,
                 Arc::clone(&home_open_task),
                 || {
@@ -625,99 +690,123 @@ fn run_root_tui(
             frontend,
         );
 
-        match frontend_result {
+        let frontend_exit = match frontend_result {
             Err(error) => break Err(error),
-            Ok(crate::tui::SessionExit::Quit) => break Ok(()),
-            Ok(crate::tui::SessionExit::SwitchContest) => {
-                let prepared = match prepared_switch.lock() {
-                    Ok(mut pending) => match pending.take() {
-                        Some(prepared) => prepared,
-                        None => {
+            Ok(exit) => exit,
+        };
+        let root_exit = {
+            let mut root_lifetime = LiveRootLifetime {
+                submissions: &mut submissions,
+                terminal: &mut terminal,
+            };
+            match orchestrate_contest_frontend_exit(
+                frontend_exit,
+                &mut location,
+                &mut refresh_frontend_state,
+                &mut root_lifetime,
+                ContestSession::shutdown,
+            ) {
+                Ok(root_exit) => root_exit,
+                Err(error) => break Err(error),
+            }
+        };
+
+        // None means Return Home was fully applied above. There is intentionally no caller-side
+        // Return arm; falling through starts the next root iteration in the fresh Home state.
+        if let Some(root_exit) = root_exit {
+            match root_exit {
+                ContestRootExit::Quit => break Ok(()),
+                ContestRootExit::SwitchContest => {
+                    let prepared = match prepared_switch.lock() {
+                        Ok(mut pending) => match pending.take() {
+                            Some(prepared) => prepared,
+                            None => {
+                                break Err(io::Error::other(
+                                    "a switch exit did not retain its validated prepared contest",
+                                ));
+                            }
+                        },
+                        Err(_) => {
                             break Err(io::Error::other(
-                                "a switch exit did not retain its validated prepared contest",
+                                "prepared contest switch state is poisoned",
                             ));
                         }
-                    },
-                    Err(_) => {
-                        break Err(io::Error::other(
-                            "prepared contest switch state is poisoned",
+                    };
+                    let RootLocation::Contest(old_session) =
+                        std::mem::replace(&mut location, RootLocation::WorkspaceHome)
+                    else {
+                        unreachable!("contest switch requires the active contest session")
+                    };
+                    if let Err(error) = old_session.shutdown() {
+                        break Err(error);
+                    }
+
+                    match ContestSession::start(prepared, &config.runner) {
+                        Ok(new_session) => {
+                            location = RootLocation::Contest(new_session);
+                            refresh_frontend_state = None;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                ContestRootExit::RefreshContest(resume) => {
+                    let prepared = match prepared_refresh.lock() {
+                        Ok(mut pending) => match pending.take() {
+                            Some(prepared) => prepared,
+                            None => {
+                                break Err(io::Error::other(
+                                    "a refresh exit did not retain its prepared refresh",
+                                ));
+                            }
+                        },
+                        Err(_) => {
+                            break Err(io::Error::other("prepared refresh state is poisoned"));
+                        }
+                    };
+                    let refresh_destination = prepared.destination().to_path_buf();
+                    let refresh_contest_id = prepared.contest_id().to_string();
+                    let RootLocation::Contest(active_session) = &location else {
+                        unreachable!("contest refresh requires the active contest session")
+                    };
+                    if active_session.input.destination != refresh_destination
+                        || active_session.input.contest.contest_id != refresh_contest_id
+                    {
+                        break Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "prepared refresh target does not match the active contest session",
                         ));
                     }
-                };
-                let RootLocation::Contest(old_session) =
-                    std::mem::replace(&mut location, RootLocation::WorkspaceHome)
-                else {
-                    unreachable!("contest switch requires the active contest session")
-                };
-                if let Err(error) = old_session.shutdown() {
-                    break Err(error);
-                }
 
-                match ContestSession::start(prepared, &config.runner) {
-                    Ok(new_session) => {
-                        location = RootLocation::Contest(new_session);
-                        refresh_frontend_state = None;
-                    }
-                    Err(error) => break Err(error),
-                }
-            }
-            Ok(crate::tui::SessionExit::RefreshContest(resume)) => {
-                let prepared = match prepared_refresh.lock() {
-                    Ok(mut pending) => match pending.take() {
-                        Some(prepared) => prepared,
-                        None => {
-                            break Err(io::Error::other(
-                                "a refresh exit did not retain its prepared refresh",
-                            ));
+                    let RootLocation::Contest(old_session) =
+                        std::mem::replace(&mut location, RootLocation::WorkspaceHome)
+                    else {
+                        unreachable!("contest refresh requires the active contest session")
+                    };
+                    let rebuilt = rebuild_contest_session_after_refresh(
+                        old_session,
+                        prepared,
+                        &refresh_destination,
+                        &refresh_contest_id,
+                        resume,
+                        RefreshRebuildHooks {
+                            shutdown: ContestSession::shutdown,
+                            apply: |prepared| {
+                                let mut reporter = RefreshApplyReporter;
+                                super::refresh::apply_refresh(prepared, &mut reporter)
+                            },
+                            load: |destination, contest_id| {
+                                PreparedWatchInput::load(destination, Some(contest_id))
+                            },
+                            start: |input| ContestSession::start(input, &config.runner),
+                        },
+                    );
+                    match rebuilt {
+                        Ok(rebuilt) => {
+                            location = RootLocation::Contest(rebuilt.session);
+                            refresh_frontend_state = Some(rebuilt.frontend_state);
                         }
-                    },
-                    Err(_) => {
-                        break Err(io::Error::other("prepared refresh state is poisoned"));
+                        Err(error) => break Err(error),
                     }
-                };
-                let refresh_destination = prepared.destination().to_path_buf();
-                let refresh_contest_id = prepared.contest_id().to_string();
-                let RootLocation::Contest(active_session) = &location else {
-                    unreachable!("contest refresh requires the active contest session")
-                };
-                if active_session.input.destination != refresh_destination
-                    || active_session.input.contest.contest_id != refresh_contest_id
-                {
-                    break Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "prepared refresh target does not match the active contest session",
-                    ));
-                }
-
-                let RootLocation::Contest(old_session) =
-                    std::mem::replace(&mut location, RootLocation::WorkspaceHome)
-                else {
-                    unreachable!("contest refresh requires the active contest session")
-                };
-                let rebuilt = rebuild_contest_session_after_refresh(
-                    old_session,
-                    prepared,
-                    &refresh_destination,
-                    &refresh_contest_id,
-                    resume,
-                    RefreshRebuildHooks {
-                        shutdown: ContestSession::shutdown,
-                        apply: |prepared| {
-                            let mut reporter = RefreshApplyReporter;
-                            super::refresh::apply_refresh(prepared, &mut reporter)
-                        },
-                        load: |destination, contest_id| {
-                            PreparedWatchInput::load(destination, Some(contest_id))
-                        },
-                        start: |input| ContestSession::start(input, &config.runner),
-                    },
-                );
-                match rebuilt {
-                    Ok(rebuilt) => {
-                        location = RootLocation::Contest(rebuilt.session);
-                        refresh_frontend_state = Some(rebuilt.frontend_state);
-                    }
-                    Err(error) => break Err(error),
                 }
             }
         }
@@ -727,19 +816,19 @@ fn run_root_tui(
     if let RootLocation::Contest(session) = &location {
         session.request_stop();
     }
-    // Submission workers outlive contest sessions, but the whole-TUI exit owns their stop.
-    submissions.request_stop();
-
     let mouse_mode_label = terminal.mouse_mode_label();
     let mouse_trace_line = terminal.mouse_trace_line();
-    let cleanup = run_tui_cleanup(
-        || submissions.shutdown(),
-        || match std::mem::replace(&mut location, RootLocation::WorkspaceHome) {
+    let mut root_lifetime = LiveRootLifetime {
+        submissions: &mut submissions,
+        terminal: &mut terminal,
+    };
+    let cleanup = run_tui_cleanup(&mut root_lifetime, || {
+        match std::mem::replace(&mut location, RootLocation::WorkspaceHome) {
             RootLocation::Contest(session) => session.shutdown(),
-            RootLocation::WorkspaceHome => Ok(()),
-        },
-        || terminal.restore(),
-    );
+            RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
+        }
+    });
+    drop(root_lifetime);
     // Explicit restore is followed by Drop so the original platform mode/code page is restored.
     drop(terminal);
     if std::env::var_os("ATC_TUI_MOUSE_TRACE").is_some() {
@@ -1408,6 +1497,29 @@ mod tests {
     use crate::language::Language;
     use crate::model::{Problem, Sample};
     use crate::tui::message::{RunKind, RunRequest, RunWorkerCommand, TestEvent};
+
+    #[derive(Default)]
+    struct RootLifetimeSpy {
+        submission_stop: usize,
+        submission_shutdown: usize,
+        terminal_restore: usize,
+    }
+
+    impl RootLifetimeOperations for RootLifetimeSpy {
+        fn request_stop_submissions(&mut self) {
+            self.submission_stop += 1;
+        }
+
+        fn shutdown_submissions(&mut self) -> io::Result<()> {
+            self.submission_shutdown += 1;
+            Ok(())
+        }
+
+        fn restore_terminal(&mut self) -> io::Result<()> {
+            self.terminal_restore += 1;
+            Ok(())
+        }
+    }
 
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
         match PreparedWatchInput::resolve_for_switch(root, contest_id) {
@@ -2411,6 +2523,79 @@ mod tests {
         session.shutdown().unwrap();
     }
 
+    #[test]
+    fn production_return_home_orchestration_shuts_down_once_without_root_lifetime_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        save_healthy_contest(root.path(), "abc123");
+        let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let shutdown_calls = std::cell::Cell::new(0);
+        let mut location = RootLocation::Contest(session);
+        let mut lifetime = RootLifetimeSpy::default();
+        let mut refresh_frontend_state = Some(crate::tui::RefreshFrontendState::after_success(
+            crate::tui::RefreshResumeState::default(),
+        ));
+
+        let root_exit = orchestrate_contest_frontend_exit(
+            crate::tui::SessionExit::ReturnToWorkspaceHome,
+            &mut location,
+            &mut refresh_frontend_state,
+            &mut lifetime,
+            |session| {
+                shutdown_calls.set(shutdown_calls.get() + 1);
+                session.shutdown()
+            },
+        )
+        .unwrap();
+
+        assert!(root_exit.is_none());
+        assert_eq!(shutdown_calls.get(), 1);
+        assert!(matches!(location, RootLocation::WorkspaceHome));
+        assert!(refresh_frontend_state.is_none());
+        assert_eq!(lifetime.submission_stop, 0);
+        assert_eq!(lifetime.submission_shutdown, 0);
+        assert_eq!(lifetime.terminal_restore, 0);
+        let reopened_input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
+        let reopened = ContestSession::start(reopened_input, &RunnerConfig::default()).unwrap();
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
+    fn production_return_home_orchestration_does_not_commit_home_on_shutdown_failure() {
+        let root = tempfile::tempdir().unwrap();
+        save_healthy_contest(root.path(), "abc123");
+        let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let mut location = RootLocation::Contest(session);
+        let lifecycle_calls = Arc::new(Mutex::new(Vec::new()));
+        let shutdown_calls = Arc::clone(&lifecycle_calls);
+        let mut lifetime = RootLifetimeSpy::default();
+        let mut refresh_frontend_state = Some(crate::tui::RefreshFrontendState::after_success(
+            crate::tui::RefreshResumeState::default(),
+        ));
+
+        let error = orchestrate_contest_frontend_exit(
+            crate::tui::SessionExit::ReturnToWorkspaceHome,
+            &mut location,
+            &mut refresh_frontend_state,
+            &mut lifetime,
+            move |session| {
+                shutdown_calls.lock().unwrap().push("contest shutdown");
+                session.shutdown()?;
+                Err(io::Error::other("injected contest shutdown failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected contest shutdown failure");
+        assert_eq!(*lifecycle_calls.lock().unwrap(), ["contest shutdown"]);
+        assert!(matches!(location, RootLocation::ContestShutdown));
+        assert!(refresh_frontend_state.is_some());
+        assert_eq!(lifetime.submission_stop, 0);
+        assert_eq!(lifetime.submission_shutdown, 0);
+        assert_eq!(lifetime.terminal_restore, 0);
+    }
+
     struct PreparedProbe {
         dropped: Arc<AtomicBool>,
     }
@@ -2959,6 +3144,29 @@ mod tests {
 
     #[test]
     fn full_tui_cleanup_joins_workers_before_restoring_terminal() {
+        struct CleanupRootLifetime {
+            cancelled: Arc<AtomicBool>,
+            worker: Option<thread::JoinHandle<()>>,
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl RootLifetimeOperations for CleanupRootLifetime {
+            fn request_stop_submissions(&mut self) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+
+            fn shutdown_submissions(&mut self) -> io::Result<()> {
+                self.worker.take().unwrap().join().unwrap();
+                self.order.lock().unwrap().push("submission joined");
+                Err(io::Error::other("join reported an error"))
+            }
+
+            fn restore_terminal(&mut self) -> io::Result<()> {
+                self.order.lock().unwrap().push("terminal restored");
+                Ok(())
+            }
+        }
+
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -2973,25 +3181,16 @@ mod tests {
         });
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let shutdown_order = Arc::clone(&order);
         let session_order = Arc::clone(&order);
-        let restore_order = Arc::clone(&order);
-        let cleanup = run_tui_cleanup(
-            || {
-                cancelled.store(true, Ordering::Release);
-                worker.join().unwrap();
-                shutdown_order.lock().unwrap().push("submission joined");
-                Err(io::Error::other("join reported an error"))
-            },
-            || {
-                session_order.lock().unwrap().push("contest joined");
-                Ok(())
-            },
-            || {
-                restore_order.lock().unwrap().push("terminal restored");
-                Ok(())
-            },
-        );
+        let mut root_lifetime = CleanupRootLifetime {
+            cancelled,
+            worker: Some(worker),
+            order: Arc::clone(&order),
+        };
+        let cleanup = run_tui_cleanup(&mut root_lifetime, || {
+            session_order.lock().unwrap().push("contest joined");
+            Ok(())
+        });
 
         assert!(cleanup.submission_workers.is_err());
         assert!(cleanup.contest_session.is_ok());

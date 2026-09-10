@@ -283,6 +283,13 @@ struct SubmissionWorker {
     handle: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionMaintenanceStep {
+    EventApplied,
+    WorkerJoined,
+}
+
 impl SubmissionWorker {
     fn request_cancel(&self) {
         self.cancellation.request_cancel();
@@ -459,6 +466,8 @@ pub(crate) struct SubmissionHub {
     stopping: bool,
     #[cfg(test)]
     join_panic_fallback_count: usize,
+    #[cfg(test)]
+    maintenance_steps: Vec<SubmissionMaintenanceStep>,
 }
 
 impl Default for SubmissionHub {
@@ -484,6 +493,8 @@ impl SubmissionHub {
             stopping: false,
             #[cfg(test)]
             join_panic_fallback_count: 0,
+            #[cfg(test)]
+            maintenance_steps: Vec::new(),
         }
     }
 
@@ -698,7 +709,15 @@ impl SubmissionHub {
         let mut changed = false;
         for _ in 0..MAX_EVENTS_PER_TICK {
             match self.event_rx.try_recv() {
-                Ok(event) => changed |= self.apply_event(event),
+                Ok(event) => {
+                    let applied = self.apply_event(event);
+                    #[cfg(test)]
+                    if applied {
+                        self.maintenance_steps
+                            .push(SubmissionMaintenanceStep::EventApplied);
+                    }
+                    changed |= applied;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -907,7 +926,13 @@ impl SubmissionHub {
                 let mut worker = self.workers.swap_remove(index);
                 let key = worker.key.clone();
                 let generation = worker.generation;
-                if worker.join().is_err() {
+                let join_result = worker.join();
+                #[cfg(test)]
+                if join_result.is_ok() {
+                    self.maintenance_steps
+                        .push(SubmissionMaintenanceStep::WorkerJoined);
+                }
+                if join_result.is_err() {
                     #[cfg(test)]
                     {
                         self.join_panic_fallback_count += 1;
@@ -1125,7 +1150,7 @@ impl SubmissionHub {
         }
     }
 
-    pub(crate) fn shutdown(mut self) -> io::Result<()> {
+    pub(crate) fn shutdown(&mut self) -> io::Result<()> {
         self.request_stop();
         let mut first_error = None;
         for worker in &mut self.workers {
@@ -3106,6 +3131,183 @@ mod tests {
             assert_eq!(hub.history[0].generation, generation);
             assert_eq!(hub.history[0].state.compact_label(), expected);
         }
+        hub.request_stop();
+    }
+
+    #[test]
+    fn production_home_loop_advances_wj_to_ac_in_place_and_reaps_the_worker() {
+        struct FakeHomeTerminal {
+            events: VecDeque<crate::tui::terminal::TerminalEvent>,
+            draws: usize,
+        }
+
+        impl crate::tui::home::HomeTerminal for FakeHomeTerminal {
+            fn draw_home(
+                &mut self,
+                _render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+            ) -> io::Result<()> {
+                self.draws += 1;
+                Ok(())
+            }
+
+            fn finish_home_redraw(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn note_home_resize(&mut self) {}
+
+            fn poll_home(&mut self, _wait: Duration) -> io::Result<bool> {
+                Ok(!self.events.is_empty())
+            }
+
+            fn read_home(&mut self) -> io::Result<crate::tui::terminal::TerminalEvent> {
+                self.events
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("fake Home terminal has no event"))
+            }
+        }
+
+        let key = SubmissionKey::new("abc474", "abc474_b");
+        let generation = 7;
+        let waiting = TuiSubmissionState::Status(SubmissionStatus::WaitingForJudge);
+        let waiting_display = SubmissionDisplayState {
+            current: Some(waiting),
+            attempt: None,
+        };
+        let mut hub = SubmissionHub::new();
+        hub.records.insert(
+            key.clone(),
+            SubmissionRecord {
+                generation: Some(generation),
+                state: Some(waiting),
+                ..SubmissionRecord::default()
+            },
+        );
+        hub.history.push(SubmissionHistoryEntry {
+            generation,
+            key: key.clone(),
+            problem_index: "B".to_string(),
+            problem_title: Some("Problem B".to_string()),
+            language_label: "C++".to_string(),
+            official_language_label: None,
+            started_at: SystemTime::now(),
+            submitted_at: None,
+            state: waiting_display,
+        });
+        let final_event = event(
+            &key,
+            generation,
+            WorkerEventKind::Submission(SubmissionEvent::Status {
+                submission_id: SubmissionId::for_test(1),
+                status: SubmissionStatus::Finished(SubmissionResult::new(Verdict::Accepted)),
+            }),
+        );
+        let event_tx = hub.event_tx.clone();
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            event_tx.send(final_event).unwrap();
+            queued_tx.send(()).unwrap();
+        });
+        hub.workers.push(SubmissionWorker {
+            key: key.clone(),
+            generation,
+            cancellation: Arc::new(SubmissionCancellation::default()),
+            progress: Arc::new(WorkerProgress::default()),
+            handle: Some(handle),
+        });
+        queued_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        while !hub.workers[0]
+            .handle
+            .as_ref()
+            .expect("the worker handle must remain owned by the Hub before maintenance")
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < finish_deadline,
+                "submission worker did not finish before Home started"
+            );
+            thread::yield_now();
+        }
+        let mut terminal = FakeHomeTerminal {
+            events: VecDeque::from([crate::tui::terminal::TerminalEvent::Key(
+                crate::tui::terminal::KeyEvent {
+                    code: crate::tui::terminal::KeyCode::Char('q'),
+                    kind: crate::tui::terminal::KeyEventKind::Press,
+                    modifiers: crate::tui::terminal::Modifiers::default(),
+                },
+            )]),
+            draws: 0,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut resolve = |_: &str| panic!("Home quit must not resolve a contest");
+        let task: crate::tui::ContestSwitchTask =
+            Arc::new(|_, _| panic!("Home quit must not start a contest operation"));
+
+        let exit = crate::tui::home::run_with_terminal(
+            &mut terminal,
+            root.path(),
+            &mut hub,
+            &mut resolve,
+            task,
+            || -> Result<(), String> { panic!("Home quit must not start a contest session") },
+        )
+        .unwrap();
+
+        assert!(matches!(exit, crate::tui::HomeExit::Quit));
+        assert_eq!(terminal.draws, 1, "submission changes must not redraw Home");
+        assert_eq!(hub.history.len(), 1);
+        assert_eq!(hub.history[0].generation, generation);
+        assert_eq!(hub.history[0].state.compact_label(), "AC");
+        assert_eq!(hub.state(&key).unwrap().compact_label(), "AC");
+        assert!(hub.workers.is_empty());
+        assert_eq!(
+            hub.maintenance_steps,
+            [
+                SubmissionMaintenanceStep::EventApplied,
+                SubmissionMaintenanceStep::WorkerJoined,
+            ]
+        );
+        assert!(!hub.stopping);
+    }
+
+    #[test]
+    fn home_maintenance_preserves_unknown_lock_and_cross_contest_history() {
+        let a = SubmissionKey::new("abc474", "abc474_a");
+        let b = SubmissionKey::new("abc475", "abc475_b");
+        let executor = TestExecutor::with_keyed_runs(vec![
+            (a.clone(), vec![waiting_test_run()]),
+            (b.clone(), vec![waiting_test_run()]),
+        ]);
+        let mut hub = SubmissionHub::with_executor(executor);
+        let a_generation = start_test_submission(&mut hub, &a, "A");
+        assert!(hub.apply_event(event(&a, a_generation, WorkerEventKind::Unknown)));
+        let b_generation = start_test_submission(&mut hub, &b, "B");
+
+        let _ = hub.handle_events();
+
+        assert_eq!(
+            hub.attempt_resolution(&a, a_generation),
+            Some(AttemptResolution::Unknown)
+        );
+        assert!(
+            hub.ensure_start_allowed(&a)
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert_eq!(
+            history_labels(&hub, "abc474"),
+            [("A".into(), "Unknown".into())]
+        );
+        assert_eq!(
+            history_labels(&hub, "abc475"),
+            [("B".into(), "Submitting".into())]
+        );
+        assert_eq!(
+            hub.attempt_resolution(&b, b_generation),
+            Some(AttemptResolution::Pending)
+        );
+        assert!(!hub.stopping);
         hub.request_stop();
     }
 

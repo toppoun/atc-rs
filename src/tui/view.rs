@@ -3731,7 +3731,7 @@ mod tests {
                 .any(|label| label == "i initialize")
         );
 
-        assert_eq!(FrontendAction::ALL.len(), 14);
+        assert_eq!(FrontendAction::ALL.len(), 15);
     }
 
     #[test]
