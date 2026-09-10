@@ -361,7 +361,7 @@ mod tests {
     use clap::{ColorChoice, error::ErrorKind};
 
     #[test]
-    fn no_subcommand_parses_as_workspace_home_dispatch() {
+    fn no_subcommand_parses_as_application_dispatch() {
         let cli = Cli::try_parse_from(["atc"]).expect("no subcommand should select Home");
 
         assert!(cli.command.is_none());

@@ -2240,6 +2240,24 @@ pub(crate) fn test_key_press(character: char) -> TerminalEvent {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn test_key_enter() -> TerminalEvent {
+    TerminalEvent::Key(KeyEvent {
+        code: KeyCode::Enter,
+        kind: KeyEventKind::Press,
+        modifiers: Modifiers::default(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_key_escape() -> TerminalEvent {
+    TerminalEvent::Key(KeyEvent {
+        code: KeyCode::Escape,
+        kind: KeyEventKind::Press,
+        modifiers: Modifiers::default(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PointerEvent {
     pub(super) kind: PointerKind,

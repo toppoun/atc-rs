@@ -371,7 +371,7 @@ pub(crate) fn run_with_terminal<T>(
     }
 }
 
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+pub(super) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = area.width.min(width);
     let height = area.height.min(height);
     Rect::new(
@@ -390,7 +390,7 @@ struct HomeLayout {
     workspace: Option<Rect>,
 }
 
-fn logo_size() -> (u16, u16) {
+pub(super) fn logo_size() -> (u16, u16) {
     let width = branding::ascii_logo_lines()
         .map(UnicodeWidthStr::width)
         .max()
@@ -402,7 +402,7 @@ fn logo_size() -> (u16, u16) {
     )
 }
 
-fn centered_row(area: Rect, y: u16, width: u16, height: u16) -> Rect {
+pub(super) fn centered_row(area: Rect, y: u16, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
@@ -496,7 +496,11 @@ fn home_layout(area: Rect) -> HomeLayout {
     }
 }
 
-fn menu_line(label: &'static str, shortcut: &'static str, width: usize) -> Line<'static> {
+pub(super) fn menu_line(
+    label: &'static str,
+    shortcut: &'static str,
+    width: usize,
+) -> Line<'static> {
     let shortcut_width = UnicodeWidthStr::width(shortcut);
     let shortcut_style = Style::default().fg(Color::Yellow);
     if width <= shortcut_width {
@@ -518,7 +522,7 @@ fn menu_line(label: &'static str, shortcut: &'static str, width: usize) -> Line<
     ])
 }
 
-fn truncate_start_with_ellipsis(text: &str, width: usize) -> String {
+pub(super) fn truncate_start_with_ellipsis(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

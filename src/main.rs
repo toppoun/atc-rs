@@ -104,7 +104,7 @@ fn run() -> Result<ExitCode, AppError> {
 
     match cli.command {
         None => {
-            commands::workspace_home()?;
+            commands::run_application()?;
         }
 
         Some(cli::Command::Workspace(cli::WorkspaceCommand::Init)) => {

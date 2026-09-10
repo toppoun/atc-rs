@@ -5,6 +5,7 @@ mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
+mod global_home;
 mod home;
 pub mod message;
 mod mouse;
@@ -37,16 +38,20 @@ pub(crate) use detail_layout::{
     DetailAnalysisResult as SessionDetailAnalysisResult,
 };
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
+pub(crate) use global_home::{
+    GlobalHomeExit, GlobalHomeState, GlobalHomeTerminal,
+    run_with_terminal as run_global_home_with_terminal,
+};
 pub(crate) use home::{HomeExit, HomeTerminal, run_with_terminal as run_home_with_terminal};
 use message::{Message, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
 pub(crate) use submission::SubmissionHub;
-#[cfg(test)]
-pub(crate) use terminal::test_key_press;
 use terminal::{KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind};
 pub(crate) use terminal::{TerminaSession, TerminalEvent};
+#[cfg(test)]
+pub(crate) use terminal::{test_key_enter, test_key_escape, test_key_press};
 
 const MAX_MESSAGES_PER_TICK: usize = 256;
 const MAX_CONTEST_PROGRESS_HISTORY: usize = 256;

@@ -34,7 +34,7 @@ pub(crate) use submit::submit;
 pub(crate) use template::{initialize_source_templates_at, template_init};
 pub(crate) use test::test;
 pub(crate) use watch::watch;
-pub(crate) use watch_tui::{watch_tui, workspace_home};
+pub(crate) use watch_tui::{run_application, watch_tui};
 
 use crate::atcoder;
 use crate::config::Config;

@@ -421,30 +421,34 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     watch_tui_at(&destination, cli_contest, app_context)
 }
 
-pub(crate) fn workspace_home() -> Result<(), AppError> {
+pub(crate) fn run_application() -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
-    workspace_home_at_with(&cwd, |app_context, initial_location| {
-        let config = Config::load()?;
-        run_root_tui(app_context, config, initial_location)
+    run_application_at_with(&cwd, |mut location| {
+        let mut preferences = crate::tui::FrontendPreferences::default();
+        run_bare_application(
+            &mut location,
+            &mut preferences,
+            crate::tui::TerminaSession::start,
+        )
     })
 }
 
-fn workspace_home_at_with<T>(
+fn run_application_at_with<T>(
     launch_root: &Path,
-    start_root: impl FnOnce(AppContext, RootLocation) -> Result<T, AppError>,
+    start_application: impl FnOnce(AppLocation) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
     let app_context = AppContext::from_launch_root(launch_root)?;
-    if !matches!(app_context, AppContext::Workspace { .. }) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "Workspace Home requires a valid .atc-workspace.toml in the exact current directory: {}",
-                launch_root.display()
-            ),
-        )
-        .into());
-    }
-    start_root(app_context, RootLocation::WorkspaceHome)
+    let location = match app_context {
+        AppContext::Workspace { .. } => AppLocation::Workspace(WorkspaceRuntime::new(
+            app_context,
+            Config::load()?,
+            RootLocation::WorkspaceHome,
+        )),
+        AppContext::Standalone { .. } => {
+            AppLocation::GlobalHome(crate::tui::GlobalHomeState::new(launch_root.to_path_buf()))
+        }
+    };
+    start_application(location)
 }
 
 pub(super) fn watch_tui_at(
@@ -467,6 +471,13 @@ enum RootLocation {
     Contest(ContestSession),
     /// A contest session has been removed for consuming shutdown, but Home is not committed yet.
     ContestShutdown,
+}
+
+/// Application-level location. Global Home deliberately has no `AppContext`, `Config`, or
+/// `SubmissionHub`; those become mandatory together only after a workspace open commits.
+enum AppLocation {
+    GlobalHome(crate::tui::GlobalHomeState),
+    Workspace(WorkspaceRuntime),
 }
 
 /// Mandatory state for one workspace TUI lifetime.
@@ -499,6 +510,33 @@ impl WorkspaceRuntime {
             location,
         }
     }
+
+    fn open(path: &Path) -> Result<Self, AppError> {
+        open_workspace_runtime_with(path, Config::load, crate::tui::SubmissionHub::new)
+    }
+}
+
+fn open_workspace_runtime_with<S>(
+    path: &Path,
+    load_config: impl FnOnce() -> Result<Config, AppError>,
+    create_submissions: impl FnOnce() -> S,
+) -> Result<WorkspaceRuntime<S>, AppError> {
+    let app_context = AppContext::from_launch_root(path)?;
+    if !matches!(&app_context, AppContext::Workspace { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Not an atc workspace: {}", path.display()),
+        )
+        .into());
+    }
+
+    let config = load_config()?;
+    Ok(WorkspaceRuntime {
+        app_context,
+        config,
+        submissions: create_submissions(),
+        location: RootLocation::WorkspaceHome,
+    })
 }
 
 impl<S> WorkspaceRuntime<S> {
@@ -593,6 +631,10 @@ impl WorkspaceTerminal for crate::tui::TerminaSession {
         )
     }
 }
+
+trait ApplicationTerminal: WorkspaceTerminal + crate::tui::GlobalHomeTerminal {}
+
+impl<T> ApplicationTerminal for T where T: WorkspaceTerminal + crate::tui::GlobalHomeTerminal {}
 
 trait RootLifetimeOperations {
     fn request_stop_submissions(&mut self);
@@ -722,6 +764,136 @@ fn run_root_tui(
         &mut preferences,
         crate::tui::TerminaSession::start,
     )
+}
+
+fn run_bare_application<T>(
+    location: &mut AppLocation,
+    preferences: &mut crate::tui::FrontendPreferences,
+    start_terminal: impl FnOnce() -> io::Result<T>,
+) -> Result<(), AppError>
+where
+    T: ApplicationTerminal,
+{
+    run_bare_application_with(
+        location,
+        preferences,
+        start_terminal,
+        WorkspaceRuntime::open,
+    )
+}
+
+fn run_bare_application_with<T>(
+    location: &mut AppLocation,
+    preferences: &mut crate::tui::FrontendPreferences,
+    start_terminal: impl FnOnce() -> io::Result<T>,
+    open_workspace: impl FnMut(&Path) -> Result<WorkspaceRuntime, AppError>,
+) -> Result<(), AppError>
+where
+    T: ApplicationTerminal,
+{
+    let mut terminal = match start_terminal() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let contest_cleanup = match location {
+                AppLocation::GlobalHome(_) => Ok(()),
+                AppLocation::Workspace(runtime) => runtime.shutdown_active_contest(),
+            };
+            return combine_primary_and_cleanup_results(
+                Err(error),
+                [("contest session shutdown", contest_cleanup)],
+            )
+            .map_err(AppError::from);
+        }
+    };
+
+    let result =
+        run_application_locations_with(location, &mut terminal, preferences, open_workspace);
+    let mouse_mode_label = terminal.mouse_mode_label();
+    let mouse_trace_line = terminal.mouse_trace_line();
+    let cleanup_result = match location {
+        AppLocation::GlobalHome(_) => combine_primary_and_cleanup_results(
+            result,
+            [("terminal restoration", terminal.restore())],
+        ),
+        AppLocation::Workspace(runtime) => {
+            runtime.request_stop_active_contest();
+            let WorkspaceRuntime {
+                submissions,
+                location,
+                ..
+            } = runtime;
+            let mut root_lifetime = LiveRootLifetime {
+                submissions,
+                terminal: &mut terminal,
+            };
+            let cleanup = run_tui_cleanup(&mut root_lifetime, || {
+                match std::mem::replace(location, RootLocation::WorkspaceHome) {
+                    RootLocation::Contest(session) => session.shutdown(),
+                    RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
+                }
+            });
+            drop(root_lifetime);
+            combine_primary_and_cleanup_results(
+                result,
+                [
+                    ("terminal restoration", cleanup.terminal_restore),
+                    ("contest session shutdown", cleanup.contest_session),
+                    ("submission worker shutdown", cleanup.submission_workers),
+                ],
+            )
+        }
+    };
+
+    // Explicit restore is followed by Drop so the original platform mode/code page is restored.
+    drop(terminal);
+    if std::env::var_os("ATC_TUI_MOUSE_TRACE").is_some() {
+        eprintln!("atc terminal mouse: {mouse_mode_label}");
+        if let Some(trace) = mouse_trace_line {
+            eprintln!("{trace}");
+        }
+    }
+
+    cleanup_result.map_err(AppError::from)
+}
+
+fn run_application_locations_with<T>(
+    location: &mut AppLocation,
+    terminal: &mut T,
+    preferences: &mut crate::tui::FrontendPreferences,
+    mut open_workspace: impl FnMut(&Path) -> Result<WorkspaceRuntime, AppError>,
+) -> io::Result<()>
+where
+    T: ApplicationTerminal,
+{
+    loop {
+        let global_exit = match location {
+            AppLocation::GlobalHome(state) => {
+                Some(crate::tui::run_global_home_with_terminal(terminal, state)?)
+            }
+            AppLocation::Workspace(runtime) => {
+                return run_workspace_runtime(runtime, terminal, preferences)
+                    .map(|WorkspaceExit::Quit| ());
+            }
+        };
+
+        match global_exit.expect("Global Home is the only location that returns here") {
+            crate::tui::GlobalHomeExit::Quit => return Ok(()),
+            crate::tui::GlobalHomeExit::OpenWorkspace(path) => match open_workspace(&path) {
+                Ok(runtime) => {
+                    *location = AppLocation::Workspace(runtime);
+                }
+                Err(error) => {
+                    let AppLocation::GlobalHome(state) = location else {
+                        unreachable!("failed workspace open cannot commit the workspace")
+                    };
+                    state.show_workspace_open_error(format!(
+                        "Could not open workspace {}:\n{error}",
+                        path.display()
+                    ));
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1673,6 +1845,8 @@ fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWa
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::language::Language;
     use crate::model::{Problem, Sample};
@@ -1746,6 +1920,178 @@ mod tests {
         probe: RootApplicationProbe,
     }
 
+    #[derive(Clone, Default)]
+    struct BareApplicationProbe {
+        terminal_starts: std::rc::Rc<std::cell::Cell<usize>>,
+        terminal_restores: std::rc::Rc<std::cell::Cell<usize>>,
+        global_draws: std::rc::Rc<std::cell::Cell<usize>>,
+        global_reads: std::rc::Rc<std::cell::Cell<usize>>,
+        workspace_draws: std::rc::Rc<std::cell::Cell<usize>>,
+        workspace_reads: std::rc::Rc<std::cell::Cell<usize>>,
+        contest_frontend_dispatches: std::rc::Rc<std::cell::Cell<usize>>,
+        rendered_global_frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    struct BareTerminalSpy {
+        batches: VecDeque<VecDeque<crate::tui::TerminalEvent>>,
+        active_batch: VecDeque<crate::tui::TerminalEvent>,
+        probe: BareApplicationProbe,
+    }
+
+    impl BareTerminalSpy {
+        fn new(
+            batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
+            probe: BareApplicationProbe,
+        ) -> Self {
+            Self {
+                batches: batches
+                    .into_iter()
+                    .map(VecDeque::from)
+                    .collect::<VecDeque<_>>(),
+                active_batch: VecDeque::new(),
+                probe,
+            }
+        }
+
+        fn poll_script(&mut self, wait: Duration) -> io::Result<bool> {
+            if !self.active_batch.is_empty() {
+                return Ok(true);
+            }
+            if wait == Duration::ZERO {
+                return Ok(false);
+            }
+            let Some(batch) = self.batches.pop_front() else {
+                return Err(io::Error::other("scripted terminal input exhausted"));
+            };
+            self.active_batch = batch;
+            Ok(!self.active_batch.is_empty())
+        }
+
+        fn read_script(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            self.active_batch
+                .pop_front()
+                .ok_or_else(|| io::Error::other("scripted terminal batch is empty"))
+        }
+
+        fn render_to_text(render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<String> {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame)).unwrap();
+            Ok(terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect())
+        }
+    }
+
+    impl RootTerminalLifetime for BareTerminalSpy {
+        fn mouse_mode_label(&self) -> &'static str {
+            "test"
+        }
+
+        fn mouse_trace_line(&self) -> Option<String> {
+            None
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.probe
+                .terminal_restores
+                .set(self.probe.terminal_restores.get() + 1);
+            Ok(())
+        }
+    }
+
+    impl crate::tui::GlobalHomeTerminal for BareTerminalSpy {
+        fn draw_global_home(
+            &mut self,
+            render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> io::Result<()> {
+            let rendered = Self::render_to_text(render)?;
+            if rendered.contains("Workspace Open Failed") {
+                assert_eq!(
+                    self.probe.terminal_restores.get(),
+                    0,
+                    "an open failure must keep the application terminal live"
+                );
+            }
+            self.probe
+                .rendered_global_frames
+                .borrow_mut()
+                .push(rendered);
+            self.probe
+                .global_draws
+                .set(self.probe.global_draws.get() + 1);
+            Ok(())
+        }
+
+        fn finish_global_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_global_home_resize(&mut self) {}
+
+        fn poll_global_home(&mut self, wait: Duration) -> io::Result<bool> {
+            self.poll_script(wait)
+        }
+
+        fn read_global_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            self.probe
+                .global_reads
+                .set(self.probe.global_reads.get() + 1);
+            self.read_script()
+        }
+    }
+
+    impl crate::tui::HomeTerminal for BareTerminalSpy {
+        fn draw_home(&mut self, render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<()> {
+            let _ = Self::render_to_text(render)?;
+            self.probe
+                .workspace_draws
+                .set(self.probe.workspace_draws.get() + 1);
+            Ok(())
+        }
+
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_home_resize(&mut self) {}
+
+        fn poll_home(&mut self, wait: Duration) -> io::Result<bool> {
+            self.poll_script(wait)
+        }
+
+        fn read_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            self.probe
+                .workspace_reads
+                .set(self.probe.workspace_reads.get() + 1);
+            self.read_script()
+        }
+    }
+
+    impl WorkspaceTerminal for BareTerminalSpy {
+        fn run_contest_frontend<R>(
+            &mut self,
+            _session: &mut ContestSession,
+            _app_context: &AppContext,
+            _config: &Config,
+            _preferences: &mut crate::tui::FrontendPreferences,
+            _submissions: &mut crate::tui::SubmissionHub,
+            _frontend: crate::tui::SessionFrontend<R>,
+        ) -> io::Result<crate::tui::SessionExit>
+        where
+            R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
+        {
+            self.probe
+                .contest_frontend_dispatches
+                .set(self.probe.contest_frontend_dispatches.get() + 1);
+            Ok(crate::tui::SessionExit::Quit)
+        }
+    }
+
     impl RootTerminalLifetime for RootTerminalSpy {
         fn mouse_mode_label(&self) -> &'static str {
             "test"
@@ -1790,6 +2136,35 @@ mod tests {
             self.home_quit_available = false;
             self.probe.home_reads.set(self.probe.home_reads.get() + 1);
             Ok(crate::tui::test_key_press('q'))
+        }
+    }
+
+    impl crate::tui::GlobalHomeTerminal for RootTerminalSpy {
+        fn draw_global_home(
+            &mut self,
+            _render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> io::Result<()> {
+            Err(io::Error::other(
+                "Workspace startup must not draw Global Home",
+            ))
+        }
+
+        fn finish_global_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_global_home_resize(&mut self) {}
+
+        fn poll_global_home(&mut self, _wait: Duration) -> io::Result<bool> {
+            Err(io::Error::other(
+                "Workspace startup must not poll Global Home",
+            ))
+        }
+
+        fn read_global_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            Err(io::Error::other(
+                "Workspace startup must not read Global Home",
+            ))
         }
     }
 
@@ -1858,16 +2233,39 @@ mod tests {
         .unwrap();
     }
 
+    fn run_scripted_bare_application(
+        launch_root: &Path,
+        batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
+        probe: &BareApplicationProbe,
+    ) -> Result<AppLocation, AppError> {
+        let terminal = BareTerminalSpy::new(batches, probe.clone());
+        run_application_at_with(launch_root, |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application(&mut location, &mut preferences, || {
+                probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                Ok(terminal)
+            })?;
+            Ok(location)
+        })
+    }
+
+    fn paste(text: impl Into<String>) -> crate::tui::TerminalEvent {
+        crate::tui::TerminalEvent::Paste(text.into())
+    }
+
     #[test]
     fn exact_workspace_root_dispatches_home_after_validation() {
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let started = std::cell::Cell::new(false);
 
-        let context = workspace_home_at_with(root.path(), |context, location| {
+        let context = run_application_at_with(root.path(), |location| {
             started.set(true);
-            assert!(matches!(location, RootLocation::WorkspaceHome));
-            Ok(context)
+            let AppLocation::Workspace(runtime) = location else {
+                panic!("an exact workspace must not pass through Global Home")
+            };
+            assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+            Ok(runtime.app_context)
         })
         .unwrap();
 
@@ -1881,15 +2279,388 @@ mod tests {
     }
 
     #[test]
+    fn production_bare_no_marker_runs_actual_global_home_and_restores_once() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            root.path(),
+            [vec![crate::tui::test_key_press('q')]],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("a no-marker bare launch must remain at Global Home")
+        };
+        assert_eq!(state.current_directory(), root.path());
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert!(probe.global_draws.get() > 0);
+        assert!(probe.global_reads.get() > 0);
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.workspace_reads.get(), 0);
+        assert_eq!(probe.contest_frontend_dispatches.get(), 0);
+    }
+
+    #[test]
+    fn production_bare_exact_workspace_skips_global_home_and_runs_workspace_home() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            root.path(),
+            [vec![crate::tui::test_key_press('q')]],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("an exact workspace must start directly in Workspace Home")
+        };
+        assert_eq!(runtime.app_context.workspace_root(), Some(root.path()));
+        assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert_eq!(probe.global_draws.get(), 0);
+        assert_eq!(probe.global_reads.get(), 0);
+        assert!(probe.workspace_draws.get() > 0);
+        assert!(probe.workspace_reads.get() > 0);
+    }
+
+    #[test]
+    fn production_global_home_opens_explicit_workspace_with_one_terminal_session() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_empty_workspace(workspace.path());
+        let probe = BareApplicationProbe::default();
+        let cwd_before = std::env::current_dir().unwrap();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste(workspace.path().to_string_lossy())],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("the validated workspace must commit after Global Home")
+        };
+        assert_eq!(runtime.app_context.workspace_root(), Some(workspace.path()));
+        assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert!(probe.global_draws.get() > 0);
+        assert!(probe.global_reads.get() >= 3);
+        assert!(probe.workspace_draws.get() > 0);
+        assert_eq!(probe.workspace_reads.get(), 1);
+        assert_eq!(probe.contest_frontend_dispatches.get(), 0);
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+    }
+
+    #[test]
+    fn successful_open_discards_later_keys_in_the_same_batch_but_next_batch_q_quits_workspace() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_empty_workspace(workspace.path());
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste(workspace.path().to_string_lossy())],
+                vec![
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        assert!(matches!(location, AppLocation::Workspace(_)));
+        assert_eq!(probe.global_reads.get(), 4);
+        assert_eq!(probe.workspace_reads.get(), 1);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+    }
+
+    #[test]
+    fn open_key_then_same_batch_q_is_owned_by_the_path_modal() {
+        let launch = tempfile::tempdir().unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_escape()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        assert_eq!(probe.global_reads.get(), 4);
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        assert!(
+            probe
+                .rendered_global_frames
+                .borrow()
+                .iter()
+                .any(|frame| frame.contains("Path: q")),
+            "the same-batch q must be inserted into the active path input"
+        );
+    }
+
+    #[test]
+    fn production_no_marker_open_failure_keeps_global_home_and_live_terminal() {
+        let launch = tempfile::tempdir().unwrap();
+        let missing = launch.path().join("not-a-workspace");
+        std::fs::create_dir(&missing).unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste(missing.to_string_lossy())],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("a no-marker selection must not commit a workspace runtime")
+        };
+        assert_eq!(state.current_directory(), launch.path());
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.contains("Not an atc workspace"));
+        assert!(rendered.contains(missing.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn production_invalid_selected_marker_keeps_global_home_and_same_terminal() {
+        let launch = tempfile::tempdir().unwrap();
+        let invalid = tempfile::tempdir().unwrap();
+        std::fs::write(invalid.path().join(".atc-workspace.toml"), "invalid").unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste(invalid.path().to_string_lossy())],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_escape()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.contains("workspace config"));
+        assert!(rendered.contains(invalid.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn config_load_failure_during_global_open_keeps_global_home_and_same_terminal() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_empty_workspace(workspace.path());
+        let probe = BareApplicationProbe::default();
+        let config_loads = std::cell::Cell::new(0);
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste(workspace.path().to_string_lossy())],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                |path| {
+                    open_workspace_runtime_with(
+                        path,
+                        || {
+                            config_loads.set(config_loads.get() + 1);
+                            Err(io::Error::other("config load failed").into())
+                        },
+                        crate::tui::SubmissionHub::new,
+                    )
+                },
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        assert_eq!(config_loads.get(), 1);
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.contains("config load failed"));
+        assert!(rendered.contains(workspace.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn production_relative_open_resolves_from_global_directory_without_changing_process_cwd() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = launch.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        write_empty_workspace(&workspace);
+        let probe = BareApplicationProbe::default();
+        let cwd_before = std::env::current_dir().unwrap();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![paste("workspace")],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("a valid relative workspace must commit")
+        };
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(workspace.as_path())
+        );
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+    }
+
+    #[test]
+    fn workspace_open_boundary_loads_config_before_constructing_runtime() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_empty_workspace(workspace.path());
+        let config_loads = std::cell::Cell::new(0);
+        let hub_creations = std::cell::Cell::new(0);
+
+        let runtime = open_workspace_runtime_with(
+            workspace.path(),
+            || {
+                config_loads.set(config_loads.get() + 1);
+                Ok(Config::default())
+            },
+            || {
+                hub_creations.set(hub_creations.get() + 1);
+                ()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config_loads.get(), 1);
+        assert_eq!(hub_creations.get(), 1);
+        assert_eq!(runtime.app_context.workspace_root(), Some(workspace.path()));
+        assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+
+        let hub_creations = std::cell::Cell::new(0);
+        let error = match open_workspace_runtime_with(
+            workspace.path(),
+            || Err(io::Error::other("config load failed").into()),
+            || {
+                hub_creations.set(hub_creations.get() + 1);
+                ()
+            },
+        ) {
+            Ok(_) => panic!("a config failure must abort before runtime construction"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("config load failed"));
+        assert_eq!(hub_creations.get(), 0);
+    }
+
+    #[test]
+    fn no_marker_open_is_rejected_before_config_or_submission_hub_creation() {
+        let selected = tempfile::tempdir().unwrap();
+        let config_loads = std::cell::Cell::new(0);
+        let hub_creations = std::cell::Cell::new(0);
+
+        let error = match open_workspace_runtime_with(
+            selected.path(),
+            || {
+                config_loads.set(config_loads.get() + 1);
+                Ok(Config::default())
+            },
+            || {
+                hub_creations.set(hub_creations.get() + 1);
+                ()
+            },
+        ) {
+            Ok(_) => panic!("Standalone classification must not construct a workspace runtime"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Not an atc workspace"));
+        assert_eq!(config_loads.get(), 0);
+        assert_eq!(hub_creations.get(), 0);
+    }
+
+    #[test]
     fn production_root_boundary_owns_one_terminal_around_workspace_home_and_cleanup() {
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let probe = RootApplicationProbe::default();
 
-        workspace_home_at_with(root.path(), |app_context, location| {
+        run_application_at_with(root.path(), |location| {
+            let AppLocation::Workspace(runtime) = location else {
+                panic!("an exact workspace must not pass through Global Home")
+            };
+            let WorkspaceRuntime {
+                app_context,
+                config,
+                submissions,
+                location,
+            } = runtime;
+            drop(submissions);
             let mut runtime = WorkspaceRuntime {
                 app_context,
-                config: Config::default(),
+                config,
                 submissions: SubmissionLifetimeSpy {
                     hub: crate::tui::SubmissionHub::new(),
                     probe: probe.clone(),
@@ -1997,18 +2768,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_exact_workspace_rejects_home_before_root_or_terminal_start() {
+    fn missing_exact_workspace_dispatches_global_home_without_a_runtime() {
         let root = tempfile::tempdir().unwrap();
         let started = std::cell::Cell::new(false);
 
-        let error = workspace_home_at_with(root.path(), |_, _| {
+        run_application_at_with(root.path(), |location| {
             started.set(true);
+            let AppLocation::GlobalHome(state) = location else {
+                panic!("a no-marker launch must enter Global Home")
+            };
+            assert_eq!(state.current_directory(), root.path());
             Ok(())
         })
-        .expect_err("standalone launch must not enter the root TUI");
+        .unwrap();
 
-        assert!(!started.get());
-        assert!(error.to_string().contains("exact current directory"));
+        assert!(started.get());
     }
 
     #[test]
@@ -2019,14 +2793,17 @@ mod tests {
         std::fs::create_dir(&child).unwrap();
         let started = std::cell::Cell::new(false);
 
-        let error = workspace_home_at_with(&child, |_, _| {
+        run_application_at_with(&child, |location| {
             started.set(true);
+            let AppLocation::GlobalHome(state) = location else {
+                panic!("a child without an exact marker must enter Global Home")
+            };
+            assert_eq!(state.current_directory(), child);
             Ok(())
         })
-        .expect_err("a parent marker must not authorize child-directory Home");
+        .unwrap();
 
-        assert!(!started.get());
-        assert!(error.to_string().contains("exact current directory"));
+        assert!(started.get());
     }
 
     #[test]
@@ -2035,7 +2812,7 @@ mod tests {
         std::fs::write(root.path().join(".atc-workspace.toml"), "invalid").unwrap();
         let started = std::cell::Cell::new(false);
 
-        let error = workspace_home_at_with(root.path(), |_, _| {
+        let error = run_application_at_with(root.path(), |_| {
             started.set(true);
             Ok(())
         })
