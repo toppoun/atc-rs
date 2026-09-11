@@ -571,9 +571,6 @@ pub(crate) fn run_with_terminal(
             TerminalEvent::Pointer(_) | TerminalEvent::Ignored => None,
         };
         if let Some(exit) = exit {
-            if matches!(exit, GlobalHomeExit::OpenWorkspace(_)) {
-                terminal.discard_global_home_input_batch()?;
-            }
             return Ok(exit);
         }
         dirty = true;
@@ -1485,7 +1482,7 @@ mod tests {
             run_with_terminal(&mut wide_terminal, &mut wide_state).unwrap(),
             GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
         );
-        assert_eq!(wide_terminal.reads, 2);
+        assert_eq!(wide_terminal.reads, 1);
 
         let mut narrow_state = GlobalHomeState::new(root.path().to_path_buf());
         let mut narrow_terminal = ScriptedGlobalTerminal::new(
@@ -1583,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn production_wide_palette_open_still_opens_and_discards_same_batch_input() {
+    fn production_wide_palette_open_returns_without_discarding_same_batch_input() {
         let root = tempfile::tempdir().unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
         let mut terminal = ScriptedGlobalTerminal::new(
@@ -1599,7 +1596,7 @@ mod tests {
             run_with_terminal(&mut terminal, &mut state).unwrap(),
             GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
         );
-        assert_eq!(terminal.reads, 3);
+        assert_eq!(terminal.reads, 2);
     }
 
     #[test]

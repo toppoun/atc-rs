@@ -491,6 +491,11 @@ struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
     location: RootLocation,
 }
 
+enum WorkspaceOpenOutcome<S = crate::tui::SubmissionHub> {
+    Opened(WorkspaceRuntime<S>),
+    NotWorkspace,
+}
+
 impl WorkspaceRuntime {
     fn new(app_context: AppContext, config: Config, location: RootLocation) -> Self {
         assert!(
@@ -511,7 +516,7 @@ impl WorkspaceRuntime {
         }
     }
 
-    fn open(path: &Path) -> Result<Self, AppError> {
+    fn open(path: &Path) -> Result<WorkspaceOpenOutcome, AppError> {
         open_workspace_runtime_with(path, Config::load, crate::tui::SubmissionHub::new)
     }
 }
@@ -520,23 +525,31 @@ fn open_workspace_runtime_with<S>(
     path: &Path,
     load_config: impl FnOnce() -> Result<Config, AppError>,
     create_submissions: impl FnOnce() -> S,
-) -> Result<WorkspaceRuntime<S>, AppError> {
-    let app_context = AppContext::from_launch_root(path)?;
-    if !matches!(&app_context, AppContext::Workspace { .. }) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Not an atc workspace: {}", path.display()),
-        )
-        .into());
-    }
+) -> Result<WorkspaceOpenOutcome<S>, AppError> {
+    open_workspace_runtime_from_context_with(
+        AppContext::from_launch_root(path),
+        load_config,
+        create_submissions,
+    )
+}
+
+fn open_workspace_runtime_from_context_with<S>(
+    app_context: io::Result<AppContext>,
+    load_config: impl FnOnce() -> Result<Config, AppError>,
+    create_submissions: impl FnOnce() -> S,
+) -> Result<WorkspaceOpenOutcome<S>, AppError> {
+    let app_context = match app_context? {
+        workspace @ AppContext::Workspace { .. } => workspace,
+        AppContext::Standalone { .. } => return Ok(WorkspaceOpenOutcome::NotWorkspace),
+    };
 
     let config = load_config()?;
-    Ok(WorkspaceRuntime {
+    Ok(WorkspaceOpenOutcome::Opened(WorkspaceRuntime {
         app_context,
         config,
         submissions: create_submissions(),
         location: RootLocation::WorkspaceHome,
-    })
+    }))
 }
 
 impl<S> WorkspaceRuntime<S> {
@@ -786,7 +799,7 @@ fn run_bare_application_with<T>(
     location: &mut AppLocation,
     preferences: &mut crate::tui::FrontendPreferences,
     start_terminal: impl FnOnce() -> io::Result<T>,
-    open_workspace: impl FnMut(&Path) -> Result<WorkspaceRuntime, AppError>,
+    open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
 ) -> Result<(), AppError>
 where
     T: ApplicationTerminal,
@@ -860,7 +873,7 @@ fn run_application_locations_with<T>(
     location: &mut AppLocation,
     terminal: &mut T,
     preferences: &mut crate::tui::FrontendPreferences,
-    mut open_workspace: impl FnMut(&Path) -> Result<WorkspaceRuntime, AppError>,
+    mut open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
 ) -> io::Result<()>
 where
     T: ApplicationTerminal,
@@ -879,8 +892,19 @@ where
         match global_exit.expect("Global Home is the only location that returns here") {
             crate::tui::GlobalHomeExit::Quit => return Ok(()),
             crate::tui::GlobalHomeExit::OpenWorkspace(path) => match open_workspace(&path) {
-                Ok(runtime) => {
+                Ok(WorkspaceOpenOutcome::Opened(runtime)) => {
+                    terminal.discard_global_home_input_batch()?;
                     *location = AppLocation::Workspace(runtime);
+                }
+                Ok(WorkspaceOpenOutcome::NotWorkspace) => {
+                    let AppLocation::GlobalHome(state) = location else {
+                        unreachable!("a non-workspace open cannot commit the workspace")
+                    };
+                    state.show_workspace_open_error(format!(
+                        "Could not open workspace {}:\nfilesystem operation failed: Not an atc workspace: {}",
+                        path.display(),
+                        path.display()
+                    ));
                 }
                 Err(error) => {
                     let AppLocation::GlobalHome(state) = location else {
@@ -2437,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn production_no_marker_open_failure_keeps_global_home_and_live_terminal() {
+    fn production_no_marker_same_batch_key_stays_with_global_home_error() {
         let launch = tempfile::tempdir().unwrap();
         let missing = launch.path().join("a-not-a-workspace");
         std::fs::create_dir(&missing).unwrap();
@@ -2448,7 +2472,10 @@ mod tests {
             [
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
-                vec![crate::tui::test_key_press('o')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_press('q'),
+                ],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2462,16 +2489,18 @@ mod tests {
         assert_eq!(state.explorer_root(), launch.path());
         assert_eq!(state.explorer_selected_path(), missing);
         assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
+        assert!(rendered.contains("filesystem operation failed"));
         assert!(rendered.contains("Not an atc workspace"));
         assert!(rendered.contains(missing.to_string_lossy().as_ref()));
     }
 
     #[test]
-    fn production_invalid_selected_marker_keeps_global_home_and_same_terminal() {
+    fn production_invalid_marker_same_batch_key_stays_with_global_home_error() {
         let launch = tempfile::tempdir().unwrap();
         let invalid = launch.path().join("a-invalid");
         std::fs::create_dir(&invalid).unwrap();
@@ -2483,7 +2512,10 @@ mod tests {
             [
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
-                vec![crate::tui::test_key_press('o')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_press('q'),
+                ],
                 vec![crate::tui::test_key_escape()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2497,16 +2529,17 @@ mod tests {
         assert_eq!(state.explorer_root(), launch.path());
         assert_eq!(state.explorer_selected_path(), invalid);
         assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
         assert!(rendered.contains("workspace config"));
         assert!(rendered.contains(invalid.to_string_lossy().as_ref()));
     }
 
     #[test]
-    fn config_load_failure_during_global_open_keeps_global_home_and_same_terminal() {
+    fn config_failure_same_batch_key_stays_with_global_home_error() {
         let launch = tempfile::tempdir().unwrap();
         let workspace = launch.path().join("a-workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -2517,7 +2550,10 @@ mod tests {
             [
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
-                vec![crate::tui::test_key_press('o')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_press('q'),
+                ],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2555,10 +2591,11 @@ mod tests {
         assert_eq!(state.explorer_selected_path(), workspace);
         assert_eq!(config_loads.get(), 1);
         assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
         assert!(rendered.contains("config load failed"));
         assert!(rendered.contains(workspace.to_string_lossy().as_ref()));
     }
@@ -2602,7 +2639,7 @@ mod tests {
         let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
-        let runtime = open_workspace_runtime_with(
+        let outcome = open_workspace_runtime_with(
             workspace.path(),
             || {
                 config_loads.set(config_loads.get() + 1);
@@ -2614,6 +2651,9 @@ mod tests {
             },
         )
         .unwrap();
+        let WorkspaceOpenOutcome::Opened(runtime) = outcome else {
+            panic!("a valid workspace marker must open a runtime")
+        };
 
         assert_eq!(config_loads.get(), 1);
         assert_eq!(hub_creations.get(), 1);
@@ -2637,8 +2677,33 @@ mod tests {
     }
 
     #[test]
-    fn no_marker_open_is_rejected_before_config_or_submission_hub_creation() {
+    fn no_marker_open_is_typed_before_config_or_submission_hub_creation() {
         let selected = tempfile::tempdir().unwrap();
+        let config_loads = std::cell::Cell::new(0);
+        let hub_creations = std::cell::Cell::new(0);
+
+        let outcome = open_workspace_runtime_with(
+            selected.path(),
+            || {
+                config_loads.set(config_loads.get() + 1);
+                Ok(Config::default())
+            },
+            || {
+                hub_creations.set(hub_creations.get() + 1);
+                ()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkspaceOpenOutcome::NotWorkspace));
+        assert_eq!(config_loads.get(), 0);
+        assert_eq!(hub_creations.get(), 0);
+    }
+
+    #[test]
+    fn invalid_marker_open_remains_an_error_before_runtime_construction() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(selected.path().join(".atc-workspace.toml"), "invalid").unwrap();
         let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
@@ -2653,11 +2718,43 @@ mod tests {
                 ()
             },
         ) {
-            Ok(_) => panic!("Standalone classification must not construct a workspace runtime"),
+            Ok(_) => panic!("an invalid marker must not become a workspace-open outcome"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("Not an atc workspace"));
+        assert!(
+            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        assert_eq!(config_loads.get(), 0);
+        assert_eq!(hub_creations.get(), 0);
+    }
+
+    #[test]
+    fn marker_io_failure_remains_an_error_before_runtime_construction() {
+        let config_loads = std::cell::Cell::new(0);
+        let hub_creations = std::cell::Cell::new(0);
+
+        let error = match open_workspace_runtime_from_context_with(
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "marker inspection failed",
+            )),
+            || {
+                config_loads.set(config_loads.get() + 1);
+                Ok(Config::default())
+            },
+            || {
+                hub_creations.set(hub_creations.get() + 1);
+                ()
+            },
+        ) {
+            Ok(_) => panic!("a marker I/O failure must not become a workspace-open outcome"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
         assert_eq!(config_loads.get(), 0);
         assert_eq!(hub_creations.get(), 0);
     }
