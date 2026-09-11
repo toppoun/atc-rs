@@ -642,7 +642,6 @@ pub(crate) enum SubmitError {
     SubmitPage(SubmitPageError),
     SubmitPageFetchFailed,
     SubmissionRejected,
-    UnexpectedRedirect,
     RateLimited,
 }
 
@@ -664,9 +663,6 @@ impl fmt::Display for SubmitError {
                 formatter.write_str("failed to fetch the AtCoder submit page")
             }
             Self::SubmissionRejected => formatter.write_str("AtCoder rejected the submission"),
-            Self::UnexpectedRedirect => {
-                formatter.write_str("AtCoder returned an unexpected submit redirect")
-            }
             Self::RateLimited => formatter.write_str("AtCoder submit was rate limited"),
         }
     }
@@ -682,7 +678,6 @@ impl std::error::Error for SubmitError {
             | Self::SubmitClientInitializationFailed
             | Self::SubmitPageFetchFailed
             | Self::SubmissionRejected
-            | Self::UnexpectedRedirect
             | Self::RateLimited => None,
         }
     }
@@ -698,7 +693,6 @@ impl SubmitError {
             Self::SubmitPage(_) => "SubmitPage",
             Self::SubmitPageFetchFailed => "SubmitPageFetchFailed",
             Self::SubmissionRejected => "SubmissionRejected",
-            Self::UnexpectedRedirect => "UnexpectedRedirect",
             Self::RateLimited => "RateLimited",
         }
     }
@@ -1125,17 +1119,14 @@ fn classify_submit_response(
     if response.status.is_success() {
         return Ok(SubmitOutcome::UnknownSubmissionOutcome);
     }
-    if matches!(response.status, StatusCode::FOUND | StatusCode::SEE_OTHER) {
-        return if unique_location(&response.headers)
+    if matches!(response.status, StatusCode::FOUND | StatusCode::SEE_OTHER)
+        && unique_location(&response.headers)
             .is_some_and(|location| is_expected_submission_location(contest_id, location))
-        {
-            Ok(SubmitOutcome::Accepted)
-        } else {
-            Err(SubmitError::UnexpectedRedirect)
-        };
+    {
+        return Ok(SubmitOutcome::Accepted);
     }
     if response.status.is_redirection() {
-        return Err(SubmitError::UnexpectedRedirect);
+        return Ok(SubmitOutcome::UnknownSubmissionOutcome);
     }
 
     Err(SubmitError::SubmissionRejected)
@@ -2864,7 +2855,7 @@ mod tests {
         transport.assert_complete();
     }
 
-    fn assert_unexpected_post_redirect(location: &str) {
+    fn assert_post_redirect_is_unknown(location: &str) {
         let source = "dummy";
         let mut transport = ScriptedSubmitTransport::new(vec![
             get_step(CURRENT_SUBMIT_PAGE),
@@ -2876,8 +2867,8 @@ mod tests {
         ]);
 
         assert_eq!(
-            submit_with_transport(&mut transport, submit_request(Language::Cpp, source),),
-            Err(SubmitError::UnexpectedRedirect)
+            submit_with_transport(&mut transport, submit_request(Language::Cpp, source)).unwrap(),
+            SubmitOutcome::UnknownSubmissionOutcome
         );
         assert_eq!(transport.post_count(), 1);
         transport.assert_complete();
@@ -2941,33 +2932,75 @@ mod tests {
     }
 
     #[test]
-    fn external_submit_redirect_is_rejected() {
-        assert_unexpected_post_redirect("https://evil.example/contests/abc466/submissions/me");
+    fn missing_post_location_is_unknown_and_is_never_retried() {
+        let source = "dummy";
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step(
+                "6017",
+                source,
+                Ok(response(StatusCode::FOUND, None, "dummy redirect body")),
+            ),
+        ]);
+
+        assert_eq!(
+            submit_with_transport(&mut transport, submit_request(Language::Cpp, source)).unwrap(),
+            SubmitOutcome::UnknownSubmissionOutcome
+        );
+        assert_eq!(transport.post_count(), 1);
+        transport.assert_complete();
     }
 
     #[test]
-    fn noncanonical_dot_segment_submission_redirects_are_rejected() {
+    fn malformed_post_location_is_unknown_and_is_never_retried() {
+        let source = "dummy";
+        let mut redirect = response(StatusCode::FOUND, None, "dummy redirect body");
+        redirect.headers.insert(
+            LOCATION,
+            HeaderValue::from_bytes(b"\x80")
+                .expect("non-UTF-8 header value should be representable"),
+        );
+        let mut transport = ScriptedSubmitTransport::new(vec![
+            get_step(CURRENT_SUBMIT_PAGE),
+            post_step("6017", source, Ok(redirect)),
+        ]);
+
+        assert_eq!(
+            submit_with_transport(&mut transport, submit_request(Language::Cpp, source)).unwrap(),
+            SubmitOutcome::UnknownSubmissionOutcome
+        );
+        assert_eq!(transport.post_count(), 1);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn external_submit_redirect_is_unknown() {
+        assert_post_redirect_is_unknown("https://evil.example/contests/abc466/submissions/me");
+    }
+
+    #[test]
+    fn noncanonical_dot_segment_submission_redirects_are_unknown() {
         for location in [
             "/contests/abc466/submissions/x/../me",
             "/contests/abc466/submissions/x/%2e%2e/me",
             "/contests/abc466/submissions/x/%2E%2E/me",
         ] {
-            assert_unexpected_post_redirect(location);
+            assert_post_redirect_is_unknown(location);
         }
     }
 
     #[test]
-    fn backslash_and_extra_path_submission_redirects_are_rejected() {
+    fn backslash_and_extra_path_submission_redirects_are_unknown() {
         for location in [
             "/contests/abc466/submissions\\me",
             "/contests/abc466/submissions/me/extra",
         ] {
-            assert_unexpected_post_redirect(location);
+            assert_post_redirect_is_unknown(location);
         }
     }
 
     #[test]
-    fn noncanonical_absolute_submission_origins_are_rejected() {
+    fn noncanonical_absolute_submission_origins_are_unknown() {
         for location in [
             "//evil.example/contests/abc466/submissions/me",
             "https://atcoder.jp.evil.example/contests/abc466/submissions/me",
@@ -2975,37 +3008,37 @@ mod tests {
             "https://atcoder.jp:8443/contests/abc466/submissions/me",
             "http://atcoder.jp/contests/abc466/submissions/me",
         ] {
-            assert_unexpected_post_redirect(location);
+            assert_post_redirect_is_unknown(location);
         }
     }
 
     #[test]
-    fn wrong_contest_submit_redirect_is_rejected() {
-        assert_unexpected_post_redirect("/contests/abc999/submissions/me");
+    fn wrong_contest_submit_redirect_is_unknown() {
+        assert_post_redirect_is_unknown("/contests/abc999/submissions/me");
     }
 
     #[test]
     fn submit_page_redirect_is_not_accepted() {
-        assert_unexpected_post_redirect("/contests/abc466/submit");
+        assert_post_redirect_is_unknown("/contests/abc466/submit");
     }
 
     #[test]
-    fn unexpected_same_origin_redirect_is_rejected() {
-        assert_unexpected_post_redirect("/contests/abc466/submissions");
+    fn unexpected_same_origin_redirect_is_unknown() {
+        assert_post_redirect_is_unknown("/contests/abc466/submissions");
     }
 
     #[test]
-    fn submission_redirect_with_query_or_fragment_is_rejected() {
+    fn submission_redirect_with_query_or_fragment_is_unknown() {
         for location in [
             "/contests/abc466/submissions/me?x=1",
             "/contests/abc466/submissions/me#x",
         ] {
-            assert_unexpected_post_redirect(location);
+            assert_post_redirect_is_unknown(location);
         }
     }
 
     #[test]
-    fn multiple_submission_locations_are_rejected() {
+    fn multiple_submission_locations_are_unknown_and_are_never_retried() {
         let source = "dummy";
         let mut redirect = accepted_response(StatusCode::FOUND, "/contests/abc466/submissions/me");
         redirect.headers.append(
@@ -3018,8 +3051,8 @@ mod tests {
         ]);
 
         assert_eq!(
-            submit_with_transport(&mut transport, submit_request(Language::Cpp, source)),
-            Err(SubmitError::UnexpectedRedirect)
+            submit_with_transport(&mut transport, submit_request(Language::Cpp, source)).unwrap(),
+            SubmitOutcome::UnknownSubmissionOutcome
         );
         assert_eq!(transport.post_count(), 1);
         transport.assert_complete();

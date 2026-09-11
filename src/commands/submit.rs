@@ -1801,12 +1801,6 @@ mod tests {
                 true,
             ),
             (
-                "unexpected redirect",
-                Err(SubmitError::UnexpectedRedirect),
-                false,
-                true,
-            ),
-            (
                 "post rate limited",
                 Err(SubmitError::RateLimited),
                 false,

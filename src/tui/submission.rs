@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn production_worker_unknown_keeps_s1_visible_and_locks_resubmit() {
+    fn production_worker_unknown_keeps_history_and_blocks_same_batch_resubmit() {
         let (s1_ready_tx, s1_ready_rx) = mpsc::channel();
         let s1_stopped = Arc::new(AtomicUsize::new(0));
         let post_count = Arc::new(AtomicUsize::new(0));
@@ -1760,6 +1760,15 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown")
         );
+        assert_eq!(hub.history.len(), 2);
+        let unknown_row = hub
+            .history
+            .iter()
+            .find(|entry| entry.generation == s2)
+            .expect("the Unknown attempt must remain in history");
+        assert_eq!(unknown_row.key, key);
+        assert_eq!(unknown_row.state.compact_label(), "Unknown");
+        let next_generation = hub.next_generation;
         let temp = tempfile::tempdir().unwrap();
         let plan = SubmitPlan::for_selected_source(
             key.contest_id.clone(),
@@ -1773,6 +1782,7 @@ mod tests {
             hub.start(key.clone(), "A".to_string(), "Problem A".to_string(), plan,)
                 .is_err()
         );
+        assert_eq!(hub.next_generation, next_generation);
         assert_eq!(post_count.load(Ordering::Acquire), 1);
         hub.request_stop();
     }
