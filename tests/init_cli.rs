@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const DEFAULT_WORKSPACE_CONFIG: &str = concat!(
@@ -40,26 +39,34 @@ fn run_init(root: &Path) -> Output {
         .expect("atc init should run")
 }
 
-fn child_reported_marker(root: &Path) -> PathBuf {
-    root.canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf())
-        .join(".atc-workspace.toml")
+fn assert_reported_marker(stderr: &[u8], message: &str, marker: &Path) {
+    let stderr = std::str::from_utf8(stderr).unwrap();
+    let reported = stderr
+        .strip_prefix(message)
+        .and_then(|reported| reported.strip_suffix('\n'))
+        .filter(|reported| !reported.contains('\n'))
+        .expect("stderr should contain exactly one workspace status line");
+    let reported_marker = Path::new(reported);
+
+    assert_eq!(
+        reported_marker.canonicalize().unwrap(),
+        marker.canonicalize().unwrap()
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(reported, marker.display().to_string());
 }
 
 #[test]
 fn init_creates_the_exact_marker_and_rerun_preserves_its_bytes() {
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join(".atc-workspace.toml");
-    let reported_marker = child_reported_marker(root.path());
 
     let created = run_init(root.path());
 
     assert_eq!(created.status.code(), Some(0));
     assert_eq!(created.stdout, b"");
-    assert_eq!(
-        String::from_utf8(created.stderr).unwrap(),
-        format!("Initialized atc workspace: {}\n", reported_marker.display())
-    );
+    assert_reported_marker(&created.stderr, "Initialized atc workspace: ", &marker);
     assert_eq!(
         fs::read(&marker).unwrap(),
         DEFAULT_WORKSPACE_CONFIG.as_bytes()
@@ -70,13 +77,7 @@ fn init_creates_the_exact_marker_and_rerun_preserves_its_bytes() {
 
     assert_eq!(rerun.status.code(), Some(0));
     assert_eq!(rerun.stdout, b"");
-    assert_eq!(
-        String::from_utf8(rerun.stderr).unwrap(),
-        format!(
-            "Workspace already initialized: {}\n",
-            reported_marker.display()
-        )
-    );
+    assert_reported_marker(&rerun.stderr, "Workspace already initialized: ", &marker);
     assert_eq!(fs::read(&marker).unwrap(), before_rerun);
 }
 
