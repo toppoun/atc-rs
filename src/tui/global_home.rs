@@ -12,6 +12,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::explorer::{self, ExplorerState};
 use super::home::{
     centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
 };
@@ -24,8 +25,9 @@ use crate::branding;
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [(&str, &str); 4] = [
-    ("Open Workspace", "o"),
+const GLOBAL_HOME_ACTIONS: [(&str, &str); 5] = [
+    ("Open", "o"),
+    ("Go to Path", "g"),
     ("Commands", ":"),
     ("Shortcuts", "?"),
     ("Quit", "q"),
@@ -33,7 +35,10 @@ const GLOBAL_HOME_ACTIONS: [(&str, &str); 4] = [
 const MENU_WIDTH: u16 = 23;
 const MENU_HEIGHT: u16 = GLOBAL_HOME_ACTIONS.len() as u16;
 const SUBTITLE: &str = "AtCoder workspace launcher";
-const DIRECTORY_PREFIX: &str = "Directory  ";
+const SELECTED_PREFIX: &str = "Selected  ";
+const EXPLORER_MIN_WIDTH: u16 = 32;
+const EXPLORER_MAX_WIDTH: u16 = 48;
+const DASHBOARD_MIN_WIDTH: u16 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalHomeExit {
@@ -43,26 +48,41 @@ pub(crate) enum GlobalHomeExit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalHomeCommand {
-    OpenWorkspace,
+    Open,
+    GoToPath,
     Quit,
 }
 
 impl GlobalHomeCommand {
-    const ALL: [Self; 2] = [Self::OpenWorkspace, Self::Quit];
+    const ALL: [Self; 3] = [Self::Open, Self::GoToPath, Self::Quit];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::OpenWorkspace => "Open Workspace",
+            Self::Open => "Open",
+            Self::GoToPath => "Go to Path",
             Self::Quit => "Quit",
         }
     }
 
     const fn shortcut(self) -> &'static str {
         match self {
-            Self::OpenWorkspace => "o",
+            Self::Open => "o",
+            Self::GoToPath => "g",
             Self::Quit => "q",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalHomeErrorKind {
+    WorkspaceOpen,
+    GoToPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalHomeError {
+    kind: GlobalHomeErrorKind,
+    message: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -233,40 +253,130 @@ impl PathInputModal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalHomeState {
-    current_directory: PathBuf,
+    explorer: ExplorerState,
     path_input: Option<PathInputModal>,
-    error: Option<String>,
+    error: Option<GlobalHomeError>,
     shortcut_help_visible: bool,
     palette: GlobalHomeCommandPalette,
+    explorer_overlay_visible: bool,
+    explorer_pane_visible: bool,
 }
 
 impl GlobalHomeState {
-    pub(crate) fn new(current_directory: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf) -> Self {
         Self {
-            current_directory,
+            explorer: ExplorerState::new(root),
             path_input: None,
             error: None,
             shortcut_help_visible: false,
             palette: GlobalHomeCommandPalette::default(),
+            explorer_overlay_visible: false,
+            explorer_pane_visible: false,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn current_directory(&self) -> &Path {
-        &self.current_directory
+    pub(crate) fn explorer_root(&self) -> &Path {
+        self.explorer.root()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn explorer_selected_path(&self) -> &Path {
+        self.explorer.selected_path()
     }
 
     pub(crate) fn show_workspace_open_error(&mut self, message: String) {
         self.path_input = None;
         self.palette.close();
         self.shortcut_help_visible = false;
-        self.error = Some(message);
+        self.error = Some(GlobalHomeError {
+            kind: GlobalHomeErrorKind::WorkspaceOpen,
+            message,
+        });
     }
 
     fn open_path_input(&mut self) {
         self.path_input = Some(PathInputModal::default());
         self.palette.close();
         self.shortcut_help_visible = false;
+    }
+
+    fn selected_open_exit(&self) -> GlobalHomeExit {
+        GlobalHomeExit::OpenWorkspace(self.explorer.selected_path().to_path_buf())
+    }
+
+    fn request_open(&mut self) -> Option<GlobalHomeExit> {
+        self.palette.close();
+        if self.explorer_pane_visible {
+            Some(self.selected_open_exit())
+        } else {
+            self.explorer_overlay_visible = true;
+            None
+        }
+    }
+
+    fn submit_path_input(&mut self, input: PathInputModal) {
+        let candidate = resolve_explorer_path(self.explorer.root(), &input.value);
+        let mut rebased = self.explorer.clone();
+        if rebased.rebase(candidate.clone()) {
+            self.explorer = rebased;
+        } else {
+            self.error = Some(GlobalHomeError {
+                kind: GlobalHomeErrorKind::GoToPath,
+                message: rebased.status().map_or_else(
+                    || format!("Could not go to {}", candidate.display()),
+                    str::to_owned,
+                ),
+            });
+        }
+    }
+
+    fn handle_explorer_navigation(&mut self, key: KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Down => self.explorer.select_next(),
+            KeyCode::Char('j') if has_plain_modifiers(key) => self.explorer.select_next(),
+            KeyCode::Up => self.explorer.select_previous(),
+            KeyCode::Char('k') if has_plain_modifiers(key) => self.explorer.select_previous(),
+            KeyCode::Right => self.explorer.select_right(),
+            KeyCode::Char('l') if has_plain_modifiers(key) => self.explorer.select_right(),
+            KeyCode::Left => self.explorer.select_left(),
+            KeyCode::Char('h') if has_plain_modifiers(key) => self.explorer.select_left(),
+            KeyCode::Enter if key.kind == KeyEventKind::Press => self.explorer.toggle_selected(),
+            KeyCode::Backspace if key.kind == KeyEventKind::Press => {
+                self.explorer.rebase_to_parent()
+            }
+            KeyCode::Char('r') if key.kind == KeyEventKind::Press && has_plain_modifiers(key) => {
+                self.explorer.reload_selected()
+            }
+            _ => return false,
+        };
+        true
+    }
+
+    fn handle_explorer_overlay_key(&mut self, key: KeyEvent) -> Option<GlobalHomeExit> {
+        if key.kind == KeyEventKind::Press {
+            match key.code {
+                KeyCode::Escape => {
+                    self.explorer_overlay_visible = false;
+                    return None;
+                }
+                KeyCode::Char('o') if has_plain_modifiers(key) => {
+                    return Some(self.selected_open_exit());
+                }
+                KeyCode::Char('g') if has_plain_modifiers(key) => {
+                    self.open_path_input();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        self.handle_explorer_navigation(key);
+        None
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<GlobalHomeExit> {
@@ -289,10 +399,8 @@ impl GlobalHomeState {
                     .path_input
                     .take()
                     .expect("active path input must remain present until Enter");
-                return Some(GlobalHomeExit::OpenWorkspace(resolve_workspace_path(
-                    &self.current_directory,
-                    &input.value,
-                )));
+                self.submit_path_input(input);
+                return None;
             }
             self.path_input
                 .as_mut()
@@ -303,7 +411,8 @@ impl GlobalHomeState {
 
         if self.palette.is_active() {
             return match self.palette.handle_key(key) {
-                PaletteKeyResult::Execute(GlobalHomeCommand::OpenWorkspace) => {
+                PaletteKeyResult::Execute(GlobalHomeCommand::Open) => self.request_open(),
+                PaletteKeyResult::Execute(GlobalHomeCommand::GoToPath) => {
                     self.open_path_input();
                     None
                 }
@@ -327,7 +436,14 @@ impl GlobalHomeState {
             ShortcutHelpTransition::PassThrough => {}
         }
 
+        if self.explorer_overlay_visible {
+            return self.handle_explorer_overlay_key(key);
+        }
+
         if key.kind != KeyEventKind::Press {
+            if self.explorer_pane_visible {
+                self.handle_explorer_navigation(key);
+            }
             return None;
         }
         if is_shortcut_help_key(key) {
@@ -338,18 +454,18 @@ impl GlobalHomeState {
             None
         } else {
             match key.code {
-                KeyCode::Char('o')
-                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-                {
+                KeyCode::Char('o') if has_plain_modifiers(key) => self.request_open(),
+                KeyCode::Char('g') if has_plain_modifiers(key) => {
                     self.open_path_input();
                     None
                 }
-                KeyCode::Char('q')
-                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-                {
-                    Some(GlobalHomeExit::Quit)
+                KeyCode::Char('q') if has_plain_modifiers(key) => Some(GlobalHomeExit::Quit),
+                _ => {
+                    if self.explorer_pane_visible {
+                        self.handle_explorer_navigation(key);
+                    }
+                    None
                 }
-                _ => None,
             }
         }
     }
@@ -366,16 +482,20 @@ impl GlobalHomeState {
     }
 }
 
-pub(crate) fn resolve_workspace_path(current_directory: &Path, input: &str) -> PathBuf {
+fn has_plain_modifiers(key: KeyEvent) -> bool {
+    !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key
+}
+
+pub(crate) fn resolve_explorer_path(current_root: &Path, input: &str) -> PathBuf {
     if input.is_empty() {
-        return current_directory.to_path_buf();
+        return current_root.to_path_buf();
     }
 
     let input = PathBuf::from(input);
     if input.is_absolute() {
         input
     } else {
-        current_directory.join(input)
+        current_root.join(input)
     }
 }
 
@@ -465,7 +585,34 @@ struct GlobalHomeLayout {
     logo: Option<Rect>,
     subtitle: Option<Rect>,
     menu: Rect,
-    directory: Option<Rect>,
+    footer: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlobalHomePanes {
+    explorer: Option<Rect>,
+    dashboard: Rect,
+}
+
+fn global_home_panes(area: Rect) -> GlobalHomePanes {
+    let proportional = area.width.saturating_mul(30) / 100;
+    let explorer_width = proportional.clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH);
+    if area.width.saturating_sub(explorer_width) < DASHBOARD_MIN_WIDTH {
+        return GlobalHomePanes {
+            explorer: None,
+            dashboard: area,
+        };
+    }
+
+    GlobalHomePanes {
+        explorer: Some(Rect::new(area.x, area.y, explorer_width, area.height)),
+        dashboard: Rect::new(
+            area.x.saturating_add(explorer_width),
+            area.y,
+            area.width.saturating_sub(explorer_width),
+            area.height,
+        ),
+    }
 }
 
 fn global_home_layout(area: Rect) -> GlobalHomeLayout {
@@ -474,19 +621,19 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
             logo: None,
             subtitle: None,
             menu: Rect::new(area.x, area.y, 0, 0),
-            directory: None,
+            footer: None,
         };
     }
 
-    let show_directory = area.height >= MENU_HEIGHT.saturating_add(1);
-    let bottom_margin = u16::from(show_directory && area.height >= MENU_HEIGHT.saturating_add(4));
-    let directory_y = area
+    let show_footer = area.height >= MENU_HEIGHT.saturating_add(1);
+    let bottom_margin = u16::from(show_footer && area.height >= MENU_HEIGHT.saturating_add(4));
+    let footer_y = area
         .y
         .saturating_add(area.height)
         .saturating_sub(1)
         .saturating_sub(bottom_margin);
-    let body_height = if show_directory {
-        directory_y.saturating_sub(area.y)
+    let body_height = if show_footer {
+        footer_y.saturating_sub(area.y)
     } else {
         area.height
     };
@@ -534,11 +681,11 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
         (None, None, content_y)
     };
 
-    let directory = show_directory.then(|| {
+    let footer = show_footer.then(|| {
         let margin = u16::from(area.width >= 4);
         Rect::new(
             area.x.saturating_add(margin),
-            directory_y,
+            footer_y,
             area.width.saturating_sub(margin.saturating_mul(2)),
             1,
         )
@@ -548,7 +695,7 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
         logo,
         subtitle,
         menu: centered_row(area, menu_y, MENU_WIDTH, MENU_HEIGHT.min(body_height)),
-        directory,
+        footer,
     }
 }
 
@@ -570,8 +717,18 @@ fn prefixed_path_line(prefix: &str, path: &Path, width: usize) -> String {
     }
 }
 
-fn render(frame: &mut Frame<'_>, state: &GlobalHomeState) {
-    let layout = global_home_layout(frame.area());
+fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
+    let panes = global_home_panes(frame.area());
+    state.explorer_pane_visible = panes.explorer.is_some();
+    if state.explorer_pane_visible {
+        state.explorer_overlay_visible = false;
+    }
+
+    if let Some(area) = panes.explorer {
+        explorer::render(frame, area, &mut state.explorer);
+    }
+
+    let layout = global_home_layout(panes.dashboard);
 
     if let Some(area) = layout.logo {
         let lines = branding::ascii_logo_lines().map(|line| {
@@ -598,11 +755,11 @@ fn render(frame: &mut Frame<'_>, state: &GlobalHomeState) {
             .map(|(label, shortcut)| menu_line(label, shortcut, usize::from(layout.menu.width)));
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
     }
-    if let Some(area) = layout.directory {
+    if let Some(area) = layout.footer {
         frame.render_widget(
             Paragraph::new(prefixed_path_line(
-                DIRECTORY_PREFIX,
-                &state.current_directory,
+                SELECTED_PREFIX,
+                state.explorer.selected_path(),
                 usize::from(area.width),
             ))
             .style(Style::default().fg(Color::DarkGray))
@@ -611,27 +768,42 @@ fn render(frame: &mut Frame<'_>, state: &GlobalHomeState) {
         );
     }
 
+    if state.explorer_overlay_visible {
+        render_explorer_overlay(frame, &mut state.explorer);
+    }
+
     if state.shortcut_help_visible {
-        render_shortcuts(frame);
+        render_shortcuts(frame, state.explorer_pane_visible);
     }
     if state.palette.is_active() {
         render_palette(frame, &state.palette);
     }
     if let Some(input) = state.path_input.as_ref() {
-        render_path_input(frame, &state.current_directory, input);
+        render_path_input(frame, state.explorer.root(), input);
     }
-    if let Some(error) = state.error.as_deref() {
+    if let Some(error) = state.error.as_ref() {
         render_error(frame, error);
     }
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>) {
-    let area = centered_rect(frame.area(), 38, 9);
+fn render_shortcuts(frame: &mut Frame<'_>, explorer_pane_visible: bool) {
+    let area = centered_rect(frame.area(), 46, 14);
+    let open_help = if explorer_pane_visible {
+        "o         Open"
+    } else {
+        "o         Explorer, then Open"
+    };
     let lines = vec![
-        Line::raw("o  Open Workspace"),
-        Line::raw(":  Commands"),
-        Line::raw("?  Shortcuts"),
-        Line::raw("q  Quit"),
+        Line::raw(open_help),
+        Line::raw("g         Go to Path"),
+        Line::raw("Enter     Expand / Collapse"),
+        Line::raw("↑↓ jk     Navigate"),
+        Line::raw("←→ hl     Collapse / Expand"),
+        Line::raw("Backspace Parent"),
+        Line::raw("r         Reload"),
+        Line::raw(":         Commands"),
+        Line::raw("?         Shortcuts"),
+        Line::raw("q         Quit"),
         Line::raw(""),
         Line::raw("? keep open   Esc close"),
     ];
@@ -641,6 +813,33 @@ fn render_shortcuts(frame: &mut Frame<'_>) {
             .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)),
         area,
     );
+}
+
+fn render_explorer_overlay(frame: &mut Frame<'_>, state: &mut ExplorerState) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let help_height = u16::from(area.height >= 2);
+    let explorer_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(help_height),
+    );
+    explorer::render(frame, explorer_area, state);
+    if help_height > 0 {
+        let help_area = Rect::new(
+            area.x,
+            area.y.saturating_add(area.height.saturating_sub(1)),
+            area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("o Open   g Go to Path   Esc Close")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            help_area,
+        );
+    }
 }
 
 fn render_palette(frame: &mut Frame<'_>, palette: &GlobalHomeCommandPalette) {
@@ -708,11 +907,9 @@ fn render_palette(frame: &mut Frame<'_>, palette: &GlobalHomeCommandPalette) {
     }
 }
 
-fn render_path_input(frame: &mut Frame<'_>, current_directory: &Path, input: &PathInputModal) {
+fn render_path_input(frame: &mut Frame<'_>, current_root: &Path, input: &PathInputModal) {
     let area = centered_rect(frame.area(), 64, 9);
-    let block = Block::default()
-        .title(" Open Workspace ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Go to Path ").borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -721,7 +918,7 @@ fn render_path_input(frame: &mut Frame<'_>, current_directory: &Path, input: &Pa
     }
 
     let width = usize::from(inner.width);
-    let current = prefixed_path_line("Current: ", current_directory, width);
+    let current = prefixed_path_line("Current root: ", current_root, width);
     let path = prefixed_text_line("Path: ", &input.value, width);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -731,7 +928,7 @@ fn render_path_input(frame: &mut Frame<'_>, current_directory: &Path, input: &Pa
             Line::raw(""),
             Line::from(vec![
                 Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::raw(" Open      "),
+                Span::raw(" Go        "),
                 Span::styled("Esc", Style::default().fg(Color::Yellow)),
                 Span::raw(" Cancel"),
             ]),
@@ -756,11 +953,13 @@ fn prefixed_text_line(prefix: &str, value: &str, width: usize) -> String {
     }
 }
 
-fn render_error(frame: &mut Frame<'_>, error: &str) {
+fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
     let area = centered_rect(frame.area(), 64, 9);
-    let block = Block::default()
-        .title(" Workspace Open Failed ")
-        .borders(Borders::ALL);
+    let title = match error.kind {
+        GlobalHomeErrorKind::WorkspaceOpen => " Workspace Open Failed ",
+        GlobalHomeErrorKind::GoToPath => " Go to Path Failed ",
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -769,13 +968,16 @@ fn render_error(frame: &mut Frame<'_>, error: &str) {
     }
 
     frame.render_widget(
-        Paragraph::new(format!("{error}\n\nEnter / Esc  Dismiss")).wrap(Wrap { trim: false }),
+        Paragraph::new(format!("{}\n\nEnter / Esc  Dismiss", error.message))
+            .wrap(Wrap { trim: false }),
         inner,
     );
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
@@ -789,7 +991,7 @@ mod tests {
         }
     }
 
-    fn draw(state: &GlobalHomeState, width: u16, height: u16) -> Buffer {
+    fn draw(state: &mut GlobalHomeState, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
         terminal.backend().buffer().clone()
@@ -799,18 +1001,94 @@ mod tests {
         buffer.content().iter().map(|cell| cell.symbol()).collect()
     }
 
+    struct ScriptedGlobalTerminal {
+        batches: VecDeque<VecDeque<TerminalEvent>>,
+        active_batch: VecDeque<TerminalEvent>,
+        width: u16,
+        height: u16,
+        frames: Vec<String>,
+        reads: usize,
+    }
+
+    impl ScriptedGlobalTerminal {
+        fn new(
+            width: u16,
+            height: u16,
+            batches: impl IntoIterator<Item = Vec<TerminalEvent>>,
+        ) -> Self {
+            Self {
+                batches: batches.into_iter().map(VecDeque::from).collect(),
+                active_batch: VecDeque::new(),
+                width,
+                height,
+                frames: Vec::new(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl GlobalHomeTerminal for ScriptedGlobalTerminal {
+        fn draw_global_home(&mut self, render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()> {
+            let mut terminal = Terminal::new(TestBackend::new(self.width, self.height)).unwrap();
+            terminal.draw(|frame| render(frame)).unwrap();
+            self.frames.push(buffer_text(terminal.backend().buffer()));
+            Ok(())
+        }
+
+        fn finish_global_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_global_home_resize(&mut self) {}
+
+        fn poll_global_home(&mut self, wait: Duration) -> io::Result<bool> {
+            if !self.active_batch.is_empty() {
+                return Ok(true);
+            }
+            if wait == Duration::ZERO {
+                return Ok(false);
+            }
+            let Some(batch) = self.batches.pop_front() else {
+                return Err(io::Error::other("scripted Global Home input exhausted"));
+            };
+            self.active_batch = batch;
+            Ok(!self.active_batch.is_empty())
+        }
+
+        fn read_global_home(&mut self) -> io::Result<TerminalEvent> {
+            self.reads = self.reads.saturating_add(1);
+            self.active_batch
+                .pop_front()
+                .ok_or_else(|| io::Error::other("scripted Global Home batch is empty"))
+        }
+    }
+
+    fn event(code: KeyCode) -> TerminalEvent {
+        TerminalEvent::Key(key(code))
+    }
+
+    fn repeat_event(code: KeyCode) -> TerminalEvent {
+        TerminalEvent::Key(KeyEvent {
+            code,
+            kind: KeyEventKind::Repeat,
+            modifiers: Modifiers::default(),
+        })
+    }
+
     #[test]
-    fn dashboard_contains_only_phase_3a_2_actions_and_explicit_directory() {
-        let state = GlobalHomeState::new(PathBuf::from(r"D:\current\directory"));
-        let rendered = buffer_text(&draw(&state, 80, 24));
+    fn production_dashboard_and_explorer_show_phase_3b_2_actions_and_selection() {
+        let mut state = GlobalHomeState::new(PathBuf::from(r"D:\current\directory"));
+        let rendered = buffer_text(&draw(&mut state, 80, 24));
 
         for expected in branding::ascii_logo_lines().chain([
             SUBTITLE,
-            "Open Workspace",
+            "Explorer",
+            "Open",
+            "Go to Path",
             "Commands",
             "Shortcuts",
             "Quit",
-            r"Directory  D:\current\directory",
+            r"Selected  D:\current\directory",
         ]) {
             assert!(
                 rendered.contains(expected),
@@ -822,55 +1100,56 @@ mod tests {
     }
 
     #[test]
-    fn path_resolution_preserves_empty_relative_and_absolute_semantics() {
+    fn explorer_path_resolution_preserves_empty_relative_and_absolute_semantics() {
         let current = tempfile::tempdir().unwrap();
         let absolute = tempfile::tempdir().unwrap();
 
-        assert_eq!(resolve_workspace_path(current.path(), ""), current.path());
+        assert_eq!(resolve_explorer_path(current.path(), ""), current.path());
         assert_eq!(
-            resolve_workspace_path(current.path(), "workspace"),
+            resolve_explorer_path(current.path(), "workspace"),
             current.path().join("workspace")
         );
         assert_eq!(
-            resolve_workspace_path(current.path(), "workspace with spaces"),
+            resolve_explorer_path(current.path(), "workspace with spaces"),
             current.path().join("workspace with spaces")
         );
         assert_eq!(
-            resolve_workspace_path(current.path(), absolute.path().to_str().unwrap()),
+            resolve_explorer_path(current.path(), absolute.path().to_str().unwrap()),
             absolute.path()
         );
         assert_eq!(
-            resolve_workspace_path(current.path(), "."),
+            resolve_explorer_path(current.path(), "."),
             current.path().join(".")
         );
         assert_eq!(
-            resolve_workspace_path(current.path(), ".."),
+            resolve_explorer_path(current.path(), ".."),
             current.path().join("..")
         );
 
         #[cfg(windows)]
         assert_eq!(
-            resolve_workspace_path(current.path(), r"D:\My Projects\atcoder"),
+            resolve_explorer_path(current.path(), r"D:\My Projects\atcoder"),
             PathBuf::from(r"D:\My Projects\atcoder")
         );
     }
 
     #[test]
-    fn empty_enter_returns_the_original_pathbuf_without_display_roundtrip() {
-        let current = PathBuf::from("workspace/競プロ");
-        let mut state = GlobalHomeState::new(current.clone());
-        state.handle_key(key(KeyCode::Char('o')));
+    fn empty_go_to_path_rebases_the_original_pathbuf_without_display_roundtrip() {
+        let current = tempfile::tempdir().unwrap();
+        let original = current.path().to_path_buf();
+        let mut state = GlobalHomeState::new(original.clone());
+        state.handle_key(key(KeyCode::Char('g')));
 
-        assert_eq!(
-            state.handle_key(key(KeyCode::Enter)),
-            Some(GlobalHomeExit::OpenWorkspace(current))
-        );
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(state.explorer.root(), original);
+        assert_eq!(state.explorer.selected_path(), original);
+        assert!(state.path_input.is_none());
     }
 
     #[test]
     fn path_modal_owns_q_colon_and_question_mark_until_escape() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.handle_key(key(KeyCode::Char('o')));
+        state.handle_key(key(KeyCode::Char('g')));
         for character in ['q', ':', '?'] {
             assert_eq!(state.handle_key(key(KeyCode::Char(character))), None);
         }
@@ -885,20 +1164,28 @@ mod tests {
     }
 
     #[test]
-    fn palette_searches_open_workspace_and_quit_and_opens_the_path_modal() {
+    fn palette_searches_open_go_to_path_and_quit_and_runs_each_owner() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
         state.handle_key(key(KeyCode::Char(':')));
-        for character in "workspace".chars() {
+        for character in "path".chars() {
             state.handle_key(key(KeyCode::Char(character)));
         }
         assert_eq!(
             state.palette.filtered_commands(),
-            [GlobalHomeCommand::OpenWorkspace]
+            [GlobalHomeCommand::GoToPath]
         );
 
         state.handle_key(key(KeyCode::Enter));
         assert!(state.path_input.is_some());
         assert!(!state.palette.is_active());
+
+        state.handle_key(key(KeyCode::Escape));
+        let _ = draw(&mut state, 80, 24);
+        state.handle_key(key(KeyCode::Char(':')));
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(GlobalHomeExit::OpenWorkspace(PathBuf::from("root")))
+        );
     }
 
     #[test]
@@ -911,7 +1198,7 @@ mod tests {
         assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
         assert!(state.error.is_none());
 
-        state.handle_key(key(KeyCode::Char('o')));
+        state.handle_key(key(KeyCode::Char('g')));
         assert!(state.path_input.is_some());
     }
 
@@ -919,12 +1206,18 @@ mod tests {
     fn shortcut_help_matches_global_actions_and_is_one_shot() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
         state.handle_key(key(KeyCode::Char('?')));
-        let rendered = buffer_text(&draw(&state, 80, 24));
+        let rendered = buffer_text(&draw(&mut state, 80, 24));
         for expected in [
-            "o  Open Workspace",
-            ":  Commands",
-            "?  Shortcuts",
-            "q  Quit",
+            "o         Open",
+            "g         Go to Path",
+            "Enter     Expand / Collapse",
+            "↑↓ jk     Navigate",
+            "←→ hl     Collapse / Expand",
+            "Backspace Parent",
+            "r         Reload",
+            ":         Commands",
+            "?         Shortcuts",
+            "q         Quit",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -932,17 +1225,20 @@ mod tests {
             );
         }
 
-        state.handle_key(key(KeyCode::Char('o')));
+        let exit = state.handle_key(key(KeyCode::Char('o')));
         assert!(!state.shortcut_help_visible);
-        assert!(state.path_input.is_some());
+        assert_eq!(
+            exit,
+            Some(GlobalHomeExit::OpenWorkspace(PathBuf::from("root")))
+        );
     }
 
     #[test]
     fn palette_selection_highlights_the_full_usable_row_with_unicode_width() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
         state.handle_key(key(KeyCode::Char(':')));
-        let buffer = draw(&state, 80, 24);
-        let palette_area = centered_rect(Rect::new(0, 0, 80, 24), 52, 9);
+        let buffer = draw(&mut state, 80, 24);
+        let palette_area = centered_rect(Rect::new(0, 0, 80, 24), 52, 10);
         let inner = Block::default().borders(Borders::ALL).inner(palette_area);
         let list_area = view::command_palette_list_area(
             Rect::new(
@@ -974,15 +1270,15 @@ mod tests {
 
     #[test]
     fn unicode_and_tiny_layouts_do_not_panic_and_keep_the_directory_tail_when_possible() {
-        let state = GlobalHomeState::new(PathBuf::from(
+        let mut state = GlobalHomeState::new(PathBuf::from(
             r"C:\Users\ユーザー\very-long-parent\競プロ\atcoder",
         ));
 
         for (width, height) in [(0, 0), (1, 1), (12, 4), (30, 8), (80, 24)] {
-            let _ = draw(&state, width, height);
+            let _ = draw(&mut state, width, height);
         }
 
-        let line = prefixed_path_line(DIRECTORY_PREFIX, &state.current_directory, 30);
+        let line = prefixed_path_line(SELECTED_PREFIX, state.explorer.selected_path(), 30);
         assert!(UnicodeWidthStr::width(line.as_str()) <= 30);
         assert!(line.ends_with(r"\競プロ\atcoder"));
         assert!(!line.contains('\u{fffd}'));
@@ -991,15 +1287,366 @@ mod tests {
     #[test]
     fn path_and_error_modals_render_safely_in_small_terminals() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.handle_key(key(KeyCode::Char('o')));
+        state.handle_key(key(KeyCode::Char('g')));
         state.handle_paste("relative/workspace");
         for (width, height) in [(0, 0), (1, 1), (8, 3), (24, 5), (80, 24)] {
-            let _ = draw(&state, width, height);
+            let _ = draw(&mut state, width, height);
         }
 
         state.show_workspace_open_error("failed".to_string());
         for (width, height) in [(0, 0), (1, 1), (8, 3), (24, 5), (80, 24)] {
-            let _ = draw(&state, width, height);
+            let _ = draw(&mut state, width, height);
         }
+    }
+
+    #[test]
+    fn responsive_panes_apply_threshold_clamp_centering_separator_and_selected_footer() {
+        for (width, expected_explorer, expected_dashboard) in [
+            (61, None, 61),
+            (62, Some(32), 30),
+            (80, Some(32), 48),
+            (120, Some(36), 84),
+            (160, Some(48), 112),
+        ] {
+            let area = Rect::new(0, 0, width, 24);
+            let panes = global_home_panes(area);
+            assert_eq!(panes.explorer.map(|area| area.width), expected_explorer);
+            assert_eq!(panes.dashboard.width, expected_dashboard);
+            assert_eq!(
+                panes.dashboard.x,
+                expected_explorer.unwrap_or_default(),
+                "unexpected dashboard origin at width {width}"
+            );
+            let layout = global_home_layout(panes.dashboard);
+            assert_eq!(
+                layout.menu.x,
+                panes
+                    .dashboard
+                    .x
+                    .saturating_add(panes.dashboard.width.saturating_sub(MENU_WIDTH) / 2),
+                "menu was not centered inside the right pane at width {width}"
+            );
+
+            let mut state = GlobalHomeState::new(PathBuf::from("selected-root"));
+            let buffer = draw(&mut state, width, 24);
+            let text = buffer_text(&buffer);
+            assert!(text.contains("Selected  selected-root"));
+            if let Some(explorer_width) = expected_explorer {
+                assert!(text.contains("Explorer"));
+                assert_eq!(buffer.cell((explorer_width - 1, 0)).unwrap().symbol(), "│");
+            } else {
+                assert!(!text.contains("Explorer"));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_open_uses_full_screen_overlay_and_resize_to_wide_closes_it_without_state_loss() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("a-child");
+        std::fs::create_dir(&child).unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+
+        let dashboard = buffer_text(&draw(&mut state, 61, 12));
+        assert!(!dashboard.contains("Explorer"));
+        assert_eq!(state.handle_key(key(KeyCode::Char('o'))), None);
+        assert!(state.explorer_overlay_visible);
+
+        let overlay = buffer_text(&draw(&mut state, 61, 12));
+        assert!(overlay.contains("Explorer"));
+        assert!(overlay.contains("o Open   g Go to Path   Esc Close"));
+        state.handle_key(key(KeyCode::Enter));
+        state.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(state.explorer.selected_path(), child);
+
+        let _ = draw(&mut state, 80, 12);
+        assert!(!state.explorer_overlay_visible);
+        assert_eq!(state.explorer.selected_path(), child);
+    }
+
+    #[test]
+    fn explorer_overlay_renderer_survives_zero_very_narrow_and_very_short_geometry() {
+        for (width, height) in [(0, 0), (1, 1), (4, 2), (20, 3)] {
+            let mut state = GlobalHomeState::new(PathBuf::from("root"));
+            state.explorer_overlay_visible = true;
+            let _ = draw(&mut state, width, height);
+        }
+    }
+
+    #[test]
+    fn production_loop_routes_tree_navigation_and_opens_the_selected_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("a-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("nested")).unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            24,
+            [
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('j'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('o'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::OpenWorkspace(workspace.clone())
+        );
+        assert_eq!(state.explorer.selected_path(), workspace);
+        assert!(terminal.frames.iter().any(|frame| frame.contains("nested")));
+    }
+
+    #[test]
+    fn production_loop_go_to_path_handles_relative_then_absolute_without_opening_or_chdir() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = root.path().join("relative");
+        std::fs::create_dir(&relative).unwrap();
+        let absolute = tempfile::tempdir().unwrap();
+        let cwd_before = std::env::current_dir().unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            24,
+            [
+                vec![event(KeyCode::Char('g'))],
+                vec![TerminalEvent::Paste("relative".to_string())],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('g'))],
+                vec![TerminalEvent::Paste(
+                    absolute.path().to_string_lossy().into_owned(),
+                )],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| { frame.contains(relative.to_string_lossy().as_ref()) })
+        );
+        assert_eq!(state.explorer.root(), absolute.path());
+        assert_eq!(state.explorer.selected_path(), absolute.path());
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+    }
+
+    #[test]
+    fn go_to_path_failure_closes_input_shows_global_error_and_preserves_entire_explorer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "not a directory").unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        state.handle_key(key(KeyCode::Enter));
+        state.handle_key(key(KeyCode::Char('j')));
+        let old_explorer = state.explorer.clone();
+
+        state.handle_key(key(KeyCode::Char('g')));
+        state.handle_paste(file.to_string_lossy().as_ref());
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+
+        assert_eq!(state.explorer, old_explorer);
+        assert!(state.path_input.is_none());
+        assert!(matches!(
+            state.error.as_ref().map(|error| error.kind),
+            Some(GlobalHomeErrorKind::GoToPath)
+        ));
+        assert!(
+            state
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("path is not a directory")
+        );
+        let rendered = buffer_text(&draw(&mut state, 80, 24));
+        assert!(rendered.contains("Go to Path Failed"));
+    }
+
+    #[test]
+    fn open_and_modal_or_overlay_transitions_preserve_same_batch_ownership() {
+        let root = tempfile::tempdir().unwrap();
+
+        let mut wide_state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut wide_terminal = ScriptedGlobalTerminal::new(
+            80,
+            24,
+            [vec![event(KeyCode::Char('o')), event(KeyCode::Char('q'))]],
+        );
+        assert_eq!(
+            run_with_terminal(&mut wide_terminal, &mut wide_state).unwrap(),
+            GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
+        );
+        assert_eq!(wide_terminal.reads, 2);
+
+        let mut narrow_state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut narrow_terminal = ScriptedGlobalTerminal::new(
+            61,
+            24,
+            [
+                vec![event(KeyCode::Char('o')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        assert_eq!(
+            run_with_terminal(&mut narrow_terminal, &mut narrow_state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(narrow_terminal.reads, 4);
+
+        let mut modal_state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut modal_terminal = ScriptedGlobalTerminal::new(
+            80,
+            24,
+            [
+                vec![event(KeyCode::Char('g')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        assert_eq!(
+            run_with_terminal(&mut modal_terminal, &mut modal_state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(modal_terminal.reads, 4);
+        assert!(
+            modal_terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Path: q"))
+        );
+    }
+
+    #[test]
+    fn production_narrow_palette_open_opens_the_explorer_overlay_before_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            61,
+            24,
+            [
+                vec![event(KeyCode::Char(':'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.reads, 4);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("o Open   g Go to Path   Esc Close"))
+        );
+    }
+
+    #[test]
+    fn production_narrow_palette_open_gives_same_batch_q_to_the_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            61,
+            24,
+            [
+                vec![event(KeyCode::Char(':'))],
+                vec![event(KeyCode::Enter), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.reads, 5);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Explorer"))
+        );
+    }
+
+    #[test]
+    fn production_wide_palette_open_still_opens_and_discards_same_batch_input() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            80,
+            24,
+            [
+                vec![event(KeyCode::Char(':'))],
+                vec![event(KeyCode::Enter), event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
+        );
+        assert_eq!(terminal.reads, 3);
+    }
+
+    #[test]
+    fn production_narrow_hidden_enter_keeps_the_root_collapsed_and_unloaded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let old_explorer = state.explorer.clone();
+        let mut terminal = ScriptedGlobalTerminal::new(
+            61,
+            24,
+            [vec![event(KeyCode::Enter)], vec![event(KeyCode::Char('q'))]],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(state.explorer, old_explorer);
+    }
+
+    #[test]
+    fn production_narrow_hidden_navigation_and_repeat_leave_explorer_and_cwd_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("a-child")).unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        assert!(state.explorer.toggle_selected());
+        std::fs::create_dir(root.path().join("b-child-added-after-load")).unwrap();
+        let old_explorer = state.explorer.clone();
+        let cwd_before = std::env::current_dir().unwrap();
+        let mut terminal = ScriptedGlobalTerminal::new(
+            61,
+            24,
+            [
+                vec![repeat_event(KeyCode::Char('j'))],
+                vec![event(KeyCode::Char('j'))],
+                vec![event(KeyCode::Backspace)],
+                vec![event(KeyCode::Char('r'))],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(state.explorer, old_explorer);
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
     }
 }

@@ -5,7 +5,6 @@ mod detail;
 pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
-#[allow(dead_code)] // Staged for Home integration in Phase 3B-2.
 pub(crate) mod explorer;
 mod global_home;
 mod home;

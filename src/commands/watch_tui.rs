@@ -2293,7 +2293,7 @@ mod tests {
         let AppLocation::GlobalHome(state) = location else {
             panic!("a no-marker bare launch must remain at Global Home")
         };
-        assert_eq!(state.current_directory(), root.path());
+        assert_eq!(state.explorer_root(), root.path());
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         assert!(probe.global_draws.get() > 0);
@@ -2330,19 +2330,24 @@ mod tests {
     }
 
     #[test]
-    fn production_global_home_opens_explicit_workspace_with_one_terminal_session() {
+    fn production_global_home_tree_navigation_opens_workspace_with_one_terminal_session() {
         let launch = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        write_empty_workspace(workspace.path());
+        let workspace = launch.path().join("a-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("nested")).unwrap();
+        std::fs::create_dir(launch.path().join("b-other")).unwrap();
+        std::fs::write(launch.path().join("file.txt"), "ignored by Explorer").unwrap();
+        write_empty_workspace(&workspace);
         let probe = BareApplicationProbe::default();
         let cwd_before = std::env::current_dir().unwrap();
 
         let location = run_scripted_bare_application(
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
-                vec![paste(workspace.path().to_string_lossy())],
                 vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('o')],
                 vec![crate::tui::test_key_press('q')],
             ],
             &probe,
@@ -2352,12 +2357,15 @@ mod tests {
         let AppLocation::Workspace(runtime) = location else {
             panic!("the validated workspace must commit after Global Home")
         };
-        assert_eq!(runtime.app_context.workspace_root(), Some(workspace.path()));
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(workspace.as_path())
+        );
         assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         assert!(probe.global_draws.get() > 0);
-        assert!(probe.global_reads.get() >= 3);
+        assert!(probe.global_reads.get() >= 4);
         assert!(probe.workspace_draws.get() > 0);
         assert_eq!(probe.workspace_reads.get(), 1);
         assert_eq!(probe.contest_frontend_dispatches.get(), 0);
@@ -2367,17 +2375,18 @@ mod tests {
     #[test]
     fn successful_open_discards_later_keys_in_the_same_batch_but_next_batch_q_quits_workspace() {
         let launch = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        write_empty_workspace(workspace.path());
+        let workspace = launch.path().join("a-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        write_empty_workspace(&workspace);
         let probe = BareApplicationProbe::default();
 
         let location = run_scripted_bare_application(
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
-                vec![paste(workspace.path().to_string_lossy())],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
                 vec![
-                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('o'),
                     crate::tui::test_key_press('q'),
                 ],
                 vec![crate::tui::test_key_press('q')],
@@ -2394,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn open_key_then_same_batch_q_is_owned_by_the_path_modal() {
+    fn go_to_path_key_then_same_batch_q_is_owned_by_the_path_modal() {
         let launch = tempfile::tempdir().unwrap();
         let probe = BareApplicationProbe::default();
 
@@ -2402,7 +2411,7 @@ mod tests {
             launch.path(),
             [
                 vec![
-                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_press('g'),
                     crate::tui::test_key_press('q'),
                 ],
                 vec![crate::tui::test_key_escape()],
@@ -2430,16 +2439,16 @@ mod tests {
     #[test]
     fn production_no_marker_open_failure_keeps_global_home_and_live_terminal() {
         let launch = tempfile::tempdir().unwrap();
-        let missing = launch.path().join("not-a-workspace");
+        let missing = launch.path().join("a-not-a-workspace");
         std::fs::create_dir(&missing).unwrap();
         let probe = BareApplicationProbe::default();
 
         let location = run_scripted_bare_application(
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
-                vec![paste(missing.to_string_lossy())],
                 vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![crate::tui::test_key_press('o')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2450,7 +2459,8 @@ mod tests {
         let AppLocation::GlobalHome(state) = location else {
             panic!("a no-marker selection must not commit a workspace runtime")
         };
-        assert_eq!(state.current_directory(), launch.path());
+        assert_eq!(state.explorer_root(), launch.path());
+        assert_eq!(state.explorer_selected_path(), missing);
         assert_eq!(probe.workspace_draws.get(), 0);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
@@ -2463,16 +2473,17 @@ mod tests {
     #[test]
     fn production_invalid_selected_marker_keeps_global_home_and_same_terminal() {
         let launch = tempfile::tempdir().unwrap();
-        let invalid = tempfile::tempdir().unwrap();
-        std::fs::write(invalid.path().join(".atc-workspace.toml"), "invalid").unwrap();
+        let invalid = launch.path().join("a-invalid");
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::write(invalid.join(".atc-workspace.toml"), "invalid").unwrap();
         let probe = BareApplicationProbe::default();
 
         let location = run_scripted_bare_application(
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
-                vec![paste(invalid.path().to_string_lossy())],
                 vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![crate::tui::test_key_press('o')],
                 vec![crate::tui::test_key_escape()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2480,28 +2491,33 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("an invalid selected marker must retain Global Home")
+        };
+        assert_eq!(state.explorer_root(), launch.path());
+        assert_eq!(state.explorer_selected_path(), invalid);
         assert_eq!(probe.workspace_draws.get(), 0);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.contains("Workspace Open Failed"));
         assert!(rendered.contains("workspace config"));
-        assert!(rendered.contains(invalid.path().to_string_lossy().as_ref()));
+        assert!(rendered.contains(invalid.to_string_lossy().as_ref()));
     }
 
     #[test]
     fn config_load_failure_during_global_open_keeps_global_home_and_same_terminal() {
         let launch = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        write_empty_workspace(workspace.path());
+        let workspace = launch.path().join("a-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        write_empty_workspace(&workspace);
         let probe = BareApplicationProbe::default();
         let config_loads = std::cell::Cell::new(0);
         let terminal = BareTerminalSpy::new(
             [
-                vec![crate::tui::test_key_press('o')],
-                vec![paste(workspace.path().to_string_lossy())],
                 vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![crate::tui::test_key_press('o')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('q')],
             ],
@@ -2532,7 +2548,11 @@ mod tests {
         })
         .unwrap();
 
-        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("a config load failure must retain Global Home")
+        };
+        assert_eq!(state.explorer_root(), launch.path());
+        assert_eq!(state.explorer_selected_path(), workspace);
         assert_eq!(config_loads.get(), 1);
         assert_eq!(probe.workspace_draws.get(), 0);
         assert_eq!(probe.terminal_starts.get(), 1);
@@ -2540,11 +2560,11 @@ mod tests {
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.contains("Workspace Open Failed"));
         assert!(rendered.contains("config load failed"));
-        assert!(rendered.contains(workspace.path().to_string_lossy().as_ref()));
+        assert!(rendered.contains(workspace.to_string_lossy().as_ref()));
     }
 
     #[test]
-    fn production_relative_open_resolves_from_global_directory_without_changing_process_cwd() {
+    fn production_relative_go_to_path_rebases_then_open_uses_selection_without_changing_cwd() {
         let launch = tempfile::tempdir().unwrap();
         let workspace = launch.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -2555,9 +2575,10 @@ mod tests {
         let location = run_scripted_bare_application(
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_press('g')],
                 vec![paste("workspace")],
                 vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('o')],
                 vec![crate::tui::test_key_press('q')],
             ],
             &probe,
@@ -2777,7 +2798,7 @@ mod tests {
             let AppLocation::GlobalHome(state) = location else {
                 panic!("a no-marker launch must enter Global Home")
             };
-            assert_eq!(state.current_directory(), root.path());
+            assert_eq!(state.explorer_root(), root.path());
             Ok(())
         })
         .unwrap();
@@ -2798,7 +2819,7 @@ mod tests {
             let AppLocation::GlobalHome(state) = location else {
                 panic!("a child without an exact marker must enter Global Home")
             };
-            assert_eq!(state.current_directory(), child);
+            assert_eq!(state.explorer_root(), child);
             Ok(())
         })
         .unwrap();

@@ -83,7 +83,7 @@ impl ExplorerState {
         }
     }
 
-    fn root_path(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
@@ -91,10 +91,11 @@ impl ExplorerState {
         &self.selected
     }
 
-    fn status(&self) -> Option<&str> {
+    pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
 
+    #[cfg(test)]
     fn scroll(&self) -> usize {
         self.scroll
     }
@@ -619,7 +620,7 @@ mod tests {
         let root = PathBuf::from("missing-root-is-fine");
         let state = ExplorerState::new(root.clone());
 
-        assert_eq!(state.root_path(), root);
+        assert_eq!(state.root(), root);
         assert_eq!(state.selected_path(), root);
         assert_eq!(state.scroll(), 0);
         assert_eq!(state.status(), None);
@@ -933,7 +934,7 @@ mod tests {
         state.scroll = 3;
 
         assert!(state.rebase(new_root.clone()));
-        assert_eq!(state.root_path(), new_root);
+        assert_eq!(state.root(), new_root);
         assert_eq!(state.selected_path(), new_root);
         assert_eq!(state.nodes.len(), 1);
         assert!(state.nodes[&new_root].children.is_none());
@@ -941,9 +942,9 @@ mod tests {
         assert_eq!(state.status(), None);
 
         assert!(state.rebase_to_parent());
-        assert_eq!(state.root_path(), temp.path());
+        assert_eq!(state.root(), temp.path());
         assert_eq!(state.selected_path(), temp.path());
-        assert!(state.nodes[state.root_path()].children.is_none());
+        assert!(state.nodes[state.root()].children.is_none());
     }
 
     #[test]
