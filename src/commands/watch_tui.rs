@@ -792,6 +792,7 @@ where
         preferences,
         start_terminal,
         WorkspaceRuntime::open,
+        workspace::initialize_workspace,
     )
 }
 
@@ -800,6 +801,7 @@ fn run_bare_application_with<T>(
     preferences: &mut crate::tui::FrontendPreferences,
     start_terminal: impl FnOnce() -> io::Result<T>,
     open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
+    initialize_workspace: impl FnMut(&Path) -> io::Result<workspace::WorkspaceInitialization>,
 ) -> Result<(), AppError>
 where
     T: ApplicationTerminal,
@@ -819,8 +821,13 @@ where
         }
     };
 
-    let result =
-        run_application_locations_with(location, &mut terminal, preferences, open_workspace);
+    let result = run_application_locations_with(
+        location,
+        &mut terminal,
+        preferences,
+        open_workspace,
+        initialize_workspace,
+    );
     let mouse_mode_label = terminal.mouse_mode_label();
     let mouse_trace_line = terminal.mouse_trace_line();
     let cleanup_result = match location {
@@ -874,6 +881,7 @@ fn run_application_locations_with<T>(
     terminal: &mut T,
     preferences: &mut crate::tui::FrontendPreferences,
     mut open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
+    mut initialize_workspace: impl FnMut(&Path) -> io::Result<workspace::WorkspaceInitialization>,
 ) -> io::Result<()>
 where
     T: ApplicationTerminal,
@@ -900,11 +908,7 @@ where
                     let AppLocation::GlobalHome(state) = location else {
                         unreachable!("a non-workspace open cannot commit the workspace")
                     };
-                    state.show_workspace_open_error(format!(
-                        "Could not open workspace {}:\nfilesystem operation failed: Not an atc workspace: {}",
-                        path.display(),
-                        path.display()
-                    ));
+                    state.show_initialize_workspace_confirmation(path);
                 }
                 Err(error) => {
                     let AppLocation::GlobalHome(state) = location else {
@@ -916,6 +920,50 @@ where
                     ));
                 }
             },
+            crate::tui::GlobalHomeExit::InitializeWorkspace(path) => {
+                match initialize_workspace(&path) {
+                    Ok(
+                        workspace::WorkspaceInitialization::Created(_)
+                        | workspace::WorkspaceInitialization::AlreadyInitialized(_),
+                    ) => match open_workspace(&path) {
+                        Ok(WorkspaceOpenOutcome::Opened(runtime)) => {
+                            terminal.discard_global_home_input_batch()?;
+                            *location = AppLocation::Workspace(runtime);
+                        }
+                        Ok(WorkspaceOpenOutcome::NotWorkspace) => {
+                            let AppLocation::GlobalHome(state) = location else {
+                                unreachable!(
+                                    "post-initialization open failure cannot commit the workspace"
+                                )
+                            };
+                            state.show_workspace_initialized_open_error(format!(
+                                "Workspace initialized, but opening failed:\nNot an atc workspace: {}",
+                                path.display()
+                            ));
+                        }
+                        Err(error) => {
+                            let AppLocation::GlobalHome(state) = location else {
+                                unreachable!(
+                                    "post-initialization open failure cannot commit the workspace"
+                                )
+                            };
+                            state.show_workspace_initialized_open_error(format!(
+                                "Workspace initialized at {}, but opening failed:\n{error}",
+                                path.display()
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        let AppLocation::GlobalHome(state) = location else {
+                            unreachable!("failed initialization cannot commit the workspace")
+                        };
+                        state.show_workspace_initialization_error(format!(
+                            "Could not initialize workspace {}:\n{error}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -1959,11 +2007,23 @@ mod tests {
     struct BareTerminalSpy {
         batches: VecDeque<VecDeque<crate::tui::TerminalEvent>>,
         active_batch: VecDeque<crate::tui::TerminalEvent>,
+        width: u16,
+        height: u16,
+        discard_error: bool,
         probe: BareApplicationProbe,
     }
 
     impl BareTerminalSpy {
         fn new(
+            batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
+            probe: BareApplicationProbe,
+        ) -> Self {
+            Self::new_at_size(100, 30, batches, probe)
+        }
+
+        fn new_at_size(
+            width: u16,
+            height: u16,
             batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
             probe: BareApplicationProbe,
         ) -> Self {
@@ -1973,8 +2033,16 @@ mod tests {
                     .map(VecDeque::from)
                     .collect::<VecDeque<_>>(),
                 active_batch: VecDeque::new(),
+                width,
+                height,
+                discard_error: false,
                 probe,
             }
+        }
+
+        fn with_discard_error(mut self) -> Self {
+            self.discard_error = true;
+            self
         }
 
         fn poll_script(&mut self, wait: Duration) -> io::Result<bool> {
@@ -1997,9 +2065,13 @@ mod tests {
                 .ok_or_else(|| io::Error::other("scripted terminal batch is empty"))
         }
 
-        fn render_to_text(render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<String> {
+        fn render_to_text(
+            width: u16,
+            height: u16,
+            render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> io::Result<String> {
             let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame)).unwrap();
             Ok(terminal
                 .backend()
@@ -2033,8 +2105,11 @@ mod tests {
             &mut self,
             render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
         ) -> io::Result<()> {
-            let rendered = Self::render_to_text(render)?;
-            if rendered.contains("Workspace Open Failed") {
+            let rendered = Self::render_to_text(self.width, self.height, render)?;
+            if rendered.contains("Workspace Open Failed")
+                || rendered.contains("Workspace Initialization Failed")
+                || rendered.contains("Workspace Initialized, Open Failed")
+            {
                 assert_eq!(
                     self.probe.terminal_restores.get(),
                     0,
@@ -2067,11 +2142,27 @@ mod tests {
                 .set(self.probe.global_reads.get() + 1);
             self.read_script()
         }
+
+        fn discard_global_home_input_batch(&mut self) -> io::Result<()> {
+            if self.discard_error {
+                return Err(io::Error::other("scripted input discard failed"));
+            }
+            for _ in 0..256 {
+                if !self.poll_script(Duration::ZERO)? {
+                    break;
+                }
+                self.probe
+                    .global_reads
+                    .set(self.probe.global_reads.get() + 1);
+                let _ = self.read_script()?;
+            }
+            Ok(())
+        }
     }
 
     impl crate::tui::HomeTerminal for BareTerminalSpy {
         fn draw_home(&mut self, render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<()> {
-            let _ = Self::render_to_text(render)?;
+            let _ = Self::render_to_text(self.width, self.height, render)?;
             self.probe
                 .workspace_draws
                 .set(self.probe.workspace_draws.get() + 1);
@@ -2262,7 +2353,17 @@ mod tests {
         batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
         probe: &BareApplicationProbe,
     ) -> Result<AppLocation, AppError> {
-        let terminal = BareTerminalSpy::new(batches, probe.clone());
+        run_scripted_bare_application_at_size(100, 30, launch_root, batches, probe)
+    }
+
+    fn run_scripted_bare_application_at_size(
+        width: u16,
+        height: u16,
+        launch_root: &Path,
+        batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
+        probe: &BareApplicationProbe,
+    ) -> Result<AppLocation, AppError> {
+        let terminal = BareTerminalSpy::new_at_size(width, height, batches, probe.clone());
         run_application_at_with(launch_root, |mut location| {
             let mut preferences = crate::tui::FrontendPreferences::default();
             run_bare_application(&mut location, &mut preferences, || {
@@ -2394,6 +2495,13 @@ mod tests {
         assert_eq!(probe.workspace_reads.get(), 1);
         assert_eq!(probe.contest_frontend_dispatches.get(), 0);
         assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+        assert!(
+            probe
+                .rendered_global_frames
+                .borrow()
+                .iter()
+                .all(|frame| !frame.contains("Initialize Workspace"))
+        );
     }
 
     #[test]
@@ -2461,10 +2569,104 @@ mod tests {
     }
 
     #[test]
-    fn production_no_marker_same_batch_key_stays_with_global_home_error() {
+    fn production_wide_init_here_same_batch_opens_workspace_and_discards_later_key() {
         let launch = tempfile::tempdir().unwrap();
-        let missing = launch.path().join("a-not-a-workspace");
-        std::fs::create_dir(&missing).unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::write(ordinary.join("keep.txt"), "untouched").unwrap();
+        let probe = BareApplicationProbe::default();
+        let cwd_before = std::env::current_dir().unwrap();
+
+        let location = run_scripted_bare_application(
+            launch.path(),
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("confirmed initialization must open Workspace Home")
+        };
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(ordinary.as_path())
+        );
+        assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
+        let reference = tempfile::tempdir().unwrap();
+        workspace::initialize_workspace(reference.path()).unwrap();
+        assert_eq!(
+            std::fs::read(ordinary.join(".atc-workspace.toml")).unwrap(),
+            std::fs::read(reference.path().join(".atc-workspace.toml")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(ordinary.join("keep.txt")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(probe.global_reads.get(), 5);
+        assert_eq!(probe.workspace_reads.get(), 1);
+        assert_eq!(probe.terminal_starts.get(), 1);
+        assert_eq!(probe.terminal_restores.get(), 1);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Initialize Workspace"));
+        assert!(rendered.contains(ordinary.to_string_lossy().as_ref()));
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+    }
+
+    #[test]
+    fn initialization_does_not_commit_workspace_when_batch_discard_fails() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+            ],
+            probe.clone(),
+        )
+        .with_discard_error();
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            let error = run_bare_application(&mut location, &mut preferences, || {
+                probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                Ok(terminal)
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("scripted input discard failed"));
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("discard failure must leave the workspace candidate uncommitted")
+        };
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert!(ordinary.join(".atc-workspace.toml").is_file());
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.terminal_restores.get(), 1);
+    }
+
+    #[test]
+    fn production_wide_init_here_cancel_same_batch_preserves_selection_and_quits_globally() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
         let probe = BareApplicationProbe::default();
 
         let location = run_scripted_bare_application(
@@ -2474,29 +2676,108 @@ mod tests {
                 vec![crate::tui::test_key_press('j')],
                 vec![
                     crate::tui::test_key_press('o'),
+                    crate::tui::test_key_escape(),
                     crate::tui::test_key_press('q'),
                 ],
-                vec![crate::tui::test_key_enter()],
-                vec![crate::tui::test_key_press('q')],
             ],
             &probe,
         )
         .unwrap();
 
         let AppLocation::GlobalHome(state) = location else {
-            panic!("a no-marker selection must not commit a workspace runtime")
+            panic!("cancelled initialization must retain Global Home")
         };
         assert_eq!(state.explorer_root(), launch.path());
-        assert_eq!(state.explorer_selected_path(), missing);
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert!(!ordinary.join(".atc-workspace.toml").exists());
+        assert_eq!(probe.global_reads.get(), 5);
         assert_eq!(probe.workspace_draws.get(), 0);
+        assert!(
+            probe
+                .rendered_global_frames
+                .borrow()
+                .iter()
+                .any(|frame| frame.contains("Initialize Workspace"))
+        );
+    }
+
+    #[test]
+    fn production_narrow_init_here_opens_overlay_then_initializes_workspace() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application_at_size(
+            61,
+            24,
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("narrow confirmed initialization must open Workspace Home")
+        };
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(ordinary.as_path())
+        );
+        assert!(ordinary.join(".atc-workspace.toml").is_file());
         assert_eq!(probe.global_reads.get(), 6);
-        assert_eq!(probe.terminal_starts.get(), 1);
-        assert_eq!(probe.terminal_restores.get(), 1);
+        assert_eq!(probe.workspace_reads.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
-        assert!(rendered.contains("filesystem operation failed"));
-        assert!(rendered.contains("Not an atc workspace"));
-        assert!(rendered.contains(missing.to_string_lossy().as_ref()));
+        assert!(rendered.contains("o Open   g Go to Path   Esc Close"));
+        assert!(rendered.contains("Initialize Workspace"));
+    }
+
+    #[test]
+    fn production_narrow_init_here_cancel_returns_to_overlay_and_same_batch_q_cannot_quit() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+
+        let location = run_scripted_bare_application_at_size(
+            61,
+            24,
+            launch.path(),
+            [
+                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_escape(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![
+                    crate::tui::test_key_escape(),
+                    crate::tui::test_key_press('q'),
+                ],
+            ],
+            &probe,
+        )
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("narrow cancelled initialization must retain Global Home")
+        };
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert!(!ordinary.join(".atc-workspace.toml").exists());
+        assert_eq!(probe.global_reads.get(), 8);
+        assert_eq!(probe.workspace_draws.get(), 0);
     }
 
     #[test]
@@ -2534,6 +2815,7 @@ mod tests {
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.matches("Workspace Open Failed").count() >= 2);
+        assert!(!rendered.contains("Initialize Workspace"));
         assert!(rendered.contains("workspace config"));
         assert!(rendered.contains(invalid.to_string_lossy().as_ref()));
     }
@@ -2579,6 +2861,7 @@ mod tests {
                         crate::tui::SubmissionHub::new,
                     )
                 },
+                workspace::initialize_workspace,
             )?;
             Ok(location)
         })
@@ -2596,8 +2879,323 @@ mod tests {
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.matches("Workspace Open Failed").count() >= 2);
+        assert!(!rendered.contains("Initialize Workspace"));
         assert!(rendered.contains("config load failed"));
         assert!(rendered.contains(workspace.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn initialization_failure_same_batch_key_is_owned_by_error_and_keeps_global_home() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+        let initialization_attempts = std::cell::Cell::new(0);
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                WorkspaceRuntime::open,
+                |path| {
+                    initialization_attempts.set(initialization_attempts.get() + 1);
+                    std::fs::remove_dir(path).unwrap();
+                    workspace::initialize_workspace(path)
+                },
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("failed initialization must retain Global Home")
+        };
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert_eq!(state.initialize_workspace_target(), None);
+        assert_eq!(initialization_attempts.get(), 1);
+        assert_eq!(probe.global_reads.get(), 7);
+        assert_eq!(probe.workspace_draws.get(), 0);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Initialization Failed"));
+        assert!(rendered.contains("Could not initialize workspace"));
+        assert!(rendered.contains("Initialize Workspace"));
+    }
+
+    #[test]
+    fn initialized_workspace_open_failure_keeps_marker_and_same_batch_error_ownership() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+        let config_loads = std::cell::Cell::new(0);
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                |path| {
+                    open_workspace_runtime_with(
+                        path,
+                        || {
+                            config_loads.set(config_loads.get() + 1);
+                            Err(io::Error::other("config load failed after initialization").into())
+                        },
+                        crate::tui::SubmissionHub::new,
+                    )
+                },
+                workspace::initialize_workspace,
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("post-initialization open failure must retain Global Home")
+        };
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert_eq!(state.initialize_workspace_target(), None);
+        assert_eq!(config_loads.get(), 1);
+        assert!(ordinary.join(".atc-workspace.toml").is_file());
+        assert_eq!(probe.global_reads.get(), 7);
+        assert_eq!(probe.workspace_draws.get(), 0);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Initialized, Open Failed"));
+        assert!(rendered.contains("Workspace initialized at"));
+        assert!(rendered.contains("config load failed after"));
+        assert!(rendered.contains("initialization"));
+    }
+
+    #[test]
+    fn valid_marker_created_during_confirmation_is_not_overwritten_and_opens_workspace() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let external_marker = b"version = 1\npaths = []\n# externally initialized\n";
+        let probe = BareApplicationProbe::default();
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                WorkspaceRuntime::open,
+                |path| {
+                    std::fs::write(path.join(".atc-workspace.toml"), external_marker).unwrap();
+                    let result = workspace::initialize_workspace(path)?;
+                    assert!(matches!(
+                        result,
+                        workspace::WorkspaceInitialization::AlreadyInitialized(_)
+                    ));
+                    Ok(result)
+                },
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("an externally initialized workspace must open")
+        };
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(ordinary.as_path())
+        );
+        assert_eq!(
+            std::fs::read(ordinary.join(".atc-workspace.toml")).unwrap(),
+            external_marker
+        );
+        assert_eq!(probe.global_reads.get(), 5);
+        assert_eq!(probe.workspace_reads.get(), 1);
+    }
+
+    #[test]
+    fn invalid_marker_created_during_confirmation_is_preserved_as_initialization_failure() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let invalid_marker = b"invalid external bytes";
+        let probe = BareApplicationProbe::default();
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                WorkspaceRuntime::open,
+                |path| {
+                    std::fs::write(path.join(".atc-workspace.toml"), invalid_marker).unwrap();
+                    workspace::initialize_workspace(path)
+                },
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("an invalid marker race must retain Global Home")
+        };
+        assert_eq!(state.explorer_selected_path(), ordinary);
+        assert_eq!(
+            std::fs::read(ordinary.join(".atc-workspace.toml")).unwrap(),
+            invalid_marker
+        );
+        assert_eq!(probe.workspace_draws.get(), 0);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Initialization Failed"));
+        assert!(rendered.contains("failed to parse workspace config"));
+    }
+
+    #[test]
+    fn marker_removed_after_initialization_reopens_as_not_workspace_without_reproposal() {
+        let launch = tempfile::tempdir().unwrap();
+        let ordinary = launch.path().join("a-ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let probe = BareApplicationProbe::default();
+        let initialization_attempts = std::cell::Cell::new(0);
+        let marker_created = std::cell::Cell::new(false);
+        let marker_removed = std::cell::Cell::new(false);
+        let terminal = BareTerminalSpy::new(
+            [
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('j')],
+                vec![
+                    crate::tui::test_key_press('o'),
+                    crate::tui::test_key_enter(),
+                    crate::tui::test_key_press('q'),
+                ],
+                vec![crate::tui::test_key_enter()],
+                vec![crate::tui::test_key_press('q')],
+            ],
+            probe.clone(),
+        );
+
+        let location = run_application_at_with(launch.path(), |mut location| {
+            let mut preferences = crate::tui::FrontendPreferences::default();
+            run_bare_application_with(
+                &mut location,
+                &mut preferences,
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+                WorkspaceRuntime::open,
+                |path| {
+                    initialization_attempts.set(initialization_attempts.get() + 1);
+                    let outcome = workspace::initialize_workspace(path)?;
+                    assert!(matches!(
+                        &outcome,
+                        workspace::WorkspaceInitialization::Created(_)
+                    ));
+
+                    let marker = path.join(".atc-workspace.toml");
+                    marker_created.set(marker.is_file());
+                    std::fs::remove_file(&marker)?;
+                    marker_removed.set(!marker.exists());
+                    Ok(outcome)
+                },
+            )?;
+            Ok(location)
+        })
+        .unwrap();
+
+        let AppLocation::GlobalHome(state) = location else {
+            panic!("post-initialization NotWorkspace must retain Global Home")
+        };
+        assert_eq!(state.initialize_workspace_target(), None);
+        assert_eq!(initialization_attempts.get(), 1);
+        assert!(marker_created.get());
+        assert!(marker_removed.get());
+        assert!(!ordinary.join(".atc-workspace.toml").exists());
+        assert_eq!(probe.workspace_draws.get(), 0);
+        assert_eq!(probe.workspace_reads.get(), 0);
+        assert_eq!(probe.global_reads.get(), 7);
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Initialized, Open Failed"));
+        assert!(rendered.contains("Workspace initialized, but opening failed"));
+        assert!(rendered.contains("Not an atc workspace"));
+        assert_eq!(
+            probe
+                .rendered_global_frames
+                .borrow()
+                .iter()
+                .filter(|frame| frame.contains("Initialize Workspace"))
+                .count(),
+            1,
+            "the marker-removal race must not re-propose initialization"
+        );
     }
 
     #[test]

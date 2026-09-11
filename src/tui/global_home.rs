@@ -44,6 +44,7 @@ const DASHBOARD_MIN_WIDTH: u16 = 30;
 pub(crate) enum GlobalHomeExit {
     Quit,
     OpenWorkspace(PathBuf),
+    InitializeWorkspace(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,8 @@ impl GlobalHomeCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalHomeErrorKind {
     WorkspaceOpen,
+    WorkspaceInitialization,
+    WorkspaceInitializedOpen,
     GoToPath,
 }
 
@@ -83,6 +86,11 @@ enum GlobalHomeErrorKind {
 struct GlobalHomeError {
     kind: GlobalHomeErrorKind,
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitializeWorkspaceModal {
+    target: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -256,6 +264,7 @@ pub(crate) struct GlobalHomeState {
     explorer: ExplorerState,
     path_input: Option<PathInputModal>,
     error: Option<GlobalHomeError>,
+    initialize_workspace: Option<InitializeWorkspaceModal>,
     shortcut_help_visible: bool,
     palette: GlobalHomeCommandPalette,
     explorer_overlay_visible: bool,
@@ -268,6 +277,7 @@ impl GlobalHomeState {
             explorer: ExplorerState::new(root),
             path_input: None,
             error: None,
+            initialize_workspace: None,
             shortcut_help_visible: false,
             palette: GlobalHomeCommandPalette::default(),
             explorer_overlay_visible: false,
@@ -285,14 +295,38 @@ impl GlobalHomeState {
         self.explorer.selected_path()
     }
 
+    #[cfg(test)]
+    pub(crate) fn initialize_workspace_target(&self) -> Option<&Path> {
+        self.initialize_workspace
+            .as_ref()
+            .map(|modal| modal.target.as_path())
+    }
+
     pub(crate) fn show_workspace_open_error(&mut self, message: String) {
+        self.show_workspace_error(GlobalHomeErrorKind::WorkspaceOpen, message);
+    }
+
+    pub(crate) fn show_initialize_workspace_confirmation(&mut self, target: PathBuf) {
         self.path_input = None;
         self.palette.close();
         self.shortcut_help_visible = false;
-        self.error = Some(GlobalHomeError {
-            kind: GlobalHomeErrorKind::WorkspaceOpen,
-            message,
-        });
+        self.initialize_workspace = Some(InitializeWorkspaceModal { target });
+    }
+
+    pub(crate) fn show_workspace_initialization_error(&mut self, message: String) {
+        self.show_workspace_error(GlobalHomeErrorKind::WorkspaceInitialization, message);
+    }
+
+    pub(crate) fn show_workspace_initialized_open_error(&mut self, message: String) {
+        self.show_workspace_error(GlobalHomeErrorKind::WorkspaceInitializedOpen, message);
+    }
+
+    fn show_workspace_error(&mut self, kind: GlobalHomeErrorKind, message: String) {
+        self.initialize_workspace = None;
+        self.path_input = None;
+        self.palette.close();
+        self.shortcut_help_visible = false;
+        self.error = Some(GlobalHomeError { kind, message });
     }
 
     fn open_path_input(&mut self) {
@@ -389,6 +423,21 @@ impl GlobalHomeState {
             return None;
         }
 
+        if self.initialize_workspace.is_some() {
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
+                self.initialize_workspace = None;
+                return None;
+            }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+                let modal = self
+                    .initialize_workspace
+                    .take()
+                    .expect("active initialization confirmation must remain present until Enter");
+                return Some(GlobalHomeExit::InitializeWorkspace(modal.target));
+            }
+            return None;
+        }
+
         if self.path_input.is_some() {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
                 self.path_input = None;
@@ -471,7 +520,7 @@ impl GlobalHomeState {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.error.is_some() {
+        if self.error.is_some() || self.initialize_workspace.is_some() {
             return;
         }
         if let Some(input) = self.path_input.as_mut() {
@@ -778,9 +827,45 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     if let Some(input) = state.path_input.as_ref() {
         render_path_input(frame, state.explorer.root(), input);
     }
+    if let Some(modal) = state.initialize_workspace.as_ref() {
+        render_initialize_workspace(frame, modal);
+    }
     if let Some(error) = state.error.as_ref() {
         render_error(frame, error);
     }
+}
+
+fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspaceModal) {
+    let area = centered_rect(frame.area(), 64, 11);
+    let block = Block::default()
+        .title(" Initialize Workspace ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let target = prefixed_path_line("", &modal.target, usize::from(inner.width));
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::raw("This directory is not an atc workspace."),
+            Line::raw(""),
+            Line::raw("Initialize here?"),
+            Line::raw(""),
+            Line::raw(target),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::raw(" Initialize       "),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(" Cancel"),
+            ]),
+        ]))
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_shortcuts(frame: &mut Frame<'_>, explorer_pane_visible: bool) {
@@ -951,9 +1036,16 @@ fn prefixed_text_line(prefix: &str, value: &str, width: usize) -> String {
 }
 
 fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
-    let area = centered_rect(frame.area(), 64, 9);
+    let height = match error.kind {
+        GlobalHomeErrorKind::WorkspaceInitialization
+        | GlobalHomeErrorKind::WorkspaceInitializedOpen => 12,
+        GlobalHomeErrorKind::WorkspaceOpen | GlobalHomeErrorKind::GoToPath => 9,
+    };
+    let area = centered_rect(frame.area(), 64, height);
     let title = match error.kind {
         GlobalHomeErrorKind::WorkspaceOpen => " Workspace Open Failed ",
+        GlobalHomeErrorKind::WorkspaceInitialization => " Workspace Initialization Failed ",
+        GlobalHomeErrorKind::WorkspaceInitializedOpen => " Workspace Initialized, Open Failed ",
         GlobalHomeErrorKind::GoToPath => " Go to Path Failed ",
     };
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -978,7 +1070,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
-    use crate::tui::terminal::Modifiers;
+    use crate::tui::terminal::{Modifiers, PointerEvent, PointerKind, PointerPosition};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -1197,6 +1289,160 @@ mod tests {
 
         state.handle_key(key(KeyCode::Char('g')));
         assert!(state.path_input.is_some());
+    }
+
+    #[test]
+    fn initialization_confirmation_owns_input_and_returns_the_original_pathbuf_snapshot() {
+        let selected_directory = tempfile::tempdir().unwrap();
+        let changed_directory = tempfile::tempdir().unwrap();
+        let selected = selected_directory.path().to_path_buf();
+        let changed_selection = changed_directory.path().to_path_buf();
+        let mut state = GlobalHomeState::new(selected.clone());
+        state.show_initialize_workspace_confirmation(selected.clone());
+        assert!(state.explorer.rebase(changed_selection.clone()));
+        let explorer_after_selection_change = state.explorer.clone();
+
+        for code in [
+            KeyCode::Char('o'),
+            KeyCode::Char('g'),
+            KeyCode::Char(':'),
+            KeyCode::Char('?'),
+            KeyCode::Char('q'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+            KeyCode::Char('r'),
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Backspace,
+        ] {
+            assert_eq!(state.handle_key(key(code)), None);
+        }
+        assert_eq!(
+            state.handle_key(KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Repeat,
+                modifiers: Modifiers::default(),
+            }),
+            None
+        );
+        state.handle_paste("ignored paste");
+
+        assert_eq!(state.explorer, explorer_after_selection_change);
+        assert_eq!(state.explorer.selected_path(), changed_selection);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(GlobalHomeExit::InitializeWorkspace(selected))
+        );
+        assert!(state.initialize_workspace.is_none());
+    }
+
+    #[test]
+    fn initialization_confirmation_consumes_pointer_events_in_the_production_loop() {
+        let target = PathBuf::from("confirmed-target");
+        let mut state = GlobalHomeState::new(PathBuf::from("root"));
+        state.show_initialize_workspace_confirmation(target.clone());
+        let pointer = TerminalEvent::Pointer(PointerEvent {
+            kind: PointerKind::Move,
+            position: PointerPosition::Cells { column: 3, row: 4 },
+            modifiers: Modifiers::default(),
+            pixel_generation: None,
+        });
+        let mut terminal = ScriptedGlobalTerminal::new(
+            80,
+            24,
+            [
+                vec![pointer],
+                vec![event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Enter)],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            GlobalHomeExit::InitializeWorkspace(target)
+        );
+        assert_eq!(terminal.reads, 3);
+    }
+
+    #[test]
+    fn initialization_confirmation_cancel_preserves_wide_and_narrow_explorer_context() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+
+        let mut wide = GlobalHomeState::new(root.path().to_path_buf());
+        let _ = draw(&mut wide, 80, 24);
+        wide.handle_key(key(KeyCode::Enter));
+        wide.handle_key(key(KeyCode::Char('j')));
+        let wide_explorer = wide.explorer.clone();
+        wide.show_initialize_workspace_confirmation(child.clone());
+        assert_eq!(wide.handle_key(key(KeyCode::Escape)), None);
+        assert_eq!(wide.explorer, wide_explorer);
+        assert!(!wide.explorer_overlay_visible);
+
+        let mut narrow = GlobalHomeState::new(root.path().to_path_buf());
+        let _ = draw(&mut narrow, 61, 24);
+        narrow.handle_key(key(KeyCode::Char('o')));
+        narrow.handle_key(key(KeyCode::Enter));
+        narrow.handle_key(key(KeyCode::Char('j')));
+        let narrow_explorer = narrow.explorer.clone();
+        narrow.show_initialize_workspace_confirmation(child);
+        assert_eq!(narrow.handle_key(key(KeyCode::Escape)), None);
+        assert_eq!(narrow.explorer, narrow_explorer);
+        assert!(narrow.explorer_overlay_visible);
+        assert_eq!(narrow.handle_key(key(KeyCode::Char('q'))), None);
+        assert!(narrow.explorer_overlay_visible);
+    }
+
+    #[test]
+    fn initialization_confirmation_renders_unicode_safe_tail_and_tiny_frames() {
+        let target = PathBuf::from(r"C:\very-long-parent\another-long-parent\projects\日本語\abc");
+        let clipped = prefixed_path_line("", &target, 30);
+        assert!(UnicodeWidthStr::width(clipped.as_str()) <= 30);
+        assert!(clipped.ends_with(r"\projects\日本語\abc"));
+        assert!(!clipped.contains('\u{fffd}'));
+        let mut state = GlobalHomeState::new(PathBuf::from("root"));
+        state.show_initialize_workspace_confirmation(target);
+
+        for (width, height) in [(0, 0), (0, 8), (8, 0), (1, 1), (8, 3), (24, 5)] {
+            let _ = draw(&mut state, width, height);
+        }
+
+        let rendered = buffer_text(&draw(&mut state, 80, 24));
+        for expected in [
+            "Initialize Workspace",
+            "This directory is not an atc workspace.",
+            "Initialize here?",
+            "abc",
+            "Enter Initialize",
+            "Esc Cancel",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains('\u{fffd}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_confirmation_preserves_non_utf8_path_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let target = PathBuf::from(OsString::from_vec(b"workspace-\xff".to_vec()));
+        let mut state = GlobalHomeState::new(PathBuf::from("root"));
+        state.show_initialize_workspace_confirmation(target.clone());
+
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(GlobalHomeExit::InitializeWorkspace(target))
+        );
     }
 
     #[test]
