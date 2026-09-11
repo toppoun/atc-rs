@@ -1006,6 +1006,29 @@ mod tests {
     fn non_utf8_directory_identity_is_preserved_and_rendering_does_not_panic() {
         use std::os::unix::ffi::OsStringExt;
 
+        let root = PathBuf::from("root");
+        let name = OsString::from_vec(vec![b'n', 0x80]);
+        let directory = root.join(&name);
+        let mut state = ExplorerState::new(root.clone());
+
+        assert!(state.expand_selected_with(|path| {
+            assert_eq!(path, root);
+            Ok(vec![LoadedChild {
+                path: directory.clone(),
+                name: name.clone(),
+            }])
+        }));
+        assert!(state.nodes.contains_key(&directory));
+        state.selected = directory.clone();
+        assert_eq!(state.selected_path(), directory);
+        let _ = draw(&mut state, 20, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_filesystem_non_utf8_directory_is_loaded_without_losing_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
         let temp = tempdir().unwrap();
         let name = OsString::from_vec(vec![b'n', 0x80]);
         let directory = temp.path().join(&name);
@@ -1016,7 +1039,6 @@ mod tests {
         assert!(state.nodes.contains_key(&directory));
         state.selected = directory.clone();
         assert_eq!(state.selected_path(), directory);
-        let _ = draw(&mut state, 20, 4);
     }
 
     #[test]

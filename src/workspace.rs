@@ -962,7 +962,7 @@ fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
 
     if is_single_normal_component
         && !contains_path_separator
-        && is_safe_platform_path_component(value)
+        && is_safe_portable_path_component(value)
     {
         return Ok(());
     }
@@ -1049,38 +1049,8 @@ fn validate_workspace_path_component(component: &str) -> Result<(), &'static str
     Ok(())
 }
 
-fn is_safe_platform_path_component(value: &str) -> bool {
-    #[cfg(not(windows))]
-    {
-        let _ = value;
-        true
-    }
-
-    #[cfg(windows)]
-    {
-        if value.ends_with([' ', '.'])
-            || value
-                .chars()
-                .any(|character| character < '\u{20}' || r#"<>:"|?*"#.contains(character))
-        {
-            return false;
-        }
-
-        let stem = value
-            .split('.')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
-            && !matches!(
-                stem.as_str(),
-                "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            )
-            && !matches!(
-                stem.as_str(),
-                "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
-            )
-    }
+fn is_safe_portable_path_component(value: &str) -> bool {
+    validate_workspace_path_component(value).is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2622,15 +2592,14 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn contest_resolver_rejects_windows_ads_ids() {
+    fn contest_resolver_rejects_nonportable_ids_on_every_os() {
         let temp = tempfile::tempdir().unwrap();
         for id in ["abc466:stream", "CON", "nul.txt", "abc466.", "abc466?x"] {
             assert_eq!(
                 resolve_contest_path(temp.path(), id).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
-                "unsafe Windows component: {id:?}"
+                "nonportable path component: {id:?}"
             );
         }
     }

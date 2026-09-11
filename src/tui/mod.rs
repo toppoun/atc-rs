@@ -39,6 +39,8 @@ pub(crate) use detail_layout::{
     DetailAnalysisResult as SessionDetailAnalysisResult,
 };
 use detail_scrollbar::{DetailScrollbarHit, DetailScrollbarStableIdentity};
+#[cfg(test)]
+pub(crate) use global_home::prefixed_path_line_for_test as global_home_prefixed_path_line_for_test;
 pub(crate) use global_home::{
     GlobalHomeExit, GlobalHomeState, GlobalHomeTerminal,
     run_with_terminal as run_global_home_with_terminal,

@@ -11,6 +11,7 @@ const DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
     rx: mpsc::Receiver<notify::Result<Event>>,
+    path_mapper: EventPathMapper,
 }
 
 impl FileWatcher {
@@ -22,18 +23,20 @@ impl FileWatcher {
         })
         .map_err(io::Error::other)?;
 
+        let watch_directory = watch_directory(directory)?;
         watcher
-            .watch(directory, RecursiveMode::NonRecursive)
+            .watch(&watch_directory, RecursiveMode::NonRecursive)
             .map_err(io::Error::other)?;
 
         Ok(Self {
             _watcher: watcher,
             rx,
+            path_mapper: EventPathMapper::new(watch_directory, directory.to_path_buf()),
         })
     }
 
     pub fn next_batch(&self) -> io::Result<Vec<PathBuf>> {
-        receive_next_batch(&self.rx, DEBOUNCE_DURATION)
+        receive_next_batch(&self.rx, DEBOUNCE_DURATION, &self.path_mapper)
     }
 
     pub fn next_batch_timeout_with_cancel(
@@ -41,20 +44,61 @@ impl FileWatcher {
         timeout: Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Option<Vec<PathBuf>>> {
-        receive_next_batch_timeout_with_cancel(&self.rx, DEBOUNCE_DURATION, timeout, is_cancelled)
+        receive_next_batch_timeout_with_cancel(
+            &self.rx,
+            DEBOUNCE_DURATION,
+            timeout,
+            is_cancelled,
+            &self.path_mapper,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
+    directory.canonicalize()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
+    Ok(directory.to_path_buf())
+}
+
+struct EventPathMapper {
+    observed_root: PathBuf,
+    reported_root: PathBuf,
+}
+
+impl EventPathMapper {
+    fn new(observed_root: PathBuf, reported_root: PathBuf) -> Self {
+        Self {
+            observed_root,
+            reported_root,
+        }
+    }
+
+    fn map(&self, path: PathBuf) -> PathBuf {
+        if self.observed_root == self.reported_root {
+            return path;
+        }
+        match path.strip_prefix(&self.observed_root) {
+            Ok(suffix) => self.reported_root.join(suffix),
+            Err(_) => path,
+        }
     }
 }
 
 fn receive_next_batch(
     rx: &mpsc::Receiver<notify::Result<Event>>,
     debounce_duration: Duration,
+    path_mapper: &EventPathMapper,
 ) -> io::Result<Vec<PathBuf>> {
     loop {
         let first = rx.recv().map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "filesystem watcher disconnected")
         })?;
 
-        let pending = collect_batch_ordered(rx, first, debounce_duration, None)?;
+        let pending = collect_batch_ordered(rx, first, debounce_duration, None, path_mapper)?;
 
         if !pending.is_empty() {
             let mut paths = pending;
@@ -69,6 +113,7 @@ fn receive_next_batch_timeout(
     rx: &mpsc::Receiver<notify::Result<Event>>,
     debounce_duration: Duration,
     timeout: Duration,
+    path_mapper: &EventPathMapper,
 ) -> io::Result<Option<Vec<PathBuf>>> {
     let first = match rx.recv_timeout(timeout) {
         Ok(result) => result,
@@ -86,6 +131,7 @@ fn receive_next_batch_timeout(
         first,
         debounce_duration,
         Some(Instant::now() + debounce_duration),
+        path_mapper,
     )?;
     Ok(Some(paths))
 }
@@ -95,6 +141,7 @@ fn receive_next_batch_timeout_with_cancel(
     debounce_duration: Duration,
     timeout: Duration,
     is_cancelled: &dyn Fn() -> bool,
+    path_mapper: &EventPathMapper,
 ) -> io::Result<Option<Vec<PathBuf>>> {
     if is_cancelled() {
         return Ok(None);
@@ -112,7 +159,7 @@ fn receive_next_batch_timeout_with_cancel(
     };
 
     let mut pending = Vec::new();
-    collect_result_ordered(first, &mut pending)?;
+    collect_result_ordered(first, &mut pending, path_mapper)?;
 
     let deadline = Instant::now() + debounce_duration;
     let cancel_poll_interval = if timeout.is_zero() {
@@ -132,7 +179,7 @@ fn receive_next_batch_timeout_with_cancel(
         }
 
         match rx.recv_timeout(remaining.min(cancel_poll_interval)) {
-            Ok(result) => collect_result_ordered(result, &mut pending)?,
+            Ok(result) => collect_result_ordered(result, &mut pending, path_mapper)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::new(
@@ -149,9 +196,10 @@ fn collect_batch_ordered(
     first: notify::Result<Event>,
     debounce_duration: Duration,
     deadline: Option<Instant>,
+    path_mapper: &EventPathMapper,
 ) -> io::Result<Vec<PathBuf>> {
     let mut pending = Vec::new();
-    collect_result_ordered(first, &mut pending)?;
+    collect_result_ordered(first, &mut pending, path_mapper)?;
 
     loop {
         let wait = deadline
@@ -163,7 +211,7 @@ fn collect_batch_ordered(
         }
 
         match rx.recv_timeout(wait) {
-            Ok(result) => collect_result_ordered(result, &mut pending)?,
+            Ok(result) => collect_result_ordered(result, &mut pending, path_mapper)?,
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::new(
@@ -180,6 +228,7 @@ fn collect_batch_ordered(
 fn collect_result_ordered(
     result: notify::Result<Event>,
     pending: &mut Vec<PathBuf>,
+    path_mapper: &EventPathMapper,
 ) -> io::Result<()> {
     let event = result.map_err(io::Error::other)?;
 
@@ -191,6 +240,7 @@ fn collect_result_ordered(
     }
 
     for path in event.paths {
+        let path = path_mapper.map(path);
         if let Some(position) = pending.iter().position(|existing| existing == &path) {
             pending.remove(position);
         }
@@ -224,6 +274,39 @@ mod tests {
 
     fn event(kind: EventKind, path: &Path) -> notify::Result<Event> {
         Ok(Event::new(kind).add_path(path.to_path_buf()))
+    }
+
+    fn identity_mapper() -> EventPathMapper {
+        EventPathMapper::new(PathBuf::new(), PathBuf::new())
+    }
+
+    #[test]
+    fn maps_observed_backend_root_back_to_reported_root() {
+        let mapper = EventPathMapper::new(
+            PathBuf::from("/private/var/folders/workspace"),
+            PathBuf::from("/var/folders/workspace"),
+        );
+        let source = PathBuf::from("/private/var/folders/workspace/A.py");
+        let unrelated = PathBuf::from("/private/var/other/A.py");
+        let mut pending = Vec::new();
+
+        collect_result_ordered(
+            event(EventKind::Modify(ModifyKind::Any), &source),
+            &mut pending,
+            &mapper,
+        )
+        .unwrap();
+        collect_result_ordered(
+            event(EventKind::Modify(ModifyKind::Any), &unrelated),
+            &mut pending,
+            &mapper,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending,
+            [PathBuf::from("/var/folders/workspace/A.py"), unrelated]
+        );
     }
 
     #[test]
@@ -301,7 +384,7 @@ mod tests {
         tx.send(event(EventKind::Modify(ModifyKind::Any), &b))
             .unwrap();
 
-        let batch = receive_next_batch(&rx, Duration::from_millis(1)).unwrap();
+        let batch = receive_next_batch(&rx, Duration::from_millis(1), &identity_mapper()).unwrap();
 
         assert_eq!(batch, [a, b]);
     }
@@ -311,7 +394,8 @@ mod tests {
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
         drop(tx);
 
-        let error = receive_next_batch(&rx, Duration::from_millis(1)).unwrap_err();
+        let error =
+            receive_next_batch(&rx, Duration::from_millis(1), &identity_mapper()).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -320,8 +404,13 @@ mod tests {
     fn timeout_wait_returns_none_without_an_event() {
         let (_tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
-        let batch =
-            receive_next_batch_timeout(&rx, Duration::from_millis(1), Duration::ZERO).unwrap();
+        let batch = receive_next_batch_timeout(
+            &rx,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            &identity_mapper(),
+        )
+        .unwrap();
 
         assert!(batch.is_none());
     }
@@ -345,6 +434,7 @@ mod tests {
                 checks.set(next);
                 next >= 2
             },
+            &identity_mapper(),
         )
         .unwrap();
 
@@ -364,9 +454,14 @@ mod tests {
         tx.send(event(EventKind::Modify(ModifyKind::Any), &b))
             .unwrap();
 
-        let batch = receive_next_batch_timeout(&rx, Duration::from_millis(1), Duration::ZERO)
-            .unwrap()
-            .unwrap();
+        let batch = receive_next_batch_timeout(
+            &rx,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            &identity_mapper(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(batch, [a, b]);
     }

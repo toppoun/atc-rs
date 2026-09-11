@@ -763,6 +763,11 @@ fn prefixed_path_line(prefix: &str, path: &Path, width: usize) -> String {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn prefixed_path_line_for_test(prefix: &str, path: &Path, width: usize) -> String {
+    prefixed_path_line(prefix, path, width)
+}
+
 fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     let panes = global_home_panes(frame.area());
     state.explorer_pane_visible = panes.explorer.is_some();
@@ -1670,11 +1675,12 @@ mod tests {
             run_with_terminal(&mut terminal, &mut state).unwrap(),
             GlobalHomeExit::Quit
         );
+        let visible_relative = prefixed_path_line(SELECTED_PREFIX, &relative, 66);
         assert!(
             terminal
                 .frames
                 .iter()
-                .any(|frame| { frame.contains(relative.to_string_lossy().as_ref()) })
+                .any(|frame| { frame.contains(&visible_relative) })
         );
         assert_eq!(state.explorer.root(), absolute.path());
         assert_eq!(state.explorer.selected_path(), absolute.path());

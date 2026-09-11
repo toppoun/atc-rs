@@ -682,6 +682,8 @@ mod tests {
             cpp_compiler: executable(&["g++", "clang++"]),
             ..Default::default()
         };
+        config.timeout_seconds = 10.0;
+        config.compile_timeout_seconds = 20.0;
         config.cpp_flags.push("-DEXTRA=7".into());
         let output = temp
             .path()

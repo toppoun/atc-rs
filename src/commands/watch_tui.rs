@@ -2374,6 +2374,14 @@ mod tests {
         })
     }
 
+    fn wide_global_home_modal_path(path: &Path) -> String {
+        crate::tui::global_home_prefixed_path_line_for_test("", path, 62)
+    }
+
+    fn wide_global_home_footer_path(path: &Path) -> String {
+        crate::tui::global_home_prefixed_path_line_for_test("Selected  ", path, 66)
+    }
+
     fn paste(text: impl Into<String>) -> crate::tui::TerminalEvent {
         crate::tui::TerminalEvent::Paste(text.into())
     }
@@ -2617,7 +2625,7 @@ mod tests {
         assert_eq!(probe.terminal_restores.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.contains("Initialize Workspace"));
-        assert!(rendered.contains(ordinary.to_string_lossy().as_ref()));
+        assert!(rendered.contains(&wide_global_home_modal_path(&ordinary)));
         assert_eq!(std::env::current_dir().unwrap(), cwd_before);
     }
 
@@ -2817,7 +2825,7 @@ mod tests {
         assert!(rendered.matches("Workspace Open Failed").count() >= 2);
         assert!(!rendered.contains("Initialize Workspace"));
         assert!(rendered.contains("workspace config"));
-        assert!(rendered.contains(invalid.to_string_lossy().as_ref()));
+        assert!(rendered.contains(&wide_global_home_footer_path(&invalid)));
     }
 
     #[test]
@@ -2881,7 +2889,7 @@ mod tests {
         assert!(rendered.matches("Workspace Open Failed").count() >= 2);
         assert!(!rendered.contains("Initialize Workspace"));
         assert!(rendered.contains("config load failed"));
-        assert!(rendered.contains(workspace.to_string_lossy().as_ref()));
+        assert!(rendered.contains(&wide_global_home_footer_path(&workspace)));
     }
 
     #[test]
@@ -4980,6 +4988,16 @@ mod tests {
             };
             let watched = build_watched_sources(temp.path(), &contest).unwrap();
             let watcher = crate::watcher::FileWatcher::new(temp.path()).unwrap();
+            let ready = temp.path().join("ready.tmp");
+            std::fs::write(&ready, "ready").unwrap();
+            let ready_paths = watcher
+                .next_batch_timeout_with_cancel(Duration::from_secs(3), &|| false)
+                .unwrap()
+                .expect("watcher readiness notification");
+            assert!(
+                ready_paths.contains(&ready),
+                "readiness event must be reported under the watched lexical root: {ready_paths:?}"
+            );
             if rename {
                 std::fs::rename(&source, temp.path().join("away.py")).unwrap();
             } else {

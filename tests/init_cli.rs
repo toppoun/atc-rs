@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const DEFAULT_WORKSPACE_CONFIG: &str = concat!(
@@ -39,10 +40,17 @@ fn run_init(root: &Path) -> Output {
         .expect("atc init should run")
 }
 
+fn child_reported_marker(root: &Path) -> PathBuf {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(".atc-workspace.toml")
+}
+
 #[test]
 fn init_creates_the_exact_marker_and_rerun_preserves_its_bytes() {
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join(".atc-workspace.toml");
+    let reported_marker = child_reported_marker(root.path());
 
     let created = run_init(root.path());
 
@@ -50,7 +58,7 @@ fn init_creates_the_exact_marker_and_rerun_preserves_its_bytes() {
     assert_eq!(created.stdout, b"");
     assert_eq!(
         String::from_utf8(created.stderr).unwrap(),
-        format!("Initialized atc workspace: {}\n", marker.display())
+        format!("Initialized atc workspace: {}\n", reported_marker.display())
     );
     assert_eq!(
         fs::read(&marker).unwrap(),
@@ -64,7 +72,10 @@ fn init_creates_the_exact_marker_and_rerun_preserves_its_bytes() {
     assert_eq!(rerun.stdout, b"");
     assert_eq!(
         String::from_utf8(rerun.stderr).unwrap(),
-        format!("Workspace already initialized: {}\n", marker.display())
+        format!(
+            "Workspace already initialized: {}\n",
+            reported_marker.display()
+        )
     );
     assert_eq!(fs::read(&marker).unwrap(), before_rerun);
 }

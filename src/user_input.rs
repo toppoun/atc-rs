@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 #[cfg(windows)]
@@ -21,9 +22,16 @@ const METADATA_FILE: &str = "meta.toml";
 const STAGING_PREFIX: &str = ".user-input-staging-";
 
 static NEXT_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PROCESS_USER_INPUT_LOCK: Mutex<()> = Mutex::new(());
 
 fn io_context(error: io::Error, context: impl Into<String>) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", context.into()))
+}
+
+fn lock_process_user_input_storage() -> io::Result<MutexGuard<'static, ()>> {
+    PROCESS_USER_INPUT_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("process-local user input storage lock poisoned"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +119,7 @@ fn load_user_inputs_with_hooks(
 
     let lock = open_problem_lock(&root, problem_index, false)?;
     if let Some(lock) = lock.as_ref() {
+        let _process_lock = lock_process_user_input_storage()?;
         lock.lock_shared()?;
         return load_problem_user_inputs(&root, problem_index);
     }
@@ -122,6 +131,7 @@ fn load_user_inputs_with_hooks(
     let Some(lock) = open_problem_lock(&root, problem_index, false)? else {
         return optimistic_result;
     };
+    let _process_lock = lock_process_user_input_storage()?;
     lock.lock_shared()?;
     load_problem_user_inputs(&root, problem_index)
 }
@@ -230,6 +240,8 @@ fn create_user_input_with_reservation(
 
     let marker = open_workspace_marker_after(destination, after_destination_validation)
         .map_err(UserInputCreateError::BeforeInstall)?;
+    let _process_lock =
+        lock_process_user_input_storage().map_err(UserInputCreateError::BeforeInstall)?;
     let root =
         ensure_real_child_directory(&marker, USER_INPUTS_DIRECTORY, "user input root directory")
             .map_err(UserInputCreateError::BeforeInstall)?;
@@ -323,9 +335,10 @@ fn save_user_input_if_unchanged_with_hooks(
         Err(error) => return Err(error),
     };
     drop(problem);
+    before_lock()?;
+    let _process_lock = lock_process_user_input_storage()?;
     let lock = open_problem_lock(&root, problem_index, true)?
         .expect("create was requested for the user input lock");
-    before_lock()?;
     lock.lock()
         .map_err(|error| io_context(error, "failed to lock user input storage for checked save"))?;
 
@@ -408,6 +421,7 @@ fn save_user_input_with_hooks(
     let (root, problem) =
         open_existing_problem(destination, problem_index, after_destination_validation)?;
     drop(problem);
+    let _process_lock = lock_process_user_input_storage()?;
     let lock = open_problem_lock(&root, problem_index, true)?
         .expect("create was requested for the user input lock");
     lock.lock()
@@ -460,6 +474,7 @@ fn delete_user_input_with_hook(
     let (root, problem) =
         open_existing_problem(destination, problem_index, after_destination_validation)?;
     drop(problem);
+    let _process_lock = lock_process_user_input_storage()?;
     let lock = open_problem_lock(&root, problem_index, true)?
         .expect("create was requested for the user input lock");
     lock.lock()?;
