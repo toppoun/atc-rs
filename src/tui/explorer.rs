@@ -568,8 +568,13 @@ where
 {
     let mut children = Vec::new();
     for entry in entries {
-        if let Some(child) = entry? {
-            children.push(child);
+        match entry {
+            Ok(Some(child)) => children.push(child),
+            Ok(None) => {}
+            // A directory entry may disappear after `read_dir`, and following a broken
+            // symlink has the same result. Neither should hide the remaining directories.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     sort_children(&mut children);
@@ -774,6 +779,20 @@ mod tests {
         assert!(!state.nodes[&root].expanded);
         assert!(!state.nodes.contains_key(&partial.path));
         assert!(state.status().unwrap().contains("denied"));
+    }
+
+    #[test]
+    fn individual_not_found_entry_is_skipped() {
+        let root = PathBuf::from("root");
+        let visible = child(&root, "visible");
+
+        let children = collect_directory_children(vec![
+            Err(io::Error::new(io::ErrorKind::NotFound, "entry disappeared")),
+            Ok(Some(visible.clone())),
+        ])
+        .unwrap();
+
+        assert_eq!(children, vec![visible]);
     }
 
     #[test]
@@ -1001,6 +1020,22 @@ mod tests {
         assert_eq!(state.selected_path(), japanese);
     }
 
+    #[test]
+    fn missing_root_still_fails_to_load() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("missing");
+        let mut state = ExplorerState::new(root.clone());
+
+        assert!(!state.expand_selected());
+        assert!(state.nodes[&root].children.is_none());
+        assert!(!state.nodes[&root].expanded);
+        assert!(
+            state
+                .status()
+                .is_some_and(|status| status.starts_with("Could not load "))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_utf8_directory_identity_is_preserved_and_rendering_does_not_panic() {
@@ -1069,6 +1104,37 @@ mod tests {
         state.selected = link.clone();
         assert!(state.expand_selected());
         assert_eq!(state.nodes[&link].children, Some(vec![link.join("nested")]));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn broken_symlink_is_omitted_without_aborting_directory_load_when_supported() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let real = root.join("real");
+        let broken = root.join("broken");
+        fs::create_dir_all(&real).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("missing-target"), &broken).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(root.join("missing-target"), &broken)
+        {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) {
+                return;
+            }
+            panic!("could not create broken directory symlink: {error}");
+        }
+
+        let mut state = ExplorerState::new(root.clone());
+        assert!(state.expand_selected());
+        assert_eq!(state.nodes[&root].children, Some(vec![real.clone()]));
+        assert!(state.nodes.contains_key(&real));
+        assert!(!state.nodes.contains_key(&broken));
+        assert_eq!(state.status(), None);
     }
 
     #[test]
