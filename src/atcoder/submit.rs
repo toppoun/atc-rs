@@ -1663,7 +1663,7 @@ mod tests {
     fn missing_source_code_textarea_is_rejected() {
         let html = replace_once(
             CURRENT_SUBMIT_PAGE,
-            "    <textarea id=\"plain-textarea\" name=\"sourceCode\"></textarea>\n",
+            "    <textarea id=\"plain-textarea\" name=\"sourceCode\"></textarea>",
             "",
         );
 
@@ -1705,7 +1705,7 @@ mod tests {
     fn missing_csrf_token_is_rejected() {
         let html = replace_once(
             CURRENT_SUBMIT_PAGE,
-            "    <input type=\"hidden\" name=\"csrf_token\" value=\"dummy-submit-csrf-token\">\n",
+            "    <input type=\"hidden\" name=\"csrf_token\" value=\"dummy-submit-csrf-token\">",
             "",
         );
 
@@ -3363,7 +3363,7 @@ mod tests {
     fn missing_csrf_fails_before_post() {
         let html = replace_once(
             CURRENT_SUBMIT_PAGE,
-            "    <input type=\"hidden\" name=\"csrf_token\" value=\"dummy-submit-csrf-token\">\n",
+            "    <input type=\"hidden\" name=\"csrf_token\" value=\"dummy-submit-csrf-token\">",
             "",
         );
         let mut transport = ScriptedSubmitTransport::new(vec![get_step(&html)]);

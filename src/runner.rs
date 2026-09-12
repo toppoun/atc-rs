@@ -860,16 +860,34 @@ mod tests {
 
     #[test]
     fn timeout_terminates_descendants_that_inherit_the_output_pipes() {
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_started = temp.path().join("descendant-started");
+        let synchronization_deadline = Instant::now() + Duration::from_secs(5);
         let started = Instant::now();
-        let result = execute(
+        let result = execute_with_cancel_observer_in(
             &std::env::current_exe().unwrap(),
             &helper_args("spawn_descendant_and_sleep_helper"),
             "",
-            Duration::from_millis(200),
+            Duration::ZERO,
+            &|| false,
+            &|checkpoint| {
+                if checkpoint == ExecutionCheckpoint::ChildSpawned {
+                    while !descendant_started.exists() {
+                        assert!(
+                            Instant::now() < synchronization_deadline,
+                            "descendant did not start"
+                        );
+                        thread::yield_now();
+                    }
+                }
+            },
+            Some(temp.path()),
         )
         .unwrap();
 
         assert!(matches!(result.outcome, ExecutionOutcome::TimedOut));
+        assert!(result.stdout.contains("descendant-started"));
+        assert!(result.stderr.contains("descendant-stderr"));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -1003,6 +1021,11 @@ mod tests {
             .args(helper_args("sleep_helper"))
             .spawn()
             .unwrap();
+        io::stdout().write_all(b"descendant-started\n").unwrap();
+        io::stdout().flush().unwrap();
+        io::stderr().write_all(b"descendant-stderr\n").unwrap();
+        io::stderr().flush().unwrap();
+        std::fs::write("descendant-started", "ready").unwrap();
         thread::sleep(Duration::from_secs(10));
     }
 

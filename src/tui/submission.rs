@@ -2353,7 +2353,21 @@ mod tests {
             start_test_submission(&mut hub, key, ["A", "B", "C"][index]);
         }
         barrier.wait();
-        wait_for_hub(&mut hub, "three workers", |hub| hub.workers.is_empty());
+        wait_for_hub(&mut hub, "three final problem states", |hub| {
+            hub.workers.is_empty()
+                && hub.state(&keys[0])
+                    == display_current(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForJudge,
+                    ))
+                && hub.state(&keys[1])
+                    == display_current(TuiSubmissionState::Status(
+                        SubmissionStatus::WaitingForRejudge,
+                    ))
+                && hub.state(&keys[2])
+                    == display_current(TuiSubmissionState::Status(SubmissionStatus::Finished(
+                        SubmissionResult::new(Verdict::WrongAnswer),
+                    )))
+        });
 
         assert_eq!(executor.calls.load(Ordering::Acquire), 3);
         assert_eq!(calls.load(Ordering::Acquire), 3);

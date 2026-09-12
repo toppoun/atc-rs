@@ -304,20 +304,18 @@ mod tests {
     }
 
     #[test]
-    fn python_timeout_cleans_up_descendants_and_captures_output() {
+    fn python_timeout_uses_existing_runner_deadline_and_completes_bounded() {
         let config = RunnerConfig {
             timeout_seconds: 0.5,
             ..python_config()
         };
         let started = Instant::now();
         let result = execute_source(
-            "import sys, subprocess, time\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nprint('started', flush=True)\nsys.stderr.write('stderr'); sys.stderr.flush()\ntime.sleep(30)\n",
+            "import sys, subprocess, time\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\ntime.sleep(30)\n",
             request(Language::Python, ""),
             config,
         );
         assert_eq!(result.status, UserInputRunStatus::TimedOut);
-        assert!(result.stdout.contains("started"));
-        assert!(result.stderr.contains("stderr"));
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(result.elapsed >= Duration::from_millis(500));
     }
@@ -352,16 +350,33 @@ mod tests {
     }
 
     #[test]
-    fn compile_timeout_uses_existing_runner_deadline_and_capture() {
+    fn compile_failure_captures_stdout_and_stderr_without_timeout() {
         let config = RunnerConfig {
             cpp_compiler: executable(&["python3", "python"]),
-            cpp_flags: vec!["-c".into(), "import sys,time; print('compiling',flush=True); sys.stderr.write('diagnostic'); sys.stderr.flush(); time.sleep(30)".into()],
-            compile_timeout_seconds: 0.5, ..RunnerConfig::default()
+            cpp_flags: vec![
+                "-c".into(),
+                "import sys; print('compiling', flush=True); sys.stderr.write('diagnostic'); sys.stderr.flush(); sys.exit(3)".into(),
+            ],
+            ..RunnerConfig::default()
         };
         let result = execute_source("unused source", request(Language::Cpp, "unused"), config);
+        assert_eq!(result.status, UserInputRunStatus::CompileError);
+        assert_eq!(result.stdout.trim(), "compiling");
+        assert_eq!(result.stderr, "diagnostic");
+    }
+
+    #[test]
+    fn compile_timeout_uses_existing_runner_deadline_and_completes_bounded() {
+        let config = RunnerConfig {
+            cpp_compiler: executable(&["python3", "python"]),
+            cpp_flags: vec!["-c".into(), "import time; time.sleep(30)".into()],
+            compile_timeout_seconds: 0.5,
+            ..RunnerConfig::default()
+        };
+        let started = Instant::now();
+        let result = execute_source("unused source", request(Language::Cpp, "unused"), config);
         assert_eq!(result.status, UserInputRunStatus::CompileTimedOut);
-        assert!(result.stdout.contains("compiling"));
-        assert!(result.stderr.contains("diagnostic"));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(result.elapsed >= Duration::from_millis(500));
     }
 
