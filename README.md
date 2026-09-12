@@ -64,12 +64,12 @@ atc
 
 workspace 外で `atc` を起動したときに開く補助的な入口です。Explorer で directory を探して既存 workspace を開けます。
 通常の directory を選んで Open すると、確認後にその場所を Init Here して workspace 化し、Workspace Home を開けます。
-`G` で global config を editor で開けます。`a` は authentication cookie を開かず、安全なinspectionによる設定状態とpathを表示します。`?` は Explorer Shortcuts を表示します。
+`G` で global config、`t` で C++ / Python の user source template を editor で開けます。`a` は authentication cookie を開かず、安全なinspectionによる設定状態とpathを表示します。`?` は Explorer Shortcuts を表示します。
 
 ### Workspace Home
 
 workspace root で `atc` を起動すると直接開きます。contest を開く、または作成して Contest 画面へ進む入口です。
-`w` で workspace config、`G` で global configをeditorで開けます。`a` はauthentication cookieの安全な設定状態とpathを表示します。
+`w` で workspace config、`G` で global config、`t` で global な C++ / Python source template を editor で開けます。`a` はauthentication cookieの安全な設定状態とpathを表示します。
 Contest 画面からも Command Palette の `Back to Workspace Home` で戻れます。
 
 現在、Workspace Home から別 workspace への切り替えはできません。別 workspace へ移る場合は、一度終了して移動先で `atc` を起動してください。
@@ -114,6 +114,8 @@ Contest 画面の主な操作:
 | `q` | 終了 |
 
 User Input の作成・編集・保存・実行・削除、Submit modal、submission history、Workspace Home への戻り方など、詳しい操作は [TUI](docs/tui.md) を参照してください。
+
+Contest の source template は Command Palette の `Open Template` から開きます。Contest の `t` は引き続き Submit です。
 
 ## Submit と AtCoder 認証
 

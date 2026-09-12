@@ -36,6 +36,7 @@ workspace 外で引数なしの `atc` を起動すると Global Home が開き�
 | `o` | 選択 directory を Open |
 | `g` | Go to Path を開き、入力した directory を Explorer root にする |
 | `G` | Global Config を editor で開く |
+| `t` | C++ / Python の global source template を開く |
 | `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
 | `?` | Explorer Shortcuts を表示 |
 | `q` | 終了 |
@@ -61,6 +62,7 @@ workspace root で `atc` を起動すると直接 Workspace Home へ入ります
 | `c` | Open / Create Contest modal を開く |
 | `w` | active workspace root の Workspace Config を editor で開く |
 | `G` | Global Config を editor で開く |
+| `t` | C++ / Python の global source template を開く |
 | `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
 | `q` | 終了 |
 
@@ -230,7 +232,16 @@ Esc    閉じる
 
 `Open Workspace Settings` は、workspace から TUI を起動している場合に `.atc-workspace.toml` を開きます。workspace 外では unavailable です。workspace config の新規作成は、対象 directory で `atc init` を実行します。
 
-`Open Template` は C++ / Python の通常 source template を開きます。まだ存在しない場合は `i` で初期化して開けます。
+`Open Template` は Global Home / Workspace Home の `t`、または Contest の Command Palette から開く共通 modal です。Contest の `t` は Submit のままです。
+
+各 language row には user template の状態を表示します。`Ready` は有効な user override、`Missing` は未初期化で built-in fallback を使用中、`Invalid` は存在する path を template として読み込めない状態です。`Default` は全画面で `Config.defaults.language` だけを表し、Contest の current source language とは独立しています。Path 欄は built-in fallback ではなく、選択中 language の user template path を表示します。
+
+- Ready: `Enter` で Open
+- Missing: `Enter` で選択中 language だけを Initialize & Open
+- Invalid かつ regular file として修復可能: `Enter` で Open to Repair
+- directory、dangling symlink など安全に開けない Invalid path: Enter action なし
+
+`↑` / `↓` または `j` / `k` で language を選び、`Esc` で閉じます。Global Home は modal を開くたびに global Config を読み直し、missing / invalid / path failure では default Config へ fallback します。Workspace Home と Contest は実行中の WorkspaceRuntime Config snapshot を使います。source template の保存先は全contextでglobalです。
 
 詳しくは [設定](configuration.md) を参照してください。
 

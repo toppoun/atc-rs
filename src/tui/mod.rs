@@ -12,6 +12,7 @@ pub mod message;
 mod mouse;
 pub mod reporter;
 mod submission;
+mod template_modal;
 mod termina_adapter;
 mod terminal;
 pub mod view;
@@ -51,6 +52,7 @@ use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
 pub(crate) use submission::SubmissionHub;
+use template_modal::{OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest};
 use terminal::{KeyCode, KeyEvent, KeyEventKind, PointerButton, PointerEvent, PointerKind};
 pub(crate) use terminal::{TerminaSession, TerminalEvent};
 #[cfg(test)]
@@ -869,6 +871,7 @@ fn launch_live_home_editor(
 #[derive(Debug, Clone)]
 pub(crate) struct HomeActionPaths {
     global_config: Result<PathBuf, String>,
+    templates_dir: Result<PathBuf, String>,
     cookie_file: Result<PathBuf, String>,
     cookie_location: Result<crate::paths::CookieLocation, String>,
 }
@@ -877,6 +880,7 @@ impl HomeActionPaths {
     fn current() -> Self {
         Self {
             global_config: crate::paths::config_file().map_err(|error| error.to_string()),
+            templates_dir: crate::paths::source_templates_dir().map_err(|error| error.to_string()),
             cookie_file: crate::paths::cookie_file().map_err(|error| error.to_string()),
             cookie_location: crate::paths::cookie_location().map_err(|error| error.to_string()),
         }
@@ -884,6 +888,10 @@ impl HomeActionPaths {
 
     pub(crate) fn global_config(&self) -> Result<&Path, &str> {
         self.global_config.as_deref().map_err(String::as_str)
+    }
+
+    pub(crate) fn templates_dir_result(&self) -> Result<PathBuf, String> {
+        self.templates_dir.clone()
     }
 
     pub(crate) fn cookie(&self) -> Result<(&Path, &crate::paths::CookieLocation), String> {
@@ -901,7 +909,25 @@ impl HomeActionPaths {
         cookie_location: crate::paths::CookieLocation,
     ) -> Self {
         Self {
+            templates_dir: Ok(global_config
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join("templates")),
             global_config: Ok(global_config),
+            cookie_file: Ok(cookie_location.file.clone()),
+            cookie_location: Ok(cookie_location),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_templates(
+        global_config: PathBuf,
+        templates_dir: PathBuf,
+        cookie_location: crate::paths::CookieLocation,
+    ) -> Self {
+        Self {
+            global_config: Ok(global_config),
+            templates_dir: Ok(templates_dir),
             cookie_file: Ok(cookie_location.file.clone()),
             cookie_location: Ok(cookie_location),
         }
@@ -1032,45 +1058,7 @@ impl OpenWorkspaceSettingsModal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OpenTemplateModal {
-    templates_dir: Result<PathBuf, String>,
-    selected_language: Language,
-    current_language: Option<Language>,
-    pub(super) error: Option<String>,
-}
-
-impl OpenTemplateModal {
-    pub(super) fn selected_language(&self) -> Language {
-        self.selected_language
-    }
-
-    pub(super) fn current_language(&self) -> Option<Language> {
-        self.current_language
-    }
-
-    pub(super) fn path_for(&self, language: Language) -> Result<PathBuf, String> {
-        self.templates_dir
-            .as_deref()
-            .map(|directory| crate::template::source_template_path(directory, language))
-            .map_err(Clone::clone)
-    }
-
-    pub(super) fn selected_path(&self) -> Result<PathBuf, String> {
-        self.path_for(self.selected_language)
-    }
-
-    pub(super) fn file_state_for(
-        &self,
-        language: Language,
-    ) -> Result<crate::user_config_fs::EditableFileState, String> {
-        let target = self.path_for(language)?;
-        crate::user_config_fs::inspect_editable_file(&target, "source template")
-            .map_err(|error| error.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum EditorTargetModal {
+pub(in crate::tui) enum EditorTargetModal {
     Settings(OpenSettingsModal),
     WorkspaceSettings(OpenWorkspaceSettingsModal),
     Template(OpenTemplateModal),
@@ -1100,7 +1088,6 @@ struct EditorTargetController {
 enum ManagedTargetInitialization {
     None,
     Settings,
-    Template(Language),
 }
 
 impl EditorTargetController {
@@ -1163,12 +1150,11 @@ impl EditorTargetController {
             .filter(|path| *path == source.path)
             .map(|_| source.language)
         });
-        self.modal = Some(EditorTargetModal::Template(OpenTemplateModal {
-            templates_dir: self.templates_dir.clone(),
-            selected_language: current_language.unwrap_or(self.default_language),
-            current_language,
-            error: None,
-        }));
+        self.modal = Some(EditorTargetModal::Template(OpenTemplateModal::new(
+            self.templates_dir.clone(),
+            current_language.unwrap_or(self.default_language),
+            self.default_language,
+        )));
         true
     }
 
@@ -1177,6 +1163,20 @@ impl EditorTargetController {
         key: KeyEvent,
         editor: &mut EditorInputContext<'_>,
     ) -> io::Result<bool> {
+        if let Some(EditorTargetModal::Template(modal)) = self.modal.as_mut() {
+            return match modal.handle_key(key) {
+                TemplateModalTransition::NotHandled => Ok(false),
+                TemplateModalTransition::Handled => Ok(true),
+                TemplateModalTransition::Close => {
+                    self.close();
+                    Ok(true)
+                }
+                TemplateModalTransition::Activate(request) => {
+                    self.open_template_request(request, editor)
+                }
+            };
+        }
+
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(false);
         }
@@ -1184,21 +1184,6 @@ impl EditorTargetController {
             self.close();
             return Ok(true);
         }
-
-        if let Some(EditorTargetModal::Template(modal)) = self.modal.as_mut()
-            && matches!(
-                key.code,
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k')
-            )
-        {
-            modal.selected_language = match modal.selected_language {
-                Language::Cpp => Language::Python,
-                Language::Python => Language::Cpp,
-            };
-            modal.error = None;
-            return Ok(true);
-        }
-
         if key.kind != KeyEventKind::Press {
             return Ok(false);
         }
@@ -1207,6 +1192,48 @@ impl EditorTargetController {
             KeyCode::Char('i') => self.open_selected(true, editor),
             _ => Ok(false),
         }
+    }
+
+    fn open_template_request(
+        &mut self,
+        request: TemplateRequest,
+        editor: &mut EditorInputContext<'_>,
+    ) -> io::Result<bool> {
+        let resolved = match editor.host.resolve() {
+            Ok(editor) => editor,
+            Err(error) => {
+                self.set_error(error);
+                return Ok(true);
+            }
+        };
+
+        if request.action == TemplateAction::InitializeAndOpen {
+            let Some(templates_dir) = request.path.parent() else {
+                self.set_error(format!(
+                    "source template has no parent directory: {}",
+                    request.path.display()
+                ));
+                return Ok(true);
+            };
+            let mut reporter = EditorInitializationReporter;
+            if let Err(error) = crate::commands::initialize_source_templates_at(
+                templates_dir,
+                std::slice::from_ref(&request.language),
+                &mut reporter,
+            ) {
+                self.set_error(format!("failed to initialize source template: {error}"));
+                return Ok(true);
+            }
+        }
+
+        match editor.launch(&resolved, &request.path) {
+            Ok(()) => self.close(),
+            Err(EditorLaunchError::Recoverable(error)) => self.set_error(error),
+            Err(EditorLaunchError::TerminalRestore(error)) => {
+                return Err(io::Error::other(error));
+            }
+        }
+        Ok(true)
     }
 
     fn open_selected(
@@ -1238,22 +1265,6 @@ impl EditorTargetController {
                 let mut reporter = EditorInitializationReporter;
                 crate::commands::initialize_config_at(&target, &mut reporter)
                     .map_err(|error| format!("failed to initialize settings: {error}"))
-            }
-            ManagedTargetInitialization::Template(language) => {
-                let Some(templates_dir) = target.parent() else {
-                    self.set_error(format!(
-                        "source template has no parent directory: {}",
-                        target.display()
-                    ));
-                    return Ok(true);
-                };
-                let mut reporter = EditorInitializationReporter;
-                crate::commands::initialize_source_templates_at(
-                    templates_dir,
-                    std::slice::from_ref(&language),
-                    &mut reporter,
-                )
-                .map_err(|error| format!("failed to initialize source template: {error}"))
             }
         };
         if let Err(error) = initialization_result {
@@ -1307,21 +1318,7 @@ impl EditorTargetController {
                     crate::workspace::WorkspaceConfigFileState::Missing => Ok(None),
                 }
             }
-            EditorTargetModal::Template(modal) => {
-                let language = modal.selected_language();
-                let target = modal.selected_path()?;
-                let state = modal.file_state_for(language)?;
-                match (initialize, state) {
-                    (false, crate::user_config_fs::EditableFileState::Existing) => {
-                        Ok(Some((target, ManagedTargetInitialization::None)))
-                    }
-                    (true, crate::user_config_fs::EditableFileState::Missing) => Ok(Some((
-                        target,
-                        ManagedTargetInitialization::Template(language),
-                    ))),
-                    _ => Ok(None),
-                }
-            }
+            EditorTargetModal::Template(_) => Ok(None),
         }
     }
 
@@ -7948,13 +7945,14 @@ mod tests {
         };
         assert_eq!(Language::ALL, [Language::Cpp, Language::Python]);
         assert_eq!(modal.selected_language(), Language::Python);
-        assert_eq!(modal.current_language(), Some(Language::Python));
+        assert_eq!(modal.default_language(), Language::Cpp);
 
         let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        editor.resolve_error = Some("editor unresolved".to_string());
         let mut events =
             VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
         assert!(
-            !handle_editor_target_events(
+            handle_editor_target_events(
                 &mut watch_app,
                 &view::RenderInfo::default(),
                 &mut events,
@@ -7967,28 +7965,9 @@ mod tests {
         );
         assert!(!templates_dir.exists());
 
-        editor.resolve_error = Some("editor unresolved".to_string());
-        let mut events = VecDeque::from([TerminalEvent::Key(key(
-            KeyCode::Char('i'),
-            KeyEventKind::Press,
-        ))]);
-        handle_editor_target_events(
-            &mut watch_app,
-            &view::RenderInfo::default(),
-            &mut events,
-            &mut controller,
-            &mut editor,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(!templates_dir.exists());
-
         editor.resolve_error = None;
-        let mut events = VecDeque::from([TerminalEvent::Key(key(
-            KeyCode::Char('i'),
-            KeyEventKind::Press,
-        ))]);
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
         handle_editor_target_events(
             &mut watch_app,
             &view::RenderInfo::default(),
@@ -8026,7 +8005,7 @@ mod tests {
             panic!("expected template modal");
         };
         assert_eq!(modal.selected_language(), Language::Python);
-        assert_eq!(modal.current_language(), None);
+        assert_eq!(modal.default_language(), Language::Python);
         assert!(!no_source.should_quit());
     }
 
@@ -8034,21 +8013,11 @@ mod tests {
     fn open_template_initial_language_covers_both_current_and_default_languages() {
         let temp = tempfile::tempdir().unwrap();
         let current = temp.path().join("contest");
-        for (current_language, default_language, expected, expected_current) in [
-            (
-                Some(Language::Cpp),
-                Language::Python,
-                Language::Cpp,
-                Some(Language::Cpp),
-            ),
-            (
-                Some(Language::Python),
-                Language::Cpp,
-                Language::Python,
-                Some(Language::Python),
-            ),
-            (None, Language::Cpp, Language::Cpp, None),
-            (None, Language::Python, Language::Python, None),
+        for (current_language, default_language, expected) in [
+            (Some(Language::Cpp), Language::Python, Language::Cpp),
+            (Some(Language::Python), Language::Cpp, Language::Python),
+            (None, Language::Cpp, Language::Cpp),
+            (None, Language::Python, Language::Python),
         ] {
             let mut app = app();
             if let Some(language) = current_language {
@@ -8067,8 +8036,27 @@ mod tests {
                 panic!("expected template modal");
             };
             assert_eq!(modal.selected_language(), expected);
-            assert_eq!(modal.current_language(), expected_current);
+            assert_eq!(modal.default_language(), default_language);
         }
+
+        let mut mismatched = app();
+        assert!(mismatched.source_changed(
+            0,
+            temp.path().join("unexpected-location.py"),
+            Language::Python,
+        ));
+        let mut controller = editor_target_controller(
+            &current,
+            Language::Cpp,
+            &temp.path().join("config.toml"),
+            &temp.path().join("templates"),
+            None,
+        );
+        controller.open_template(&mismatched);
+        let EditorTargetModal::Template(modal) = controller.modal().unwrap() else {
+            panic!("expected template modal")
+        };
+        assert_eq!(modal.selected_language(), Language::Cpp);
     }
 
     #[test]
@@ -8156,6 +8144,104 @@ mod tests {
             std::slice::from_ref(&cpp)
         );
         assert_eq!(fs::read(cpp).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_unsafe_template_does_not_resolve_mutate_or_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates_dir = temp.path().join("templates");
+        fs::create_dir(&templates_dir).unwrap();
+        let cpp = crate::template::source_template_path(&templates_dir, Language::Cpp);
+        fs::create_dir(&cpp).unwrap();
+        let mut controller = editor_target_controller(
+            temp.path(),
+            Language::Cpp,
+            &temp.path().join("config.toml"),
+            &templates_dir,
+            None,
+        );
+        let mut app = app();
+        controller.open_template(&app);
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        assert!(
+            handle_editor_target_events(
+                &mut app,
+                &view::RenderInfo::default(),
+                &mut events,
+                &mut controller,
+                &mut editor,
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(editor.resolve_calls, 0);
+        assert!(editor.external_targets.is_empty());
+        assert!(cpp.is_dir());
+        assert!(controller.modal_active());
+    }
+
+    #[test]
+    fn template_terminal_editor_preserves_discard_recoverability_and_fatal_restore_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates_dir = temp.path().join("templates");
+        fs::create_dir(&templates_dir).unwrap();
+        let cpp = crate::template::source_template_path(&templates_dir, Language::Cpp);
+        fs::write(&cpp, "// ready\n").unwrap();
+        let mut controller = editor_target_controller(
+            temp.path(),
+            Language::Cpp,
+            &temp.path().join("config.toml"),
+            &templates_dir,
+            None,
+        );
+        let mut app = app();
+        controller.open_template(&app);
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::Terminal);
+        editor.launch_error = Some("terminal editor failed".to_string());
+        let mut events = VecDeque::from([
+            TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press)),
+            TerminalEvent::Key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+        ]);
+        handle_editor_target_events(
+            &mut app,
+            &view::RenderInfo::default(),
+            &mut events,
+            &mut controller,
+            &mut editor,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(events.is_empty());
+        assert!(!app.should_quit());
+        assert_eq!(
+            editor.terminal_targets.as_slice(),
+            std::slice::from_ref(&cpp)
+        );
+        let EditorTargetModal::Template(modal) = controller.modal().unwrap() else {
+            panic!("recoverable failure must keep template modal")
+        };
+        assert_eq!(modal.error.as_deref(), Some("terminal editor failed"));
+
+        editor.launch_error = None;
+        editor.terminal_restore_error = Some("failed to restore terminal".to_string());
+        let mut events =
+            VecDeque::from([TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))]);
+        let error = handle_editor_target_events(
+            &mut app,
+            &view::RenderInfo::default(),
+            &mut events,
+            &mut controller,
+            &mut editor,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to restore terminal"));
+        assert_eq!(editor.terminal_targets, [cpp.clone(), cpp]);
     }
 
     #[test]
@@ -8339,6 +8425,73 @@ mod tests {
             .unwrap();
             assert!(app.should_quit());
         }
+    }
+
+    #[test]
+    fn open_template_modal_suppresses_the_contest_submit_shortcut() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("contest");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("A.cpp"), "int main() {}\n").unwrap();
+        let mut app = app();
+        let mut editor_targets = editor_target_controller(
+            &destination,
+            Language::Cpp,
+            &root.path().join("config.toml"),
+            &root.path().join("templates"),
+            None,
+        );
+        assert!(editor_targets.open_template(&app));
+        assert!(editor_targets.modal_active());
+
+        let mut submit_controller =
+            SubmitController::new(&destination, Language::Cpp, PythonRuntime::CPython);
+        let mut submissions = SubmissionHub::new();
+        let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
+        let mut events = VecDeque::from([TerminalEvent::Key(key(
+            KeyCode::Char('t'),
+            KeyEventKind::Press,
+        ))]);
+        let (run_tx, _run_rx) = mpsc::channel();
+        let mut detail_layout = detail_layout::DetailLayout::default();
+        let mut drag = DetailScrollbarDragState::default();
+
+        assert!(
+            !handle_terminal_events_with_mouse_mode(
+                &mut app,
+                &mut detail_layout,
+                &mut drag,
+                &view::RenderInfo::default(),
+                &mut events,
+                MouseMode::Cells,
+                FrontendInputContext {
+                    terminal: TerminalInputContext::new(&run_tx, Some(&destination), None),
+                    contest_switch: None,
+                    contest_refresh: None,
+                    return_home_requested: None,
+                    command_palette: None,
+                    open_source: None,
+                    submit: Some(SubmitInputContext {
+                        controller: &mut submit_controller,
+                        hub: &mut submissions,
+                    }),
+                    editor_targets: Some(&mut editor_targets),
+                    editor: Some(EditorInputContext {
+                        host: &mut editor,
+                        discard_input_batch: false,
+                    }),
+                },
+            )
+            .unwrap()
+        );
+
+        assert!(events.is_empty());
+        assert!(editor_targets.modal_active());
+        assert!(!submit_controller.modal_active());
+        assert_eq!(
+            FrontendAction::from_shortcut(key(KeyCode::Char('t'), KeyEventKind::Press)),
+            Some(FrontendAction::Submit)
+        );
     }
 
     #[test]

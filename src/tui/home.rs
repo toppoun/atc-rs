@@ -12,6 +12,9 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::template_modal::{
+    OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
+};
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::view::{self, ContestOpenPurpose};
 use super::{
@@ -22,11 +25,12 @@ use super::{
 use crate::{branding, config::Config};
 
 const HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const HOME_ACTIONS: [Option<(&str, &str)>; 7] = [
+const HOME_ACTIONS: [Option<(&str, &str)>; 8] = [
     Some(("Open / Create Contest", "c")),
     None,
     Some(("Workspace Config", "w")),
     Some(("Global Config", "G")),
+    Some(("Template", "t")),
     Some(("Authentication Cookie", "a")),
     None,
     Some(("Quit", "q")),
@@ -42,6 +46,8 @@ pub(crate) enum HomeAction {
     OpenContest,
     OpenWorkspaceConfig,
     OpenGlobalConfig,
+    OpenTemplate,
+    Template(TemplateRequest),
     ShowAuthenticationCookie,
     InitializeGlobalConfig(PathBuf),
     Quit,
@@ -70,6 +76,7 @@ struct InitializeGlobalConfigModal {
 struct HomeState<'a> {
     error: Option<HomeActionError>,
     initialize_global_config: Option<InitializeGlobalConfigModal>,
+    template: Option<OpenTemplateModal>,
     open_contest: ContestOpenController<'a>,
 }
 
@@ -81,18 +88,41 @@ impl<'a> HomeState<'a> {
         Self {
             error: None,
             initialize_global_config: None,
+            template: None,
             open_contest: ContestOpenController::new(resolve, task),
         }
     }
 
     fn show_error(&mut self, kind: HomeActionErrorKind, message: String) {
         self.initialize_global_config = None;
+        self.template = None;
         self.error = Some(HomeActionError { kind, message });
     }
 
     fn show_initialize_global_config(&mut self, target: PathBuf) {
         self.error = None;
+        self.template = None;
         self.initialize_global_config = Some(InitializeGlobalConfigModal { target });
+    }
+
+    fn open_template(&mut self, templates_dir: Result<PathBuf, String>, config: &Config) {
+        self.error = None;
+        self.initialize_global_config = None;
+        self.template = Some(OpenTemplateModal::new(
+            templates_dir,
+            config.defaults.language,
+            config.defaults.language,
+        ));
+    }
+
+    fn close_template(&mut self) {
+        self.template = None;
+    }
+
+    fn show_template_error(&mut self, error: String) {
+        if let Some(modal) = self.template.as_mut() {
+            modal.set_error(error);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> HomeAction {
@@ -118,6 +148,19 @@ impl<'a> HomeState<'a> {
                 return HomeAction::InitializeGlobalConfig(modal.target);
             }
             return HomeAction::None;
+        }
+
+        if let Some(modal) = self.template.as_mut() {
+            return match modal.handle_key(key) {
+                TemplateModalTransition::NotHandled | TemplateModalTransition::Handled => {
+                    HomeAction::None
+                }
+                TemplateModalTransition::Close => {
+                    self.template = None;
+                    HomeAction::None
+                }
+                TemplateModalTransition::Activate(request) => HomeAction::Template(request),
+            };
         }
 
         if self.open_contest.modal_active() {
@@ -148,6 +191,7 @@ impl<'a> HomeState<'a> {
             }
             KeyCode::Char('w') => HomeAction::OpenWorkspaceConfig,
             KeyCode::Char('G') => HomeAction::OpenGlobalConfig,
+            KeyCode::Char('t') => HomeAction::OpenTemplate,
             KeyCode::Char('a') => HomeAction::ShowAuthenticationCookie,
             KeyCode::Char('q') => HomeAction::Quit,
             _ => HomeAction::None,
@@ -334,6 +378,14 @@ fn run_with_terminal_and_paths<T>(
                     open_global_config(terminal, &mut state, config, paths)?;
                     dirty = true;
                 }
+                HomeAction::OpenTemplate => {
+                    state.open_template(paths.templates_dir_result(), config);
+                    dirty = true;
+                }
+                HomeAction::Template(request) => {
+                    handle_template_action(terminal, &mut state, config, request)?;
+                    dirty = true;
+                }
                 HomeAction::ShowAuthenticationCookie => {
                     show_authentication_cookie_status(&mut state, paths);
                     dirty = true;
@@ -351,6 +403,49 @@ fn run_with_terminal_and_paths<T>(
             TerminalEvent::Paste(_) | TerminalEvent::Pointer(_) | TerminalEvent::Ignored => {}
         }
     }
+}
+
+fn handle_template_action(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    config: &Config,
+    request: TemplateRequest,
+) -> io::Result<()> {
+    let editor = match terminal.resolve_home_editor(config) {
+        Ok(editor) => editor,
+        Err(error) => {
+            state.show_template_error(error);
+            return Ok(());
+        }
+    };
+    if request.action == TemplateAction::InitializeAndOpen {
+        let Some(templates_dir) = request.path.parent() else {
+            state.show_template_error(format!(
+                "source template has no parent directory: {}",
+                request.path.display()
+            ));
+            return Ok(());
+        };
+        let mut reporter = super::EditorInitializationReporter;
+        if let Err(error) = crate::commands::initialize_source_templates_at(
+            templates_dir,
+            std::slice::from_ref(&request.language),
+            &mut reporter,
+        ) {
+            state.show_template_error(format!("failed to initialize source template: {error}"));
+            return Ok(());
+        }
+    }
+
+    let outcome = terminal.launch_home_editor(config, &editor, &request.path)?;
+    if outcome.discard_input_batch {
+        terminal.discard_home_input_batch()?;
+    }
+    match outcome.result {
+        HomeEditorResult::Launched => state.close_template(),
+        HomeEditorResult::RecoverableError(error) => state.show_template_error(error),
+    }
+    Ok(())
 }
 
 fn launch_target(
@@ -735,6 +830,9 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
     if let Some(error) = state.error.as_ref() {
         render_home_action_error(frame, error);
     }
+    if let Some(modal) = state.template.as_ref() {
+        view::render_open_template_modal(frame, modal);
+    }
 }
 
 fn render_initialize_global_config(frame: &mut Frame<'_>, modal: &InitializeGlobalConfigModal) {
@@ -793,6 +891,7 @@ fn render_home_action_error(frame: &mut Frame<'_>, error: &HomeActionError) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -920,6 +1019,84 @@ mod tests {
         }
     }
 
+    struct ScriptedHomeTerminal {
+        batches: VecDeque<VecDeque<TerminalEvent>>,
+        active_batch: VecDeque<TerminalEvent>,
+        frames: Vec<String>,
+        targets: Vec<PathBuf>,
+        reads: usize,
+    }
+
+    impl ScriptedHomeTerminal {
+        fn new(batches: impl IntoIterator<Item = Vec<TerminalEvent>>) -> Self {
+            Self {
+                batches: batches.into_iter().map(VecDeque::from).collect(),
+                active_batch: VecDeque::new(),
+                frames: Vec::new(),
+                targets: Vec::new(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl HomeTerminal for ScriptedHomeTerminal {
+        fn draw_home(&mut self, render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()> {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(frame)).unwrap();
+            self.frames.push(buffer_text(terminal.backend().buffer()));
+            Ok(())
+        }
+
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_home_resize(&mut self) {}
+
+        fn poll_home(&mut self, wait: Duration) -> io::Result<bool> {
+            if !self.active_batch.is_empty() {
+                return Ok(true);
+            }
+            if wait == Duration::ZERO {
+                return Ok(false);
+            }
+            let Some(batch) = self.batches.pop_front() else {
+                return Err(io::Error::other("scripted Workspace Home input exhausted"));
+            };
+            self.active_batch = batch;
+            Ok(!self.active_batch.is_empty())
+        }
+
+        fn read_home(&mut self) -> io::Result<TerminalEvent> {
+            self.reads = self.reads.saturating_add(1);
+            self.active_batch
+                .pop_front()
+                .ok_or_else(|| io::Error::other("scripted Workspace Home batch is empty"))
+        }
+
+        fn resolve_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
+            Ok(ResolvedEditor {
+                program: "test-editor".into(),
+                args: Vec::new(),
+                mode: crate::editor::EditorLaunchMode::External,
+                source: crate::editor::EditorSource::EditorEnv,
+            })
+        }
+
+        fn launch_home_editor(
+            &mut self,
+            _config: &Config,
+            _editor: &ResolvedEditor,
+            target: &Path,
+        ) -> io::Result<HomeEditorOutcome> {
+            self.targets.push(target.to_path_buf());
+            Ok(HomeEditorOutcome {
+                result: HomeEditorResult::Launched,
+                discard_input_batch: false,
+            })
+        }
+    }
+
     fn cookie_location(root: &Path) -> crate::paths::CookieLocation {
         let platform_base = root.join("platform-state");
         let state_dir = platform_base.join("atc").join("state");
@@ -1017,6 +1194,175 @@ mod tests {
             home.error
                 .as_ref()
                 .is_some_and(|error| error.message.contains("No editor configured."))
+        );
+    }
+
+    #[test]
+    fn workspace_home_template_uses_runtime_config_and_enter_initializes_only_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates = temp.path().join("templates");
+        let paths = HomeActionPaths::for_test_with_templates(
+            temp.path().join("config.toml"),
+            templates.clone(),
+            cookie_location(temp.path()),
+        );
+        let mut config = Config::default();
+        config.defaults.language = crate::language::Language::Python;
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('t'), KeyEventKind::Press)),
+            HomeAction::OpenTemplate
+        );
+        home.open_template(paths.templates_dir_result(), &config);
+        assert_eq!(
+            home.template.as_ref().unwrap().selected_language(),
+            crate::language::Language::Python
+        );
+
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('G'),
+            KeyCode::Char('a'),
+            KeyCode::Char('c'),
+            KeyCode::Char('o'),
+            KeyCode::Char('t'),
+        ] {
+            assert_eq!(
+                home.handle_key(key(code, KeyEventKind::Press)),
+                HomeAction::None
+            );
+            assert!(home.template.is_some());
+        }
+
+        let HomeAction::Template(request) =
+            home.handle_key(key(KeyCode::Enter, KeyEventKind::Press))
+        else {
+            panic!("Enter must activate the missing selected template")
+        };
+        assert_eq!(request.language, crate::language::Language::Python);
+        assert_eq!(request.action, TemplateAction::InitializeAndOpen);
+        assert_eq!(request.path, templates.join("python.py"));
+
+        let mut terminal = RecordingHomeTerminal {
+            resolve_error: Some("No editor configured.".to_string()),
+            ..RecordingHomeTerminal::default()
+        };
+        handle_template_action(&mut terminal, &mut home, &config, request).unwrap();
+        assert!(!templates.exists());
+        assert!(home.template.as_ref().unwrap().error.is_some());
+
+        terminal.resolve_error = None;
+        let HomeAction::Template(request) =
+            home.handle_key(key(KeyCode::Enter, KeyEventKind::Press))
+        else {
+            panic!("Enter must allow retry after resolver recovery")
+        };
+        handle_template_action(&mut terminal, &mut home, &config, request).unwrap();
+        assert_eq!(
+            std::fs::read(templates.join("python.py")).unwrap(),
+            crate::template::builtin_template(crate::language::Language::Python).as_bytes()
+        );
+        assert!(!templates.join("cpp.cpp").exists());
+        assert_eq!(terminal.targets, [templates.join("python.py")]);
+        assert!(home.template.is_none());
+    }
+
+    #[test]
+    fn workspace_template_runs_through_the_production_home_loop() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates = temp.path().join("templates");
+        let paths = HomeActionPaths::for_test_with_templates(
+            temp.path().join("config.toml"),
+            templates.clone(),
+            cookie_location(temp.path()),
+        );
+        let mut config = Config::default();
+        config.defaults.language = crate::language::Language::Python;
+        let mut terminal = ScriptedHomeTerminal::new([
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('t'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('t'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+        ]);
+        let mut submissions = SubmissionHub::new();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+
+        let exit = run_with_terminal_and_paths(
+            &mut terminal,
+            temp.path(),
+            &config,
+            &mut submissions,
+            &mut resolve,
+            Arc::new(|_, _| Ok(())),
+            || Ok::<(), String>(()),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(matches!(exit, HomeExit::Quit));
+        assert_eq!(terminal.reads, 6);
+        assert_eq!(terminal.targets, [templates.join("python.py")]);
+        assert_eq!(
+            std::fs::read(templates.join("python.py")).unwrap(),
+            crate::template::builtin_template(crate::language::Language::Python).as_bytes()
+        );
+        assert!(terminal.frames[1].contains("[Enter] Initialize & Open"));
+        assert!(terminal.frames[2].contains("[Enter] Initialize & Open"));
+        assert!(terminal.frames[4].contains("[Enter] Open"));
+    }
+
+    #[test]
+    fn workspace_template_terminal_outcome_preserves_discard_and_recoverable_error_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates = temp.path().join("templates");
+        std::fs::create_dir(&templates).unwrap();
+        let cpp = templates.join("cpp.cpp");
+        std::fs::write(&cpp, "// ready\n").unwrap();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let config = Config::default();
+        home.open_template(Ok(templates), &config);
+        let HomeAction::Template(request) =
+            home.handle_key(key(KeyCode::Enter, KeyEventKind::Press))
+        else {
+            panic!("ready template must open")
+        };
+        let mut terminal = RecordingHomeTerminal {
+            outcome: HomeEditorOutcome {
+                result: HomeEditorResult::RecoverableError("launch failed".to_string()),
+                discard_input_batch: true,
+            },
+            ..RecordingHomeTerminal::default()
+        };
+        handle_template_action(&mut terminal, &mut home, &config, request).unwrap();
+
+        assert_eq!(terminal.discarded_batches, 1);
+        assert_eq!(terminal.targets, [cpp]);
+        assert_eq!(
+            home.template.as_ref().unwrap().error.as_deref(),
+            Some("launch failed")
         );
     }
 
@@ -1281,6 +1627,7 @@ mod tests {
             "Open / Create Contest",
             "Workspace Config",
             "Global Config",
+            "Template",
             "Authentication Cookie",
             "Quit",
         ]) {
@@ -1368,7 +1715,7 @@ mod tests {
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let home = state(&mut resolve);
         let width = 30;
-        let height = 8;
+        let height = 9;
         let workspace_area = home_layout(Rect::new(0, 0, width, height))
             .workspace
             .expect("workspace row should fit");

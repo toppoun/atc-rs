@@ -32,11 +32,11 @@ use super::submission::{
     SubmissionDisplayState, SubmissionHistoryEntry, SubmissionTone, SubmissionViewState,
     TuiSubmissionAttemptState, TuiSubmissionState, UserVisibleSubmissionState,
 };
+use super::template_modal::{OpenTemplateModal, TemplateRow, TemplateStatus};
 use super::{
     CommandPalette, EditorTargetModal, FrontendAction, FrontendActionAvailability,
-    OpenSettingsModal, OpenSourceModal, OpenTemplateModal, OpenWorkspaceSettingsModal,
-    RefreshContestModal, RefreshContestModalState, SubmitModal, SwitchContestModal,
-    SwitchContestModalState,
+    OpenSettingsModal, OpenSourceModal, OpenWorkspaceSettingsModal, RefreshContestModal,
+    RefreshContestModalState, SubmitModal, SwitchContestModal, SwitchContestModalState,
 };
 use crate::atcoder::submission_tracking::SubmissionStatus;
 use crate::language::Language;
@@ -1717,79 +1717,106 @@ fn render_open_workspace_settings_modal(frame: &mut Frame, modal: &OpenWorkspace
     render_editor_modal(frame, area, "Open Workspace Settings", lines);
 }
 
-fn render_open_template_modal(frame: &mut Frame, modal: &OpenTemplateModal) {
-    use crate::user_config_fs::EditableFileState;
-
+pub(super) fn render_open_template_modal(frame: &mut Frame, modal: &OpenTemplateModal) {
     let (area, line_width) = editor_modal_geometry(frame.area(), 15);
     let mut lines = Vec::new();
-    let mut inspection_error = None;
-    for language in Language::ALL {
-        let marker = if modal.selected_language() == language {
-            ">"
-        } else {
-            " "
-        };
-        let mut states = Vec::new();
-        if modal.current_language() == Some(language) {
-            states.push("current");
-        }
-        match modal.file_state_for(language) {
-            Ok(EditableFileState::Missing) => states.push("not initialized"),
-            Ok(EditableFileState::Existing) => {}
-            Err(error) => {
-                states.push("unavailable");
-                inspection_error.get_or_insert(error);
-            }
-        }
-        let state = if states.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", states.join(", "))
-        };
-        let row = fit_command_palette_row(
-            &format!("{marker} {:<8}{state}", language_label(language)),
-            line_width,
-        );
-        let style = if modal.selected_language() == language {
+    for row in modal.rows() {
+        let style = if modal.selected_language() == row.language {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::default()
         };
-        lines.push(Line::styled(row, style));
+        lines.push(template_row_line(&row, modal.selected_language(), line_width).style(style));
     }
 
-    let destination = modal
+    let path = modal
         .selected_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("unavailable: {error}"));
-    let action = match modal.file_state_for(modal.selected_language()) {
-        Ok(EditableFileState::Existing) => "[Enter] Open",
-        Ok(EditableFileState::Missing) => "[i] Initialize & Open",
-        Err(error) => {
-            inspection_error.get_or_insert(error);
-            ""
-        }
-    };
+    let inspection = modal.selected_inspection();
     lines.extend([
         Line::raw(""),
-        Line::raw(fit_command_palette_row("Destination:", line_width)),
-        Line::raw(fit_command_palette_row(
-            &format!("  {destination}"),
-            line_width,
-        )),
+        Line::raw(fit_command_palette_row("Path", line_width)),
+        Line::raw(fit_command_palette_row(&path, line_width)),
         Line::raw(""),
-        Line::raw(fit_command_palette_row(action, line_width)),
-        Line::raw(fit_command_palette_row(
-            "[↑/↓ or j/k] Select   [Esc] Close",
-            line_width,
-        )),
     ]);
     append_modal_error(
         &mut lines,
-        inspection_error.as_deref().or(modal.error.as_deref()),
+        modal.error.as_deref().or(inspection.detail.as_deref()),
         line_width,
     );
+    let footer = inspection.action.map_or_else(
+        || "[↑↓ / j/k] Select   [Esc] Close".to_string(),
+        |action| {
+            format!(
+                "{}   [↑↓ / j/k] Select   [Esc] Close",
+                action.footer_label()
+            )
+        },
+    );
+    lines.push(Line::raw(fit_command_palette_row(&footer, line_width)));
     render_editor_modal(frame, area, "Open Template", lines);
+}
+
+fn template_row_line(
+    row: &TemplateRow,
+    selected_language: Language,
+    width: usize,
+) -> Line<'static> {
+    let language = language_label(row.language);
+    let status = row.status.label();
+    let default = if row.is_default { "Default" } else { "" };
+    let marker = if row.language == selected_language {
+        "> "
+    } else {
+        "  "
+    };
+    let language_width = UnicodeWidthStr::width(language);
+    let filename_width = UnicodeWidthStr::width(row.filename);
+    let status_width = UnicodeWidthStr::width(status);
+    let default_width = UnicodeWidthStr::width(default);
+    let mut gaps = [
+        10usize.saturating_sub(language_width).max(1),
+        14usize.saturating_sub(filename_width).max(1),
+        if row.is_default {
+            11usize.saturating_sub(status_width).max(1)
+        } else {
+            0
+        },
+    ];
+    let minimums = [1, 1, usize::from(row.is_default)];
+    let content_width = UnicodeWidthStr::width(marker)
+        .saturating_add(language_width)
+        .saturating_add(filename_width)
+        .saturating_add(status_width)
+        .saturating_add(default_width);
+    let mut excess = content_width
+        .saturating_add(gaps.iter().sum::<usize>())
+        .saturating_sub(width);
+    for index in (0..gaps.len()).rev() {
+        let removable = gaps[index].saturating_sub(minimums[index]).min(excess);
+        gaps[index] = gaps[index].saturating_sub(removable);
+        excess = excess.saturating_sub(removable);
+    }
+
+    let status_style = match row.status {
+        TemplateStatus::Ready => Style::default().fg(Color::Green),
+        TemplateStatus::Missing => Style::default().fg(Color::Yellow),
+        TemplateStatus::Invalid => Style::default().fg(Color::Red),
+    };
+    fit_styled_row(
+        vec![
+            Span::raw(marker),
+            Span::raw(language),
+            Span::raw(" ".repeat(gaps[0])),
+            Span::raw(row.filename),
+            Span::raw(" ".repeat(gaps[1])),
+            Span::styled(status, status_style),
+            Span::raw(" ".repeat(gaps[2])),
+            Span::raw(default),
+        ],
+        width,
+    )
 }
 
 fn render_open_source_modal(frame: &mut Frame, app: &WatchApp, modal: &OpenSourceModal) {
@@ -5859,7 +5886,10 @@ mod tests {
             Ok(templates_dir.clone()),
             Some(temp.path()),
         );
-        let app = app();
+        let mut app = app();
+        let current_cpp =
+            crate::workspace::source_file_path(temp.path(), "A", Language::Cpp).unwrap();
+        assert!(app.source_changed(0, current_cpp, Language::Cpp));
 
         controller.open_settings();
         let EditorTargetModal::Settings(settings) = controller.modal().unwrap() else {
@@ -5902,9 +5932,86 @@ mod tests {
         let cpp_position = rendered.find("C++").unwrap();
         let python_position = rendered.find("Python").unwrap();
         assert!(cpp_position < python_position);
-        assert!(rendered.contains("Python    not initialized"));
-        assert!(rendered.contains("[i] Initialize & Open"));
+        let cpp_row = rendered
+            .lines()
+            .find(|line| line.contains("cpp.cpp"))
+            .unwrap();
+        let python_row = rendered
+            .lines()
+            .find(|line| line.contains("python.py"))
+            .unwrap();
+        assert!(!cpp_row.contains("Default"));
+        assert!(python_row.contains("Default"));
+        assert_eq!(cpp_row.find("Ready"), python_row.find("Missing"));
+        assert!(rendered.contains("cpp.cpp"));
+        assert!(rendered.contains("python.py"));
+        assert!(rendered.contains("Ready"));
+        assert!(rendered.contains("Missing"));
+        assert!(rendered.contains("Default"));
+        assert!(rendered.contains("Path"));
+        assert!(rendered.contains("[Enter] Open"));
         assert!(!rendered.contains("Problem:"));
+    }
+
+    #[test]
+    fn template_modal_renders_all_actions_and_unicode_safe_responsive_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates = temp.path().join("templates");
+        fs::create_dir(&templates).unwrap();
+        let cpp = crate::template::source_template_path(&templates, Language::Cpp);
+        fs::write(&cpp, "// ready\n").unwrap();
+        let ready = OpenTemplateModal::new(Ok(templates.clone()), Language::Cpp, Language::Cpp);
+        let ready_modal = EditorTargetModal::Template(ready.clone());
+        let rendered = rendered_editor_target_text(&app(), &ready_modal, 76, 15);
+        assert!(rendered.contains("[Enter] Open"));
+        assert!(rendered.contains("[↑↓ / j/k] Select"));
+
+        fs::write(&cpp, [0xff, 0xfe]).unwrap();
+        let repairable = EditorTargetModal::Template(ready.clone());
+        let rendered = rendered_editor_target_text(&app(), &repairable, 76, 15);
+        assert!(rendered.contains("Invalid"));
+        assert!(rendered.contains("[Enter] Open to Repair"));
+        assert!(rendered.contains("UTF-8"));
+
+        fs::remove_file(&cpp).unwrap();
+        fs::create_dir(&cpp).unwrap();
+        let unsafe_modal = EditorTargetModal::Template(ready);
+        let rendered = rendered_editor_target_text(&app(), &unsafe_modal, 76, 15);
+        assert!(rendered.contains("Invalid"));
+        assert!(rendered.contains("source template must"));
+        assert!(!rendered.contains("[Enter]"));
+
+        let unicode_templates =
+            PathBuf::from(r"C:\Users\ユーザー\非常に長いテンプレートディレクトリ\さらに長い保存先");
+        let narrow_modal = EditorTargetModal::Template(OpenTemplateModal::new(
+            Ok(unicode_templates),
+            Language::Cpp,
+            Language::Cpp,
+        ));
+        let narrow = rendered_editor_target_text(&app(), &narrow_modal, 48, 15);
+        assert!(narrow.contains("C++"));
+        assert!(narrow.contains("cpp.cpp"));
+        assert!(narrow.contains("Missing"));
+        assert!(narrow.contains("Default"));
+        assert!(narrow.contains('…'));
+        assert!(!narrow.contains('\u{fffd}'));
+        for (width, height) in [(20, 8), (8, 4), (1, 1), (0, 0)] {
+            let _ = rendered_editor_target_text(&app(), &narrow_modal, width, height);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(76, 15)).unwrap();
+        terminal
+            .draw(|frame| {
+                let EditorTargetModal::Template(modal) = &narrow_modal else {
+                    unreachable!()
+                };
+                render_open_template_modal(frame, modal);
+            })
+            .unwrap();
+        let selected = terminal.backend().buffer().cell((1, 1)).unwrap();
+        assert_eq!(selected.symbol(), ">");
+        assert!(selected.modifier.contains(Modifier::BOLD));
+        assert!(selected.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

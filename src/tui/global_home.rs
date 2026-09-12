@@ -16,7 +16,11 @@ use super::explorer::{self, ExplorerState};
 use super::home::{
     centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
 };
+use super::template_modal::{
+    OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
+};
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
+use super::view;
 use super::{
     HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, ShortcutHelpTransition,
     TerminaSession, is_shortcut_help_key, shortcut_help_transition,
@@ -25,11 +29,12 @@ use crate::{branding, config::Config};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 8] = [
+const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 9] = [
     Some(("Open", "o")),
     Some(("Go to Path", "g")),
     None,
     Some(("Global Config", "G")),
+    Some(("Template", "t")),
     Some(("Authentication Cookie", "a")),
     None,
     Some(("Explorer Shortcuts", "?")),
@@ -79,6 +84,8 @@ struct InitializeGlobalConfigModal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalHomeFileAction {
     OpenGlobalConfig,
+    OpenTemplate,
+    Template(TemplateRequest),
     ShowAuthenticationCookie,
     InitializeGlobalConfig(PathBuf),
 }
@@ -147,13 +154,34 @@ impl PathInputModal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+struct ActiveTemplateModal {
+    modal: OpenTemplateModal,
+    config: Config,
+}
+
+impl std::ops::Deref for ActiveTemplateModal {
+    type Target = OpenTemplateModal;
+
+    fn deref(&self) -> &Self::Target {
+        &self.modal
+    }
+}
+
+impl std::ops::DerefMut for ActiveTemplateModal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.modal
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GlobalHomeState {
     explorer: ExplorerState,
     path_input: Option<PathInputModal>,
     error: Option<GlobalHomeError>,
     initialize_workspace: Option<InitializeWorkspaceModal>,
     initialize_global_config: Option<InitializeGlobalConfigModal>,
+    template: Option<ActiveTemplateModal>,
     file_action: Option<GlobalHomeFileAction>,
     shortcut_help_visible: bool,
     explorer_overlay_visible: bool,
@@ -168,6 +196,7 @@ impl GlobalHomeState {
             error: None,
             initialize_workspace: None,
             initialize_global_config: None,
+            template: None,
             file_action: None,
             shortcut_help_visible: false,
             explorer_overlay_visible: false,
@@ -199,6 +228,7 @@ impl GlobalHomeState {
     pub(crate) fn show_initialize_workspace_confirmation(&mut self, target: PathBuf) {
         self.path_input = None;
         self.initialize_global_config = None;
+        self.template = None;
         self.file_action = None;
         self.shortcut_help_visible = false;
         self.initialize_workspace = Some(InitializeWorkspaceModal { target });
@@ -215,6 +245,7 @@ impl GlobalHomeState {
     fn show_workspace_error(&mut self, kind: GlobalHomeErrorKind, message: String) {
         self.initialize_workspace = None;
         self.initialize_global_config = None;
+        self.template = None;
         self.file_action = None;
         self.path_input = None;
         self.shortcut_help_visible = false;
@@ -228,6 +259,7 @@ impl GlobalHomeState {
     fn show_initialize_global_config(&mut self, target: PathBuf) {
         self.initialize_workspace = None;
         self.path_input = None;
+        self.template = None;
         self.shortcut_help_visible = false;
         self.error = None;
         self.initialize_global_config = Some(InitializeGlobalConfigModal { target });
@@ -235,6 +267,30 @@ impl GlobalHomeState {
 
     fn take_file_action(&mut self) -> Option<GlobalHomeFileAction> {
         self.file_action.take()
+    }
+
+    fn open_template(&mut self, templates_dir: Result<PathBuf, String>, config: Config) {
+        self.initialize_workspace = None;
+        self.initialize_global_config = None;
+        self.path_input = None;
+        self.error = None;
+        self.shortcut_help_visible = false;
+        self.explorer_overlay_visible = false;
+        let default_language = config.defaults.language;
+        self.template = Some(ActiveTemplateModal {
+            modal: OpenTemplateModal::new(templates_dir, default_language, default_language),
+            config,
+        });
+    }
+
+    fn close_template(&mut self) {
+        self.template = None;
+    }
+
+    fn show_template_error(&mut self, error: String) {
+        if let Some(modal) = self.template.as_mut() {
+            modal.set_error(error);
+        }
     }
 
     fn open_path_input(&mut self) {
@@ -359,6 +415,17 @@ impl GlobalHomeState {
             return None;
         }
 
+        if let Some(modal) = self.template.as_mut() {
+            match modal.handle_key(key) {
+                TemplateModalTransition::NotHandled | TemplateModalTransition::Handled => {}
+                TemplateModalTransition::Close => self.template = None,
+                TemplateModalTransition::Activate(request) => {
+                    self.file_action = Some(GlobalHomeFileAction::Template(request));
+                }
+            }
+            return None;
+        }
+
         if self.path_input.is_some() {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
                 self.path_input = None;
@@ -415,6 +482,10 @@ impl GlobalHomeState {
                     self.file_action = Some(GlobalHomeFileAction::OpenGlobalConfig);
                     None
                 }
+                KeyCode::Char('t') if has_plain_modifiers(key) => {
+                    self.file_action = Some(GlobalHomeFileAction::OpenTemplate);
+                    None
+                }
                 KeyCode::Char('a') if has_plain_modifiers(key) => {
                     self.file_action = Some(GlobalHomeFileAction::ShowAuthenticationCookie);
                     None
@@ -434,6 +505,7 @@ impl GlobalHomeState {
         if self.error.is_some()
             || self.initialize_workspace.is_some()
             || self.initialize_global_config.is_some()
+            || self.template.is_some()
         {
             return;
         }
@@ -693,6 +765,58 @@ fn handle_file_action(
                 GlobalHomeErrorKind::GlobalConfig,
             )
         }
+        GlobalHomeFileAction::OpenTemplate => {
+            let config = editor_config(paths);
+            state.open_template(paths.templates_dir_result(), config);
+            Ok(())
+        }
+        GlobalHomeFileAction::Template(request) => {
+            let resolution = match state.template.as_ref() {
+                Some(active) => terminal.resolve_global_home_editor(&active.config),
+                None => return Ok(()),
+            };
+            let editor = match resolution {
+                Ok(editor) => editor,
+                Err(error) => {
+                    state.show_template_error(error);
+                    return Ok(());
+                }
+            };
+            if request.action == TemplateAction::InitializeAndOpen {
+                let Some(templates_dir) = request.path.parent() else {
+                    state.show_template_error(format!(
+                        "source template has no parent directory: {}",
+                        request.path.display()
+                    ));
+                    return Ok(());
+                };
+                let mut reporter = super::EditorInitializationReporter;
+                if let Err(error) = crate::commands::initialize_source_templates_at(
+                    templates_dir,
+                    std::slice::from_ref(&request.language),
+                    &mut reporter,
+                ) {
+                    state.show_template_error(format!(
+                        "failed to initialize source template: {error}"
+                    ));
+                    return Ok(());
+                }
+            }
+            let outcome = match state.template.as_ref() {
+                Some(active) => {
+                    terminal.launch_global_home_editor(&active.config, &editor, &request.path)?
+                }
+                None => return Ok(()),
+            };
+            if outcome.discard_input_batch {
+                terminal.discard_global_home_input_batch()?;
+            }
+            match outcome.result {
+                HomeEditorResult::Launched => state.close_template(),
+                HomeEditorResult::RecoverableError(error) => state.show_template_error(error),
+            }
+            Ok(())
+        }
         GlobalHomeFileAction::ShowAuthenticationCookie => {
             state.show_home_action_error(
                 GlobalHomeErrorKind::AuthenticationCookie,
@@ -915,6 +1039,9 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
     if let Some(error) = state.error.as_ref() {
         render_error(frame, error);
+    }
+    if let Some(modal) = state.template.as_ref() {
+        view::render_open_template_modal(frame, modal);
     }
 }
 
@@ -1151,6 +1278,7 @@ mod tests {
         resolve_error: Option<String>,
         editor_outcome: HomeEditorOutcome,
         discarded_events: usize,
+        batch_file_writes: VecDeque<Option<(PathBuf, String)>>,
     }
 
     impl ScriptedGlobalTerminal {
@@ -1176,6 +1304,7 @@ mod tests {
                     discard_input_batch: false,
                 },
                 discarded_events: 0,
+                batch_file_writes: VecDeque::new(),
             }
         }
     }
@@ -1204,6 +1333,9 @@ mod tests {
             let Some(batch) = self.batches.pop_front() else {
                 return Err(io::Error::other("scripted Global Home input exhausted"));
             };
+            if let Some(Some((path, contents))) = self.batch_file_writes.pop_front() {
+                std::fs::write(path, contents)?;
+            }
             self.active_batch = batch;
             Ok(!self.active_batch.is_empty())
         }
@@ -1396,6 +1528,138 @@ mod tests {
         );
         assert_eq!(resolved.mode, crate::editor::EditorLaunchMode::Terminal);
         assert_eq!(resolved.source, crate::editor::EditorSource::Config);
+    }
+
+    #[test]
+    fn global_home_template_fresh_loads_default_and_initializes_with_enter() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let templates = temp.path().join("templates");
+        std::fs::write(&config, "[defaults]\nlanguage = \"python\"\n").unwrap();
+        let paths = HomeActionPaths::for_test_with_templates(
+            config.clone(),
+            templates.clone(),
+            cookie_location(temp.path()),
+        );
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('t'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(
+            std::fs::read(templates.join("python.py")).unwrap(),
+            crate::template::builtin_template(crate::language::Language::Python).as_bytes()
+        );
+        assert!(!templates.join("cpp.cpp").exists());
+        assert_eq!(terminal.editor_targets, [templates.join("python.py")]);
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Open Template")
+                && frame.contains("Python")
+                && frame.contains("Default")
+                && frame.contains("[Enter] Initialize & Open")
+        }));
+
+        std::fs::write(&config, "invalid = [\n").unwrap();
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        assert_eq!(state.handle_key(key(KeyCode::Char('t'))), None);
+        let action = state.take_file_action().unwrap();
+        let mut direct_terminal = ScriptedGlobalTerminal::new(100, 30, []);
+        handle_file_action(&mut direct_terminal, &mut state, &paths, action).unwrap();
+        let modal = state.template.as_ref().unwrap();
+        assert_eq!(modal.selected_language(), crate::language::Language::Cpp);
+        assert_eq!(modal.default_language(), crate::language::Language::Cpp);
+    }
+
+    #[test]
+    fn global_template_session_keeps_one_config_generation_and_reloads_after_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let templates = temp.path().join("templates");
+        let config_a = "[defaults]\nlanguage = \"cpp\"\n\
+[editor]\ncommand = \"editor-a\"\nmode = \"external\"\n";
+        let config_b = "[defaults]\nlanguage = \"python\"\n\
+[editor]\ncommand = \"editor-b\"\nmode = \"external\"\n";
+        std::fs::write(&config_path, config_a).unwrap();
+        let paths = HomeActionPaths::for_test_with_templates(
+            config_path.clone(),
+            templates.clone(),
+            cookie_location(temp.path()),
+        );
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('t'))],
+                vec![event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('t'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.use_production_editor_resolver = true;
+        terminal.batch_file_writes =
+            VecDeque::from([None, Some((config_path.clone(), config_b.to_string()))]);
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+
+        assert!(terminal.frames[2].contains("cpp.cpp       Missing    Default"));
+        assert!(terminal.frames[4].contains("python.py     Missing    Default"));
+        assert_eq!(
+            terminal
+                .launched_editors
+                .iter()
+                .map(|editor| editor.program.as_os_str())
+                .collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("editor-a"),
+                std::ffi::OsStr::new("editor-b")
+            ]
+        );
+        assert_eq!(
+            terminal.editor_targets,
+            [templates.join("cpp.cpp"), templates.join("python.py")]
+        );
+    }
+
+    #[test]
+    fn global_template_modal_owns_home_shortcuts_until_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        state.open_template(Ok(temp.path().join("templates")), Config::default());
+
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('G'),
+            KeyCode::Char('a'),
+            KeyCode::Char('o'),
+            KeyCode::Char('g'),
+            KeyCode::Char('t'),
+        ] {
+            assert_eq!(state.handle_key(key(code)), None);
+            assert!(state.take_file_action().is_none());
+            assert!(state.template.is_some());
+        }
+        assert_eq!(state.handle_key(key(KeyCode::Escape)), None);
+        assert!(state.template.is_none());
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('q'))),
+            Some(GlobalHomeExit::Quit)
+        );
     }
 
     #[test]
@@ -1609,6 +1873,7 @@ mod tests {
             "Open",
             "Go to Path",
             "Global Config",
+            "Template",
             "Authentication Cookie",
             "Explorer Shortcuts",
             "Quit",
