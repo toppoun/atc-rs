@@ -37,9 +37,75 @@ jobs:
           cargo about generate about.hbs \
             -o "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"
 
-          diff -u \
+          python3 - \
             THIRD_PARTY_LICENSES.html \
-            "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"
+            "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html" <<'PY'
+          from collections import Counter
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import sys
+
+          class UsedByParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.in_used_by = False
+                  self.in_link = False
+                  self.buf = []
+                  self.packages = []
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+
+                  if tag == "ul":
+                      classes = attrs.get("class", "").split()
+                      if "license-used-by" in classes:
+                          self.in_used_by = True
+
+                  elif tag == "a" and self.in_used_by:
+                      self.in_link = True
+                      self.buf = []
+
+              def handle_data(self, data):
+                  if self.in_link:
+                      self.buf.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag == "a" and self.in_link:
+                      value = "".join(self.buf).strip()
+                      if value:
+                          self.packages.append(value)
+                      self.in_link = False
+                      self.buf = []
+
+                  elif tag == "ul" and self.in_used_by:
+                      self.in_used_by = False
+
+          def inventory(path):
+              parser = UsedByParser()
+              parser.feed(Path(path).read_text(encoding="utf-8"))
+              return Counter(parser.packages)
+
+          committed = inventory(sys.argv[1])
+          generated = inventory(sys.argv[2])
+
+          if committed != generated:
+              missing = generated - committed
+              extra = committed - generated
+
+              if missing:
+                  print("Missing from committed license inventory:", file=sys.stderr)
+                  for package, count in sorted(missing.items()):
+                      print(f"  {package} x{count}", file=sys.stderr)
+
+              if extra:
+                  print("Extra in committed license inventory:", file=sys.stderr)
+                  for package, count in sorted(extra.items()):
+                      print(f"  {package} x{count}", file=sys.stderr)
+
+              sys.exit(1)
+
+          print("Third-party license package inventory is current.")
+          PY
 
   windows:
     name: Windows x86_64
