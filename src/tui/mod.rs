@@ -795,6 +795,145 @@ struct LiveEditorHost<'a> {
     config: &'a Config,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HomeEditorResult {
+    Launched,
+    RecoverableError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomeEditorOutcome {
+    pub(crate) result: HomeEditorResult,
+    pub(crate) discard_input_batch: bool,
+}
+
+#[cfg(test)]
+fn launch_home_editor_with_host(
+    host: &mut dyn EditorHost,
+    target: &Path,
+) -> io::Result<HomeEditorOutcome> {
+    let resolved = match host.resolve() {
+        Ok(editor) => editor,
+        Err(error) => {
+            return Ok(HomeEditorOutcome {
+                result: HomeEditorResult::RecoverableError(error),
+                discard_input_batch: false,
+            });
+        }
+    };
+    launch_resolved_home_editor_with_host(host, &resolved, target)
+}
+
+fn launch_resolved_home_editor_with_host(
+    host: &mut dyn EditorHost,
+    resolved: &ResolvedEditor,
+    target: &Path,
+) -> io::Result<HomeEditorOutcome> {
+    let mut editor = EditorInputContext {
+        host,
+        discard_input_batch: false,
+    };
+    let result = editor.launch(resolved, target);
+    let discard_input_batch = editor.take_discard_input_batch();
+    match result {
+        Ok(()) => Ok(HomeEditorOutcome {
+            result: HomeEditorResult::Launched,
+            discard_input_batch,
+        }),
+        Err(EditorLaunchError::Recoverable(error)) => Ok(HomeEditorOutcome {
+            result: HomeEditorResult::RecoverableError(error),
+            discard_input_batch,
+        }),
+        Err(EditorLaunchError::TerminalRestore(error)) => Err(io::Error::other(error)),
+    }
+}
+
+fn resolve_live_home_editor(
+    terminal: &mut TerminaSession,
+    config: &Config,
+) -> Result<ResolvedEditor, String> {
+    let mut host = LiveEditorHost { terminal, config };
+    host.resolve()
+}
+
+fn launch_live_home_editor(
+    terminal: &mut TerminaSession,
+    config: &Config,
+    resolved: &ResolvedEditor,
+    target: &Path,
+) -> io::Result<HomeEditorOutcome> {
+    let mut host = LiveEditorHost { terminal, config };
+    launch_resolved_home_editor_with_host(&mut host, resolved, target)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HomeActionPaths {
+    global_config: Result<PathBuf, String>,
+    cookie_file: Result<PathBuf, String>,
+    cookie_location: Result<crate::paths::CookieLocation, String>,
+}
+
+impl HomeActionPaths {
+    fn current() -> Self {
+        Self {
+            global_config: crate::paths::config_file().map_err(|error| error.to_string()),
+            cookie_file: crate::paths::cookie_file().map_err(|error| error.to_string()),
+            cookie_location: crate::paths::cookie_location().map_err(|error| error.to_string()),
+        }
+    }
+
+    pub(crate) fn global_config(&self) -> Result<&Path, &str> {
+        self.global_config.as_deref().map_err(String::as_str)
+    }
+
+    pub(crate) fn cookie(&self) -> Result<(&Path, &crate::paths::CookieLocation), String> {
+        let file = self.cookie_file.as_deref().map_err(Clone::clone)?;
+        let location = self.cookie_location.as_ref().map_err(Clone::clone)?;
+        if file != location.file {
+            return Err("authentication cookie path resolution was inconsistent".to_string());
+        }
+        Ok((file, location))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        global_config: PathBuf,
+        cookie_location: crate::paths::CookieLocation,
+    ) -> Self {
+        Self {
+            global_config: Ok(global_config),
+            cookie_file: Ok(cookie_location.file.clone()),
+            cookie_location: Ok(cookie_location),
+        }
+    }
+}
+
+pub(crate) fn authentication_cookie_status(paths: &HomeActionPaths) -> String {
+    const FORMAT: &str = "REVEL_SESSION=<value>";
+    const PERMISSIONS: &str = "On Unix, group/other access must be denied (0600 is recommended).";
+
+    let (target, location) = match paths.cookie() {
+        Ok(cookie) => cookie,
+        Err(error) => {
+            return format!(
+                "Status: Invalid\nPath: unavailable\nFormat: {FORMAT}\n\n{error}\n\n{PERMISSIONS}"
+            );
+        }
+    };
+    let path = target.display();
+    match crate::auth::inspect_cookie_file(location) {
+        Ok(crate::auth::CookieFileState::Existing) => format!(
+            "Status: Configured\nPath: {path}\nFormat: {FORMAT}\n\nCredential contents are not displayed.\n{PERMISSIONS}"
+        ),
+        Ok(crate::auth::CookieFileState::Missing) => format!(
+            "Status: Not configured\nPath: {path}\nFormat: {FORMAT}\n\nRun `atc login` to set it up. The file was not created.\n{PERMISSIONS}"
+        ),
+        Err(error) => {
+            format!("Status: Invalid\nPath: {path}\nFormat: {FORMAT}\n\n{error}\n\n{PERMISSIONS}")
+        }
+    }
+}
+
 impl EditorHost for LiveEditorHost<'_> {
     fn resolve(&mut self) -> Result<ResolvedEditor, String> {
         editor::resolve(self.config).map_err(|error| error.to_string())
@@ -5950,6 +6089,61 @@ mod tests {
                 .clone()
                 .map_or(Ok(()), |error| Err(EditorLaunchError::Recoverable(error)))
         }
+    }
+
+    #[test]
+    fn home_editor_bridge_reuses_routing_recoverability_and_terminal_discard_contract() {
+        let target = Path::new("settings.toml");
+        let mut external = RecordingSourceEditor::new(EditorLaunchMode::External);
+        assert_eq!(
+            launch_home_editor_with_host(&mut external, target).unwrap(),
+            HomeEditorOutcome {
+                result: HomeEditorResult::Launched,
+                discard_input_batch: false
+            }
+        );
+        assert_eq!(external.external_targets, [target.to_path_buf()]);
+        assert!(external.terminal_targets.is_empty());
+
+        let mut terminal = RecordingSourceEditor::new(EditorLaunchMode::Terminal);
+        assert_eq!(
+            launch_home_editor_with_host(&mut terminal, target).unwrap(),
+            HomeEditorOutcome {
+                result: HomeEditorResult::Launched,
+                discard_input_batch: true
+            }
+        );
+        assert_eq!(terminal.terminal_targets, [target.to_path_buf()]);
+        assert!(terminal.external_targets.is_empty());
+
+        terminal.launch_error = Some("launch failed".to_string());
+        assert_eq!(
+            launch_home_editor_with_host(&mut terminal, target).unwrap(),
+            HomeEditorOutcome {
+                result: HomeEditorResult::RecoverableError("launch failed".to_string()),
+                discard_input_batch: true,
+            }
+        );
+        assert_eq!(terminal.terminal_targets.len(), 2);
+
+        let mut external_failure = RecordingSourceEditor::new(EditorLaunchMode::External);
+        external_failure.launch_error = Some("launch failed".to_string());
+        assert_eq!(
+            launch_home_editor_with_host(&mut external_failure, target).unwrap(),
+            HomeEditorOutcome {
+                result: HomeEditorResult::RecoverableError("launch failed".to_string()),
+                discard_input_batch: false,
+            }
+        );
+
+        terminal.launch_error = None;
+        terminal.terminal_restore_error = Some("restore failed".to_string());
+        assert_eq!(
+            launch_home_editor_with_host(&mut terminal, target)
+                .unwrap_err()
+                .to_string(),
+            "restore failed"
+        );
     }
 
     #[derive(Debug)]

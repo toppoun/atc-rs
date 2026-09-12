@@ -1,13 +1,13 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -16,157 +16,60 @@ use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::view::{self, ContestOpenPurpose};
 use super::{
     ContestOpenController, ContestOpenKeyResult, ContestSwitchResolution, ContestSwitchTask,
-    ShortcutHelpTransition, SubmissionHub, TerminaSession, command_matches,
-    is_command_palette_open_key, is_shortcut_help_key, shortcut_help_transition,
+    HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, SubmissionHub,
+    TerminaSession,
 };
-use crate::branding;
+use crate::{branding, config::Config};
 
 const HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const HOME_ACTIONS: [(&str, &str); 4] = [
-    ("Open Contest", "c"),
-    ("Commands", ":"),
-    ("Shortcuts", "?"),
-    ("Quit", "q"),
+const HOME_ACTIONS: [Option<(&str, &str)>; 7] = [
+    Some(("Open / Create Contest", "c")),
+    None,
+    Some(("Workspace Config", "w")),
+    Some(("Global Config", "G")),
+    Some(("Authentication Cookie", "a")),
+    None,
+    Some(("Quit", "q")),
 ];
 const MENU_WIDTH: u16 = 23;
 const MENU_HEIGHT: u16 = HOME_ACTIONS.len() as u16;
 const SUBTITLE: &str = "AtCoder workspace";
 const WORKSPACE_PREFIX: &str = "Workspace  ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HomeAction {
     None,
     OpenContest,
+    OpenWorkspaceConfig,
+    OpenGlobalConfig,
+    ShowAuthenticationCookie,
+    InitializeGlobalConfig(PathBuf),
     Quit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HomeCommand {
-    OpenContest,
-    Quit,
+enum HomeActionErrorKind {
+    WorkspaceConfig,
+    GlobalConfig,
+    AuthenticationCookie,
 }
 
-impl HomeCommand {
-    const ALL: [Self; 2] = [Self::OpenContest, Self::Quit];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::OpenContest => "Open Contest",
-            Self::Quit => "Quit",
-        }
-    }
-
-    const fn shortcut(self) -> &'static str {
-        match self {
-            Self::OpenContest => "c",
-            Self::Quit => "q",
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomeActionError {
+    kind: HomeActionErrorKind,
+    message: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct HomeCommandPalette {
-    open: bool,
-    query: String,
-    selected: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HomePaletteKeyResult {
-    NotHandled,
-    Handled,
-    Execute(HomeCommand),
-}
-
-impl HomeCommandPalette {
-    fn is_active(&self) -> bool {
-        self.open
-    }
-
-    fn open(&mut self) {
-        self.open = true;
-        self.query.clear();
-        self.selected = 0;
-    }
-
-    fn close(&mut self) {
-        self.open = false;
-        self.query.clear();
-        self.selected = 0;
-    }
-
-    fn filtered_commands(&self) -> Vec<HomeCommand> {
-        HomeCommand::ALL
-            .into_iter()
-            .filter(|command| command_matches(command.label(), &self.query))
-            .collect()
-    }
-
-    fn selected_command(&self) -> Option<HomeCommand> {
-        self.filtered_commands().get(self.selected).copied()
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> HomePaletteKeyResult {
-        if !self.is_active() {
-            return HomePaletteKeyResult::NotHandled;
-        }
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return HomePaletteKeyResult::Handled;
-        }
-
-        match key.code {
-            KeyCode::Escape if key.kind == KeyEventKind::Press => {
-                self.close();
-                HomePaletteKeyResult::Handled
-            }
-            KeyCode::Enter if key.kind == KeyEventKind::Press => self
-                .selected_command()
-                .map(HomePaletteKeyResult::Execute)
-                .unwrap_or(HomePaletteKeyResult::Handled),
-            KeyCode::Backspace => {
-                if let Some((start, _)) = self.query.grapheme_indices(true).next_back() {
-                    self.query.truncate(start);
-                }
-                self.selected = 0;
-                HomePaletteKeyResult::Handled
-            }
-            KeyCode::Up => {
-                let count = self.filtered_commands().len();
-                self.selected = if count <= 1 {
-                    0
-                } else if self.selected == 0 {
-                    count - 1
-                } else {
-                    self.selected.min(count - 1) - 1
-                };
-                HomePaletteKeyResult::Handled
-            }
-            KeyCode::Down => {
-                let count = self.filtered_commands().len();
-                self.selected = if count <= 1 {
-                    0
-                } else {
-                    (self.selected + 1) % count
-                };
-                HomePaletteKeyResult::Handled
-            }
-            KeyCode::Char(character)
-                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-            {
-                self.query.push(character);
-                self.selected = 0;
-                HomePaletteKeyResult::Handled
-            }
-            _ => HomePaletteKeyResult::Handled,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitializeGlobalConfigModal {
+    target: PathBuf,
 }
 
 /// Workspace Home owns only Home-specific UI state. Contest state remains mandatory inside
 /// `WatchApp`/`SessionRuntime` and is created only after this state produces a prepared handoff.
 struct HomeState<'a> {
-    shortcut_help_visible: bool,
-    palette: HomeCommandPalette,
+    error: Option<HomeActionError>,
+    initialize_global_config: Option<InitializeGlobalConfigModal>,
     open_contest: ContestOpenController<'a>,
 }
 
@@ -176,13 +79,47 @@ impl<'a> HomeState<'a> {
         task: ContestSwitchTask,
     ) -> Self {
         Self {
-            shortcut_help_visible: false,
-            palette: HomeCommandPalette::default(),
+            error: None,
+            initialize_global_config: None,
             open_contest: ContestOpenController::new(resolve, task),
         }
     }
 
+    fn show_error(&mut self, kind: HomeActionErrorKind, message: String) {
+        self.initialize_global_config = None;
+        self.error = Some(HomeActionError { kind, message });
+    }
+
+    fn show_initialize_global_config(&mut self, target: PathBuf) {
+        self.error = None;
+        self.initialize_global_config = Some(InitializeGlobalConfigModal { target });
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> HomeAction {
+        if self.error.is_some() {
+            if key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Enter | KeyCode::Escape)
+            {
+                self.error = None;
+            }
+            return HomeAction::None;
+        }
+
+        if self.initialize_global_config.is_some() {
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
+                self.initialize_global_config = None;
+                return HomeAction::None;
+            }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+                let modal = self
+                    .initialize_global_config
+                    .take()
+                    .expect("global config initialization modal must remain active");
+                return HomeAction::InitializeGlobalConfig(modal.target);
+            }
+            return HomeAction::None;
+        }
+
         if self.open_contest.modal_active() {
             let mut identity = |resolution| resolution;
             let mut no_current_destination = |_destination: &std::path::Path| false;
@@ -198,59 +135,22 @@ impl<'a> HomeState<'a> {
             };
         }
 
-        if self.palette.is_active() {
-            return match self.palette.handle_key(key) {
-                HomePaletteKeyResult::Execute(HomeCommand::OpenContest) => {
-                    self.palette.close();
-                    self.open_contest.open();
-                    HomeAction::None
-                }
-                HomePaletteKeyResult::Execute(HomeCommand::Quit) => {
-                    self.palette.close();
-                    HomeAction::Quit
-                }
-                HomePaletteKeyResult::NotHandled | HomePaletteKeyResult::Handled => {
-                    HomeAction::None
-                }
-            };
-        }
-
-        match shortcut_help_transition(self.shortcut_help_visible, key) {
-            ShortcutHelpTransition::KeepAndConsume => return HomeAction::None,
-            ShortcutHelpTransition::DismissAndConsume => {
-                self.shortcut_help_visible = false;
-                return HomeAction::None;
-            }
-            ShortcutHelpTransition::DismissAndPassThrough => {
-                self.shortcut_help_visible = false;
-            }
-            ShortcutHelpTransition::PassThrough => {}
-        }
-
         if key.kind != KeyEventKind::Press {
             return HomeAction::None;
         }
-        if is_shortcut_help_key(key) {
-            self.shortcut_help_visible = true;
-            HomeAction::None
-        } else if is_command_palette_open_key(key) {
-            self.palette.open();
-            HomeAction::None
-        } else {
-            match key.code {
-                KeyCode::Char('c')
-                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-                {
-                    self.open_contest.open();
-                    HomeAction::None
-                }
-                KeyCode::Char('q')
-                    if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-                {
-                    HomeAction::Quit
-                }
-                _ => HomeAction::None,
+        if key.modifiers.control || key.modifiers.alt || key.modifiers.super_key {
+            return HomeAction::None;
+        }
+        match key.code {
+            KeyCode::Char('c') => {
+                self.open_contest.open();
+                HomeAction::None
             }
+            KeyCode::Char('w') => HomeAction::OpenWorkspaceConfig,
+            KeyCode::Char('G') => HomeAction::OpenGlobalConfig,
+            KeyCode::Char('a') => HomeAction::ShowAuthenticationCookie,
+            KeyCode::Char('q') => HomeAction::Quit,
+            _ => HomeAction::None,
         }
     }
 
@@ -297,6 +197,34 @@ pub(crate) trait HomeTerminal {
     fn note_home_resize(&mut self);
     fn poll_home(&mut self, wait: Duration) -> io::Result<bool>;
     fn read_home(&mut self) -> io::Result<TerminalEvent>;
+
+    fn resolve_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
+        Err("editor launching is unavailable".to_string())
+    }
+
+    fn launch_home_editor(
+        &mut self,
+        _config: &Config,
+        _editor: &ResolvedEditor,
+        _target: &Path,
+    ) -> io::Result<HomeEditorOutcome> {
+        Ok(HomeEditorOutcome {
+            result: HomeEditorResult::RecoverableError(
+                "editor launching is unavailable".to_string(),
+            ),
+            discard_input_batch: false,
+        })
+    }
+
+    fn discard_home_input_batch(&mut self) -> io::Result<()> {
+        for _ in 0..256 {
+            if !self.poll_home(Duration::ZERO)? {
+                break;
+            }
+            let _ = self.read_home()?;
+        }
+        Ok(())
+    }
 }
 
 impl HomeTerminal for TerminaSession {
@@ -321,15 +249,53 @@ impl HomeTerminal for TerminaSession {
     fn read_home(&mut self) -> io::Result<TerminalEvent> {
         self.read()
     }
+
+    fn resolve_home_editor(&mut self, config: &Config) -> Result<ResolvedEditor, String> {
+        super::resolve_live_home_editor(self, config)
+    }
+
+    fn launch_home_editor(
+        &mut self,
+        config: &Config,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> io::Result<HomeEditorOutcome> {
+        super::launch_live_home_editor(self, config, editor, target)
+    }
 }
 
 pub(crate) fn run_with_terminal<T>(
     terminal: &mut impl HomeTerminal,
     workspace_root: &Path,
+    config: &Config,
+    submissions: &mut SubmissionHub,
+    resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
+    task: ContestSwitchTask,
+    start_contest: impl FnMut() -> Result<T, String>,
+) -> io::Result<HomeExit<T>> {
+    let paths = HomeActionPaths::current();
+    run_with_terminal_and_paths(
+        terminal,
+        workspace_root,
+        config,
+        submissions,
+        resolve,
+        task,
+        start_contest,
+        &paths,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_terminal_and_paths<T>(
+    terminal: &mut impl HomeTerminal,
+    workspace_root: &Path,
+    config: &Config,
     submissions: &mut SubmissionHub,
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
     mut start_contest: impl FnMut() -> Result<T, String>,
+    paths: &HomeActionPaths,
 ) -> io::Result<HomeExit<T>> {
     let mut state = HomeState::new(resolve, task);
     let mut dirty = true;
@@ -360,6 +326,22 @@ pub(crate) fn run_with_terminal<T>(
                 HomeAction::OpenContest => {
                     dirty = true;
                 }
+                HomeAction::OpenWorkspaceConfig => {
+                    open_workspace_config(terminal, &mut state, workspace_root, config)?;
+                    dirty = true;
+                }
+                HomeAction::OpenGlobalConfig => {
+                    open_global_config(terminal, &mut state, config, paths)?;
+                    dirty = true;
+                }
+                HomeAction::ShowAuthenticationCookie => {
+                    show_authentication_cookie_status(&mut state, paths);
+                    dirty = true;
+                }
+                HomeAction::InitializeGlobalConfig(target) => {
+                    initialize_and_open_global_config(terminal, &mut state, config, &target)?;
+                    dirty = true;
+                }
                 HomeAction::Quit => return Ok(HomeExit::Quit),
             },
             TerminalEvent::Resize(_) => {
@@ -369,6 +351,144 @@ pub(crate) fn run_with_terminal<T>(
             TerminalEvent::Paste(_) | TerminalEvent::Pointer(_) | TerminalEvent::Ignored => {}
         }
     }
+}
+
+fn launch_target(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    config: &Config,
+    target: &Path,
+    kind: HomeActionErrorKind,
+) -> io::Result<()> {
+    let editor = match terminal.resolve_home_editor(config) {
+        Ok(editor) => editor,
+        Err(error) => {
+            state.show_error(kind, error);
+            return Ok(());
+        }
+    };
+    launch_resolved_target(terminal, state, config, &editor, target, kind)
+}
+
+fn launch_resolved_target(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    config: &Config,
+    editor: &ResolvedEditor,
+    target: &Path,
+    kind: HomeActionErrorKind,
+) -> io::Result<()> {
+    let outcome = terminal.launch_home_editor(config, editor, target)?;
+    if outcome.discard_input_batch {
+        terminal.discard_home_input_batch()?;
+    }
+    match outcome.result {
+        HomeEditorResult::Launched => {}
+        HomeEditorResult::RecoverableError(error) => state.show_error(kind, error),
+    }
+    Ok(())
+}
+
+fn open_workspace_config(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    workspace_root: &Path,
+    config: &Config,
+) -> io::Result<()> {
+    let target = crate::workspace::workspace_config_path(workspace_root);
+    match crate::workspace::inspect_workspace_config_file(workspace_root) {
+        Ok(crate::workspace::WorkspaceConfigFileState::Existing) => launch_target(
+            terminal,
+            state,
+            config,
+            &target,
+            HomeActionErrorKind::WorkspaceConfig,
+        ),
+        Ok(crate::workspace::WorkspaceConfigFileState::Missing) => {
+            state.show_error(
+                HomeActionErrorKind::WorkspaceConfig,
+                format!(
+                    "Workspace config is missing and was not recreated:\n{}",
+                    target.display()
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            state.show_error(HomeActionErrorKind::WorkspaceConfig, error.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn open_global_config(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    config: &Config,
+    paths: &HomeActionPaths,
+) -> io::Result<()> {
+    let target = match paths.global_config() {
+        Ok(target) => target,
+        Err(error) => {
+            state.show_error(HomeActionErrorKind::GlobalConfig, error.to_string());
+            return Ok(());
+        }
+    };
+    match crate::user_config_fs::inspect_editable_file(target, "global config file") {
+        Ok(crate::user_config_fs::EditableFileState::Existing) => launch_target(
+            terminal,
+            state,
+            config,
+            target,
+            HomeActionErrorKind::GlobalConfig,
+        ),
+        Ok(crate::user_config_fs::EditableFileState::Missing) => {
+            state.show_initialize_global_config(target.to_path_buf());
+            Ok(())
+        }
+        Err(error) => {
+            state.show_error(HomeActionErrorKind::GlobalConfig, error.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn initialize_and_open_global_config(
+    terminal: &mut impl HomeTerminal,
+    state: &mut HomeState<'_>,
+    config: &Config,
+    target: &Path,
+) -> io::Result<()> {
+    let editor = match terminal.resolve_home_editor(config) {
+        Ok(editor) => editor,
+        Err(error) => {
+            state.show_error(HomeActionErrorKind::GlobalConfig, error);
+            return Ok(());
+        }
+    };
+    let mut reporter = super::EditorInitializationReporter;
+    if let Err(error) = crate::commands::initialize_config_at(target, &mut reporter) {
+        state.show_error(
+            HomeActionErrorKind::GlobalConfig,
+            format!("failed to initialize global config: {error}"),
+        );
+        return Ok(());
+    }
+    launch_resolved_target(
+        terminal,
+        state,
+        config,
+        &editor,
+        target,
+        HomeActionErrorKind::GlobalConfig,
+    )
+}
+
+fn show_authentication_cookie_status(state: &mut HomeState<'_>, paths: &HomeActionPaths) {
+    state.show_error(
+        HomeActionErrorKind::AuthenticationCookie,
+        super::authentication_cookie_status(paths),
+    );
 }
 
 pub(super) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -591,9 +711,10 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
         );
     }
     if layout.menu.width > 0 && layout.menu.height > 0 {
-        let lines = HOME_ACTIONS
-            .iter()
-            .map(|(label, shortcut)| menu_line(label, shortcut, usize::from(layout.menu.width)));
+        let lines = HOME_ACTIONS.iter().map(|action| match action {
+            Some((label, shortcut)) => menu_line(label, shortcut, usize::from(layout.menu.width)),
+            None => Line::raw(""),
+        });
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
     }
     if let Some(area) = layout.workspace {
@@ -605,85 +726,69 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
         );
     }
 
-    if state.shortcut_help_visible {
-        render_shortcuts(frame);
-    }
-    if state.palette.is_active() {
-        render_palette(frame, &state.palette);
-    }
     if let Some(modal) = state.open_contest.modal() {
         view::render_contest_open_modal(frame, modal, ContestOpenPurpose::Open);
     }
+    if let Some(modal) = state.initialize_global_config.as_ref() {
+        render_initialize_global_config(frame, modal);
+    }
+    if let Some(error) = state.error.as_ref() {
+        render_home_action_error(frame, error);
+    }
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>) {
-    let area = centered_rect(frame.area(), 38, 8);
-    let lines = vec![
-        Line::raw("c  Open Contest"),
-        Line::raw(":  Commands"),
-        Line::raw("q  Quit"),
-        Line::raw(""),
-        Line::raw("? keep open   Esc close"),
-    ];
+fn render_initialize_global_config(frame: &mut Frame<'_>, modal: &InitializeGlobalConfigModal) {
+    let area = centered_rect(frame.area(), 64, 11);
+    let block = Block::default()
+        .title(" Initialize Global Config ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let target = truncate_start_with_ellipsis(
+        modal.target.to_string_lossy().as_ref(),
+        usize::from(inner.width),
+    );
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)),
-        area,
+        Paragraph::new(Text::from(vec![
+            Line::raw("Global config does not exist."),
+            Line::raw(""),
+            Line::raw(target),
+            Line::raw(""),
+            Line::raw("Create the comments-only default and open it?"),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::raw(" Initialize & Open       "),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(" Cancel"),
+            ]),
+        ])),
+        inner,
     );
 }
 
-fn render_palette(frame: &mut Frame<'_>, palette: &HomeCommandPalette) {
-    let commands = palette.filtered_commands();
-    let height = 7u16.saturating_add(u16::try_from(commands.len()).unwrap_or(u16::MAX));
-    let area = centered_rect(frame.area(), 52, height);
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-    let list_area = view::command_palette_list_area(rows[1], None);
-    let list_width = usize::from(list_area.width);
-    let lines = if commands.is_empty() {
-        vec![Line::styled(
-            "  No matching commands",
-            Style::default().fg(Color::DarkGray),
-        )]
-    } else {
-        commands
-            .iter()
-            .enumerate()
-            .map(|(index, command)| {
-                let selected = index == palette.selected;
-                view::command_palette_line(
-                    if selected { ">" } else { " " },
-                    command.label(),
-                    Some(command.shortcut()),
-                    list_width,
-                    Style::default(),
-                    selected,
-                )
-            })
-            .collect()
+fn render_home_action_error(frame: &mut Frame<'_>, error: &HomeActionError) {
+    let title = match error.kind {
+        HomeActionErrorKind::WorkspaceConfig => " Workspace Config Unavailable ",
+        HomeActionErrorKind::GlobalConfig => " Global Config Failed ",
+        HomeActionErrorKind::AuthenticationCookie => " Authentication Cookie ",
     };
-
+    let area = centered_rect(frame.area(), 68, 13);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .title(" Command Palette ")
-            .borders(Borders::ALL),
-        area,
-    );
-    frame.render_widget(Paragraph::new(format!("> {}", palette.query)), rows[0]);
-    frame.render_widget(Paragraph::new(Text::from(lines)), list_area);
-    frame.render_widget(
-        Paragraph::new("[↑↓] Select   [Enter] Run   [Esc] Cancel"),
-        rows[2],
-    );
+    frame.render_widget(block, area);
+    if inner.width > 0 && inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(format!("{}\n\nEnter / Esc  Dismiss", error.message))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -742,6 +847,232 @@ mod tests {
         text
     }
 
+    #[derive(Debug)]
+    struct RecordingHomeTerminal {
+        targets: Vec<PathBuf>,
+        resolve_error: Option<String>,
+        outcome: HomeEditorOutcome,
+        discarded_batches: usize,
+    }
+
+    impl Default for RecordingHomeTerminal {
+        fn default() -> Self {
+            Self {
+                targets: Vec::new(),
+                resolve_error: None,
+                outcome: HomeEditorOutcome {
+                    result: HomeEditorResult::Launched,
+                    discard_input_batch: false,
+                },
+                discarded_batches: 0,
+            }
+        }
+    }
+
+    impl HomeTerminal for RecordingHomeTerminal {
+        fn draw_home(&mut self, _render: &mut dyn FnMut(&mut Frame<'_>)) -> io::Result<()> {
+            unreachable!("direct action tests do not draw")
+        }
+
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            unreachable!("direct action tests do not redraw")
+        }
+
+        fn note_home_resize(&mut self) {
+            unreachable!("direct action tests do not resize")
+        }
+
+        fn poll_home(&mut self, _wait: Duration) -> io::Result<bool> {
+            unreachable!("direct action tests do not poll")
+        }
+
+        fn read_home(&mut self) -> io::Result<TerminalEvent> {
+            unreachable!("direct action tests do not read")
+        }
+
+        fn resolve_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
+            self.resolve_error.clone().map_or_else(
+                || {
+                    Ok(ResolvedEditor {
+                        program: "test-editor".into(),
+                        args: Vec::new(),
+                        mode: crate::editor::EditorLaunchMode::External,
+                        source: crate::editor::EditorSource::EditorEnv,
+                    })
+                },
+                Err,
+            )
+        }
+
+        fn launch_home_editor(
+            &mut self,
+            _config: &Config,
+            _editor: &ResolvedEditor,
+            target: &Path,
+        ) -> io::Result<HomeEditorOutcome> {
+            self.targets.push(target.to_path_buf());
+            Ok(self.outcome.clone())
+        }
+
+        fn discard_home_input_batch(&mut self) -> io::Result<()> {
+            self.discarded_batches += 1;
+            Ok(())
+        }
+    }
+
+    fn cookie_location(root: &Path) -> crate::paths::CookieLocation {
+        let platform_base = root.join("platform-state");
+        let state_dir = platform_base.join("atc").join("state");
+        let file = state_dir.join("cookie");
+        crate::paths::CookieLocation {
+            platform_base,
+            state_dir,
+            file,
+        }
+    }
+
+    fn write_cookie(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn workspace_config_uses_the_active_root_and_is_never_recreated() {
+        let root = tempfile::tempdir().unwrap();
+        let target = crate::workspace::workspace_config_path(root.path());
+        std::fs::write(&target, "malformed = [\n").unwrap();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let mut terminal = RecordingHomeTerminal::default();
+
+        open_workspace_config(&mut terminal, &mut home, root.path(), &Config::default()).unwrap();
+        assert_eq!(terminal.targets.as_slice(), std::slice::from_ref(&target));
+
+        std::fs::remove_file(&target).unwrap();
+        open_workspace_config(&mut terminal, &mut home, root.path(), &Config::default()).unwrap();
+        assert!(!target.exists());
+        assert_eq!(terminal.targets.len(), 1);
+        assert!(matches!(
+            home.error.as_ref().map(|error| error.kind),
+            Some(HomeActionErrorKind::WorkspaceConfig)
+        ));
+    }
+
+    #[test]
+    fn workspace_home_global_config_opens_existing_and_initializes_only_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let paths = HomeActionPaths::for_test(target.clone(), cookie_location(temp.path()));
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let mut terminal = RecordingHomeTerminal::default();
+
+        std::fs::write(&target, "invalid = [\n").unwrap();
+        open_global_config(&mut terminal, &mut home, &Config::default(), &paths).unwrap();
+        assert_eq!(terminal.targets.as_slice(), std::slice::from_ref(&target));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "invalid = [\n");
+
+        std::fs::remove_file(&target).unwrap();
+        open_global_config(&mut terminal, &mut home, &Config::default(), &paths).unwrap();
+        assert!(home.initialize_global_config.is_some());
+        assert!(!target.exists());
+        let HomeAction::InitializeGlobalConfig(confirmed) =
+            home.handle_key(key(KeyCode::Enter, KeyEventKind::Press))
+        else {
+            panic!("Enter must confirm global config initialization")
+        };
+        initialize_and_open_global_config(&mut terminal, &mut home, &Config::default(), &confirmed)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            crate::config::INITIAL_CONFIG
+        );
+        assert_eq!(terminal.targets, [target.clone(), target]);
+    }
+
+    #[test]
+    fn workspace_home_resolves_editor_before_initializing_global_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let mut terminal = RecordingHomeTerminal {
+            resolve_error: Some("No editor configured.".to_string()),
+            ..RecordingHomeTerminal::default()
+        };
+
+        initialize_and_open_global_config(&mut terminal, &mut home, &Config::default(), &target)
+            .unwrap();
+
+        assert!(!target.exists());
+        assert!(terminal.targets.is_empty());
+        assert!(
+            home.error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("No editor configured."))
+        );
+    }
+
+    #[test]
+    fn workspace_home_cookie_action_never_creates_a_missing_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let cookie = cookie_location(temp.path());
+        let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie.clone());
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+
+        show_authentication_cookie_status(&mut home, &paths);
+        assert!(!cookie.file.exists());
+        assert!(
+            home.error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("Status: Not configured")
+                    && error.message.contains("REVEL_SESSION=<value>"))
+        );
+
+        home.error = None;
+        std::fs::create_dir_all(&cookie.state_dir).unwrap();
+        write_cookie(&cookie.file, "REVEL_SESSION=secret-not-for-ui");
+        show_authentication_cookie_status(&mut home, &paths);
+        assert!(home.error.as_ref().is_some_and(|error| {
+            error.message.contains("Status: Configured")
+                && error.message.contains(&cookie.file.display().to_string())
+                && !error.message.contains("secret-not-for-ui")
+        }));
+    }
+
+    #[test]
+    fn terminal_editor_launch_marks_workspace_home_input_for_discard() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let mut terminal = RecordingHomeTerminal {
+            outcome: HomeEditorOutcome {
+                result: HomeEditorResult::Launched,
+                discard_input_batch: true,
+            },
+            ..RecordingHomeTerminal::default()
+        };
+
+        launch_target(
+            &mut terminal,
+            &mut home,
+            &Config::default(),
+            Path::new("config.toml"),
+            HomeActionErrorKind::GlobalConfig,
+        )
+        .unwrap();
+        assert_eq!(terminal.discarded_batches, 1);
+    }
+
     #[test]
     fn c_opens_contest_input() {
         let mut resolve =
@@ -756,88 +1087,55 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_help_is_one_shot_and_passes_the_next_action_once() {
+    fn q_still_quits_workspace_home() {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
-
-        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
-        assert!(home.shortcut_help_visible);
-        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Repeat));
-        assert!(home.shortcut_help_visible);
-        home.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
-
-        assert!(!home.shortcut_help_visible);
-        assert!(home.open_contest.modal_active());
-        assert_eq!(home.open_contest.modal().unwrap().contest_id, "");
-    }
-
-    #[test]
-    fn escape_closes_only_shortcut_help() {
-        let mut resolve =
-            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
-        let mut home = state(&mut resolve);
-
-        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
-        assert_eq!(
-            home.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
-            HomeAction::None
-        );
-        assert!(!home.shortcut_help_visible);
-        assert!(!home.open_contest.modal_active());
-        assert!(!home.palette.is_active());
-    }
-
-    #[test]
-    fn colon_opens_home_only_palette_and_q_quits_at_root() {
-        let mut resolve =
-            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
-        let mut home = state(&mut resolve);
-
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-        assert!(home.palette.is_active());
-        assert_eq!(
-            home.palette
-                .filtered_commands()
-                .iter()
-                .map(|command| command.label())
-                .collect::<Vec<_>>(),
-            ["Open Contest", "Quit"]
-        );
-        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
         assert_eq!(
             home.handle_key(key(KeyCode::Char('q'), KeyEventKind::Press)),
             HomeAction::Quit
         );
-
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-        home.handle_key(key(KeyCode::Down, KeyEventKind::Press));
-        assert_eq!(
-            home.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
-            HomeAction::Quit
-        );
     }
 
     #[test]
-    fn home_overlays_follow_single_modal_precedence() {
+    fn colon_and_question_mark_are_ignored_while_direct_actions_still_work() {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
 
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
-        assert!(home.palette.is_active());
-        assert!(!home.shortcut_help_visible);
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press)),
+            HomeAction::None
+        );
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press)),
+            HomeAction::None
+        );
         assert!(!home.open_contest.modal_active());
-        assert_eq!(home.palette.query, "?");
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('w'), KeyEventKind::Press)),
+            HomeAction::OpenWorkspaceConfig
+        );
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('G'), KeyEventKind::Press)),
+            HomeAction::OpenGlobalConfig
+        );
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('a'), KeyEventKind::Press)),
+            HomeAction::ShowAuthenticationCookie
+        );
+    }
 
-        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+    #[test]
+    fn contest_modal_owns_home_action_keys() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+
         home.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
+        home.handle_key(key(KeyCode::Char('G'), KeyEventKind::Press));
         assert!(home.open_contest.modal_active());
-        assert!(!home.palette.is_active());
-        assert!(!home.shortcut_help_visible);
-        assert_eq!(home.open_contest.modal().unwrap().contest_id, ":");
+        assert_eq!(home.open_contest.modal().unwrap().contest_id, "G");
     }
 
     #[test]
@@ -980,9 +1278,10 @@ mod tests {
 
         for expected in branding::ascii_logo_lines().chain([
             SUBTITLE,
-            "Open Contest",
-            "Commands",
-            "Shortcuts",
+            "Open / Create Contest",
+            "Workspace Config",
+            "Global Config",
+            "Authentication Cookie",
             "Quit",
         ]) {
             assert!(
@@ -1011,20 +1310,24 @@ mod tests {
 
         assert_eq!(layout.menu.width, MENU_WIDTH);
         assert_eq!(layout.menu.x, (80 - MENU_WIDTH) / 2);
-        for (offset, (label, shortcut)) in HOME_ACTIONS.iter().enumerate() {
+        for (offset, action) in HOME_ACTIONS.iter().enumerate() {
             let row = layout.menu.y + u16::try_from(offset).unwrap();
             let text = row_text(&buffer, row);
             let start = usize::from(layout.menu.x);
             let end = start + usize::from(layout.menu.width);
-            assert_eq!(
-                &text[start..end],
-                menu_line(label, shortcut, usize::from(MENU_WIDTH)).to_string()
-            );
+            if let Some((label, shortcut)) = action {
+                assert_eq!(
+                    &text[start..end],
+                    menu_line(label, shortcut, usize::from(MENU_WIDTH)).to_string()
+                );
 
-            let shortcut_column = layout.menu.x + layout.menu.width - 1;
-            let shortcut_cell = buffer.cell((shortcut_column, row)).unwrap();
-            assert_eq!(shortcut_cell.symbol(), *shortcut);
-            assert_eq!(shortcut_cell.fg, Color::Yellow);
+                let shortcut_column = layout.menu.x + layout.menu.width - 1;
+                let shortcut_cell = buffer.cell((shortcut_column, row)).unwrap();
+                assert_eq!(shortcut_cell.symbol(), *shortcut);
+                assert_eq!(shortcut_cell.fg, Color::Yellow);
+            } else {
+                assert!(text[start..end].trim().is_empty());
+            }
         }
     }
 
@@ -1112,7 +1415,7 @@ mod tests {
         assert_eq!(menu_only.logo, None);
         assert_eq!(menu_only.subtitle, None);
         assert_eq!(menu_only.workspace, None);
-        assert_eq!(menu_only.menu.height, MENU_HEIGHT);
+        assert_eq!(menu_only.menu.height, 4);
     }
 
     #[test]
@@ -1163,116 +1466,24 @@ mod tests {
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
 
-        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
-        let shortcuts = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
-        assert!(shortcuts.contains("Shortcuts"));
-        assert!(shortcuts.contains("Esc close"));
-        assert!(shortcuts.contains('┌'));
-
-        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-        let palette = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
-        assert!(palette.contains("Command Palette"));
-        assert!(palette.contains("Open Contest"));
-        assert!(palette.contains("Quit"));
-        assert!(!palette.contains("Run Tests"));
-
-        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
         home.handle_key(key(KeyCode::Char('c'), KeyEventKind::Press));
         let open = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
         assert!(open.contains("Open Contest"));
         assert!(open.contains("Contest:"));
         assert!(open.contains('┌'));
-    }
 
-    #[test]
-    fn home_palette_selected_row_fills_the_shared_usable_width() {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
+        home.show_initialize_global_config(PathBuf::from("config.toml"));
+        let initialize = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(initialize.contains("Initialize Global Config"));
+        assert!(initialize.contains("Initialize & Open"));
 
-        let width = 80;
-        let height = 24;
-        let buffer = draw_home(&home, Path::new("workspace"), width, height);
-        let command_count = home.palette.filtered_commands().len();
-        let palette_height = 7u16.saturating_add(u16::try_from(command_count).unwrap());
-        let area = centered_rect(Rect::new(0, 0, width, height), 52, palette_height);
-        let inner = Block::default().borders(Borders::ALL).inner(area);
-        let reversed = buffer
-            .content()
-            .iter()
-            .enumerate()
-            .filter(|(_, cell)| cell.modifier.contains(Modifier::REVERSED))
-            .map(|(index, _)| {
-                let index = u16::try_from(index).unwrap();
-                (index % width, index / width)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(reversed.len(), usize::from(inner.width));
-        let selected_row = reversed.first().unwrap().1;
-        assert_eq!(
-            reversed,
-            (inner.x..inner.right())
-                .map(|column| (column, selected_row))
-                .collect::<Vec<_>>()
-        );
-        for column in inner.x..inner.right() {
-            assert!(
-                buffer
-                    .cell((column, selected_row))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::BOLD)
-            );
-            assert!(
-                !buffer
-                    .cell((column, selected_row.saturating_add(1)))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::REVERSED)
-            );
-        }
-        assert!(
-            !buffer
-                .cell((area.right().saturating_sub(1), selected_row))
-                .unwrap()
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-
-        home.handle_key(key(KeyCode::Down, KeyEventKind::Press));
-        let moved = draw_home(&home, Path::new("workspace"), width, height);
-        for column in inner.x..inner.right() {
-            assert!(
-                !moved
-                    .cell((column, selected_row))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::REVERSED)
-            );
-            assert!(
-                moved
-                    .cell((column, selected_row.saturating_add(1)))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::BOLD | Modifier::REVERSED)
-            );
-        }
-    }
-
-    #[test]
-    fn home_palette_shared_rows_survive_narrow_and_zero_sized_frames() {
-        let mut resolve =
-            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
-        let mut home = state(&mut resolve);
-        home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press));
-
-        for width in [0, 1, 2, 8, 16, 30, 52, 80] {
-            for height in [0, 1, 4, 8, 12, 24] {
-                let _ = draw_home(&home, Path::new("workspace"), width, height);
-            }
-        }
+        home.handle_key(key(KeyCode::Escape, KeyEventKind::Press));
+        home.show_error(HomeActionErrorKind::WorkspaceConfig, "missing".to_string());
+        let error = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(error.contains("Workspace Config Unavailable"));
+        assert!(error.contains("Enter / Esc"));
     }
 }

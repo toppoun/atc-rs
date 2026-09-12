@@ -192,7 +192,7 @@ impl Config {
         Self::load_from(&path)
     }
 
-    fn load_from(path: &Path) -> Result<Self, AppError> {
+    pub(crate) fn load_from(path: &Path) -> Result<Self, AppError> {
         let Some(text) = read_optional_config(path)? else {
             return Ok(Self::default());
         };

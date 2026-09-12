@@ -35,11 +35,16 @@ workspace 外で引数なしの `atc` を起動すると Global Home が開き�
 | `r` | 選択 directory を再読み込み |
 | `o` | 選択 directory を Open |
 | `g` | Go to Path を開き、入力した directory を Explorer root にする |
-| `:` | Global Home の Command Palette |
-| `?` | shortcut help |
+| `G` | Global Config を editor で開く |
+| `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
+| `?` | Explorer Shortcuts を表示 |
 | `q` | 終了 |
 
-`Go to Path` では `Enter` で移動し、`Esc` で cancel します。Global Home の Command Palette には `Open`、`Go to Path`、`Quit` があります。
+`Go to Path` では `Enter` で移動し、`Esc` で cancel します。Explorer Shortcuts は展開・移動・折りたたみ・親への移動・再読み込みの操作を案内します。Global Home に Command Palette はありません。
+
+Global Config が missing の場合は、確認後に comments-only default を初期化して editor で開けます。既存 file は parse error があっても修復用に開けます。編集内容は、すでに開いている workspace session の Config snapshot には自動反映されません。新しく workspace を開くなど、Config が再読込されるタイミングでは反映され得ます。
+
+Authentication Cookie は credential file です。Home actionはeditorを起動せず、credential内容も読みません。既存authと同じ安全なinspectionで Configured / Not configured / Invalid、期待path、`REVEL_SESSION=<value>` 形式を表示します。missing fileは作成せず、Unixではgroup / otherからアクセス可能なfile、symlink、不正なfile typeをInvalidとして扱います。
 
 ### Open / Init Here
 
@@ -53,14 +58,15 @@ workspace root で `atc` を起動すると直接 Workspace Home へ入ります
 
 | キー | 操作 |
 | --- | --- |
-| `c` | Open Contest modal を開く |
-| `:` | Workspace Home の Command Palette |
-| `?` | shortcut help |
+| `c` | Open / Create Contest modal を開く |
+| `w` | active workspace root の Workspace Config を editor で開く |
+| `G` | Global Config を editor で開く |
+| `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
 | `q` | 終了 |
 
 `c` で contest ID を入力します。既存 contest なら `Enter` で Open し、存在しなければ `Enter` で Create & Open します。修復が必要な contest は、確認後に Repair & Open できます。`Esc` で cancel します。
 
-Workspace Home の Command Palette には `Open Contest` と `Quit` があります。contest を開くと Contest 画面へ遷移します。
+Workspace Home に Command Palette と shortcut modal はありません。画面上の action 一覧から直接操作します。Workspace Config が session 中に missing になった場合は再作成せず、recoverable error を表示します。Global Config と Authentication Cookie の file policy は Global Home と同じです。
 
 現在、Workspace Home から別 workspace へ切り替える機能はありません。別 workspace へ移るには `q` で終了し、移動先の workspace root で `atc` を起動してください。
 
@@ -174,7 +180,7 @@ workspace から開いた Contest 画面では、Command Palette の `Back to Wo
 
 ## Command Palette
 
-`:` を押すと Command Palette が開きます。文字を入力して action を絞り込み、`↑` / `↓` で選択、`Enter` で実行します。`Backspace` で query を消し、`Esc` で閉じます。
+Contest 画面で `:` を押すと Command Palette が開きます。文字を入力して action を絞り込み、`↑` / `↓` で選択、`Enter` で実行します。`Backspace` で query を消し、`Esc` で閉じます。
 
 Contest 画面の現在の action:
 

@@ -1078,6 +1078,7 @@ where
             match crate::tui::run_home_with_terminal(
                 terminal,
                 workspace_root,
+                config,
                 submissions.hub(),
                 &mut resolve,
                 Arc::clone(&home_open_task),

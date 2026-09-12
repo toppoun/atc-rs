@@ -64,10 +64,12 @@ atc
 
 workspace 外で `atc` を起動したときに開く補助的な入口です。Explorer で directory を探して既存 workspace を開けます。
 通常の directory を選んで Open すると、確認後にその場所を Init Here して workspace 化し、Workspace Home を開けます。
+`G` で global config を editor で開けます。`a` は authentication cookie を開かず、安全なinspectionによる設定状態とpathを表示します。`?` は Explorer Shortcuts を表示します。
 
 ### Workspace Home
 
 workspace root で `atc` を起動すると直接開きます。contest を開く、または作成して Contest 画面へ進む入口です。
+`w` で workspace config、`G` で global configをeditorで開けます。`a` はauthentication cookieの安全な設定状態とpathを表示します。
 Contest 画面からも Command Palette の `Back to Workspace Home` で戻れます。
 
 現在、Workspace Home から別 workspace への切り替えはできません。別 workspace へ移る場合は、一度終了して移動先で `atc` を起動してください。
@@ -118,6 +120,7 @@ User Input の作成・編集・保存・実行・削除、Submit modal、submis
 解答は CLI の `atc submit <problem>` または Contest TUI の `t` から提出できます。C++ / Python source を選択でき、Python は設定または CLI の `--runtime` で runtime を選べます。提出後は AtCoder の submission status を追跡し、TUI では最新 receipt と history も表示します。
 
 提出には AtCoder の `REVEL_SESSION` cookie を atc の cookie file へ手動で配置する必要があります。file には `REVEL_SESSION=<value>` の1行だけを保存します。
+Home の Authentication Cookie action は credential file を開かず、安全なinspectionによる設定状態とpathだけを表示します。missing file は自動生成しません。
 
 ```bash
 atc login

@@ -3271,6 +3271,7 @@ mod tests {
         let exit = crate::tui::home::run_with_terminal(
             &mut terminal,
             root.path(),
+            &crate::config::Config::default(),
             &mut hub,
             &mut resolve,
             task,

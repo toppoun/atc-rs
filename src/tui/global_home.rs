@@ -18,19 +18,22 @@ use super::home::{
 };
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::{
-    ShortcutHelpTransition, TerminaSession, command_matches, is_command_palette_open_key,
-    is_shortcut_help_key, shortcut_help_transition, view,
+    HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, ShortcutHelpTransition,
+    TerminaSession, is_shortcut_help_key, shortcut_help_transition,
 };
-use crate::branding;
+use crate::{branding, config::Config};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [(&str, &str); 5] = [
-    ("Open", "o"),
-    ("Go to Path", "g"),
-    ("Commands", ":"),
-    ("Shortcuts", "?"),
-    ("Quit", "q"),
+const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 8] = [
+    Some(("Open", "o")),
+    Some(("Go to Path", "g")),
+    None,
+    Some(("Global Config", "G")),
+    Some(("Authentication Cookie", "a")),
+    None,
+    Some(("Explorer Shortcuts", "?")),
+    Some(("Quit", "q")),
 ];
 const MENU_WIDTH: u16 = 23;
 const MENU_HEIGHT: u16 = GLOBAL_HOME_ACTIONS.len() as u16;
@@ -48,38 +51,13 @@ pub(crate) enum GlobalHomeExit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlobalHomeCommand {
-    Open,
-    GoToPath,
-    Quit,
-}
-
-impl GlobalHomeCommand {
-    const ALL: [Self; 3] = [Self::Open, Self::GoToPath, Self::Quit];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Open => "Open",
-            Self::GoToPath => "Go to Path",
-            Self::Quit => "Quit",
-        }
-    }
-
-    const fn shortcut(self) -> &'static str {
-        match self {
-            Self::Open => "o",
-            Self::GoToPath => "g",
-            Self::Quit => "q",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalHomeErrorKind {
     WorkspaceOpen,
     WorkspaceInitialization,
     WorkspaceInitializedOpen,
     GoToPath,
+    GlobalConfig,
+    AuthenticationCookie,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,106 +71,16 @@ struct InitializeWorkspaceModal {
     target: PathBuf,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct GlobalHomeCommandPalette {
-    open: bool,
-    query: String,
-    selected: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitializeGlobalConfigModal {
+    target: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaletteKeyResult {
-    Handled,
-    Execute(GlobalHomeCommand),
-}
-
-impl GlobalHomeCommandPalette {
-    fn is_active(&self) -> bool {
-        self.open
-    }
-
-    fn open(&mut self) {
-        self.open = true;
-        self.query.clear();
-        self.selected = 0;
-    }
-
-    fn close(&mut self) {
-        self.open = false;
-        self.query.clear();
-        self.selected = 0;
-    }
-
-    fn filtered_commands(&self) -> Vec<GlobalHomeCommand> {
-        GlobalHomeCommand::ALL
-            .into_iter()
-            .filter(|command| command_matches(command.label(), &self.query))
-            .collect()
-    }
-
-    fn selected_command(&self) -> Option<GlobalHomeCommand> {
-        self.filtered_commands().get(self.selected).copied()
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> PaletteKeyResult {
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return PaletteKeyResult::Handled;
-        }
-
-        match key.code {
-            KeyCode::Escape if key.kind == KeyEventKind::Press => {
-                self.close();
-                PaletteKeyResult::Handled
-            }
-            KeyCode::Enter if key.kind == KeyEventKind::Press => self
-                .selected_command()
-                .map(PaletteKeyResult::Execute)
-                .unwrap_or(PaletteKeyResult::Handled),
-            KeyCode::Backspace => {
-                if let Some((start, _)) = self.query.grapheme_indices(true).next_back() {
-                    self.query.truncate(start);
-                }
-                self.selected = 0;
-                PaletteKeyResult::Handled
-            }
-            KeyCode::Up => {
-                let count = self.filtered_commands().len();
-                self.selected = if count <= 1 {
-                    0
-                } else if self.selected == 0 {
-                    count - 1
-                } else {
-                    self.selected.min(count - 1) - 1
-                };
-                PaletteKeyResult::Handled
-            }
-            KeyCode::Down => {
-                let count = self.filtered_commands().len();
-                self.selected = if count <= 1 {
-                    0
-                } else {
-                    (self.selected + 1) % count
-                };
-                PaletteKeyResult::Handled
-            }
-            KeyCode::Char(character)
-                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key =>
-            {
-                self.query.push(character);
-                self.selected = 0;
-                PaletteKeyResult::Handled
-            }
-            _ => PaletteKeyResult::Handled,
-        }
-    }
-
-    fn handle_paste(&mut self, text: &str) {
-        self.query.extend(
-            text.chars()
-                .filter(|character| !matches!(character, '\r' | '\n')),
-        );
-        self.selected = 0;
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlobalHomeFileAction {
+    OpenGlobalConfig,
+    ShowAuthenticationCookie,
+    InitializeGlobalConfig(PathBuf),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -265,8 +153,9 @@ pub(crate) struct GlobalHomeState {
     path_input: Option<PathInputModal>,
     error: Option<GlobalHomeError>,
     initialize_workspace: Option<InitializeWorkspaceModal>,
+    initialize_global_config: Option<InitializeGlobalConfigModal>,
+    file_action: Option<GlobalHomeFileAction>,
     shortcut_help_visible: bool,
-    palette: GlobalHomeCommandPalette,
     explorer_overlay_visible: bool,
     explorer_pane_visible: bool,
 }
@@ -278,8 +167,9 @@ impl GlobalHomeState {
             path_input: None,
             error: None,
             initialize_workspace: None,
+            initialize_global_config: None,
+            file_action: None,
             shortcut_help_visible: false,
-            palette: GlobalHomeCommandPalette::default(),
             explorer_overlay_visible: false,
             explorer_pane_visible: false,
         }
@@ -308,7 +198,8 @@ impl GlobalHomeState {
 
     pub(crate) fn show_initialize_workspace_confirmation(&mut self, target: PathBuf) {
         self.path_input = None;
-        self.palette.close();
+        self.initialize_global_config = None;
+        self.file_action = None;
         self.shortcut_help_visible = false;
         self.initialize_workspace = Some(InitializeWorkspaceModal { target });
     }
@@ -323,15 +214,31 @@ impl GlobalHomeState {
 
     fn show_workspace_error(&mut self, kind: GlobalHomeErrorKind, message: String) {
         self.initialize_workspace = None;
+        self.initialize_global_config = None;
+        self.file_action = None;
         self.path_input = None;
-        self.palette.close();
         self.shortcut_help_visible = false;
         self.error = Some(GlobalHomeError { kind, message });
     }
 
+    fn show_home_action_error(&mut self, kind: GlobalHomeErrorKind, message: String) {
+        self.show_workspace_error(kind, message);
+    }
+
+    fn show_initialize_global_config(&mut self, target: PathBuf) {
+        self.initialize_workspace = None;
+        self.path_input = None;
+        self.shortcut_help_visible = false;
+        self.error = None;
+        self.initialize_global_config = Some(InitializeGlobalConfigModal { target });
+    }
+
+    fn take_file_action(&mut self) -> Option<GlobalHomeFileAction> {
+        self.file_action.take()
+    }
+
     fn open_path_input(&mut self) {
         self.path_input = Some(PathInputModal::default());
-        self.palette.close();
         self.shortcut_help_visible = false;
     }
 
@@ -340,7 +247,6 @@ impl GlobalHomeState {
     }
 
     fn request_open(&mut self) -> Option<GlobalHomeExit> {
-        self.palette.close();
         if self.explorer_pane_visible {
             Some(self.selected_open_exit())
         } else {
@@ -438,6 +344,21 @@ impl GlobalHomeState {
             return None;
         }
 
+        if self.initialize_global_config.is_some() {
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
+                self.initialize_global_config = None;
+                return None;
+            }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+                let modal = self
+                    .initialize_global_config
+                    .take()
+                    .expect("global config initialization modal must remain active");
+                self.file_action = Some(GlobalHomeFileAction::InitializeGlobalConfig(modal.target));
+            }
+            return None;
+        }
+
         if self.path_input.is_some() {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
                 self.path_input = None;
@@ -456,21 +377,6 @@ impl GlobalHomeState {
                 .expect("active path input must remain present")
                 .handle_edit_key(key);
             return None;
-        }
-
-        if self.palette.is_active() {
-            return match self.palette.handle_key(key) {
-                PaletteKeyResult::Execute(GlobalHomeCommand::Open) => self.request_open(),
-                PaletteKeyResult::Execute(GlobalHomeCommand::GoToPath) => {
-                    self.open_path_input();
-                    None
-                }
-                PaletteKeyResult::Execute(GlobalHomeCommand::Quit) => {
-                    self.palette.close();
-                    Some(GlobalHomeExit::Quit)
-                }
-                PaletteKeyResult::Handled => None,
-            };
         }
 
         match shortcut_help_transition(self.shortcut_help_visible, key) {
@@ -498,14 +404,19 @@ impl GlobalHomeState {
         if is_shortcut_help_key(key) {
             self.shortcut_help_visible = true;
             None
-        } else if is_command_palette_open_key(key) {
-            self.palette.open();
-            None
         } else {
             match key.code {
                 KeyCode::Char('o') if has_plain_modifiers(key) => self.request_open(),
                 KeyCode::Char('g') if has_plain_modifiers(key) => {
                     self.open_path_input();
+                    None
+                }
+                KeyCode::Char('G') if has_plain_modifiers(key) => {
+                    self.file_action = Some(GlobalHomeFileAction::OpenGlobalConfig);
+                    None
+                }
+                KeyCode::Char('a') if has_plain_modifiers(key) => {
+                    self.file_action = Some(GlobalHomeFileAction::ShowAuthenticationCookie);
                     None
                 }
                 KeyCode::Char('q') if has_plain_modifiers(key) => Some(GlobalHomeExit::Quit),
@@ -520,13 +431,14 @@ impl GlobalHomeState {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.error.is_some() || self.initialize_workspace.is_some() {
+        if self.error.is_some()
+            || self.initialize_workspace.is_some()
+            || self.initialize_global_config.is_some()
+        {
             return;
         }
         if let Some(input) = self.path_input.as_mut() {
             input.insert_text(text);
-        } else if self.palette.is_active() {
-            self.palette.handle_paste(text);
         }
     }
 }
@@ -554,6 +466,24 @@ pub(crate) trait GlobalHomeTerminal {
     fn note_global_home_resize(&mut self);
     fn poll_global_home(&mut self, wait: Duration) -> io::Result<bool>;
     fn read_global_home(&mut self) -> io::Result<TerminalEvent>;
+
+    fn resolve_global_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
+        Err("editor launching is unavailable".to_string())
+    }
+
+    fn launch_global_home_editor(
+        &mut self,
+        _config: &Config,
+        _editor: &ResolvedEditor,
+        _target: &Path,
+    ) -> io::Result<HomeEditorOutcome> {
+        Ok(HomeEditorOutcome {
+            result: HomeEditorResult::RecoverableError(
+                "editor launching is unavailable".to_string(),
+            ),
+            discard_input_batch: false,
+        })
+    }
 
     fn discard_global_home_input_batch(&mut self) -> io::Result<()> {
         for _ in 0..MAX_DISCARDED_TRANSITION_EVENTS {
@@ -588,11 +518,33 @@ impl GlobalHomeTerminal for TerminaSession {
     fn read_global_home(&mut self) -> io::Result<TerminalEvent> {
         self.read()
     }
+
+    fn resolve_global_home_editor(&mut self, config: &Config) -> Result<ResolvedEditor, String> {
+        super::resolve_live_home_editor(self, config)
+    }
+
+    fn launch_global_home_editor(
+        &mut self,
+        config: &Config,
+        editor: &ResolvedEditor,
+        target: &Path,
+    ) -> io::Result<HomeEditorOutcome> {
+        super::launch_live_home_editor(self, config, editor, target)
+    }
 }
 
 pub(crate) fn run_with_terminal(
     terminal: &mut impl GlobalHomeTerminal,
     state: &mut GlobalHomeState,
+) -> io::Result<GlobalHomeExit> {
+    let paths = HomeActionPaths::current();
+    run_with_terminal_and_paths(terminal, state, &paths)
+}
+
+fn run_with_terminal_and_paths(
+    terminal: &mut impl GlobalHomeTerminal,
+    state: &mut GlobalHomeState,
+    paths: &HomeActionPaths,
 ) -> io::Result<GlobalHomeExit> {
     let mut dirty = true;
 
@@ -622,7 +574,132 @@ pub(crate) fn run_with_terminal(
         if let Some(exit) = exit {
             return Ok(exit);
         }
+        if let Some(action) = state.take_file_action() {
+            handle_file_action(terminal, state, paths, action)?;
+        }
         dirty = true;
+    }
+}
+
+fn editor_config(paths: &HomeActionPaths) -> Config {
+    paths
+        .global_config()
+        .ok()
+        .and_then(|path| Config::load_from(path).ok())
+        .unwrap_or_default()
+}
+
+fn launch_target(
+    terminal: &mut impl GlobalHomeTerminal,
+    state: &mut GlobalHomeState,
+    paths: &HomeActionPaths,
+    target: &Path,
+    kind: GlobalHomeErrorKind,
+) -> io::Result<()> {
+    let config = editor_config(paths);
+    let editor = match terminal.resolve_global_home_editor(&config) {
+        Ok(editor) => editor,
+        Err(error) => {
+            state.show_home_action_error(kind, error);
+            return Ok(());
+        }
+    };
+    launch_resolved_target(terminal, state, &config, &editor, target, kind)
+}
+
+fn launch_resolved_target(
+    terminal: &mut impl GlobalHomeTerminal,
+    state: &mut GlobalHomeState,
+    config: &Config,
+    editor: &ResolvedEditor,
+    target: &Path,
+    kind: GlobalHomeErrorKind,
+) -> io::Result<()> {
+    let outcome = terminal.launch_global_home_editor(config, editor, target)?;
+    if outcome.discard_input_batch {
+        terminal.discard_global_home_input_batch()?;
+    }
+    match outcome.result {
+        HomeEditorResult::Launched => {}
+        HomeEditorResult::RecoverableError(error) => {
+            state.show_home_action_error(kind, error);
+        }
+    }
+    Ok(())
+}
+
+fn handle_file_action(
+    terminal: &mut impl GlobalHomeTerminal,
+    state: &mut GlobalHomeState,
+    paths: &HomeActionPaths,
+    action: GlobalHomeFileAction,
+) -> io::Result<()> {
+    match action {
+        GlobalHomeFileAction::OpenGlobalConfig => {
+            let target = match paths.global_config() {
+                Ok(target) => target,
+                Err(error) => {
+                    state.show_home_action_error(
+                        GlobalHomeErrorKind::GlobalConfig,
+                        error.to_string(),
+                    );
+                    return Ok(());
+                }
+            };
+            match crate::user_config_fs::inspect_editable_file(target, "global config file") {
+                Ok(crate::user_config_fs::EditableFileState::Existing) => launch_target(
+                    terminal,
+                    state,
+                    paths,
+                    target,
+                    GlobalHomeErrorKind::GlobalConfig,
+                ),
+                Ok(crate::user_config_fs::EditableFileState::Missing) => {
+                    state.show_initialize_global_config(target.to_path_buf());
+                    Ok(())
+                }
+                Err(error) => {
+                    state.show_home_action_error(
+                        GlobalHomeErrorKind::GlobalConfig,
+                        error.to_string(),
+                    );
+                    Ok(())
+                }
+            }
+        }
+        GlobalHomeFileAction::InitializeGlobalConfig(target) => {
+            let config = editor_config(paths);
+            let editor = match terminal.resolve_global_home_editor(&config) {
+                Ok(editor) => editor,
+                Err(error) => {
+                    state.show_home_action_error(GlobalHomeErrorKind::GlobalConfig, error);
+                    return Ok(());
+                }
+            };
+            let mut reporter = super::EditorInitializationReporter;
+            if let Err(error) = crate::commands::initialize_config_at(&target, &mut reporter) {
+                state.show_home_action_error(
+                    GlobalHomeErrorKind::GlobalConfig,
+                    format!("failed to initialize global config: {error}"),
+                );
+                return Ok(());
+            }
+            launch_resolved_target(
+                terminal,
+                state,
+                &config,
+                &editor,
+                &target,
+                GlobalHomeErrorKind::GlobalConfig,
+            )
+        }
+        GlobalHomeFileAction::ShowAuthenticationCookie => {
+            state.show_home_action_error(
+                GlobalHomeErrorKind::AuthenticationCookie,
+                super::authentication_cookie_status(paths),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -801,9 +878,10 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
         );
     }
     if layout.menu.width > 0 && layout.menu.height > 0 {
-        let lines = GLOBAL_HOME_ACTIONS
-            .iter()
-            .map(|(label, shortcut)| menu_line(label, shortcut, usize::from(layout.menu.width)));
+        let lines = GLOBAL_HOME_ACTIONS.iter().map(|action| match action {
+            Some((label, shortcut)) => menu_line(label, shortcut, usize::from(layout.menu.width)),
+            None => Line::raw(""),
+        });
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
     }
     if let Some(area) = layout.footer {
@@ -826,14 +904,14 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     if state.shortcut_help_visible {
         render_shortcuts(frame, state.explorer_pane_visible);
     }
-    if state.palette.is_active() {
-        render_palette(frame, &state.palette);
-    }
     if let Some(input) = state.path_input.as_ref() {
         render_path_input(frame, state.explorer.root(), input);
     }
     if let Some(modal) = state.initialize_workspace.as_ref() {
         render_initialize_workspace(frame, modal);
+    }
+    if let Some(modal) = state.initialize_global_config.as_ref() {
+        render_initialize_global_config(frame, modal);
     }
     if let Some(error) = state.error.as_ref() {
         render_error(frame, error);
@@ -873,31 +951,24 @@ fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspac
     );
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, explorer_pane_visible: bool) {
-    let area = centered_rect(frame.area(), 46, 14);
-    let open_help = if explorer_pane_visible {
-        "o         Open"
-    } else {
-        "o         Explorer, then Open"
-    };
+fn render_shortcuts(frame: &mut Frame<'_>, _explorer_pane_visible: bool) {
+    let area = centered_rect(frame.area(), 46, 11);
     let lines = vec![
-        Line::raw(open_help),
-        Line::raw("g         Go to Path"),
         Line::raw("Enter     Expand / Collapse"),
         Line::raw("↑↓ jk     Navigate"),
         Line::raw("←→ hl     Collapse / Expand"),
         Line::raw("Backspace Parent"),
         Line::raw("r         Reload"),
-        Line::raw(":         Commands"),
-        Line::raw("?         Shortcuts"),
-        Line::raw("q         Quit"),
         Line::raw(""),
         Line::raw("? keep open   Esc close"),
     ];
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)),
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .title(" Explorer Shortcuts ")
+                .borders(Borders::ALL),
+        ),
         area,
     );
 }
@@ -929,69 +1000,36 @@ fn render_explorer_overlay(frame: &mut Frame<'_>, state: &mut ExplorerState) {
     }
 }
 
-fn render_palette(frame: &mut Frame<'_>, palette: &GlobalHomeCommandPalette) {
-    let commands = palette.filtered_commands();
-    let height = 7u16.saturating_add(u16::try_from(commands.len()).unwrap_or(u16::MAX));
-    let area = centered_rect(frame.area(), 52, height);
+fn render_initialize_global_config(frame: &mut Frame<'_>, modal: &InitializeGlobalConfigModal) {
+    let area = centered_rect(frame.area(), 64, 11);
     let block = Block::default()
-        .title(" Command Palette ")
+        .title(" Initialize Global Config ")
         .borders(Borders::ALL);
     let inner = block.inner(area);
-    let query_height = inner.height.min(2);
-    let help_height = inner.height.saturating_sub(query_height).min(2);
-    let list_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(query_height),
-        inner.width,
-        inner.height.saturating_sub(query_height + help_height),
-    );
-    let list_area = view::command_palette_list_area(list_area, None);
-    let list_width = usize::from(list_area.width);
-    let lines = if commands.is_empty() {
-        vec![Line::styled(
-            "  No matching commands",
-            Style::default().fg(Color::DarkGray),
-        )]
-    } else {
-        commands
-            .iter()
-            .enumerate()
-            .map(|(index, command)| {
-                let selected = index == palette.selected;
-                view::command_palette_line(
-                    if selected { ">" } else { " " },
-                    command.label(),
-                    Some(command.shortcut()),
-                    list_width,
-                    Style::default(),
-                    selected,
-                )
-            })
-            .collect()
-    };
-
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    if query_height > 0 {
-        frame.render_widget(
-            Paragraph::new(format!("> {}", palette.query)),
-            Rect::new(inner.x, inner.y, inner.width, query_height),
-        );
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), list_area);
-    if help_height > 0 {
-        frame.render_widget(
-            Paragraph::new("[↑↓] Select   [Enter] Run   [Esc] Cancel"),
-            Rect::new(
-                inner.x,
-                inner
-                    .y
-                    .saturating_add(inner.height.saturating_sub(help_height)),
-                inner.width,
-                help_height,
-            ),
-        );
-    }
+    let target = prefixed_path_line("", &modal.target, usize::from(inner.width));
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::raw("Global config does not exist."),
+            Line::raw(""),
+            Line::raw(target),
+            Line::raw(""),
+            Line::raw("Create the comments-only default and open it?"),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::raw(" Initialize & Open       "),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(" Cancel"),
+            ]),
+        ]))
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_path_input(frame: &mut Frame<'_>, current_root: &Path, input: &PathInputModal) {
@@ -1043,8 +1081,10 @@ fn prefixed_text_line(prefix: &str, value: &str, width: usize) -> String {
 fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
     let height = match error.kind {
         GlobalHomeErrorKind::WorkspaceInitialization
-        | GlobalHomeErrorKind::WorkspaceInitializedOpen => 12,
+        | GlobalHomeErrorKind::WorkspaceInitializedOpen
+        | GlobalHomeErrorKind::AuthenticationCookie => 13,
         GlobalHomeErrorKind::WorkspaceOpen | GlobalHomeErrorKind::GoToPath => 9,
+        GlobalHomeErrorKind::GlobalConfig => 11,
     };
     let area = centered_rect(frame.area(), 64, height);
     let title = match error.kind {
@@ -1052,6 +1092,8 @@ fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
         GlobalHomeErrorKind::WorkspaceInitialization => " Workspace Initialization Failed ",
         GlobalHomeErrorKind::WorkspaceInitializedOpen => " Workspace Initialized, Open Failed ",
         GlobalHomeErrorKind::GoToPath => " Go to Path Failed ",
+        GlobalHomeErrorKind::GlobalConfig => " Global Config Failed ",
+        GlobalHomeErrorKind::AuthenticationCookie => " Authentication Cookie ",
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -1102,6 +1144,13 @@ mod tests {
         height: u16,
         frames: Vec<String>,
         reads: usize,
+        editor_targets: Vec<PathBuf>,
+        editor_configs_have_override: Vec<bool>,
+        launched_editors: Vec<ResolvedEditor>,
+        use_production_editor_resolver: bool,
+        resolve_error: Option<String>,
+        editor_outcome: HomeEditorOutcome,
+        discarded_events: usize,
     }
 
     impl ScriptedGlobalTerminal {
@@ -1117,6 +1166,16 @@ mod tests {
                 height,
                 frames: Vec::new(),
                 reads: 0,
+                editor_targets: Vec::new(),
+                editor_configs_have_override: Vec::new(),
+                launched_editors: Vec::new(),
+                use_production_editor_resolver: false,
+                resolve_error: None,
+                editor_outcome: HomeEditorOutcome {
+                    result: HomeEditorResult::Launched,
+                    discard_input_batch: false,
+                },
+                discarded_events: 0,
             }
         }
     }
@@ -1155,6 +1214,45 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| io::Error::other("scripted Global Home batch is empty"))
         }
+
+        fn resolve_global_home_editor(
+            &mut self,
+            config: &Config,
+        ) -> Result<ResolvedEditor, String> {
+            self.editor_configs_have_override
+                .push(config.editor.is_some());
+            if let Some(error) = self.resolve_error.clone() {
+                Err(error)
+            } else if self.use_production_editor_resolver {
+                crate::editor::resolve(config).map_err(|error| error.to_string())
+            } else {
+                Ok(ResolvedEditor {
+                    program: "test-editor".into(),
+                    args: Vec::new(),
+                    mode: crate::editor::EditorLaunchMode::External,
+                    source: crate::editor::EditorSource::EditorEnv,
+                })
+            }
+        }
+
+        fn launch_global_home_editor(
+            &mut self,
+            _config: &Config,
+            editor: &ResolvedEditor,
+            target: &Path,
+        ) -> io::Result<HomeEditorOutcome> {
+            self.launched_editors.push(editor.clone());
+            self.editor_targets.push(target.to_path_buf());
+            Ok(self.editor_outcome.clone())
+        }
+
+        fn discard_global_home_input_batch(&mut self) -> io::Result<()> {
+            while self.poll_global_home(Duration::ZERO)? {
+                let _ = self.read_global_home()?;
+                self.discarded_events += 1;
+            }
+            Ok(())
+        }
     }
 
     fn event(code: KeyCode) -> TerminalEvent {
@@ -1169,6 +1267,337 @@ mod tests {
         })
     }
 
+    fn cookie_location(root: &Path) -> crate::paths::CookieLocation {
+        let platform_base = root.join("platform-state");
+        let state_dir = platform_base.join("atc").join("state");
+        let file = state_dir.join("cookie");
+        crate::paths::CookieLocation {
+            platform_base,
+            state_dir,
+            file,
+        }
+    }
+
+    fn write_cookie(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn create_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create cookie symlink: {error}"),
+        }
+    }
+
+    #[test]
+    fn global_config_actions_open_invalid_existing_and_initialize_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let cookie = cookie_location(temp.path());
+        let paths = HomeActionPaths::for_test(config.clone(), cookie);
+        std::fs::write(&config, "invalid = [\n").unwrap();
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(
+            terminal.editor_targets.as_slice(),
+            std::slice::from_ref(&config)
+        );
+        assert_eq!(terminal.editor_configs_have_override, [false]);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "invalid = [\n");
+
+        std::fs::remove_file(&config).unwrap();
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            crate::config::INITIAL_CONFIG
+        );
+        assert_eq!(terminal.editor_targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Initialize & Open"))
+        );
+    }
+
+    #[test]
+    fn valid_global_config_editor_override_reaches_the_home_resolver() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[editor]\ncommand = \"configured-editor\"\nmode = \"terminal\"\n",
+        )
+        .unwrap();
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.use_production_editor_resolver = true;
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.editor_targets, [config]);
+        assert_eq!(terminal.launched_editors.len(), 1);
+        let resolved = &terminal.launched_editors[0];
+        assert_eq!(
+            resolved.program,
+            std::ffi::OsString::from("configured-editor")
+        );
+        assert_eq!(resolved.mode, crate::editor::EditorLaunchMode::Terminal);
+        assert_eq!(resolved.source, crate::editor::EditorSource::Config);
+    }
+
+    #[test]
+    fn global_home_resolves_editor_before_initializing_global_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.resolve_error = Some("No editor configured.".to_string());
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert!(!config.exists());
+        assert!(terminal.editor_targets.is_empty());
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("No editor configured."))
+        );
+    }
+
+    #[test]
+    fn authentication_cookie_reports_a_safe_existing_path_without_opening_or_rendering_its_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let cookie = cookie_location(temp.path());
+        std::fs::create_dir_all(&cookie.state_dir).unwrap();
+        let secret = "REVEL_SESSION=super-secret-cookie-value";
+        write_cookie(&cookie.file, secret);
+        let paths = HomeActionPaths::for_test(config, cookie.clone());
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('a'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert!(terminal.editor_targets.is_empty());
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Status: Configured")
+                && frame.contains("REVEL_SESSION=<value>")
+                && frame.contains("cookie")
+        }));
+        assert!(terminal.frames.iter().all(|frame| !frame.contains(secret)));
+    }
+
+    #[test]
+    fn missing_cookie_is_not_created_and_shows_setup_guidance() {
+        let temp = tempfile::tempdir().unwrap();
+        let cookie = cookie_location(temp.path());
+        let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie.clone());
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('a'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert!(!cookie.file.exists());
+        assert!(terminal.editor_targets.is_empty());
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Status: Not configured")
+                && frame.contains("REVEL_SESSION=<value>")
+                && frame.contains("Path:")
+                && frame.contains("cookie")
+        }));
+    }
+
+    #[test]
+    fn cookie_symlink_is_rejected_without_exposing_or_opening_the_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        let secret = "REVEL_SESSION=external-secret";
+        write_cookie(external.path(), secret);
+        let cookie = cookie_location(temp.path());
+        std::fs::create_dir_all(&cookie.state_dir).unwrap();
+        if !create_file_symlink(external.path(), &cookie.file) {
+            return;
+        }
+        let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie);
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('a'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert!(terminal.editor_targets.is_empty());
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Status: Invalid"))
+        );
+        assert!(terminal.frames.iter().all(|frame| !frame.contains(secret)));
+        assert_eq!(std::fs::read_to_string(external.path()).unwrap(), secret);
+    }
+
+    #[test]
+    fn terminal_editor_discards_the_rest_of_the_current_global_home_input_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let paths = HomeActionPaths::for_test(config, cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('G')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.editor_outcome = HomeEditorOutcome {
+            result: HomeEditorResult::Launched,
+            discard_input_batch: true,
+        };
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.discarded_events, 1);
+        assert_eq!(terminal.reads, 3);
+    }
+
+    #[test]
+    fn recoverable_terminal_editor_failure_discards_queued_modal_and_quit_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let paths = HomeActionPaths::for_test(config, cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![
+                    event(KeyCode::Char('G')),
+                    event(KeyCode::Enter),
+                    event(KeyCode::Char('q')),
+                ],
+                vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.editor_outcome = HomeEditorOutcome {
+            result: HomeEditorResult::RecoverableError("editor launch failed".to_string()),
+            discard_input_batch: true,
+        };
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.discarded_events, 2);
+        assert_eq!(terminal.reads, 5);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("editor launch failed"))
+        );
+    }
+
     #[test]
     fn production_dashboard_and_explorer_show_phase_3b_2_actions_and_selection() {
         let mut state = GlobalHomeState::new(PathBuf::from(r"D:\current\directory"));
@@ -1179,8 +1608,9 @@ mod tests {
             "Explorer",
             "Open",
             "Go to Path",
-            "Commands",
-            "Shortcuts",
+            "Global Config",
+            "Authentication Cookie",
+            "Explorer Shortcuts",
             "Quit",
             r"Selected  D:\current\directory",
         ]) {
@@ -1258,28 +1688,17 @@ mod tests {
     }
 
     #[test]
-    fn palette_searches_open_go_to_path_and_quit_and_runs_each_owner() {
+    fn colon_is_ignored_and_uppercase_g_is_distinct_from_go_to_path() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.handle_key(key(KeyCode::Char(':')));
-        for character in "path".chars() {
-            state.handle_key(key(KeyCode::Char(character)));
-        }
+        assert_eq!(state.handle_key(key(KeyCode::Char(':'))), None);
+        assert!(state.take_file_action().is_none());
+        assert_eq!(state.handle_key(key(KeyCode::Char('G'))), None);
         assert_eq!(
-            state.palette.filtered_commands(),
-            [GlobalHomeCommand::GoToPath]
+            state.take_file_action(),
+            Some(GlobalHomeFileAction::OpenGlobalConfig)
         );
-
-        state.handle_key(key(KeyCode::Enter));
+        assert_eq!(state.handle_key(key(KeyCode::Char('g'))), None);
         assert!(state.path_input.is_some());
-        assert!(!state.palette.is_active());
-
-        state.handle_key(key(KeyCode::Escape));
-        let _ = draw(&mut state, 80, 24);
-        state.handle_key(key(KeyCode::Char(':')));
-        assert_eq!(
-            state.handle_key(key(KeyCode::Enter)),
-            Some(GlobalHomeExit::OpenWorkspace(PathBuf::from("root")))
-        );
     }
 
     #[test]
@@ -1451,21 +1870,17 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_help_matches_global_actions_and_is_one_shot() {
+    fn explorer_shortcut_help_is_retained_and_one_shot() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
         state.handle_key(key(KeyCode::Char('?')));
         let rendered = buffer_text(&draw(&mut state, 80, 24));
         for expected in [
-            "o         Open",
-            "g         Go to Path",
+            "Explorer Shortcuts",
             "Enter     Expand / Collapse",
             "↑↓ jk     Navigate",
             "←→ hl     Collapse / Expand",
             "Backspace Parent",
             "r         Reload",
-            ":         Commands",
-            "?         Shortcuts",
-            "q         Quit",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -1478,41 +1893,6 @@ mod tests {
         assert_eq!(
             exit,
             Some(GlobalHomeExit::OpenWorkspace(PathBuf::from("root")))
-        );
-    }
-
-    #[test]
-    fn palette_selection_highlights_the_full_usable_row_with_unicode_width() {
-        let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.handle_key(key(KeyCode::Char(':')));
-        let buffer = draw(&mut state, 80, 24);
-        let palette_area = centered_rect(Rect::new(0, 0, 80, 24), 52, 10);
-        let inner = Block::default().borders(Borders::ALL).inner(palette_area);
-        let list_area = view::command_palette_list_area(
-            Rect::new(
-                inner.x,
-                inner.y.saturating_add(2),
-                inner.width,
-                inner.height.saturating_sub(4),
-            ),
-            None,
-        );
-        for column in list_area.x..list_area.x.saturating_add(list_area.width) {
-            assert!(
-                buffer
-                    .cell((column, list_area.y))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::REVERSED),
-                "column {column} was outside the selected-row highlight"
-            );
-        }
-        assert!(
-            !buffer
-                .cell((palette_area.x, list_area.y))
-                .unwrap()
-                .modifier
-                .contains(Modifier::REVERSED)
         );
     }
 
@@ -1580,10 +1960,10 @@ mod tests {
             let text = buffer_text(&buffer);
             assert!(text.contains("Selected  selected-root"));
             if let Some(explorer_width) = expected_explorer {
-                assert!(text.contains("Explorer"));
+                assert!(state.explorer_pane_visible);
                 assert_eq!(buffer.cell((explorer_width - 1, 0)).unwrap().symbol(), "│");
             } else {
-                assert!(!text.contains("Explorer"));
+                assert!(!state.explorer_pane_visible);
             }
         }
     }
@@ -1596,7 +1976,8 @@ mod tests {
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
 
         let dashboard = buffer_text(&draw(&mut state, 61, 12));
-        assert!(!dashboard.contains("Explorer"));
+        assert!(!state.explorer_pane_visible);
+        assert!(dashboard.contains("Explorer Shortcuts"));
         assert_eq!(state.handle_key(key(KeyCode::Char('o'))), None);
         assert!(state.explorer_overlay_visible);
 
@@ -1776,77 +2157,18 @@ mod tests {
     }
 
     #[test]
-    fn production_narrow_palette_open_opens_the_explorer_overlay_before_opening() {
-        let root = tempfile::tempdir().unwrap();
-        let mut state = GlobalHomeState::new(root.path().to_path_buf());
-        let mut terminal = ScriptedGlobalTerminal::new(
-            61,
-            24,
-            [
-                vec![event(KeyCode::Char(':'))],
-                vec![event(KeyCode::Enter)],
-                vec![event(KeyCode::Escape)],
-                vec![event(KeyCode::Char('q'))],
-            ],
-        );
-
-        assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
-            GlobalHomeExit::Quit
-        );
-        assert_eq!(terminal.reads, 4);
-        assert!(
-            terminal
-                .frames
-                .iter()
-                .any(|frame| frame.contains("o Open   g Go to Path   Esc Close"))
-        );
-    }
-
-    #[test]
-    fn production_narrow_palette_open_gives_same_batch_q_to_the_overlay() {
-        let root = tempfile::tempdir().unwrap();
-        let mut state = GlobalHomeState::new(root.path().to_path_buf());
-        let mut terminal = ScriptedGlobalTerminal::new(
-            61,
-            24,
-            [
-                vec![event(KeyCode::Char(':'))],
-                vec![event(KeyCode::Enter), event(KeyCode::Char('q'))],
-                vec![event(KeyCode::Escape)],
-                vec![event(KeyCode::Char('q'))],
-            ],
-        );
-
-        assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
-            GlobalHomeExit::Quit
-        );
-        assert_eq!(terminal.reads, 5);
-        assert!(
-            terminal
-                .frames
-                .iter()
-                .any(|frame| frame.contains("Explorer"))
-        );
-    }
-
-    #[test]
-    fn production_wide_palette_open_returns_without_discarding_same_batch_input() {
+    fn production_colon_is_ignored_without_consuming_later_input() {
         let root = tempfile::tempdir().unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
         let mut terminal = ScriptedGlobalTerminal::new(
             80,
             24,
-            [
-                vec![event(KeyCode::Char(':'))],
-                vec![event(KeyCode::Enter), event(KeyCode::Char('q'))],
-            ],
+            [vec![event(KeyCode::Char(':')), event(KeyCode::Char('q'))]],
         );
 
         assert_eq!(
             run_with_terminal(&mut terminal, &mut state).unwrap(),
-            GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
+            GlobalHomeExit::Quit
         );
         assert_eq!(terminal.reads, 2);
     }

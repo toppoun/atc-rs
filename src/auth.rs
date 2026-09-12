@@ -17,16 +17,28 @@ pub fn load_cookie() -> io::Result<Option<String>> {
     load_cookie_from(&location)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CookieFileState {
+    Missing,
+    Existing,
+}
+
+/// Inspect cookie state without reading credential contents.
+///
+/// The file is opened with the same path-hierarchy, no-follow, regular-file, and permission checks
+/// used by authentication. This is intended for status and setup guidance only: the result does
+/// not make a later pathname reopen safe or guarantee that it would refer to the inspected object.
+pub(crate) fn inspect_cookie_file(location: &CookieLocation) -> io::Result<CookieFileState> {
+    match open_validated_cookie_file(location)? {
+        Some(_) => Ok(CookieFileState::Existing),
+        None => Ok(CookieFileState::Missing),
+    }
+}
+
 fn load_cookie_from(location: &CookieLocation) -> io::Result<Option<String>> {
-    validate_cookie_location(location)?;
-    let Some(file) = open_cookie_file(location)? else {
+    let Some(file) = open_validated_cookie_file(location)? else {
         return Ok(None);
     };
-
-    if !file.metadata()?.file_type().is_file() {
-        return Err(unsafe_path_error("cookie path is not a regular file"));
-    }
-    validate_cookie_file_permissions(&file)?;
 
     let mut cookie = String::new();
     file.take((MAX_COOKIE_LINE_BYTES + 3) as u64)
@@ -93,6 +105,19 @@ fn validate_cookie_location(location: &CookieLocation) -> io::Result<()> {
 
 fn open_cookie_file(location: &CookieLocation) -> io::Result<Option<fs::File>> {
     open_cookie_file_with(location, || {})
+}
+
+fn open_validated_cookie_file(location: &CookieLocation) -> io::Result<Option<fs::File>> {
+    validate_cookie_location(location)?;
+    let Some(file) = open_cookie_file(location)? else {
+        return Ok(None);
+    };
+
+    if !file.metadata()?.file_type().is_file() {
+        return Err(unsafe_path_error("cookie path is not a regular file"));
+    }
+    validate_cookie_file_permissions(&file)?;
+    Ok(Some(file))
 }
 
 fn open_cookie_file_with(
@@ -253,6 +278,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let location = location(temp.path());
         assert_eq!(load_cookie_from(&location).unwrap(), None);
+        assert_eq!(
+            inspect_cookie_file(&location).unwrap(),
+            CookieFileState::Missing
+        );
 
         fs::create_dir_all(&location.state_dir).unwrap();
         write_cookie_file(&location.file, " \r\n ");
@@ -277,6 +306,10 @@ mod tests {
         assert_eq!(
             load_cookie_from(&location).unwrap().as_deref(),
             Some("REVEL_SESSION=secret")
+        );
+        assert_eq!(
+            inspect_cookie_file(&location).unwrap(),
+            CookieFileState::Existing
         );
     }
 
@@ -308,6 +341,7 @@ mod tests {
             };
 
             assert!(load_cookie_from(&location).is_err());
+            assert!(inspect_cookie_file(&location).is_err());
         }
     }
 
@@ -323,6 +357,7 @@ mod tests {
         }
 
         assert!(load_cookie_from(&symlink_location).is_err());
+        assert!(inspect_cookie_file(&symlink_location).is_err());
         assert_eq!(
             fs::read_to_string(external.path()).unwrap(),
             "external secret"
@@ -332,6 +367,7 @@ mod tests {
         let directory_location = location(directory_root.path());
         fs::create_dir_all(&directory_location.file).unwrap();
         assert!(load_cookie_from(&directory_location).is_err());
+        assert!(inspect_cookie_file(&directory_location).is_err());
     }
 
     #[test]
@@ -345,6 +381,7 @@ mod tests {
         }
 
         assert!(load_cookie_from(&location).is_err());
+        assert!(inspect_cookie_file(&location).is_err());
         assert!(!external.path().join("cookie").exists());
     }
 
@@ -359,6 +396,7 @@ mod tests {
         let _listener = UnixListener::bind(&location.file).unwrap();
 
         assert!(load_cookie_from(&location).is_err());
+        assert!(inspect_cookie_file(&location).is_err());
     }
 
     #[test]
@@ -496,6 +534,10 @@ mod tests {
 
         assert_eq!(
             load_cookie_from(&location).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            inspect_cookie_file(&location).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
     }
