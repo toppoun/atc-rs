@@ -653,22 +653,22 @@ fn run_with_terminal_and_paths(
     }
 }
 
-fn editor_config(paths: &HomeActionPaths) -> Config {
-    paths
+fn load_home_config(paths: &HomeActionPaths) -> Result<Config, String> {
+    let path = paths
         .global_config()
-        .ok()
-        .and_then(|path| Config::load_from(path).ok())
-        .unwrap_or_default()
+        .map_err(|error| format!("Global Config invalid: {error}"))?;
+    Config::load_from(path).map_err(|error| format!("Global Config invalid: {error}"))
 }
 
 fn launch_target(
     terminal: &mut impl GlobalHomeTerminal,
     state: &mut GlobalHomeState,
-    paths: &HomeActionPaths,
     target: &Path,
     kind: GlobalHomeErrorKind,
 ) -> io::Result<()> {
-    let config = editor_config(paths);
+    // A valid Config keeps the normal editor policy. Invalid Config is deliberately ignored only
+    // for this repair action so its own editor field cannot prevent repair.
+    let config = Config::load_from(target).unwrap_or_default();
     let editor = match terminal.resolve_global_home_editor(&config) {
         Ok(editor) => editor,
         Err(error) => {
@@ -719,13 +719,9 @@ fn handle_file_action(
                 }
             };
             match crate::user_config_fs::inspect_editable_file(target, "global config file") {
-                Ok(crate::user_config_fs::EditableFileState::Existing) => launch_target(
-                    terminal,
-                    state,
-                    paths,
-                    target,
-                    GlobalHomeErrorKind::GlobalConfig,
-                ),
+                Ok(crate::user_config_fs::EditableFileState::Existing) => {
+                    launch_target(terminal, state, target, GlobalHomeErrorKind::GlobalConfig)
+                }
                 Ok(crate::user_config_fs::EditableFileState::Missing) => {
                     state.show_initialize_global_config(target.to_path_buf());
                     Ok(())
@@ -740,7 +736,7 @@ fn handle_file_action(
             }
         }
         GlobalHomeFileAction::InitializeGlobalConfig(target) => {
-            let config = editor_config(paths);
+            let config = Config::default();
             let editor = match terminal.resolve_global_home_editor(&config) {
                 Ok(editor) => editor,
                 Err(error) => {
@@ -766,8 +762,12 @@ fn handle_file_action(
             )
         }
         GlobalHomeFileAction::OpenTemplate => {
-            let config = editor_config(paths);
-            state.open_template(paths.templates_dir_result(), config);
+            match load_home_config(paths) {
+                Ok(config) => state.open_template(paths.templates_dir_result(), config),
+                Err(error) => {
+                    state.show_home_action_error(GlobalHomeErrorKind::GlobalConfig, error)
+                }
+            }
             Ok(())
         }
         GlobalHomeFileAction::Template(request) => {
@@ -1495,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_global_config_editor_override_reaches_the_home_resolver() {
+    fn valid_global_config_editor_uses_the_fresh_configured_editor() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
         std::fs::write(
@@ -1514,7 +1514,6 @@ mod tests {
             ],
         );
         terminal.use_production_editor_resolver = true;
-
         assert_eq!(
             run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
             GlobalHomeExit::Quit
@@ -1528,6 +1527,7 @@ mod tests {
         );
         assert_eq!(resolved.mode, crate::editor::EditorLaunchMode::Terminal);
         assert_eq!(resolved.source, crate::editor::EditorSource::Config);
+        assert_eq!(terminal.editor_configs_have_override, [true]);
     }
 
     #[test]
@@ -1575,9 +1575,13 @@ mod tests {
         let action = state.take_file_action().unwrap();
         let mut direct_terminal = ScriptedGlobalTerminal::new(100, 30, []);
         handle_file_action(&mut direct_terminal, &mut state, &paths, action).unwrap();
-        let modal = state.template.as_ref().unwrap();
-        assert_eq!(modal.selected_language(), crate::language::Language::Cpp);
-        assert_eq!(modal.default_language(), crate::language::Language::Cpp);
+        assert!(state.template.is_none());
+        let error = state
+            .error
+            .as_ref()
+            .expect("invalid Config must remain repairable");
+        assert_eq!(error.kind, GlobalHomeErrorKind::GlobalConfig);
+        assert!(error.message.contains("Global Config invalid"));
     }
 
     #[test]

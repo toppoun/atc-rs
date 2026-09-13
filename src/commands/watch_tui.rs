@@ -1,5 +1,7 @@
 use crate::app_context::AppContext;
-use crate::config::{Config, RunnerConfig};
+use crate::config::Config;
+#[cfg(test)]
+use crate::config::RunnerConfig;
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
@@ -416,9 +418,15 @@ fn send_source_changes(
 pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     let app_context = AppContext::from_launch_root(&cwd)?;
-    let destination = workspace::resolve_contest_target(&cwd, cli_contest)?;
+    let destination = match (&app_context, cli_contest) {
+        (AppContext::Workspace { .. }, Some(contest_id)) => {
+            workspace::resolve_active_workspace_contest_path(&cwd, contest_id)?
+        }
+        _ => workspace::resolve_contest_target(&cwd, cli_contest)?,
+    };
+    let config = Config::load()?;
 
-    watch_tui_at(&destination, cli_contest, app_context)
+    watch_tui_at(&destination, cli_contest, app_context, config)
 }
 
 pub(crate) fn run_application() -> Result<(), AppError> {
@@ -439,9 +447,8 @@ fn run_application_at_with<T>(
 ) -> Result<T, AppError> {
     let app_context = AppContext::from_launch_root(launch_root)?;
     let location = match app_context {
-        AppContext::Workspace { .. } => AppLocation::Workspace(WorkspaceRuntime::new(
+        AppContext::Workspace { .. } => AppLocation::Workspace(WorkspaceRuntime::from_location(
             app_context,
-            Config::load()?,
             RootLocation::WorkspaceHome,
         )),
         AppContext::Standalone { .. } => {
@@ -455,15 +462,39 @@ pub(super) fn watch_tui_at(
     destination: &Path,
     expected_contest_id: Option<&str>,
     app_context: AppContext,
+    config: Config,
 ) -> Result<(), AppError> {
+    let session = start_direct_contest_session_with_hooks(
+        destination,
+        expected_contest_id,
+        &app_context,
+        config,
+        || {},
+        |_| Ok(()),
+    )?;
+
+    run_root_tui(app_context, RootLocation::Contest(session))
+}
+
+fn start_direct_contest_session_with_hooks(
+    destination: &Path,
+    expected_contest_id: Option<&str>,
+    app_context: &AppContext,
+    config: Config,
+    before_final_revalidation: impl FnOnce(),
+    after_start_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
+) -> Result<ContestSession, AppError> {
     let initial_input = PreparedWatchInput::load(destination, expected_contest_id)?;
-
-    // workerが使うrunner設定。
-    // thread開始前に読み込んでおく。
-    let config = Config::load()?;
-    let session = ContestSession::start(initial_input, &config.runner)?;
-
-    run_root_tui(app_context, config, RootLocation::Contest(session))
+    let entry = PreparedContestEntry {
+        input: initial_input,
+        environment: ContestEnvironment::new(config),
+    };
+    let finalized =
+        finalize_prepared_contest_entry_with_hook(entry, app_context, before_final_revalidation)?;
+    Ok(ContestSession::start_finalized_entry_with_hook(
+        finalized,
+        after_start_stage,
+    )?)
 }
 
 enum RootLocation {
@@ -473,8 +504,8 @@ enum RootLocation {
     ContestShutdown,
 }
 
-/// Application-level location. Global Home deliberately has no `AppContext`, `Config`, or
-/// `SubmissionHub`; those become mandatory together only after a workspace open commits.
+/// Application-level location. Global Home has no long-lived Config or `SubmissionHub`; Config is
+/// loaded only for a Home action or a new Contest entry.
 enum AppLocation {
     GlobalHome(crate::tui::GlobalHomeState),
     Workspace(WorkspaceRuntime),
@@ -486,7 +517,6 @@ enum AppLocation {
 /// workspace context can enter Workspace Home.
 struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
     app_context: AppContext,
-    config: Config,
     submissions: S,
     location: RootLocation,
 }
@@ -497,7 +527,7 @@ enum WorkspaceOpenOutcome<S = crate::tui::SubmissionHub> {
 }
 
 impl WorkspaceRuntime {
-    fn new(app_context: AppContext, config: Config, location: RootLocation) -> Self {
+    fn from_location(app_context: AppContext, location: RootLocation) -> Self {
         assert!(
             matches!(&app_context, AppContext::Workspace { .. })
                 || matches!(&location, RootLocation::Contest(_)),
@@ -510,32 +540,25 @@ impl WorkspaceRuntime {
         );
         Self {
             app_context,
-            config,
             submissions: crate::tui::SubmissionHub::new(),
             location,
         }
     }
 
     fn open(path: &Path) -> Result<WorkspaceOpenOutcome, AppError> {
-        open_workspace_runtime_with(path, Config::load, crate::tui::SubmissionHub::new)
+        open_workspace_runtime_with(path, crate::tui::SubmissionHub::new)
     }
 }
 
 fn open_workspace_runtime_with<S>(
     path: &Path,
-    load_config: impl FnOnce() -> Result<Config, AppError>,
     create_submissions: impl FnOnce() -> S,
 ) -> Result<WorkspaceOpenOutcome<S>, AppError> {
-    open_workspace_runtime_from_context_with(
-        AppContext::from_launch_root(path),
-        load_config,
-        create_submissions,
-    )
+    open_workspace_runtime_from_context_with(AppContext::from_launch_root(path), create_submissions)
 }
 
 fn open_workspace_runtime_from_context_with<S>(
     app_context: io::Result<AppContext>,
-    load_config: impl FnOnce() -> Result<Config, AppError>,
     create_submissions: impl FnOnce() -> S,
 ) -> Result<WorkspaceOpenOutcome<S>, AppError> {
     let app_context = match app_context? {
@@ -543,10 +566,8 @@ fn open_workspace_runtime_from_context_with<S>(
         AppContext::Standalone { .. } => return Ok(WorkspaceOpenOutcome::NotWorkspace),
     };
 
-    let config = load_config()?;
     Ok(WorkspaceOpenOutcome::Opened(WorkspaceRuntime {
         app_context,
-        config,
         submissions: create_submissions(),
         location: RootLocation::WorkspaceHome,
     }))
@@ -612,7 +633,6 @@ trait WorkspaceTerminal: RootTerminalLifetime + crate::tui::HomeTerminal {
         &mut self,
         session: &mut ContestSession,
         app_context: &AppContext,
-        config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
         submissions: &mut crate::tui::SubmissionHub,
         frontend: crate::tui::SessionFrontend<R>,
@@ -626,7 +646,6 @@ impl WorkspaceTerminal for crate::tui::TerminaSession {
         &mut self,
         session: &mut ContestSession,
         app_context: &AppContext,
-        config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
         submissions: &mut crate::tui::SubmissionHub,
         frontend: crate::tui::SessionFrontend<R>,
@@ -634,14 +653,7 @@ impl WorkspaceTerminal for crate::tui::TerminaSession {
     where
         R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
     {
-        session.run_frontend(
-            self,
-            app_context,
-            config,
-            preferences,
-            submissions,
-            frontend,
-        )
+        session.run_frontend(self, app_context, preferences, submissions, frontend)
     }
 }
 
@@ -716,7 +728,6 @@ fn orchestrate_contest_frontend_exit(
 
 fn resolve_contest_open(
     app_context: &AppContext,
-    prepared: &Arc<Mutex<Option<PreparedWatchInput>>>,
     contest_id: &str,
 ) -> crate::tui::ContestSwitchResolution {
     let Some(root) = app_context.workspace_root() else {
@@ -728,36 +739,23 @@ fn resolve_contest_open(
 
     match PreparedWatchInput::resolve_for_switch(root, contest_id) {
         Ok(SwitchTargetPreparation::Existing(input)) => {
-            let destination = input.destination.clone();
-            if let Ok(mut pending) = prepared.lock() {
-                *pending = Some(input);
-            }
-            crate::tui::ContestSwitchResolution::accepted(destination)
+            crate::tui::ContestSwitchResolution::accepted(input.destination)
         }
         Ok(SwitchTargetPreparation::Missing { destination }) => {
-            if let Ok(mut pending) = prepared.lock() {
-                *pending = None;
-            }
             crate::tui::ContestSwitchResolution::missing(destination)
         }
         Ok(SwitchTargetPreparation::RepairRequired { destination }) => {
-            if let Ok(mut pending) = prepared.lock() {
-                *pending = None;
-            }
             crate::tui::ContestSwitchResolution::repair_required(destination)
         }
         Err(SwitchPreparationError { destination, error }) => {
-            if let Ok(mut pending) = prepared.lock() {
-                *pending = None;
-            }
             crate::tui::ContestSwitchResolution::rejected(destination, error.to_string())
         }
     }
 }
 
 fn take_prepared_open(
-    prepared: &Arc<Mutex<Option<PreparedWatchInput>>>,
-) -> Result<PreparedWatchInput, String> {
+    prepared: &Arc<Mutex<Option<PreparedContestEntry>>>,
+) -> Result<PreparedContestEntry, String> {
     prepared
         .lock()
         .map_err(|_| "prepared contest open state is poisoned".to_string())?
@@ -765,12 +763,8 @@ fn take_prepared_open(
         .ok_or_else(|| "contest open did not retain its validated prepared contest".to_string())
 }
 
-fn run_root_tui(
-    app_context: AppContext,
-    config: Config,
-    location: RootLocation,
-) -> Result<(), AppError> {
-    let mut runtime = WorkspaceRuntime::new(app_context, config, location);
+fn run_root_tui(app_context: AppContext, location: RootLocation) -> Result<(), AppError> {
+    let mut runtime = WorkspaceRuntime::from_location(app_context, location);
     let mut preferences = crate::tui::FrontendPreferences::default();
     run_root_application(
         &mut runtime,
@@ -1049,7 +1043,6 @@ where
     T: WorkspaceTerminal,
 {
     let app_context = &runtime.app_context;
-    let config = &runtime.config;
     let submissions = &mut runtime.submissions;
     let location = &mut runtime.location;
     let prepared_switch = Arc::new(Mutex::new(None));
@@ -1066,25 +1059,20 @@ where
                     break Err(io::Error::other("prepared contest open state is poisoned"));
                 }
             }
-            let resolver_prepared = Arc::clone(&prepared_home_open);
-            let mut resolve = |contest_id: &str| {
-                resolve_contest_open(app_context, &resolver_prepared, contest_id)
-            };
+            let mut resolve = |contest_id: &str| resolve_contest_open(app_context, contest_id);
             let start_prepared = Arc::clone(&prepared_home_open);
-            let runner_config = &config.runner;
             let workspace_root = app_context
                 .workspace_root()
                 .expect("Workspace Home is reachable only from a workspace context");
             match crate::tui::run_home_with_terminal(
                 terminal,
                 workspace_root,
-                config,
                 submissions.hub(),
                 &mut resolve,
                 Arc::clone(&home_open_task),
                 || {
                     let prepared = take_prepared_open(&start_prepared)?;
-                    ContestSession::start(prepared, runner_config)
+                    start_prepared_contest_entry(prepared, app_context)
                         .map_err(|error| error.to_string())
                 },
             ) {
@@ -1121,10 +1109,9 @@ where
             Arc::clone(&prepared_refresh),
         );
         let refresh_check = prepared_refresh_check(Arc::clone(&prepared_refresh));
-        let resolver_prepared = Arc::clone(&prepared_switch);
         let frontend = crate::tui::SessionFrontend::new(
             refresh_frontend_state.take(),
-            |contest_id: &str| resolve_contest_open(app_context, &resolver_prepared, contest_id),
+            |contest_id: &str| resolve_contest_open(app_context, contest_id),
             Arc::clone(&switch_task),
             refresh_task,
             refresh_check,
@@ -1132,7 +1119,6 @@ where
         let frontend_result = terminal.run_contest_frontend(
             active_session,
             app_context,
-            config,
             preferences,
             submissions.hub(),
             frontend,
@@ -1185,11 +1171,7 @@ where
                     else {
                         unreachable!("contest switch requires the active contest session")
                     };
-                    if let Err(error) = old_session.shutdown() {
-                        break Err(error);
-                    }
-
-                    match ContestSession::start(prepared, &config.runner) {
+                    match switch_to_prepared_contest(old_session, prepared, app_context) {
                         Ok(new_session) => {
                             *location = RootLocation::Contest(new_session);
                             refresh_frontend_state = None;
@@ -1211,43 +1193,13 @@ where
                             break Err(io::Error::other("prepared refresh state is poisoned"));
                         }
                     };
-                    let refresh_destination = prepared.destination().to_path_buf();
-                    let refresh_contest_id = prepared.contest_id().to_string();
-                    let RootLocation::Contest(active_session) = &*location else {
-                        unreachable!("contest refresh requires the active contest session")
-                    };
-                    if active_session.input.destination != refresh_destination
-                        || active_session.input.contest.contest_id != refresh_contest_id
-                    {
-                        break Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "prepared refresh target does not match the active contest session",
-                        ));
-                    }
-
                     let RootLocation::Contest(old_session) =
                         std::mem::replace(location, RootLocation::WorkspaceHome)
                     else {
                         unreachable!("contest refresh requires the active contest session")
                     };
-                    let rebuilt = rebuild_contest_session_after_refresh(
-                        old_session,
-                        prepared,
-                        &refresh_destination,
-                        &refresh_contest_id,
-                        resume,
-                        RefreshRebuildHooks {
-                            shutdown: ContestSession::shutdown,
-                            apply: |prepared| {
-                                let mut reporter = RefreshApplyReporter;
-                                super::refresh::apply_refresh(prepared, &mut reporter)
-                            },
-                            load: |destination, contest_id| {
-                                PreparedWatchInput::load(destination, Some(contest_id))
-                            },
-                            start: |input| ContestSession::start(input, &config.runner),
-                        },
-                    );
+                    let rebuilt =
+                        rebuild_active_contest_session_after_refresh(old_session, prepared, resume);
                     match rebuilt {
                         Ok(rebuilt) => {
                             *location = RootLocation::Contest(rebuilt.session);
@@ -1259,6 +1211,125 @@ where
             }
         }
     }
+}
+
+fn switch_to_prepared_contest(
+    old_session: ContestSession,
+    prepared: PreparedContestEntry,
+    app_context: &AppContext,
+) -> io::Result<ContestSession> {
+    let finalized = match finalize_prepared_contest_entry(prepared, app_context) {
+        Ok(finalized) => finalized,
+        Err(error) => {
+            let error = combine_primary_and_cleanup_results(
+                Err(error),
+                [("old contest session shutdown", old_session.shutdown())],
+            )
+            .expect_err("a failed final workspace validation must remain an error");
+            return Err(error);
+        }
+    };
+    old_session.shutdown()?;
+    ContestSession::start_finalized_entry(finalized)
+}
+
+fn rebuild_active_contest_session_after_refresh(
+    old_session: ContestSession,
+    prepared: PreparedRefresh,
+    resume: crate::tui::RefreshResumeState,
+) -> io::Result<RefreshRebuild<ContestSession>> {
+    let refresh_destination = prepared.destination().to_path_buf();
+    let refresh_contest_id = prepared.contest_id().to_string();
+    if old_session.input.destination != refresh_destination
+        || old_session.input.contest.contest_id != refresh_contest_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prepared refresh target does not match the active contest session",
+        ));
+    }
+    let environment = old_session.environment.clone();
+
+    rebuild_contest_session_after_refresh(
+        old_session,
+        prepared,
+        &refresh_destination,
+        &refresh_contest_id,
+        resume,
+        RefreshRebuildHooks {
+            shutdown: ContestSession::shutdown,
+            apply: |prepared| {
+                let mut reporter = RefreshApplyReporter;
+                super::refresh::apply_refresh(prepared, &mut reporter)
+            },
+            load: |destination, contest_id| PreparedWatchInput::load(destination, Some(contest_id)),
+            start: |input| ContestSession::start_entry(PreparedContestEntry { input, environment }),
+        },
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ContestEnvironment {
+    config: Box<Config>,
+}
+
+impl ContestEnvironment {
+    fn new(config: Config) -> Self {
+        Self {
+            config: Box::new(config),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedContestEntry {
+    input: PreparedWatchInput,
+    environment: ContestEnvironment,
+}
+
+/// A new ContestSession entry whose active-workspace identity and routing were checked after all
+/// preparation completed. Standalone entries are finalized without workspace routing checks.
+struct FinalizedContestEntry(PreparedContestEntry);
+
+fn finalize_prepared_contest_entry(
+    entry: PreparedContestEntry,
+    app_context: &AppContext,
+) -> io::Result<FinalizedContestEntry> {
+    finalize_prepared_contest_entry_with_hook(entry, app_context, || {})
+}
+
+fn finalize_prepared_contest_entry_with_hook(
+    entry: PreparedContestEntry,
+    app_context: &AppContext,
+    before_final_revalidation: impl FnOnce(),
+) -> io::Result<FinalizedContestEntry> {
+    before_final_revalidation();
+    if let Some(root) = app_context.workspace_root() {
+        let contest_id = &entry.input.contest.contest_id;
+        let expected_destination = &entry.input.destination;
+        let final_destination = workspace::resolve_active_workspace_contest_path(root, contest_id)
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("Workspace Config invalid: {error}"))
+            })?;
+        if final_destination != *expected_destination {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "workspace config changed after preparing contest {contest_id:?}: expected {}, now resolves to {}",
+                    expected_destination.display(),
+                    final_destination.display()
+                ),
+            ));
+        }
+    }
+    Ok(FinalizedContestEntry(entry))
+}
+
+fn start_prepared_contest_entry(
+    entry: PreparedContestEntry,
+    app_context: &AppContext,
+) -> io::Result<ContestSession> {
+    ContestSession::start_finalized_entry(finalize_prepared_contest_entry(entry, app_context)?)
 }
 
 #[derive(Debug)]
@@ -1316,12 +1387,11 @@ impl PreparedWatchInput {
         expected_destination: Option<&Path>,
         after_healthy_inspection: impl FnOnce(),
     ) -> Result<SwitchTargetPreparation, SwitchPreparationError> {
-        let destination = workspace::resolve_contest_path(root, contest_id).map_err(|error| {
-            SwitchPreparationError {
+        let destination = workspace::resolve_active_workspace_contest_path(root, contest_id)
+            .map_err(|error| SwitchPreparationError {
                 destination: None,
                 error,
-            }
-        })?;
+            })?;
 
         if let Some(expected_destination) = expected_destination
             && destination != expected_destination
@@ -1384,7 +1454,7 @@ impl PreparedWatchInput {
 
 fn contest_open_task(
     app_context: &AppContext,
-    prepared_switch: Arc<Mutex<Option<PreparedWatchInput>>>,
+    prepared_switch: Arc<Mutex<Option<PreparedContestEntry>>>,
 ) -> crate::tui::ContestSwitchTask {
     let workspace_root = app_context.workspace_root().map(Path::to_path_buf);
     Arc::new(move |request, reporter| {
@@ -1394,19 +1464,146 @@ fn contest_open_task(
                 "contest switching is unavailable outside a workspace",
             )
         })?;
-        let prepared = match request.mutation {
-            crate::tui::ContestSwitchMutation::Create => {
-                create_and_prepare_contest_switch(root, &request, reporter)?
-            }
-            crate::tui::ContestSwitchMutation::Repair => {
-                repair_and_prepare_contest_switch(root, &request, reporter)?
-            }
-        };
+        let prepared = prepare_workspace_contest_entry(root, &request, reporter)?;
         *prepared_switch
             .lock()
             .map_err(|_| io::Error::other("prepared contest switch state is poisoned"))? =
             Some(prepared);
         Ok(())
+    })
+}
+
+fn prepare_workspace_contest_entry(
+    root: &Path,
+    request: &crate::tui::ContestSwitchRequest,
+    reporter: &mut dyn Reporter,
+) -> Result<PreparedContestEntry, AppError> {
+    prepare_workspace_contest_entry_with(
+        root,
+        request,
+        reporter,
+        Config::load,
+        |destination, contest_id, config, reporter| {
+            super::contest::create_contest_in_active_workspace(
+                root,
+                destination,
+                contest_id,
+                config,
+                reporter,
+            )
+        },
+        |destination, contest_id, reporter| {
+            super::contest::repair_contest_in_active_workspace(
+                root,
+                destination,
+                contest_id,
+                reporter,
+            )
+        },
+    )
+}
+
+fn prepare_workspace_contest_entry_with<L, C, R>(
+    root: &Path,
+    request: &crate::tui::ContestSwitchRequest,
+    reporter: &mut dyn Reporter,
+    load_config: L,
+    create: C,
+    repair: R,
+) -> Result<PreparedContestEntry, AppError>
+where
+    L: FnOnce() -> Result<Config, AppError>,
+    C: FnOnce(&Path, &str, &Config, &mut dyn Reporter) -> Result<(), AppError>,
+    R: FnOnce(&Path, &str, &mut dyn Reporter) -> Result<(), AppError>,
+{
+    // Establish the active workspace routing generation before loading Config or mutating the
+    // contest. A second strict check is performed by the shared session finalization boundary.
+    let destination = workspace::resolve_active_workspace_contest_path(root, &request.contest_id)
+        .map_err(|error| {
+        io::Error::new(error.kind(), format!("Workspace Config invalid: {error}"))
+    })?;
+    if destination != request.destination {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workspace config changed while preparing contest {:?}: expected {}, now resolves to {}",
+                request.contest_id,
+                request.destination.display(),
+                destination.display()
+            ),
+        )
+        .into());
+    }
+
+    // Config is established before contest inspection, creation, repair, or worker startup.
+    let config = load_config().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Global Config invalid: {error}"),
+        )
+    })?;
+    let health = inspect_contest_target(&destination, &request.contest_id)?;
+    match (request.mutation, health) {
+        (crate::tui::ContestSwitchMutation::Open, ContestTargetHealth::Healthy) => {}
+        (crate::tui::ContestSwitchMutation::Create, ContestTargetHealth::MissingDirectory) => {
+            create(&destination, &request.contest_id, &config, reporter)?;
+        }
+        (crate::tui::ContestSwitchMutation::Repair, ContestTargetHealth::RepairRequired) => {
+            repair(&destination, &request.contest_id, reporter)?;
+        }
+        (_, ContestTargetHealth::UnsupportedVersion(version)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported contest metadata version: {version}"),
+            )
+            .into());
+        }
+        (mutation, actual) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contest target changed before {mutation:?}: expected matching target, found {actual:?} at {}",
+                    destination.display()
+                ),
+            )
+            .into());
+        }
+    }
+
+    match inspect_contest_target(&destination, &request.contest_id)? {
+        ContestTargetHealth::Healthy => {}
+        ContestTargetHealth::MissingDirectory => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "contest preparation completed but the destination is missing: {}",
+                    destination.display()
+                ),
+            )
+            .into());
+        }
+        ContestTargetHealth::RepairRequired => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contest preparation completed but contest data requires repair: {}",
+                    destination.display()
+                ),
+            )
+            .into());
+        }
+        ContestTargetHealth::UnsupportedVersion(version) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported contest metadata version: {version}"),
+            )
+            .into());
+        }
+    }
+
+    Ok(PreparedContestEntry {
+        input: PreparedWatchInput::load(&destination, Some(&request.contest_id))?,
+        environment: ContestEnvironment::new(config),
     })
 }
 
@@ -1464,21 +1661,7 @@ impl Reporter for RefreshApplyReporter {
     fn report(&mut self, _event: crate::ui::Event<'_>) {}
 }
 
-fn create_and_prepare_contest_switch(
-    root: &Path,
-    request: &crate::tui::ContestSwitchRequest,
-    reporter: &mut dyn Reporter,
-) -> Result<PreparedWatchInput, AppError> {
-    create_and_prepare_contest_switch_with(
-        root,
-        request,
-        reporter,
-        |destination, contest_id, reporter| {
-            super::contest::create_contest(root, destination, contest_id, reporter)
-        },
-    )
-}
-
+#[cfg(test)]
 fn create_and_prepare_contest_switch_with(
     root: &Path,
     request: &crate::tui::ContestSwitchRequest,
@@ -1544,14 +1727,7 @@ fn create_and_prepare_contest_switch_with(
     }
 }
 
-fn repair_and_prepare_contest_switch(
-    root: &Path,
-    request: &crate::tui::ContestSwitchRequest,
-    reporter: &mut dyn Reporter,
-) -> Result<PreparedWatchInput, AppError> {
-    repair_and_prepare_contest_switch_with(root, request, reporter, super::contest::repair_contest)
-}
-
+#[cfg(test)]
 fn repair_and_prepare_contest_switch_with(
     root: &Path,
     request: &crate::tui::ContestSwitchRequest,
@@ -1561,6 +1737,7 @@ fn repair_and_prepare_contest_switch_with(
     repair_and_prepare_contest_switch_with_final_hook(root, request, reporter, repair, || {})
 }
 
+#[cfg(test)]
 fn repair_and_prepare_contest_switch_with_final_hook(
     root: &Path,
     request: &crate::tui::ContestSwitchRequest,
@@ -1639,6 +1816,7 @@ struct ContestSession {
     run_worker: Option<RunWorker>,
     watcher_thread: Option<WatcherThread>,
     detail_analysis_worker: Option<DetailAnalysisWorker>,
+    environment: ContestEnvironment,
     input: PreparedWatchInput,
     message_rx: mpsc::Receiver<Message>,
     run_tx: mpsc::Sender<crate::tui::message::RunWorkerCommand>,
@@ -1655,15 +1833,26 @@ enum SessionStartStage {
 }
 
 impl ContestSession {
-    fn start(input: PreparedWatchInput, runner_config: &RunnerConfig) -> io::Result<Self> {
-        Self::start_with_hook(input, runner_config, |_| Ok(()))
+    fn start_finalized_entry(entry: FinalizedContestEntry) -> io::Result<Self> {
+        Self::start_finalized_entry_with_hook(entry, |_| Ok(()))
     }
 
-    fn start_with_hook(
-        input: PreparedWatchInput,
-        runner_config: &RunnerConfig,
+    fn start_finalized_entry_with_hook(
+        entry: FinalizedContestEntry,
+        after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::start_entry_with_hook(entry.0, after_stage)
+    }
+
+    fn start_entry(entry: PreparedContestEntry) -> io::Result<Self> {
+        Self::start_entry_with_hook(entry, |_| Ok(()))
+    }
+
+    fn start_entry_with_hook(
+        entry: PreparedContestEntry,
         mut after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
+        let PreparedContestEntry { input, environment } = entry;
         let (message_tx, message_rx) = mpsc::channel();
         let watcher_thread = start_watcher(&input.destination, &input.contest, message_tx.clone())?;
         if let Err(error) = after_stage(SessionStartStage::WatcherStarted) {
@@ -1679,7 +1868,7 @@ impl ContestSession {
             input.destination.clone(),
             input.contest.contest_id.clone(),
             input.contest.problems.clone(),
-            runner_config.clone(),
+            environment.config.runner.clone(),
             message_tx.clone(),
         ) {
             Ok(worker) => worker,
@@ -1734,6 +1923,7 @@ impl ContestSession {
             run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
+            environment,
             input,
             message_rx,
             run_tx,
@@ -1742,6 +1932,37 @@ impl ContestSession {
             #[cfg(test)]
             shutdown_probe: None,
         })
+    }
+
+    #[cfg(test)]
+    fn start(input: PreparedWatchInput, runner_config: &RunnerConfig) -> io::Result<Self> {
+        let config = Config {
+            runner: runner_config.clone(),
+            ..Config::default()
+        };
+        Self::start_entry(PreparedContestEntry {
+            input,
+            environment: ContestEnvironment::new(config),
+        })
+    }
+
+    #[cfg(test)]
+    fn start_with_hook(
+        input: PreparedWatchInput,
+        runner_config: &RunnerConfig,
+        after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let config = Config {
+            runner: runner_config.clone(),
+            ..Config::default()
+        };
+        Self::start_entry_with_hook(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::new(config),
+            },
+            after_stage,
+        )
     }
 
     fn channels(&self) -> crate::tui::SessionChannels<'_> {
@@ -1757,7 +1978,6 @@ impl ContestSession {
         &mut self,
         terminal: &mut crate::tui::TerminaSession,
         app_context: &AppContext,
-        config: &Config,
         preferences: &mut crate::tui::FrontendPreferences,
         submissions: &mut crate::tui::SubmissionHub,
         frontend: crate::tui::SessionFrontend<R>,
@@ -1771,7 +1991,7 @@ impl ContestSession {
         let channels = self.channels();
         let runtime = crate::tui::SessionRuntime::new(
             &self.input.destination,
-            config,
+            &self.environment.config,
             &self.input.contest,
             sample_counts,
             stress_cases,
@@ -2014,6 +2234,101 @@ mod tests {
         probe: BareApplicationProbe,
     }
 
+    struct RepairingWorkspaceHomeTerminal {
+        events: VecDeque<crate::tui::TerminalEvent>,
+        marker: PathBuf,
+        repaired_contents: String,
+        first_confirmation_seen: bool,
+        repair_launches: usize,
+        rendered_invalid_workspace: bool,
+    }
+
+    impl RepairingWorkspaceHomeTerminal {
+        fn new(marker: PathBuf, contest_id: &str, repaired_contents: &str) -> Self {
+            let mut events = VecDeque::from([crate::tui::test_key_press('c')]);
+            events.extend(contest_id.chars().map(crate::tui::test_key_press));
+            events.push_back(crate::tui::test_key_enter());
+            Self {
+                events,
+                marker,
+                repaired_contents: repaired_contents.to_string(),
+                first_confirmation_seen: false,
+                repair_launches: 0,
+                rendered_invalid_workspace: false,
+            }
+        }
+    }
+
+    impl crate::tui::HomeTerminal for RepairingWorkspaceHomeTerminal {
+        fn draw_home(&mut self, render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<()> {
+            let rendered = BareTerminalSpy::render_to_text(100, 30, render)?;
+            if self.first_confirmation_seen
+                && !self.rendered_invalid_workspace
+                && rendered.contains("failed to parse workspace config")
+            {
+                self.rendered_invalid_workspace = true;
+                self.events.push_back(crate::tui::test_key_escape());
+                self.events.push_back(crate::tui::test_key_press('w'));
+            }
+            Ok(())
+        }
+
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn note_home_resize(&mut self) {}
+
+        fn poll_home(&mut self, _wait: Duration) -> io::Result<bool> {
+            if self.events.is_empty() {
+                std::thread::yield_now();
+            }
+            Ok(!self.events.is_empty())
+        }
+
+        fn read_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            let event = self
+                .events
+                .pop_front()
+                .ok_or_else(|| io::Error::other("repair Home input is empty"))?;
+            if event == crate::tui::test_key_enter() && !self.first_confirmation_seen {
+                self.first_confirmation_seen = true;
+            }
+            Ok(event)
+        }
+
+        fn resolve_home_editor(
+            &mut self,
+            _config: &Config,
+        ) -> Result<crate::editor::ResolvedEditor, String> {
+            Ok(crate::editor::ResolvedEditor {
+                program: "test-editor".into(),
+                args: Vec::new(),
+                mode: crate::editor::EditorLaunchMode::External,
+                source: crate::editor::EditorSource::EditorEnv,
+            })
+        }
+
+        fn launch_home_editor(
+            &mut self,
+            _config: &Config,
+            _editor: &crate::editor::ResolvedEditor,
+            target: &Path,
+        ) -> io::Result<crate::tui::HomeEditorOutcome> {
+            assert_eq!(target, self.marker);
+            std::fs::write(&self.marker, &self.repaired_contents)?;
+            self.repair_launches += 1;
+            self.events.push_back(crate::tui::test_key_press('c'));
+            self.events
+                .extend("abc466".chars().map(crate::tui::test_key_press));
+            self.events.push_back(crate::tui::test_key_enter());
+            Ok(crate::tui::HomeEditorOutcome {
+                result: crate::tui::HomeEditorResult::Launched,
+                discard_input_batch: false,
+            })
+        }
+    }
+
     impl BareTerminalSpy {
         fn new(
             batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
@@ -2193,7 +2508,6 @@ mod tests {
             &mut self,
             _session: &mut ContestSession,
             _app_context: &AppContext,
-            _config: &Config,
             _preferences: &mut crate::tui::FrontendPreferences,
             _submissions: &mut crate::tui::SubmissionHub,
             _frontend: crate::tui::SessionFrontend<R>,
@@ -2289,7 +2603,6 @@ mod tests {
             &mut self,
             session: &mut ContestSession,
             app_context: &AppContext,
-            _config: &Config,
             _preferences: &mut crate::tui::FrontendPreferences,
             _submissions: &mut crate::tui::SubmissionHub,
             _frontend: crate::tui::SessionFrontend<R>,
@@ -2377,10 +2690,6 @@ mod tests {
 
     fn wide_global_home_modal_path(path: &Path) -> String {
         crate::tui::global_home_prefixed_path_line_for_test("", path, 62)
-    }
-
-    fn wide_global_home_footer_path(path: &Path) -> String {
-        crate::tui::global_home_prefixed_path_line_for_test("Selected  ", path, 66)
     }
 
     fn paste(text: impl Into<String>) -> crate::tui::TerminalEvent {
@@ -2790,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn production_invalid_marker_same_batch_key_stays_with_global_home_error() {
+    fn production_malformed_marker_opens_workspace_home_for_repair() {
         let launch = tempfile::tempdir().unwrap();
         let invalid = launch.path().join("a-invalid");
         std::fs::create_dir(&invalid).unwrap();
@@ -2813,30 +3122,25 @@ mod tests {
         )
         .unwrap();
 
-        let AppLocation::GlobalHome(state) = location else {
-            panic!("an invalid selected marker must retain Global Home")
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("a structurally safe malformed marker must open Workspace Home")
         };
-        assert_eq!(state.explorer_root(), launch.path());
-        assert_eq!(state.explorer_selected_path(), invalid);
-        assert_eq!(probe.workspace_draws.get(), 0);
-        assert_eq!(probe.global_reads.get(), 6);
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(invalid.as_path())
+        );
+        assert!(probe.workspace_draws.get() >= 1);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
-        let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
-        assert!(!rendered.contains("Initialize Workspace"));
-        assert!(rendered.contains("workspace config"));
-        assert!(rendered.contains(&wide_global_home_footer_path(&invalid)));
     }
 
     #[test]
-    fn config_failure_same_batch_key_stays_with_global_home_error() {
+    fn workspace_home_open_has_no_global_config_dependency() {
         let launch = tempfile::tempdir().unwrap();
         let workspace = launch.path().join("a-workspace");
         std::fs::create_dir(&workspace).unwrap();
         write_empty_workspace(&workspace);
         let probe = BareApplicationProbe::default();
-        let config_loads = std::cell::Cell::new(0);
         let terminal = BareTerminalSpy::new(
             [
                 vec![crate::tui::test_key_enter()],
@@ -2860,37 +3164,23 @@ mod tests {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
                 },
-                |path| {
-                    open_workspace_runtime_with(
-                        path,
-                        || {
-                            config_loads.set(config_loads.get() + 1);
-                            Err(io::Error::other("config load failed").into())
-                        },
-                        crate::tui::SubmissionHub::new,
-                    )
-                },
+                |path| open_workspace_runtime_with(path, crate::tui::SubmissionHub::new),
                 workspace::initialize_workspace,
             )?;
             Ok(location)
         })
         .unwrap();
 
-        let AppLocation::GlobalHome(state) = location else {
-            panic!("a config load failure must retain Global Home")
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("Global Config must not be loaded while opening Workspace Home")
         };
-        assert_eq!(state.explorer_root(), launch.path());
-        assert_eq!(state.explorer_selected_path(), workspace);
-        assert_eq!(config_loads.get(), 1);
-        assert_eq!(probe.workspace_draws.get(), 0);
-        assert_eq!(probe.global_reads.get(), 6);
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(workspace.as_path())
+        );
+        assert!(probe.workspace_draws.get() >= 1);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
-        let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.matches("Workspace Open Failed").count() >= 2);
-        assert!(!rendered.contains("Initialize Workspace"));
-        assert!(rendered.contains("config load failed"));
-        assert!(rendered.contains(&wide_global_home_footer_path(&workspace)));
     }
 
     #[test]
@@ -2950,12 +3240,11 @@ mod tests {
     }
 
     #[test]
-    fn initialized_workspace_open_failure_keeps_marker_and_same_batch_error_ownership() {
+    fn initialized_workspace_open_has_no_global_config_dependency() {
         let launch = tempfile::tempdir().unwrap();
         let ordinary = launch.path().join("a-ordinary");
         std::fs::create_dir(&ordinary).unwrap();
         let probe = BareApplicationProbe::default();
-        let config_loads = std::cell::Cell::new(0);
         let terminal = BareTerminalSpy::new(
             [
                 vec![crate::tui::test_key_enter()],
@@ -2980,36 +3269,22 @@ mod tests {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
                 },
-                |path| {
-                    open_workspace_runtime_with(
-                        path,
-                        || {
-                            config_loads.set(config_loads.get() + 1);
-                            Err(io::Error::other("config load failed after initialization").into())
-                        },
-                        crate::tui::SubmissionHub::new,
-                    )
-                },
+                |path| open_workspace_runtime_with(path, crate::tui::SubmissionHub::new),
                 workspace::initialize_workspace,
             )?;
             Ok(location)
         })
         .unwrap();
 
-        let AppLocation::GlobalHome(state) = location else {
-            panic!("post-initialization open failure must retain Global Home")
+        let AppLocation::Workspace(runtime) = location else {
+            panic!("initialized Workspace Home must not require Global Config")
         };
-        assert_eq!(state.explorer_selected_path(), ordinary);
-        assert_eq!(state.initialize_workspace_target(), None);
-        assert_eq!(config_loads.get(), 1);
+        assert_eq!(
+            runtime.app_context.workspace_root(),
+            Some(ordinary.as_path())
+        );
         assert!(ordinary.join(".atc-workspace.toml").is_file());
-        assert_eq!(probe.global_reads.get(), 7);
-        assert_eq!(probe.workspace_draws.get(), 0);
-        let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.contains("Workspace Initialized, Open Failed"));
-        assert!(rendered.contains("Workspace initialized at"));
-        assert!(rendered.contains("config load failed after"));
-        assert!(rendered.contains("initialization"));
+        assert!(probe.workspace_draws.get() >= 1);
     }
 
     #[test]
@@ -3240,105 +3515,55 @@ mod tests {
     }
 
     #[test]
-    fn workspace_open_boundary_loads_config_before_constructing_runtime() {
+    fn workspace_open_boundary_does_not_load_config_before_constructing_runtime() {
         let workspace = tempfile::tempdir().unwrap();
         write_empty_workspace(workspace.path());
-        let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
-        let outcome = open_workspace_runtime_with(
-            workspace.path(),
-            || {
-                config_loads.set(config_loads.get() + 1);
-                Ok(Config::default())
-            },
-            || {
-                hub_creations.set(hub_creations.get() + 1);
-                ()
-            },
-        )
+        let outcome = open_workspace_runtime_with(workspace.path(), || {
+            hub_creations.set(hub_creations.get() + 1)
+        })
         .unwrap();
         let WorkspaceOpenOutcome::Opened(runtime) = outcome else {
             panic!("a valid workspace marker must open a runtime")
         };
 
-        assert_eq!(config_loads.get(), 1);
         assert_eq!(hub_creations.get(), 1);
         assert_eq!(runtime.app_context.workspace_root(), Some(workspace.path()));
         assert!(matches!(runtime.location, RootLocation::WorkspaceHome));
-
-        let hub_creations = std::cell::Cell::new(0);
-        let error = match open_workspace_runtime_with(
-            workspace.path(),
-            || Err(io::Error::other("config load failed").into()),
-            || {
-                hub_creations.set(hub_creations.get() + 1);
-                ()
-            },
-        ) {
-            Ok(_) => panic!("a config failure must abort before runtime construction"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("config load failed"));
-        assert_eq!(hub_creations.get(), 0);
     }
 
     #[test]
     fn no_marker_open_is_typed_before_config_or_submission_hub_creation() {
         let selected = tempfile::tempdir().unwrap();
-        let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
-        let outcome = open_workspace_runtime_with(
-            selected.path(),
-            || {
-                config_loads.set(config_loads.get() + 1);
-                Ok(Config::default())
-            },
-            || {
-                hub_creations.set(hub_creations.get() + 1);
-                ()
-            },
-        )
+        let outcome = open_workspace_runtime_with(selected.path(), || {
+            hub_creations.set(hub_creations.get() + 1)
+        })
         .unwrap();
 
         assert!(matches!(outcome, WorkspaceOpenOutcome::NotWorkspace));
-        assert_eq!(config_loads.get(), 0);
         assert_eq!(hub_creations.get(), 0);
     }
 
     #[test]
-    fn invalid_marker_open_remains_an_error_before_runtime_construction() {
+    fn malformed_marker_opens_workspace_home_without_parsing() {
         let selected = tempfile::tempdir().unwrap();
         std::fs::write(selected.path().join(".atc-workspace.toml"), "invalid").unwrap();
-        let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
-        let error = match open_workspace_runtime_with(
-            selected.path(),
-            || {
-                config_loads.set(config_loads.get() + 1);
-                Ok(Config::default())
-            },
-            || {
-                hub_creations.set(hub_creations.get() + 1);
-                ()
-            },
-        ) {
-            Ok(_) => panic!("an invalid marker must not become a workspace-open outcome"),
-            Err(error) => error,
-        };
+        let outcome = open_workspace_runtime_with(selected.path(), || {
+            hub_creations.set(hub_creations.get() + 1)
+        })
+        .expect("malformed contents are repairable from Workspace Home");
 
-        assert!(
-            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData)
-        );
-        assert_eq!(config_loads.get(), 0);
-        assert_eq!(hub_creations.get(), 0);
+        assert!(matches!(outcome, WorkspaceOpenOutcome::Opened(_)));
+        assert_eq!(hub_creations.get(), 1);
     }
 
     #[test]
     fn marker_io_failure_remains_an_error_before_runtime_construction() {
-        let config_loads = std::cell::Cell::new(0);
         let hub_creations = std::cell::Cell::new(0);
 
         let error = match open_workspace_runtime_from_context_with(
@@ -3346,14 +3571,7 @@ mod tests {
                 io::ErrorKind::PermissionDenied,
                 "marker inspection failed",
             )),
-            || {
-                config_loads.set(config_loads.get() + 1);
-                Ok(Config::default())
-            },
-            || {
-                hub_creations.set(hub_creations.get() + 1);
-                ()
-            },
+            || hub_creations.set(hub_creations.get() + 1),
         ) {
             Ok(_) => panic!("a marker I/O failure must not become a workspace-open outcome"),
             Err(error) => error,
@@ -3362,7 +3580,6 @@ mod tests {
         assert!(
             matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
         );
-        assert_eq!(config_loads.get(), 0);
         assert_eq!(hub_creations.get(), 0);
     }
 
@@ -3378,14 +3595,12 @@ mod tests {
             };
             let WorkspaceRuntime {
                 app_context,
-                config,
                 submissions,
                 location,
             } = runtime;
             drop(submissions);
             let mut runtime = WorkspaceRuntime {
                 app_context,
-                config,
                 submissions: SubmissionLifetimeSpy {
                     hub: crate::tui::SubmissionHub::new(),
                     probe: probe.clone(),
@@ -3433,11 +3648,8 @@ mod tests {
         let context = AppContext::Standalone {
             launch_root: destination.path().to_path_buf(),
         };
-        let mut runtime = WorkspaceRuntime::new(
-            context.clone(),
-            Config::default(),
-            RootLocation::Contest(session),
-        );
+        let mut runtime =
+            WorkspaceRuntime::from_location(context.clone(), RootLocation::Contest(session));
 
         assert_eq!(runtime.app_context, context);
         assert!(matches!(runtime.location, RootLocation::Contest(_)));
@@ -3459,7 +3671,6 @@ mod tests {
         let probe = RootApplicationProbe::default();
         let mut runtime = WorkspaceRuntime {
             app_context: context.clone(),
-            config: Config::default(),
             submissions: SubmissionLifetimeSpy {
                 hub: crate::tui::SubmissionHub::new(),
                 probe: probe.clone(),
@@ -3532,40 +3743,622 @@ mod tests {
     }
 
     #[test]
-    fn invalid_exact_workspace_marker_fails_before_root_or_terminal_start() {
+    fn malformed_exact_workspace_marker_starts_workspace_home() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".atc-workspace.toml"), "invalid").unwrap();
         let started = std::cell::Cell::new(false);
 
-        let error = run_application_at_with(root.path(), |_| {
+        run_application_at_with(root.path(), |location| {
             started.set(true);
+            assert!(matches!(location, AppLocation::Workspace(_)));
             Ok(())
         })
-        .expect_err("invalid exact marker must remain a hard validation error");
+        .unwrap();
 
-        assert!(!started.get());
-        assert!(error.to_string().contains("workspace config"));
+        assert!(started.get());
     }
 
     #[test]
-    fn neutral_open_resolution_retains_prepared_watch_input_for_home_handoff() {
+    fn malformed_marker_is_repaired_from_home_and_contest_starts_without_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = crate::workspace::workspace_config_path(root.path());
+        std::fs::write(&marker, "version = [\n").unwrap();
+        let contest_id = "abc466";
+        let destination = root.path().join(contest_id);
+        save_healthy_contest(&destination, contest_id);
+        let config_path = root.path().join("global-config.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-home-repair\"\n",
+        )
+        .unwrap();
+
+        let app_context = AppContext::from_launch_root(root.path())
+            .expect("structural discovery must accept a safe malformed marker");
+        assert!(matches!(app_context, AppContext::Workspace { .. }));
+
+        let retained = Arc::new(Mutex::new(None));
+        let task_retained = Arc::clone(&retained);
+        let task_root = root.path().to_path_buf();
+        let task_config = config_path.clone();
+        let task: crate::tui::ContestSwitchTask = Arc::new(move |request, reporter| {
+            let prepared = prepare_workspace_contest_entry_with(
+                &task_root,
+                &request,
+                reporter,
+                || Config::load_from(&task_config),
+                |_, _, _, _| panic!("the repaired test contest already exists"),
+                |_, _, _| panic!("the repaired test contest is healthy"),
+            )?;
+            *task_retained
+                .lock()
+                .map_err(|_| io::Error::other("repair test handoff is poisoned"))? = Some(prepared);
+            Ok(())
+        });
+        let mut resolve = |candidate: &str| resolve_contest_open(&app_context, candidate);
+        let cookie_location = crate::paths::CookieLocation {
+            platform_base: root.path().join("platform"),
+            state_dir: root.path().join("state"),
+            file: root.path().join("state/cookie"),
+        };
+        let paths = crate::tui::HomeActionPaths::for_test(config_path, cookie_location);
+        let mut terminal = RepairingWorkspaceHomeTerminal::new(
+            marker.clone(),
+            contest_id,
+            "version = 1\npaths = []\n",
+        );
+        let mut submissions = crate::tui::SubmissionHub::new();
+
+        let exit = crate::tui::run_home_with_terminal_and_paths(
+            &mut terminal,
+            root.path(),
+            &mut submissions,
+            &mut resolve,
+            task,
+            || {
+                let prepared = take_prepared_open(&retained)?;
+                start_prepared_contest_entry(prepared, &app_context)
+                    .map_err(|error| error.to_string())
+            },
+            &paths,
+        )
+        .unwrap();
+
+        let crate::tui::HomeExit::Contest(session) = exit else {
+            panic!("the repaired marker must start the contest in the same Home session")
+        };
+        assert!(terminal.rendered_invalid_workspace);
+        assert_eq!(terminal.repair_launches, 1);
+        assert_eq!(session.input.destination, destination);
+        assert_eq!(
+            session.environment.config.defaults.language,
+            Language::Python
+        );
+        assert_eq!(
+            session.environment.config.runner.python,
+            "python-home-repair"
+        );
+        session.shutdown().unwrap();
+        submissions.shutdown().unwrap();
+    }
+
+    #[test]
+    fn contest_entry_loads_one_config_generation_before_creation_and_retains_it() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let config_path = root.path().join("global-config.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n",
+        )
+        .unwrap();
+        let destination = root.path().join("abc500");
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
+            contest_id: "abc500".to_string(),
+            destination: destination.clone(),
+        };
+        let loads = std::cell::Cell::new(0);
+        let mut reporter = crate::ui::NullReporter;
+
+        let prepared = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || {
+                loads.set(loads.get() + 1);
+                Config::load_from(&config_path)
+            },
+            |destination, contest_id, config, _| {
+                assert_eq!(config.defaults.language, Language::Python);
+                assert_eq!(config.runner.python, "python-a");
+                std::fs::write(
+                    &config_path,
+                    "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n",
+                )?;
+                save_healthy_contest(destination, contest_id);
+                Ok(())
+            },
+            |_, _, _| panic!("a missing contest must not enter repair"),
+        )
+        .unwrap();
+
+        assert_eq!(loads.get(), 1);
+        assert_eq!(prepared.input.destination, destination);
+        assert_eq!(
+            prepared.environment.config.defaults.language,
+            Language::Python
+        );
+        assert_eq!(prepared.environment.config.runner.python, "python-a");
+        let disk = Config::load_from(&config_path).unwrap();
+        assert_eq!(disk.defaults.language, Language::Cpp);
+        assert_eq!(disk.runner.python, "python-b");
+
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let session = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        assert_eq!(
+            session.environment.config.defaults.language,
+            Language::Python
+        );
+        assert_eq!(session.environment.config.runner.python, "python-a");
+        session.shutdown().unwrap();
+
+        let next_destination = root.path().join("abc503");
+        save_healthy_contest(&next_destination, "abc503");
+        let next_request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Open,
+            contest_id: "abc503".to_string(),
+            destination: next_destination,
+        };
+        let next = prepare_workspace_contest_entry_with(
+            root.path(),
+            &next_request,
+            &mut reporter,
+            || {
+                loads.set(loads.get() + 1);
+                Config::load_from(&config_path)
+            },
+            |_, _, _, _| panic!("a healthy contest must not be created"),
+            |_, _, _| panic!("a healthy contest must not be repaired"),
+        )
+        .unwrap();
+
+        assert_eq!(loads.get(), 2, "each new entry loads one fresh generation");
+        assert_eq!(next.environment.config.defaults.language, Language::Cpp);
+        assert_eq!(next.environment.config.runner.python, "python-b");
+    }
+
+    #[test]
+    fn production_refresh_rebuild_preserves_the_active_contest_environment_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("abc466");
+        save_healthy_contest(&destination, "abc466");
+        let config_path = root.path().join("config.toml");
+        let config_a = Config::parse(
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n[editor]\ncommand = \"editor-a\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n[editor]\ncommand = \"editor-b\"\n",
+        )
+        .unwrap();
+        let input = PreparedWatchInput::load(&destination, Some("abc466")).unwrap();
+        let session = ContestSession::start_entry(PreparedContestEntry {
+            input,
+            environment: ContestEnvironment::new(config_a),
+        })
+        .unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let atcoder = crate::atcoder::AtCoderClient::fixture(fixtures);
+        let mut reporter = crate::ui::NullReporter;
+        let prepared = super::super::refresh::prepare_refresh(
+            &destination,
+            "abc466",
+            false,
+            &atcoder,
+            &mut reporter,
+        )
+        .unwrap();
+
+        let rebuilt = rebuild_active_contest_session_after_refresh(
+            session,
+            prepared,
+            crate::tui::RefreshResumeState::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rebuilt.session.environment.config.defaults.language,
+            Language::Python
+        );
+        assert_eq!(rebuilt.session.environment.config.runner.python, "python-a");
+        assert_eq!(
+            rebuilt
+                .session
+                .environment
+                .config
+                .editor
+                .as_ref()
+                .map(|editor| editor.command.as_str()),
+            Some("editor-a")
+        );
+        let disk = Config::load_from(&config_path).unwrap();
+        assert_eq!(disk.defaults.language, Language::Cpp);
+        assert_eq!(disk.runner.python, "python-b");
+        assert_eq!(
+            disk.editor.as_ref().map(|editor| editor.command.as_str()),
+            Some("editor-b")
+        );
+        rebuilt.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn contest_template_activation_resolves_the_session_editor_snapshot_after_disk_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("abc466");
+        save_healthy_contest(&destination, "abc466");
+        let templates_dir = root.path().join("templates");
+        std::fs::create_dir(&templates_dir).unwrap();
+        let python_template =
+            crate::template::source_template_path(&templates_dir, Language::Python);
+        std::fs::write(&python_template, "# live template\n").unwrap();
+        let config_path = root.path().join("config.toml");
+        let config_a =
+            Config::parse("[defaults]\nlanguage = \"python\"\n[editor]\ncommand = \"editor-a\"\n")
+                .unwrap();
+        let input = PreparedWatchInput::load(&destination, Some("abc466")).unwrap();
+        let session = ContestSession::start_entry(PreparedContestEntry {
+            input,
+            environment: ContestEnvironment::new(config_a),
+        })
+        .unwrap();
+
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"cpp\"\n[editor]\ncommand = \"editor-b\"\n",
+        )
+        .unwrap();
+        let activation = crate::tui::activate_contest_template_with_production_resolver_for_test(
+            &session.input.destination,
+            &session.input.contest,
+            &session.environment.config,
+            &templates_dir,
+        )
+        .unwrap();
+
+        assert_eq!(activation.selected_language, Language::Python);
+        assert_eq!(activation.default_language, Language::Python);
+        assert_eq!(activation.target, python_template);
+        assert_eq!(
+            activation.resolved_editor.program.to_string_lossy(),
+            "editor-a"
+        );
+        assert_ne!(
+            activation.resolved_editor.program.to_string_lossy(),
+            "editor-b"
+        );
+        assert_eq!(
+            activation.resolved_editor.source,
+            crate::editor::EditorSource::Config
+        );
+        let disk = Config::load_from(&config_path).unwrap();
+        assert_eq!(disk.defaults.language, Language::Cpp);
+        assert_eq!(
+            disk.editor.as_ref().map(|editor| editor.command.as_str()),
+            Some("editor-b")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn production_switch_starts_a_fresh_config_and_workspace_routing_generation() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let old_destination = root.path().join("abc500");
+        save_healthy_contest(&old_destination, "abc500");
+        let old_input = PreparedWatchInput::load(&old_destination, Some("abc500")).unwrap();
+        let config_a =
+            Config::parse("[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n")
+                .unwrap();
+        let old_session = ContestSession::start_entry(PreparedContestEntry {
+            input: old_input,
+            environment: ContestEnvironment::new(config_a),
+        })
+        .unwrap();
+
+        std::fs::write(
+            crate::workspace::workspace_config_path(root.path()),
+            "version = 1\n\n[[paths]]\npattern = \"^abc503$\"\npath = \"fresh-routing\"\n",
+        )
+        .unwrap();
+        let config_path = root.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n[editor]\ncommand = \"editor-b\"\n",
+        )
+        .unwrap();
+        let new_destination = root.path().join("fresh-routing/abc503");
+        save_healthy_contest(&new_destination, "abc503");
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Open,
+            contest_id: "abc503".to_string(),
+            destination: new_destination.clone(),
+        };
+        let mut reporter = crate::ui::NullReporter;
+        let prepared = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Config::load_from(&config_path),
+            |_, _, _, _| panic!("the freshly routed contest already exists"),
+            |_, _, _| panic!("the freshly routed contest is healthy"),
+        )
+        .unwrap();
+
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let new_session = switch_to_prepared_contest(old_session, prepared, &app_context).unwrap();
+
+        assert_eq!(new_session.input.destination, new_destination);
+        assert_eq!(
+            new_session.environment.config.defaults.language,
+            Language::Cpp
+        );
+        assert_eq!(new_session.environment.config.runner.python, "python-b");
+        assert_eq!(
+            new_session
+                .environment
+                .config
+                .editor
+                .as_ref()
+                .map(|editor| editor.command.as_str()),
+            Some("editor-b")
+        );
+        new_session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn direct_workspace_entry_revalidates_marker_after_input_preparation_before_workers_start() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let marker = crate::workspace::workspace_config_path(root.path());
+        let destination =
+            workspace::resolve_active_workspace_contest_path(root.path(), "abc504").unwrap();
+        save_healthy_contest(&destination, "abc504");
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let start_stages = std::cell::Cell::new(0);
+
+        let error = match start_direct_contest_session_with_hooks(
+            &destination,
+            Some("abc504"),
+            &app_context,
+            Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
+            || std::fs::remove_file(&marker).unwrap(),
+            |_| {
+                start_stages.set(start_stages.get() + 1);
+                Ok(())
+            },
+        ) {
+            Ok(session) => {
+                session.shutdown().unwrap();
+                panic!("a deleted active marker must block the direct ContestSession start")
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("workspace config is missing"));
+        assert_eq!(
+            start_stages.get(),
+            0,
+            "no watcher or run worker may start before final workspace validation"
+        );
+        assert!(
+            destination.is_dir(),
+            "completed preparation is not rolled back"
+        );
+    }
+
+    #[test]
+    fn direct_workspace_entry_rejects_routing_change_after_input_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = crate::workspace::workspace_config_path(root.path());
+        std::fs::write(
+            &marker,
+            "version = 1\n\n[[paths]]\npattern = \"^abc505$\"\npath = \"routing-a\"\n",
+        )
+        .unwrap();
+        let destination =
+            workspace::resolve_active_workspace_contest_path(root.path(), "abc505").unwrap();
+        save_healthy_contest(&destination, "abc505");
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let start_stages = std::cell::Cell::new(0);
+
+        let error = match start_direct_contest_session_with_hooks(
+            &destination,
+            Some("abc505"),
+            &app_context,
+            Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
+            || {
+                std::fs::write(
+                    &marker,
+                    "version = 1\n\n[[paths]]\npattern = \"^abc505$\"\npath = \"routing-b\"\n",
+                )
+                .unwrap();
+            },
+            |_| {
+                start_stages.set(start_stages.get() + 1);
+                Ok(())
+            },
+        ) {
+            Ok(session) => {
+                session.shutdown().unwrap();
+                panic!("a changed active routing generation must block direct session start")
+            }
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("workspace config changed after preparing contest"));
+        assert!(message.contains("routing-a"));
+        assert!(message.contains("routing-b"));
+        assert_eq!(
+            start_stages.get(),
+            0,
+            "no watcher or run worker may start for a stale destination"
+        );
+    }
+
+    #[test]
+    fn direct_standalone_entry_keeps_missing_marker_compatibility() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("abc506");
+        save_healthy_contest(&destination, "abc506");
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        assert!(matches!(app_context, AppContext::Standalone { .. }));
+        let start_stages = std::cell::Cell::new(0);
+
+        let session = start_direct_contest_session_with_hooks(
+            &destination,
+            Some("abc506"),
+            &app_context,
+            Config::default(),
+            || {},
+            |_| {
+                start_stages.set(start_stages.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(start_stages.get(), 2);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn invalid_global_config_blocks_contest_entry_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let destination = root.path().join("abc501");
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
+            contest_id: "abc501".to_string(),
+            destination: destination.clone(),
+        };
+        let create_calls = std::cell::Cell::new(0);
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Err(io::Error::new(io::ErrorKind::InvalidData, "malformed TOML").into()),
+            |_, _, _, _| {
+                create_calls.set(create_calls.get() + 1);
+                Ok(())
+            },
+            |_, _, _| panic!("invalid Global Config must not enter repair"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Global Config invalid"));
+        assert_eq!(create_calls.get(), 0);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn malformed_or_missing_active_workspace_marker_blocks_before_config_load() {
+        for marker in [Some("not valid toml"), None] {
+            let root = tempfile::tempdir().unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(root.path().join(".atc-workspace.toml"), marker).unwrap();
+            }
+            let request = crate::tui::ContestSwitchRequest {
+                mutation: crate::tui::ContestSwitchMutation::Create,
+                contest_id: "abc502".to_string(),
+                destination: root.path().join("abc502"),
+            };
+            let loads = std::cell::Cell::new(0);
+            let mut reporter = crate::ui::NullReporter;
+
+            let error = prepare_workspace_contest_entry_with(
+                root.path(),
+                &request,
+                &mut reporter,
+                || {
+                    loads.set(loads.get() + 1);
+                    Ok(Config::default())
+                },
+                |_, _, _, _| panic!("invalid workspace routing must not create a contest"),
+                |_, _, _| panic!("invalid workspace routing must not repair a contest"),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("Workspace Config invalid"));
+            assert_eq!(loads.get(), 0);
+        }
+    }
+
+    #[test]
+    fn active_marker_deleted_after_fetch_blocks_creation_before_any_workspace_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let marker = crate::workspace::workspace_config_path(root.path());
+        let destination = root.path().join("abc466");
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
+            contest_id: "abc466".to_string(),
+            destination: destination.clone(),
+        };
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let hook_calls = std::cell::Cell::new(0);
+        let mut reporter = crate::ui::NullReporter;
+
+        let error = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Ok(Config::parse("[defaults]\nlanguage = \"python\"\n")?),
+            |destination, contest_id, config, reporter| {
+                super::super::contest::create_contest_in_active_workspace_with_parent_hook(
+                    root.path(),
+                    destination,
+                    contest_id,
+                    config,
+                    reporter,
+                    |language| Ok(crate::template::builtin_template(language).to_string()),
+                    || Ok(crate::atcoder::AtCoderClient::fixture(&fixtures)),
+                    || {
+                        hook_calls.set(hook_calls.get() + 1);
+                        std::fs::remove_file(&marker).unwrap();
+                    },
+                )
+            },
+            |_, _, _| panic!("a missing contest must not enter repair"),
+        )
+        .expect_err("losing an active workspace marker must abort fetched creation");
+
+        assert_eq!(hook_calls.get(), 1, "the fetch phase must complete first");
+        assert!(error.to_string().contains("workspace config is missing"));
+        assert!(!destination.exists());
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().next().is_none(),
+            "no contest, staging directory, sources, tests, or metadata may be installed"
+        );
+    }
+
+    #[test]
+    fn neutral_open_resolution_only_previews_the_target() {
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let destination = root.path().join("abc473");
         save_healthy_contest(&destination, "abc473");
         let context = AppContext::from_launch_root(root.path()).unwrap();
-        let prepared = Arc::new(Mutex::new(None));
-
-        let resolution = resolve_contest_open(&context, &prepared, "abc473");
+        let resolution = resolve_contest_open(&context, "abc473");
         assert_eq!(
             resolution.destination.as_deref(),
             Some(destination.as_path())
         );
         assert!(resolution.error.is_none());
-
-        let prepared = take_prepared_open(&prepared).expect("healthy Home target must be retained");
-        assert_eq!(prepared.destination, destination);
-        assert_eq!(prepared.contest.contest_id, "abc473");
     }
 
     fn repair_request(contest_id: &str, destination: PathBuf) -> crate::tui::ContestSwitchRequest {
@@ -4835,6 +5628,7 @@ mod tests {
             run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
+            environment: ContestEnvironment::new(Config::default()),
             input,
             message_rx,
             run_tx,

@@ -105,6 +105,28 @@ pub(super) fn new_at_in_workspace(
     )
 }
 
+pub(super) fn new_at_in_active_workspace(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    template: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    new_at_with_parent_preparation(
+        destination,
+        contest_id,
+        language,
+        template,
+        atcoder,
+        reporter,
+        |destination| {
+            workspace::ensure_active_workspace_contest_parent(root, contest_id, destination)
+        },
+    )
+}
+
 fn new_at_with_parent_preparation(
     destination: &Path,
     contest_id: &str,
@@ -123,6 +145,7 @@ fn new_at_with_parent_preparation(
         reporter,
         prepare_parent,
         || {},
+        || {},
     )
 }
 
@@ -135,9 +158,14 @@ fn new_at_with_parent_preparation_and_hook(
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
     prepare_parent: impl FnOnce(&Path) -> io::Result<()>,
+    before_parent_preparation: impl FnOnce(),
     before_install: impl FnOnce(),
 ) -> Result<(), AppError> {
     if existing_contest_is_noop(destination)? {
+        // A concurrent creator may have installed the destination after the caller classified it
+        // as missing. Active-workspace preparation must still revalidate its marker and routing
+        // instead of turning that race into a markerless successful entry.
+        prepare_parent(destination)?;
         return Ok(());
     }
 
@@ -147,6 +175,7 @@ fn new_at_with_parent_preparation_and_hook(
     } = fetch_contest_data(contest_id, atcoder, reporter)?;
     workspace::validate_contest_identity(&contest, contest_id)?;
 
+    before_parent_preparation();
     prepare_parent(destination)?;
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -197,7 +226,35 @@ pub(super) fn new_at_with_install_hook(
         atcoder,
         reporter,
         workspace::ensure_contest_parent,
+        || {},
         before_install,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn new_at_in_active_workspace_with_parent_hook(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    language: Language,
+    template: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+    before_parent_preparation: impl FnOnce(),
+) -> Result<(), AppError> {
+    new_at_with_parent_preparation_and_hook(
+        destination,
+        contest_id,
+        language,
+        template,
+        atcoder,
+        reporter,
+        |destination| {
+            workspace::ensure_active_workspace_contest_parent(root, contest_id, destination)
+        },
+        before_parent_preparation,
+        || {},
     )
 }
 

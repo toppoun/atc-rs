@@ -48,7 +48,18 @@ pub(crate) fn create_source(
     language: Language,
     reporter: &mut dyn Reporter,
 ) -> Result<std::path::PathBuf, AppError> {
-    let template = resolve_source_template(language)?;
+    let templates_dir = crate::paths::source_templates_dir()?;
+    create_source_from_templates(destination, name, language, &templates_dir, reporter)
+}
+
+pub(crate) fn create_source_from_templates(
+    destination: &Path,
+    name: &str,
+    language: Language,
+    templates_dir: &Path,
+    reporter: &mut dyn Reporter,
+) -> Result<std::path::PathBuf, AppError> {
+    let template = crate::template::resolve_source_template_in(templates_dir, language)?;
     create_source_at(destination, name, language, &template, reporter)
 }
 

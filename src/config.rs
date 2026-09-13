@@ -16,7 +16,7 @@ pub(crate) const INITIAL_CONFIG: &str = "# atc configuration\n\
 # args = []\n\
 # mode = \"terminal\"\n";
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
 pub struct Config {
@@ -103,7 +103,7 @@ struct SubmitOverrides {
     python_runtime: Option<PythonRuntime>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     #[serde(

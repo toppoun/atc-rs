@@ -12,14 +12,13 @@ pub(crate) enum AppContext {
 
 impl AppContext {
     pub(crate) fn from_launch_root(launch_root: &Path) -> io::Result<Self> {
-        if workspace::inspect_workspace_config(launch_root)?.is_some() {
-            Ok(Self::Workspace {
+        match workspace::inspect_workspace_config_file(launch_root)? {
+            workspace::WorkspaceConfigFileState::Existing => Ok(Self::Workspace {
                 root: launch_root.to_path_buf(),
-            })
-        } else {
-            Ok(Self::Standalone {
+            }),
+            workspace::WorkspaceConfigFileState::Missing => Ok(Self::Standalone {
                 launch_root: launch_root.to_path_buf(),
-            })
+            }),
         }
     }
 
@@ -100,13 +99,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_exact_root_workspace_config_is_a_hard_error() {
+    fn invalid_exact_root_workspace_config_is_still_a_workspace_context() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join(".atc-workspace.toml"), "invalid").unwrap();
 
-        let error = AppContext::from_launch_root(root.path()).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("workspace config"));
+        assert_eq!(
+            AppContext::from_launch_root(root.path()).unwrap(),
+            AppContext::Workspace {
+                root: root.path().to_path_buf()
+            }
+        );
     }
 }

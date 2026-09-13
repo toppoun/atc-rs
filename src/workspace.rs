@@ -385,6 +385,34 @@ pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf
     }
 }
 
+/// Resolve routing for an already-active workspace identity.
+///
+/// Unlike the cold-start compatibility resolver, losing the marker cannot silently turn the
+/// active workspace into an implicit `root/<contest-id>` layout.
+pub(crate) fn resolve_active_workspace_contest_path(
+    root: &Path,
+    contest_id: &str,
+) -> io::Result<PathBuf> {
+    validate_path_component(contest_id, "contest ID")?;
+    let Some(config) = load_workspace_config(root)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "workspace config is missing; repair or reinitialize the workspace before opening a contest: {}",
+                workspace_config_path(root).display()
+            ),
+        ));
+    };
+
+    match matching_workspace_path(&config, contest_id)? {
+        Some(path) => {
+            walk_workspace_mapping(root, path, false)?;
+            contest_path(&path.append_to(root), contest_id)
+        }
+        None => contest_path(root, contest_id),
+    }
+}
+
 #[derive(Debug)]
 struct WorkspaceDirectoryContext {
     action: &'static str,
@@ -435,6 +463,50 @@ pub fn ensure_workspace_contest_parent(
         None => None,
     };
 
+    let actual_destination = match mapping {
+        Some(path) => contest_path(&path.append_to(root), contest_id)?,
+        None => contest_path(root, contest_id)?,
+    };
+    if actual_destination != expected_destination {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workspace config changed while preparing contest {contest_id:?}: expected {}, now resolves to {}",
+                expected_destination.display(),
+                actual_destination.display()
+            ),
+        ));
+    }
+
+    if let Some(path) = mapping {
+        walk_workspace_mapping(root, path, true)?;
+    }
+
+    Ok(())
+}
+
+/// Revalidate routing and prepare the parent for an already-active workspace identity.
+///
+/// This deliberately differs from [`ensure_workspace_contest_parent`]: the compatibility
+/// helper permits a missing marker to mean the legacy `root/<contest-id>` layout, while an
+/// active workspace must retain its marker until the contest mutation begins.
+pub(crate) fn ensure_active_workspace_contest_parent(
+    root: &Path,
+    contest_id: &str,
+    expected_destination: &Path,
+) -> io::Result<()> {
+    validate_path_component(contest_id, "contest ID")?;
+
+    let Some(config) = load_workspace_config(root)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "workspace config is missing; repair or reinitialize the workspace before creating a contest: {}",
+                workspace_config_path(root).display()
+            ),
+        ));
+    };
+    let mapping = matching_workspace_path(&config, contest_id)?;
     let actual_destination = match mapping {
         Some(path) => contest_path(&path.append_to(root), contest_id)?,
         None => contest_path(root, contest_id)?,
@@ -2218,6 +2290,28 @@ mod tests {
     }
 
     #[test]
+    fn active_workspace_resolver_requires_a_present_strict_marker() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let missing = resolve_active_workspace_contest_path(temp.path(), "abc466").unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(missing.to_string().contains("workspace config is missing"));
+
+        write_workspace_config(temp.path(), "not valid toml");
+        let malformed = resolve_active_workspace_contest_path(temp.path(), "abc466").unwrap_err();
+        assert_eq!(malformed.kind(), io::ErrorKind::InvalidData);
+
+        write_workspace_config(
+            temp.path(),
+            "version = 1\n[[paths]]\npattern = \"^abc\"\npath = \"ABC\"\n",
+        );
+        assert_eq!(
+            resolve_active_workspace_contest_path(temp.path(), "abc466").unwrap(),
+            temp.path().join("ABC").join("abc466")
+        );
+    }
+
+    #[test]
     fn workspace_parser_treats_omitted_paths_as_an_empty_rule_list() {
         let path = Path::new(WORKSPACE_CONFIG_FILE);
 
@@ -2948,6 +3042,21 @@ mod tests {
                     .is_dir()
             );
         }
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn missing_marker_keeps_legacy_parent_compatibility_but_blocks_active_workspace_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("abc123");
+
+        ensure_workspace_contest_parent(root.path(), "abc123", &destination)
+            .expect("standalone compatibility keeps the root/contest-id fallback");
+        let error = ensure_active_workspace_contest_parent(root.path(), "abc123", &destination)
+            .expect_err("an active workspace may not lose its identity marker");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("workspace config is missing"));
         assert!(!destination.exists());
     }
 

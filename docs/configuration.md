@@ -197,7 +197,7 @@ atc submit A -l python --runtime cpython
 
 ## `[editor]`
 
-TUI の `Open Source`、`Open Settings`、`Open Template` などから起動するエディタを指定できます。
+Contest の `Open Source` / `Open Template` と、Home の Global Config / Workspace Config / Template action から起動するエディタを指定できます。
 
 ### Vim / Neovim
 

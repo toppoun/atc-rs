@@ -23,6 +23,8 @@ pub(crate) use user_input_run::execute_user_input_for_test;
 
 pub(crate) use config::{config_init, initialize_config_at};
 pub(crate) use contest::contest;
+#[cfg(test)]
+pub(crate) use create::create_source_from_templates;
 pub(crate) use create::{create, create_source};
 pub(crate) use doctor::doctor;
 pub(crate) use init::init;

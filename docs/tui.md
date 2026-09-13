@@ -43,7 +43,7 @@ workspace 外で引数なしの `atc` を起動すると Global Home が開き�
 
 `Go to Path` では `Enter` で移動し、`Esc` で cancel します。Explorer Shortcuts は展開・移動・折りたたみ・親への移動・再読み込みの操作を案内します。Global Home に Command Palette はありません。
 
-Global Config が missing の場合は、確認後に comments-only default を初期化して editor で開けます。既存 file は parse error があっても修復用に開けます。編集内容は、すでに開いている workspace session の Config snapshot には自動反映されません。新しく workspace を開くなど、Config が再読込されるタイミングでは反映され得ます。
+Global Config が missing の場合は、確認後に comments-only default を初期化して editor で開けます。既存 file は parse error があっても、通常の Config に依存しない repair editor で開けます。Template は開くたびに Global Config を厳密に読み込み、invalid の場合は開始せず Global Config の修復を促します。
 
 Authentication Cookie は credential file です。Home actionはeditorを起動せず、credential内容も読みません。既存authと同じ安全なinspectionで Configured / Not configured / Invalid、期待path、`REVEL_SESSION=<value>` 形式を表示します。missing fileは作成せず、Unixではgroup / otherからアクセス可能なfile、symlink、不正なfile typeをInvalidとして扱います。
 
@@ -69,6 +69,8 @@ workspace root で `atc` を起動すると直接 Workspace Home へ入ります
 `c` で contest ID を入力します。既存 contest なら `Enter` で Open し、存在しなければ `Enter` で Create & Open します。修復が必要な contest は、確認後に Repair & Open できます。`Esc` で cancel します。
 
 Workspace Home に Command Palette と shortcut modal はありません。画面上の action 一覧から直接操作します。Workspace Config が session 中に missing になった場合は再作成せず、recoverable error を表示します。Global Config と Authentication Cookie の file policy は Global Home と同じです。
+
+安全な `.atc-workspace.toml` が存在すれば、内容が malformed でも Workspace Home を開いて `w` から修復できます。Global Config が invalid でも Workspace Home 自体は起動できます。`c` で Contest に入るときは Workspace Config と Global Config を厳密に読み直し、どちらかが invalid なら Home に留まります。
 
 現在、Workspace Home から別 workspace へ切り替える機能はありません。別 workspace へ移るには `q` で終了し、移動先の workspace root で `atc` を起動してください。
 
@@ -189,8 +191,6 @@ Contest 画面の現在の action:
 - Run Tests
 - Submit
 - Open Source
-- Open Settings
-- Open Workspace Settings
 - Open Template
 - Toggle Debug
 - Toggle Side Pane
@@ -202,7 +202,7 @@ Contest 画面の現在の action:
 - Switch Contest
 - Back to Workspace Home
 
-現在の状態で実行できない action は、理由付きで unavailable と表示されます。`Open Workspace Settings`、`Switch Contest`、`Back to Workspace Home` は workspace 外の Standalone Contest では利用できません。
+現在の状態で実行できない action は、理由付きで unavailable と表示されます。`Switch Contest` と `Back to Workspace Home` は workspace 外の Standalone Contest では利用できません。Global Config と Workspace Config の編集は Home から行います。
 
 ## Modal の操作
 
@@ -226,11 +226,7 @@ Esc    閉じる
 
 新しく作る source には通常の source template が使われます。
 
-## Open Settings / Workspace Settings / Template
-
-`Open Settings` は global 設定ファイルを開きます。まだ存在しない場合は `i` で `atc config init` 相当の初期化を行い、そのまま editor で開けます。
-
-`Open Workspace Settings` は、workspace から TUI を起動している場合に `.atc-workspace.toml` を開きます。workspace 外では unavailable です。workspace config の新規作成は、対象 directory で `atc init` を実行します。
+## Open Template
 
 `Open Template` は Global Home / Workspace Home の `t`、または Contest の Command Palette から開く共通 modal です。Contest の `t` は Submit のままです。
 
@@ -241,7 +237,7 @@ Esc    閉じる
 - Invalid かつ regular file として修復可能: `Enter` で Open to Repair
 - directory、dangling symlink など安全に開けない Invalid path: Enter action なし
 
-`↑` / `↓` または `j` / `k` で language を選び、`Esc` で閉じます。Global Home は modal を開くたびに global Config を読み直し、missing / invalid / path failure では default Config へ fallback します。Workspace Home と Contest は実行中の WorkspaceRuntime Config snapshot を使います。source template の保存先は全contextでglobalです。
+`↑` / `↓` または `j` / `k` で language を選び、`Esc` で閉じます。Global Home と Workspace Home は modal を開くたびに Global Config を厳密に読み込み、その modal を閉じるまで同じ snapshot を使います。Contest は entry 時の ContestSession Config snapshot を使います。Config が invalid の場合に normal Template action を default Config で続行しません。source template の保存先は全contextでglobalで、template file の内容は snapshot せず次の利用時に filesystem から読みます。
 
 詳しくは [設定](configuration.md) を参照してください。
 
@@ -281,9 +277,9 @@ mode = "external"
 
 ## Contest の Refresh / Switch
 
-Command Palette の `Refresh Contest` で、現在の contest の問題情報と sample を更新できます。更新処理は開始後に cancel できません。source は上書きしません。
+Command Palette の `Refresh Contest` で、現在の contest の問題情報と sample を更新できます。更新処理は開始後に cancel できません。source は上書きしません。Refresh は新しい settings 境界ではなく、現在の ContestSession Config snapshot を維持します。
 
-workspace から起動した Contest 画面では、`c` または Command Palette の `Switch Contest` を利用できます。contest ID を入力すると、同じ workspace 設定を使って対象 contest へ切り替えます。存在しない contest は確認後に作成されます。
+workspace から起動した Contest 画面では、`c` または Command Palette の `Switch Contest` を利用できます。Switch は新しい ContestSession の開始なので、最新の Workspace Config routing と Global Config を読み直します。存在しない contest は確認後に作成されます。Home へ戻って `c` で入り直す場合や、`atc contest` / `atc c` / TUI の `atc watch` で直接起動する場合も同じ entry 時 snapshot semantics です。
 
 ## マウス操作
 

@@ -18,9 +18,8 @@ use super::template_modal::{
 use super::terminal::{KeyCode, KeyEvent, KeyEventKind, TerminalEvent};
 use super::view::{self, ContestOpenPurpose};
 use super::{
-    ContestOpenController, ContestOpenKeyResult, ContestSwitchResolution, ContestSwitchTask,
-    HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, SubmissionHub,
-    TerminaSession,
+    ContestOpenController, ContestSwitchResolution, ContestSwitchTask, HomeActionPaths,
+    HomeEditorOutcome, HomeEditorResult, ResolvedEditor, SubmissionHub, TerminaSession,
 };
 use crate::{branding, config::Config};
 
@@ -43,7 +42,6 @@ const WORKSPACE_PREFIX: &str = "Workspace  ";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HomeAction {
     None,
-    OpenContest,
     OpenWorkspaceConfig,
     OpenGlobalConfig,
     OpenTemplate,
@@ -71,12 +69,32 @@ struct InitializeGlobalConfigModal {
     target: PathBuf,
 }
 
+#[derive(Debug)]
+struct ActiveTemplateModal {
+    modal: OpenTemplateModal,
+    config: Config,
+}
+
+impl std::ops::Deref for ActiveTemplateModal {
+    type Target = OpenTemplateModal;
+
+    fn deref(&self) -> &Self::Target {
+        &self.modal
+    }
+}
+
+impl std::ops::DerefMut for ActiveTemplateModal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.modal
+    }
+}
+
 /// Workspace Home owns only Home-specific UI state. Contest state remains mandatory inside
 /// `WatchApp`/`SessionRuntime` and is created only after this state produces a prepared handoff.
 struct HomeState<'a> {
     error: Option<HomeActionError>,
     initialize_global_config: Option<InitializeGlobalConfigModal>,
-    template: Option<OpenTemplateModal>,
+    template: Option<ActiveTemplateModal>,
     open_contest: ContestOpenController<'a>,
 }
 
@@ -105,14 +123,14 @@ impl<'a> HomeState<'a> {
         self.initialize_global_config = Some(InitializeGlobalConfigModal { target });
     }
 
-    fn open_template(&mut self, templates_dir: Result<PathBuf, String>, config: &Config) {
+    fn open_template(&mut self, templates_dir: Result<PathBuf, String>, config: Config) {
         self.error = None;
         self.initialize_global_config = None;
-        self.template = Some(OpenTemplateModal::new(
-            templates_dir,
-            config.defaults.language,
-            config.defaults.language,
-        ));
+        let default_language = config.defaults.language;
+        self.template = Some(ActiveTemplateModal {
+            modal: OpenTemplateModal::new(templates_dir, default_language, default_language),
+            config,
+        });
     }
 
     fn close_template(&mut self) {
@@ -166,16 +184,9 @@ impl<'a> HomeState<'a> {
         if self.open_contest.modal_active() {
             let mut identity = |resolution| resolution;
             let mut no_current_destination = |_destination: &std::path::Path| false;
-            return match self.open_contest.handle_key(
-                key,
-                &mut identity,
-                &mut no_current_destination,
-            ) {
-                ContestOpenKeyResult::OpenRequested => HomeAction::OpenContest,
-                ContestOpenKeyResult::Handled | ContestOpenKeyResult::NotHandled => {
-                    HomeAction::None
-                }
-            };
+            self.open_contest
+                .handle_key(key, &mut identity, &mut no_current_destination);
+            return HomeAction::None;
         }
 
         if key.kind != KeyEventKind::Press {
@@ -311,7 +322,6 @@ impl HomeTerminal for TerminaSession {
 pub(crate) fn run_with_terminal<T>(
     terminal: &mut impl HomeTerminal,
     workspace_root: &Path,
-    config: &Config,
     submissions: &mut SubmissionHub,
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
@@ -321,7 +331,6 @@ pub(crate) fn run_with_terminal<T>(
     run_with_terminal_and_paths(
         terminal,
         workspace_root,
-        config,
         submissions,
         resolve,
         task,
@@ -331,10 +340,9 @@ pub(crate) fn run_with_terminal<T>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_with_terminal_and_paths<T>(
+pub(crate) fn run_with_terminal_and_paths<T>(
     terminal: &mut impl HomeTerminal,
     workspace_root: &Path,
-    config: &Config,
     submissions: &mut SubmissionHub,
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
@@ -367,23 +375,27 @@ fn run_with_terminal_and_paths<T>(
         match terminal.read_home()? {
             TerminalEvent::Key(key) => match state.handle_key(key) {
                 HomeAction::None => dirty = true,
-                HomeAction::OpenContest => {
-                    dirty = true;
-                }
                 HomeAction::OpenWorkspaceConfig => {
-                    open_workspace_config(terminal, &mut state, workspace_root, config)?;
+                    open_workspace_config(terminal, &mut state, workspace_root, paths)?;
                     dirty = true;
                 }
                 HomeAction::OpenGlobalConfig => {
-                    open_global_config(terminal, &mut state, config, paths)?;
+                    open_global_config(terminal, &mut state, paths)?;
                     dirty = true;
                 }
                 HomeAction::OpenTemplate => {
-                    state.open_template(paths.templates_dir_result(), config);
+                    match load_home_config(paths) {
+                        Ok(config) => state.open_template(paths.templates_dir_result(), config),
+                        Err(error) => state.show_error(HomeActionErrorKind::GlobalConfig, error),
+                    }
                     dirty = true;
                 }
                 HomeAction::Template(request) => {
-                    handle_template_action(terminal, &mut state, config, request)?;
+                    let Some(config) = state.template.as_ref().map(|active| active.config.clone())
+                    else {
+                        continue;
+                    };
+                    handle_template_action(terminal, &mut state, &config, request)?;
                     dirty = true;
                 }
                 HomeAction::ShowAuthenticationCookie => {
@@ -391,7 +403,7 @@ fn run_with_terminal_and_paths<T>(
                     dirty = true;
                 }
                 HomeAction::InitializeGlobalConfig(target) => {
-                    initialize_and_open_global_config(terminal, &mut state, config, &target)?;
+                    initialize_and_open_global_config(terminal, &mut state, &target)?;
                     dirty = true;
                 }
                 HomeAction::Quit => return Ok(HomeExit::Quit),
@@ -403,6 +415,13 @@ fn run_with_terminal_and_paths<T>(
             TerminalEvent::Paste(_) | TerminalEvent::Pointer(_) | TerminalEvent::Ignored => {}
         }
     }
+}
+
+fn load_home_config(paths: &HomeActionPaths) -> Result<Config, String> {
+    let path = paths
+        .global_config()
+        .map_err(|error| format!("Global Config invalid: {error}"))?;
+    Config::load_from(path).map_err(|error| format!("Global Config invalid: {error}"))
 }
 
 fn handle_template_action(
@@ -488,17 +507,20 @@ fn open_workspace_config(
     terminal: &mut impl HomeTerminal,
     state: &mut HomeState<'_>,
     workspace_root: &Path,
-    config: &Config,
+    paths: &HomeActionPaths,
 ) -> io::Result<()> {
     let target = crate::workspace::workspace_config_path(workspace_root);
     match crate::workspace::inspect_workspace_config_file(workspace_root) {
-        Ok(crate::workspace::WorkspaceConfigFileState::Existing) => launch_target(
-            terminal,
-            state,
-            config,
-            &target,
-            HomeActionErrorKind::WorkspaceConfig,
-        ),
+        Ok(crate::workspace::WorkspaceConfigFileState::Existing) => {
+            let config = repair_editor_config(paths.global_config().ok());
+            launch_target(
+                terminal,
+                state,
+                &config,
+                &target,
+                HomeActionErrorKind::WorkspaceConfig,
+            )
+        }
         Ok(crate::workspace::WorkspaceConfigFileState::Missing) => {
             state.show_error(
                 HomeActionErrorKind::WorkspaceConfig,
@@ -519,7 +541,6 @@ fn open_workspace_config(
 fn open_global_config(
     terminal: &mut impl HomeTerminal,
     state: &mut HomeState<'_>,
-    config: &Config,
     paths: &HomeActionPaths,
 ) -> io::Result<()> {
     let target = match paths.global_config() {
@@ -530,13 +551,16 @@ fn open_global_config(
         }
     };
     match crate::user_config_fs::inspect_editable_file(target, "global config file") {
-        Ok(crate::user_config_fs::EditableFileState::Existing) => launch_target(
-            terminal,
-            state,
-            config,
-            target,
-            HomeActionErrorKind::GlobalConfig,
-        ),
+        Ok(crate::user_config_fs::EditableFileState::Existing) => {
+            let config = repair_editor_config(Some(target));
+            launch_target(
+                terminal,
+                state,
+                &config,
+                target,
+                HomeActionErrorKind::GlobalConfig,
+            )
+        }
         Ok(crate::user_config_fs::EditableFileState::Missing) => {
             state.show_initialize_global_config(target.to_path_buf());
             Ok(())
@@ -548,13 +572,18 @@ fn open_global_config(
     }
 }
 
+fn repair_editor_config(path: Option<&Path>) -> Config {
+    path.and_then(|path| Config::load_from(path).ok())
+        .unwrap_or_default()
+}
+
 fn initialize_and_open_global_config(
     terminal: &mut impl HomeTerminal,
     state: &mut HomeState<'_>,
-    config: &Config,
     target: &Path,
 ) -> io::Result<()> {
-    let editor = match terminal.resolve_home_editor(config) {
+    let config = Config::default();
+    let editor = match terminal.resolve_home_editor(&config) {
         Ok(editor) => editor,
         Err(error) => {
             state.show_error(HomeActionErrorKind::GlobalConfig, error);
@@ -572,7 +601,7 @@ fn initialize_and_open_global_config(
     launch_resolved_target(
         terminal,
         state,
-        config,
+        &config,
         &editor,
         target,
         HomeActionErrorKind::GlobalConfig,
@@ -949,6 +978,7 @@ mod tests {
     #[derive(Debug)]
     struct RecordingHomeTerminal {
         targets: Vec<PathBuf>,
+        editor_configs_have_override: Vec<bool>,
         resolve_error: Option<String>,
         outcome: HomeEditorOutcome,
         discarded_batches: usize,
@@ -958,6 +988,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 targets: Vec::new(),
+                editor_configs_have_override: Vec::new(),
                 resolve_error: None,
                 outcome: HomeEditorOutcome {
                     result: HomeEditorResult::Launched,
@@ -989,7 +1020,9 @@ mod tests {
             unreachable!("direct action tests do not read")
         }
 
-        fn resolve_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
+        fn resolve_home_editor(&mut self, config: &Config) -> Result<ResolvedEditor, String> {
+            self.editor_configs_have_override
+                .push(config.editor.is_some());
             self.resolve_error.clone().map_or_else(
                 || {
                     Ok(ResolvedEditor {
@@ -1121,23 +1154,58 @@ mod tests {
     fn workspace_config_uses_the_active_root_and_is_never_recreated() {
         let root = tempfile::tempdir().unwrap();
         let target = crate::workspace::workspace_config_path(root.path());
+        let paths = HomeActionPaths::for_test(
+            root.path().join("global-config.toml"),
+            cookie_location(root.path()),
+        );
         std::fs::write(&target, "malformed = [\n").unwrap();
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
         let mut terminal = RecordingHomeTerminal::default();
 
-        open_workspace_config(&mut terminal, &mut home, root.path(), &Config::default()).unwrap();
+        open_workspace_config(&mut terminal, &mut home, root.path(), &paths).unwrap();
         assert_eq!(terminal.targets.as_slice(), std::slice::from_ref(&target));
 
         std::fs::remove_file(&target).unwrap();
-        open_workspace_config(&mut terminal, &mut home, root.path(), &Config::default()).unwrap();
+        open_workspace_config(&mut terminal, &mut home, root.path(), &paths).unwrap();
         assert!(!target.exists());
         assert_eq!(terminal.targets.len(), 1);
         assert!(matches!(
             home.error.as_ref().map(|error| error.kind),
             Some(HomeActionErrorKind::WorkspaceConfig)
         ));
+    }
+
+    #[test]
+    fn workspace_home_config_editors_fresh_load_valid_config_and_fallback_only_for_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_config = crate::workspace::workspace_config_path(root.path());
+        std::fs::write(&workspace_config, "version = 1\n").unwrap();
+        let global_config = root.path().join("global-config.toml");
+        let paths = HomeActionPaths::for_test(global_config.clone(), cookie_location(root.path()));
+        std::fs::write(
+            &global_config,
+            "[editor]\ncommand = \"configured-editor\"\nmode = \"terminal\"\n",
+        )
+        .unwrap();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        let mut terminal = RecordingHomeTerminal::default();
+
+        open_workspace_config(&mut terminal, &mut home, root.path(), &paths).unwrap();
+        open_global_config(&mut terminal, &mut home, &paths).unwrap();
+        assert_eq!(terminal.editor_configs_have_override, [true, true]);
+
+        std::fs::write(&global_config, "invalid = [\n").unwrap();
+        open_workspace_config(&mut terminal, &mut home, root.path(), &paths).unwrap();
+        open_global_config(&mut terminal, &mut home, &paths).unwrap();
+        assert_eq!(
+            terminal.editor_configs_have_override,
+            [true, true, false, false],
+            "fallback Config is restricted to Config repair actions"
+        );
     }
 
     #[test]
@@ -1151,12 +1219,12 @@ mod tests {
         let mut terminal = RecordingHomeTerminal::default();
 
         std::fs::write(&target, "invalid = [\n").unwrap();
-        open_global_config(&mut terminal, &mut home, &Config::default(), &paths).unwrap();
+        open_global_config(&mut terminal, &mut home, &paths).unwrap();
         assert_eq!(terminal.targets.as_slice(), std::slice::from_ref(&target));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "invalid = [\n");
 
         std::fs::remove_file(&target).unwrap();
-        open_global_config(&mut terminal, &mut home, &Config::default(), &paths).unwrap();
+        open_global_config(&mut terminal, &mut home, &paths).unwrap();
         assert!(home.initialize_global_config.is_some());
         assert!(!target.exists());
         let HomeAction::InitializeGlobalConfig(confirmed) =
@@ -1164,8 +1232,7 @@ mod tests {
         else {
             panic!("Enter must confirm global config initialization")
         };
-        initialize_and_open_global_config(&mut terminal, &mut home, &Config::default(), &confirmed)
-            .unwrap();
+        initialize_and_open_global_config(&mut terminal, &mut home, &confirmed).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             crate::config::INITIAL_CONFIG
@@ -1185,8 +1252,7 @@ mod tests {
             ..RecordingHomeTerminal::default()
         };
 
-        initialize_and_open_global_config(&mut terminal, &mut home, &Config::default(), &target)
-            .unwrap();
+        initialize_and_open_global_config(&mut terminal, &mut home, &target).unwrap();
 
         assert!(!target.exists());
         assert!(terminal.targets.is_empty());
@@ -1198,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_home_template_uses_runtime_config_and_enter_initializes_only_selection() {
+    fn workspace_home_template_uses_action_config_and_enter_initializes_only_selection() {
         let temp = tempfile::tempdir().unwrap();
         let templates = temp.path().join("templates");
         let paths = HomeActionPaths::for_test_with_templates(
@@ -1206,8 +1272,12 @@ mod tests {
             templates.clone(),
             cookie_location(temp.path()),
         );
-        let mut config = Config::default();
-        config.defaults.language = crate::language::Language::Python;
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[defaults]\nlanguage = \"python\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from(&temp.path().join("config.toml")).unwrap();
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
@@ -1216,7 +1286,7 @@ mod tests {
             home.handle_key(key(KeyCode::Char('t'), KeyEventKind::Press)),
             HomeAction::OpenTemplate
         );
-        home.open_template(paths.templates_dir_result(), &config);
+        home.open_template(paths.templates_dir_result(), config.clone());
         assert_eq!(
             home.template.as_ref().unwrap().selected_language(),
             crate::language::Language::Python
@@ -1271,6 +1341,68 @@ mod tests {
     }
 
     #[test]
+    fn workspace_home_template_snapshots_each_modal_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let paths = HomeActionPaths::for_test_with_templates(
+            config_path.clone(),
+            temp.path().join("templates"),
+            cookie_location(temp.path()),
+        );
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n",
+        )
+        .unwrap();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+
+        let config_a = load_home_config(&paths).unwrap();
+        home.open_template(paths.templates_dir_result(), config_a);
+        assert_eq!(
+            home.template.as_ref().unwrap().selected_language(),
+            crate::language::Language::Python
+        );
+        assert_eq!(
+            home.template.as_ref().unwrap().config.runner.python,
+            "python-a"
+        );
+
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            home.template.as_ref().unwrap().selected_language(),
+            crate::language::Language::Python,
+            "an open modal must keep its action-session Config"
+        );
+        assert_eq!(
+            home.template.as_ref().unwrap().config.runner.python,
+            "python-a"
+        );
+
+        assert_eq!(
+            home.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
+            HomeAction::None
+        );
+        assert!(home.template.is_none());
+
+        let config_b = load_home_config(&paths).unwrap();
+        home.open_template(paths.templates_dir_result(), config_b);
+        assert_eq!(
+            home.template.as_ref().unwrap().selected_language(),
+            crate::language::Language::Cpp
+        );
+        assert_eq!(
+            home.template.as_ref().unwrap().config.runner.python,
+            "python-b"
+        );
+    }
+
+    #[test]
     fn workspace_template_runs_through_the_production_home_loop() {
         let temp = tempfile::tempdir().unwrap();
         let templates = temp.path().join("templates");
@@ -1279,8 +1411,11 @@ mod tests {
             templates.clone(),
             cookie_location(temp.path()),
         );
-        let mut config = Config::default();
-        config.defaults.language = crate::language::Language::Python;
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[defaults]\nlanguage = \"python\"\n",
+        )
+        .unwrap();
         let mut terminal = ScriptedHomeTerminal::new([
             vec![TerminalEvent::Key(key(
                 KeyCode::Char('t'),
@@ -1311,7 +1446,6 @@ mod tests {
         let exit = run_with_terminal_and_paths(
             &mut terminal,
             temp.path(),
-            &config,
             &mut submissions,
             &mut resolve,
             Arc::new(|_, _| Ok(())),
@@ -1343,7 +1477,7 @@ mod tests {
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
         let config = Config::default();
-        home.open_template(Ok(templates), &config);
+        home.open_template(Ok(templates), config.clone());
         let HomeAction::Template(request) =
             home.handle_key(key(KeyCode::Enter, KeyEventKind::Press))
         else {
@@ -1497,8 +1631,13 @@ mod tests {
 
         assert_eq!(
             home.handle_key(key(KeyCode::Enter, KeyEventKind::Press)),
-            HomeAction::OpenContest
+            HomeAction::None
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !home.open_requested() && std::time::Instant::now() < deadline {
+            home.handle_operation_messages();
+            std::thread::yield_now();
+        }
         assert!(home.open_requested());
         let mut start = || Ok::<_, String>("Contest");
         assert_eq!(home.start_requested_contest(&mut start), Some("Contest"));
@@ -1513,6 +1652,12 @@ mod tests {
             home.handle_key(key(KeyCode::Char(character), KeyEventKind::Press));
         }
         home.handle_key(key(KeyCode::Enter, KeyEventKind::Press));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !home.open_requested() && std::time::Instant::now() < deadline {
+            home.handle_operation_messages();
+            std::thread::yield_now();
+        }
 
         let mut start = || Err::<(), _>("watcher start failed".to_string());
         assert_eq!(home.start_requested_contest(&mut start), None);

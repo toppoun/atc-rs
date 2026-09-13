@@ -10,6 +10,7 @@ use crate::workspace::{self, ContestDataReplacement, ContestMetadataHealth, Test
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
+#[derive(Debug)]
 pub(super) enum ContestTargetHealth {
     MissingDirectory,
     RepairRequired,
@@ -46,18 +47,40 @@ pub(super) fn inspect_contest_target(
 pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     let app_context = AppContext::from_launch_root(&cwd)?;
-
-    let destination = workspace::resolve_contest_path(&cwd, contest_id)?;
+    let destination = match &app_context {
+        AppContext::Workspace { .. } => {
+            workspace::resolve_active_workspace_contest_path(&cwd, contest_id)?
+        }
+        AppContext::Standalone { .. } => workspace::resolve_contest_path(&cwd, contest_id)?,
+    };
+    let config = Config::load()?;
 
     contest_at(
         &destination,
         contest_id,
         reporter,
         |destination| confirm_repair(destination).map_err(AppError::from),
-        |destination, contest_id, reporter| create_contest(&cwd, destination, contest_id, reporter),
-        repair_contest,
+        |destination, contest_id, reporter| match &app_context {
+            AppContext::Workspace { .. } => {
+                create_contest_in_active_workspace(&cwd, destination, contest_id, &config, reporter)
+            }
+            AppContext::Standalone { .. } => {
+                create_contest(&cwd, destination, contest_id, &config, reporter)
+            }
+        },
+        |destination, contest_id, reporter| match &app_context {
+            AppContext::Workspace { .. } => {
+                repair_contest_in_active_workspace(&cwd, destination, contest_id, reporter)
+            }
+            AppContext::Standalone { .. } => repair_contest(destination, contest_id, reporter),
+        },
         |destination, contest_id, _| {
-            super::watch_tui::watch_tui_at(destination, Some(contest_id), app_context.clone())
+            super::watch_tui::watch_tui_at(
+                destination,
+                Some(contest_id),
+                app_context.clone(),
+                config.clone(),
+            )
         },
     )
 }
@@ -106,46 +129,153 @@ pub(super) fn create_contest(
     root: &Path,
     destination: &Path,
     contest_id: &str,
+    config: &Config,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     create_contest_with(
         root,
         destination,
         contest_id,
+        config,
         reporter,
-        Config::load,
         resolve_source_template,
         create_atcoder_client,
     )
 }
 
-fn create_contest_with<L, R, C>(
+pub(super) fn create_contest_in_active_workspace(
     root: &Path,
     destination: &Path,
     contest_id: &str,
+    config: &Config,
     reporter: &mut dyn Reporter,
-    load_config: L,
+) -> Result<(), AppError> {
+    create_contest_with_install(
+        destination,
+        contest_id,
+        config,
+        reporter,
+        resolve_source_template,
+        create_atcoder_client,
+        |destination, contest_id, language, template, atcoder, reporter| {
+            super::new::new_at_in_active_workspace(
+                root,
+                destination,
+                contest_id,
+                language,
+                template,
+                atcoder,
+                reporter,
+            )
+        },
+    )
+}
+
+fn create_contest_with<R, C>(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    config: &Config,
+    reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
 ) -> Result<(), AppError>
 where
-    L: FnOnce() -> Result<Config, AppError>,
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
     C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
 {
-    let config = load_config()?;
-    let language = resolve_language(None, &config);
+    create_contest_with_install(
+        destination,
+        contest_id,
+        config,
+        reporter,
+        resolve_template,
+        create_client,
+        |destination, contest_id, language, template, atcoder, reporter| {
+            super::new::new_at_in_workspace(
+                root,
+                destination,
+                contest_id,
+                language,
+                template,
+                atcoder,
+                reporter,
+            )
+        },
+    )
+}
+
+fn create_contest_with_install<R, C, I>(
+    destination: &Path,
+    contest_id: &str,
+    config: &Config,
+    reporter: &mut dyn Reporter,
+    resolve_template: R,
+    create_client: C,
+    install: I,
+) -> Result<(), AppError>
+where
+    R: FnOnce(crate::language::Language) -> Result<String, AppError>,
+    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    I: FnOnce(
+        &Path,
+        &str,
+        crate::language::Language,
+        &str,
+        &atcoder::AtCoderClient,
+        &mut dyn Reporter,
+    ) -> Result<(), AppError>,
+{
+    let language = resolve_language(None, config);
     let template = resolve_template(language)?;
     let atcoder = create_client()?;
 
-    super::new::new_at_in_workspace(
-        root,
+    install(
         destination,
         contest_id,
         language,
         &template,
         &atcoder,
         reporter,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_contest_in_active_workspace_with_parent_hook<R, C, H>(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    config: &Config,
+    reporter: &mut dyn Reporter,
+    resolve_template: R,
+    create_client: C,
+    before_parent_preparation: H,
+) -> Result<(), AppError>
+where
+    R: FnOnce(crate::language::Language) -> Result<String, AppError>,
+    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    H: FnOnce(),
+{
+    create_contest_with_install(
+        destination,
+        contest_id,
+        config,
+        reporter,
+        resolve_template,
+        create_client,
+        |destination, contest_id, language, template, atcoder, reporter| {
+            super::new::new_at_in_active_workspace_with_parent_hook(
+                root,
+                destination,
+                contest_id,
+                language,
+                template,
+                atcoder,
+                reporter,
+                before_parent_preparation,
+            )
+        },
     )
 }
 
@@ -157,6 +287,27 @@ pub(super) fn repair_contest(
     let atcoder = create_atcoder_client()?;
 
     repair_at(destination, contest_id, &atcoder, reporter)
+}
+
+pub(super) fn repair_contest_in_active_workspace(
+    root: &Path,
+    destination: &Path,
+    contest_id: &str,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let atcoder = create_atcoder_client()?;
+
+    repair_at_with_before_install_and_validation(
+        destination,
+        contest_id,
+        &atcoder,
+        reporter,
+        || {},
+        || {
+            workspace::ensure_active_workspace_contest_parent(root, contest_id, destination)
+                .map_err(AppError::from)
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,9 +346,30 @@ fn repair_at_with_before_install(
     reporter: &mut dyn Reporter,
     before_install: impl FnOnce(),
 ) -> Result<(), AppError> {
+    repair_at_with_before_install_and_validation(
+        destination,
+        contest_id,
+        atcoder,
+        reporter,
+        before_install,
+        || Ok(()),
+    )
+}
+
+fn repair_at_with_before_install_and_validation(
+    destination: &Path,
+    contest_id: &str,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+    before_install: impl FnOnce(),
+    mut validate_workspace: impl FnMut() -> Result<(), AppError>,
+) -> Result<(), AppError> {
     workspace::validate_refresh_destination(destination, contest_id, true)?;
     let plan = plan_repair(destination, contest_id, atcoder, reporter)?;
 
+    // Active-workspace callers revalidate after the network-bound plan and before even creating
+    // temporary managed data. Revalidate again below immediately before the live replacement.
+    validate_workspace()?;
     let staging = tempfile::Builder::new()
         .prefix(".atc-repair-")
         .tempdir_in(destination)?;
@@ -209,6 +381,7 @@ fn repair_at_with_before_install(
     }
 
     before_install();
+    validate_workspace()?;
     revalidate_repair_plan(destination, contest_id, &plan)?;
 
     let replacement = match (plan.metadata, plan.tests) {
@@ -921,29 +1094,30 @@ mod tests {
     }
 
     #[test]
-    fn missing_contest_creation_uses_the_source_template_resolver() {
+    fn missing_contest_creation_uses_the_passed_config_and_live_template() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
         let templates_dir = temp.path().join("templates");
         std::fs::create_dir(&templates_dir).unwrap();
-        std::fs::write(templates_dir.join("cpp.cpp"), "// contest custom\n").unwrap();
+        std::fs::write(templates_dir.join("python.py"), "# contest custom\n").unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let mut reporter = NullReporter;
+        let config = Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap();
 
         create_contest_with(
             temp.path(),
             &destination,
             "abc466",
+            &config,
             &mut reporter,
-            || Ok(Config::default()),
             |language| crate::template::resolve_source_template_in(&templates_dir, language),
             || Ok(atcoder::AtCoderClient::fixture(&fixtures)),
         )
         .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(destination.join("A.cpp")).unwrap(),
-            "// contest custom\n"
+            std::fs::read_to_string(destination.join("A.py")).unwrap(),
+            "# contest custom\n"
         );
     }
 
