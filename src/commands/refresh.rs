@@ -1,5 +1,6 @@
 use super::{FetchedContestData, fetch_contest_data};
 use crate::atcoder;
+use crate::auth::AuthSnapshot;
 use crate::error::AppError;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
@@ -65,6 +66,16 @@ pub(super) fn create_atcoder_client() -> Result<atcoder::AtCoderClient, AppError
         Ok(atcoder::AtCoderClient::fixture(path))
     } else {
         Ok(atcoder::AtCoderClient::new()?)
+    }
+}
+
+pub(super) fn create_atcoder_client_from_auth(
+    auth: &AuthSnapshot,
+) -> Result<atcoder::AtCoderClient, AppError> {
+    if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
+        Ok(atcoder::AtCoderClient::fixture(path))
+    } else {
+        Ok(atcoder::AtCoderClient::from_auth_snapshot(auth)?)
     }
 }
 

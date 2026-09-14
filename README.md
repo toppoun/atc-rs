@@ -117,7 +117,7 @@ User Input の作成・編集・保存・実行・削除、Submit modal、submis
 
 Contest の source template は Command Palette の `Open Template` から開きます。Contest の `t` は引き続き Submit です。
 
-Global Config と Workspace Config の編集は Home から行います。Contest は entry 時に読み込んだ Config を session 中固定して使用し、Switch Contest や Home からの再 entry では最新設定を読み直します。Refresh Contest では現在の snapshot を維持します。template file の内容だけは snapshot せず、次に source/template を利用するときの filesystem 内容を使います。
+Global Config と Workspace Config の編集は Home から行います。Contest は entry 時に読み込んだ Config と Authentication Cookie を ContestSession 中固定して使用し、Switch Contest や Home からの再 entry では最新設定と cookie を読み直します。Refresh Contest では現在の Config / Authentication snapshot を維持します。Contest 中に cookie file を変更しても、その session には反映されません。template file の内容だけは snapshot せず、次に source/template を利用するときの filesystem 内容を使います。
 
 ## Submit と AtCoder 認証
 

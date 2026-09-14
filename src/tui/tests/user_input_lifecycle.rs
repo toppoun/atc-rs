@@ -220,6 +220,7 @@ fn background_tick_waits_for_all_delivered_terminal_events_not_only_q() {
         &destination,
         Language::Cpp,
         crate::language::PythonRuntime::CPython,
+        configured_auth(),
     );
     tx.send(Message::SourceChanged {
         problem: 1,

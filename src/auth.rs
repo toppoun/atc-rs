@@ -2,9 +2,11 @@ use crate::paths::{self, CookieLocation};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, PathBuf};
+use std::sync::Arc;
 
 const SESSION_COOKIE_PREFIX: &str = "REVEL_SESSION=";
 // RFC 6265 user agents are expected to support at least 4096 bytes per
@@ -12,9 +14,128 @@ const SESSION_COOKIE_PREFIX: &str = "REVEL_SESSION=";
 // accidentally large file from being read into memory or used as a header.
 const MAX_COOKIE_LINE_BYTES: usize = 4096;
 
-pub fn load_cookie() -> io::Result<Option<String>> {
-    let location = paths::cookie_location().map_err(io::Error::other)?;
-    load_cookie_from(&location)
+pub(crate) struct Credential {
+    value: String,
+}
+
+impl Credential {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Credential(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthLoadErrorKind {
+    InvalidFormat,
+    UnsafeFilesystemState,
+    Permission,
+    Io,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthLoadError {
+    kind: AuthLoadErrorKind,
+}
+
+impl AuthLoadError {
+    pub(crate) fn from_io(error: &io::Error) -> Self {
+        let kind = match error.kind() {
+            io::ErrorKind::InvalidData => AuthLoadErrorKind::InvalidFormat,
+            io::ErrorKind::InvalidInput => AuthLoadErrorKind::UnsafeFilesystemState,
+            io::ErrorKind::PermissionDenied => AuthLoadErrorKind::Permission,
+            _ => AuthLoadErrorKind::Io,
+        };
+        Self { kind }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(self) -> AuthLoadErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for AuthLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            AuthLoadErrorKind::InvalidFormat => "authentication cookie format is invalid",
+            AuthLoadErrorKind::UnsafeFilesystemState => {
+                "authentication cookie filesystem state is unsafe"
+            }
+            AuthLoadErrorKind::Permission => "authentication cookie permissions are unsafe",
+            AuthLoadErrorKind::Io => "authentication cookie could not be read safely",
+        })
+    }
+}
+
+impl std::error::Error for AuthLoadError {}
+
+pub(crate) enum AuthSnapshot {
+    Configured(Arc<Credential>),
+    Missing,
+    Invalid(AuthLoadError),
+}
+
+impl fmt::Debug for AuthSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configured(credential) => formatter
+                .debug_tuple("Configured")
+                .field(credential)
+                .finish(),
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Invalid(error) => formatter.debug_tuple("Invalid").field(error).finish(),
+        }
+    }
+}
+
+impl AuthSnapshot {
+    pub(crate) fn load() -> Arc<Self> {
+        let snapshot = match paths::cookie_location() {
+            Ok(location) => load_auth_snapshot_from(&location),
+            Err(error) => Self::Invalid(AuthLoadError::from_io(&io::Error::other(error))),
+        };
+        Arc::new(snapshot)
+    }
+
+    pub(crate) fn credential(&self) -> Option<&Credential> {
+        match self {
+            Self::Configured(credential) => Some(credential),
+            Self::Missing | Self::Invalid(_) => None,
+        }
+    }
+
+    pub(crate) fn submission_unavailable_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Configured(_) => None,
+            Self::Missing => {
+                Some("Authentication is not configured.\nReturn Home to configure authentication.")
+            }
+            Self::Invalid(_) => {
+                Some("Authentication configuration is invalid.\nReturn Home to fix authentication.")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configured_for_test(value: &str) -> Arc<Self> {
+        Arc::new(Self::Configured(Arc::new(Credential {
+            value: value.to_string(),
+        })))
+    }
+}
+
+fn load_auth_snapshot_from(location: &CookieLocation) -> AuthSnapshot {
+    match load_credential_from(location) {
+        Ok(Some(credential)) => AuthSnapshot::Configured(Arc::new(credential)),
+        Ok(None) => AuthSnapshot::Missing,
+        Err(error) => AuthSnapshot::Invalid(AuthLoadError::from_io(&error)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +156,7 @@ pub(crate) fn inspect_cookie_file(location: &CookieLocation) -> io::Result<Cooki
     }
 }
 
-fn load_cookie_from(location: &CookieLocation) -> io::Result<Option<String>> {
+fn load_credential_from(location: &CookieLocation) -> io::Result<Option<Credential>> {
     let Some(file) = open_validated_cookie_file(location)? else {
         return Ok(None);
     };
@@ -47,7 +168,7 @@ fn load_cookie_from(location: &CookieLocation) -> io::Result<Option<String>> {
     Ok(Some(parse_cookie_file(&cookie)?))
 }
 
-fn parse_cookie_file(contents: &str) -> io::Result<String> {
+fn parse_cookie_file(contents: &str) -> io::Result<Credential> {
     if contents.len() > MAX_COOKIE_LINE_BYTES + 2 {
         return Err(invalid_cookie_file_error());
     }
@@ -73,7 +194,9 @@ fn parse_cookie_file(contents: &str) -> io::Result<String> {
         return Err(invalid_cookie_file_error());
     }
 
-    Ok(cookie.to_string())
+    Ok(Credential {
+        value: cookie.to_string(),
+    })
 }
 
 fn is_cookie_octet(byte: u8) -> bool {
@@ -277,7 +400,11 @@ mod tests {
     fn missing_cookie_is_the_only_anonymous_state() {
         let temp = tempfile::tempdir().unwrap();
         let location = location(temp.path());
-        assert_eq!(load_cookie_from(&location).unwrap(), None);
+        assert!(load_credential_from(&location).unwrap().is_none());
+        assert!(matches!(
+            load_auth_snapshot_from(&location),
+            AuthSnapshot::Missing
+        ));
         assert_eq!(
             inspect_cookie_file(&location).unwrap(),
             CookieFileState::Missing
@@ -286,30 +413,73 @@ mod tests {
         fs::create_dir_all(&location.state_dir).unwrap();
         write_cookie_file(&location.file, " \r\n ");
         assert_eq!(
-            load_cookie_from(&location).unwrap_err().kind(),
+            load_credential_from(&location).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert!(matches!(
+            load_auth_snapshot_from(&location),
+            AuthSnapshot::Invalid(error)
+                if error.kind() == AuthLoadErrorKind::InvalidFormat
+        ));
 
         write_cookie_file(&location.file, [0xff]);
         assert_eq!(
-            load_cookie_from(&location).unwrap_err().kind(),
+            load_credential_from(&location).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert!(matches!(
+            load_auth_snapshot_from(&location),
+            AuthSnapshot::Invalid(error)
+                if error.kind() == AuthLoadErrorKind::InvalidFormat
+        ));
 
         write_cookie_file(&location.file, "value-only");
         assert_eq!(
-            load_cookie_from(&location).unwrap_err().kind(),
+            load_credential_from(&location).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         write_cookie_file(&location.file, "REVEL_SESSION=secret\n");
         assert_eq!(
-            load_cookie_from(&location).unwrap().as_deref(),
+            load_credential_from(&location)
+                .unwrap()
+                .as_ref()
+                .map(Credential::as_str),
             Some("REVEL_SESSION=secret")
         );
         assert_eq!(
             inspect_cookie_file(&location).unwrap(),
             CookieFileState::Existing
+        );
+        assert!(matches!(
+            load_auth_snapshot_from(&location),
+            AuthSnapshot::Configured(_)
+        ));
+    }
+
+    #[test]
+    fn credential_and_auth_snapshot_debug_are_redacted() {
+        let marker = "REVEL_SESSION=distinctive-auth-secret-7f2c";
+        let snapshot = AuthSnapshot::Configured(Arc::new(Credential {
+            value: marker.to_string(),
+        }));
+        let credential_debug = format!("{:?}", snapshot.credential().unwrap());
+        let snapshot_debug = format!("{snapshot:?}");
+
+        assert_eq!(credential_debug, "Credential(<redacted>)");
+        assert!(!credential_debug.contains(marker));
+        assert!(!snapshot_debug.contains(marker));
+        assert!(snapshot_debug.contains("Configured"));
+
+        let invalid = AuthSnapshot::Invalid(AuthLoadError {
+            kind: AuthLoadErrorKind::InvalidFormat,
+        });
+        assert!(!format!("{invalid:?}").contains(marker));
+        assert!(
+            !invalid
+                .submission_unavailable_message()
+                .unwrap()
+                .contains(marker)
         );
     }
 
@@ -321,7 +491,7 @@ mod tests {
             file: PathBuf::from("relative-platform-state/atc/state/cookie"),
         };
 
-        assert!(load_cookie_from(&location).is_err());
+        assert!(load_credential_from(&location).is_err());
     }
 
     #[test]
@@ -340,7 +510,7 @@ mod tests {
                 state_dir,
             };
 
-            assert!(load_cookie_from(&location).is_err());
+            assert!(load_credential_from(&location).is_err());
             assert!(inspect_cookie_file(&location).is_err());
         }
     }
@@ -356,7 +526,11 @@ mod tests {
             return;
         }
 
-        assert!(load_cookie_from(&symlink_location).is_err());
+        assert!(load_credential_from(&symlink_location).is_err());
+        assert!(matches!(
+            load_auth_snapshot_from(&symlink_location),
+            AuthSnapshot::Invalid(_)
+        ));
         assert!(inspect_cookie_file(&symlink_location).is_err());
         assert_eq!(
             fs::read_to_string(external.path()).unwrap(),
@@ -366,7 +540,7 @@ mod tests {
         let directory_root = tempfile::tempdir().unwrap();
         let directory_location = location(directory_root.path());
         fs::create_dir_all(&directory_location.file).unwrap();
-        assert!(load_cookie_from(&directory_location).is_err());
+        assert!(load_credential_from(&directory_location).is_err());
         assert!(inspect_cookie_file(&directory_location).is_err());
     }
 
@@ -380,7 +554,7 @@ mod tests {
             return;
         }
 
-        assert!(load_cookie_from(&location).is_err());
+        assert!(load_credential_from(&location).is_err());
         assert!(inspect_cookie_file(&location).is_err());
         assert!(!external.path().join("cookie").exists());
     }
@@ -395,14 +569,16 @@ mod tests {
         fs::create_dir_all(&location.state_dir).unwrap();
         let _listener = UnixListener::bind(&location.file).unwrap();
 
-        assert!(load_cookie_from(&location).is_err());
+        assert!(load_credential_from(&location).is_err());
         assert!(inspect_cookie_file(&location).is_err());
     }
 
     #[test]
     fn cookie_value_can_contain_percent() {
         assert_eq!(
-            parse_cookie_file("REVEL_SESSION=secret%value").unwrap(),
+            parse_cookie_file("REVEL_SESSION=secret%value")
+                .unwrap()
+                .as_str(),
             "REVEL_SESSION=secret%value"
         );
     }
@@ -410,17 +586,21 @@ mod tests {
     #[test]
     fn cookie_file_requires_exact_revel_session_format() {
         assert_eq!(
-            parse_cookie_file("REVEL_SESSION=secret").unwrap(),
+            parse_cookie_file("REVEL_SESSION=secret").unwrap().as_str(),
             "REVEL_SESSION=secret"
         );
 
         assert_eq!(
-            parse_cookie_file("REVEL_SESSION=secret\n").unwrap(),
+            parse_cookie_file("REVEL_SESSION=secret\n")
+                .unwrap()
+                .as_str(),
             "REVEL_SESSION=secret"
         );
 
         assert_eq!(
-            parse_cookie_file("REVEL_SESSION=secret\r\n").unwrap(),
+            parse_cookie_file("REVEL_SESSION=secret\r\n")
+                .unwrap()
+                .as_str(),
             "REVEL_SESSION=secret"
         );
 
@@ -455,7 +635,7 @@ mod tests {
         let max_value = "x".repeat(MAX_COOKIE_LINE_BYTES - SESSION_COOKIE_PREFIX.len());
         let max_cookie = format!("{SESSION_COOKIE_PREFIX}{max_value}");
 
-        assert_eq!(parse_cookie_file(&max_cookie).unwrap(), max_cookie);
+        assert_eq!(parse_cookie_file(&max_cookie).unwrap().as_str(), max_cookie);
         assert!(parse_cookie_file(&format!("{max_cookie}\r\n")).is_ok());
         assert_eq!(
             parse_cookie_file(&format!("{max_cookie}x"))
@@ -469,7 +649,7 @@ mod tests {
         fs::create_dir_all(&location.state_dir).unwrap();
         write_cookie_file(&location.file, format!("{max_cookie}x"));
         assert_eq!(
-            load_cookie_from(&location).unwrap_err().kind(),
+            load_credential_from(&location).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -533,9 +713,13 @@ mod tests {
         fs::set_permissions(&location.file, fs::Permissions::from_mode(0o644)).unwrap();
 
         assert_eq!(
-            load_cookie_from(&location).unwrap_err().kind(),
+            load_credential_from(&location).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+        assert!(matches!(
+            load_auth_snapshot_from(&location),
+            AuthSnapshot::Invalid(error) if error.kind() == AuthLoadErrorKind::Permission
+        ));
         assert_eq!(
             inspect_cookie_file(&location).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied

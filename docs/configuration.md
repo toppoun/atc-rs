@@ -2,6 +2,12 @@
 
 `atc` は設定ファイルがなくても動作します。変更したい項目だけを `config.toml` に追加する方式です。
 
+## ContestSession の設定境界
+
+新しい ContestSession を開始すると、その時点の Global Config と Authentication Cookie が snapshot として固定されます。Contest の Refresh は両方の snapshot を維持し、Switch Contest、Home からの再 entry、`atc contest` / `atc c` / TUI の `atc watch` は現在の Config と cookie から新しい snapshot を作ります。
+
+Contest 中に Config や cookie file を変更しても、現在の session には反映されません。反映するには Home へ戻って入り直すか、Contest を Switch してください。Authentication Cookie の保存形式と安全な file policy は [AtCoder 認証](authentication.md) を参照してください。
+
 ## 設定ファイルを作る
 
 ```bash

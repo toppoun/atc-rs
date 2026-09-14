@@ -1,6 +1,7 @@
 use super::{FetchedContestData, fetch_contest_data, fetch_samples_for_manifest, resolve_language};
 use crate::app_context::AppContext;
 use crate::atcoder;
+use crate::auth::AuthSnapshot;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{Contest, Sample};
@@ -9,6 +10,7 @@ use crate::ui::{Event, Reporter};
 use crate::workspace::{self, ContestDataReplacement, ContestMetadataHealth, TestsHealth};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) enum ContestTargetHealth {
@@ -54,6 +56,7 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
         AppContext::Standalone { .. } => workspace::resolve_contest_path(&cwd, contest_id)?,
     };
     let config = Config::load()?;
+    let auth = AuthSnapshot::load();
 
     contest_at(
         &destination,
@@ -61,18 +64,25 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
         reporter,
         |destination| confirm_repair(destination).map_err(AppError::from),
         |destination, contest_id, reporter| match &app_context {
-            AppContext::Workspace { .. } => {
-                create_contest_in_active_workspace(&cwd, destination, contest_id, &config, reporter)
-            }
+            AppContext::Workspace { .. } => create_contest_in_active_workspace(
+                &cwd,
+                destination,
+                contest_id,
+                &config,
+                &auth,
+                reporter,
+            ),
             AppContext::Standalone { .. } => {
-                create_contest(&cwd, destination, contest_id, &config, reporter)
+                create_contest(&cwd, destination, contest_id, &config, &auth, reporter)
             }
         },
         |destination, contest_id, reporter| match &app_context {
             AppContext::Workspace { .. } => {
-                repair_contest_in_active_workspace(&cwd, destination, contest_id, reporter)
+                repair_contest_in_active_workspace(&cwd, destination, contest_id, &auth, reporter)
             }
-            AppContext::Standalone { .. } => repair_contest(destination, contest_id, reporter),
+            AppContext::Standalone { .. } => {
+                repair_contest(destination, contest_id, &auth, reporter)
+            }
         },
         |destination, contest_id, _| {
             super::watch_tui::watch_tui_at(
@@ -80,6 +90,7 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
                 Some(contest_id),
                 app_context.clone(),
                 config.clone(),
+                Arc::clone(&auth),
             )
         },
     )
@@ -130,6 +141,7 @@ pub(super) fn create_contest(
     destination: &Path,
     contest_id: &str,
     config: &Config,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     create_contest_with(
@@ -137,6 +149,7 @@ pub(super) fn create_contest(
         destination,
         contest_id,
         config,
+        auth,
         reporter,
         resolve_source_template,
         create_atcoder_client,
@@ -148,12 +161,14 @@ pub(super) fn create_contest_in_active_workspace(
     destination: &Path,
     contest_id: &str,
     config: &Config,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     create_contest_with_install(
         destination,
         contest_id,
         config,
+        auth,
         reporter,
         resolve_source_template,
         create_atcoder_client,
@@ -171,23 +186,26 @@ pub(super) fn create_contest_in_active_workspace(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_contest_with<R, C>(
     root: &Path,
     destination: &Path,
     contest_id: &str,
     config: &Config,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
 {
     create_contest_with_install(
         destination,
         contest_id,
         config,
+        auth,
         reporter,
         resolve_template,
         create_client,
@@ -205,10 +223,12 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_contest_with_install<R, C, I>(
     destination: &Path,
     contest_id: &str,
     config: &Config,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
@@ -216,7 +236,7 @@ fn create_contest_with_install<R, C, I>(
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
     I: FnOnce(
         &Path,
         &str,
@@ -228,7 +248,7 @@ where
 {
     let language = resolve_language(None, config);
     let template = resolve_template(language)?;
-    let atcoder = create_client()?;
+    let atcoder = create_client(auth)?;
 
     install(
         destination,
@@ -247,6 +267,7 @@ pub(super) fn create_contest_in_active_workspace_with_parent_hook<R, C, H>(
     destination: &Path,
     contest_id: &str,
     config: &Config,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
@@ -254,13 +275,14 @@ pub(super) fn create_contest_in_active_workspace_with_parent_hook<R, C, H>(
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
     H: FnOnce(),
 {
     create_contest_with_install(
         destination,
         contest_id,
         config,
+        auth,
         reporter,
         resolve_template,
         create_client,
@@ -282,9 +304,10 @@ where
 pub(super) fn repair_contest(
     destination: &Path,
     contest_id: &str,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    let atcoder = create_atcoder_client()?;
+    let atcoder = create_atcoder_client(auth)?;
 
     repair_at(destination, contest_id, &atcoder, reporter)
 }
@@ -293,9 +316,10 @@ pub(super) fn repair_contest_in_active_workspace(
     root: &Path,
     destination: &Path,
     contest_id: &str,
+    auth: &AuthSnapshot,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    let atcoder = create_atcoder_client()?;
+    let atcoder = create_atcoder_client(auth)?;
 
     repair_at_with_before_install_and_validation(
         destination,
@@ -518,11 +542,11 @@ fn repair_plan_changed_error() -> io::Error {
     )
 }
 
-fn create_atcoder_client() -> Result<atcoder::AtCoderClient, AppError> {
+fn create_atcoder_client(auth: &AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError> {
     if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         Ok(atcoder::AtCoderClient::fixture(path))
     } else {
-        Ok(atcoder::AtCoderClient::new()?)
+        Ok(atcoder::AtCoderClient::from_auth_snapshot(auth)?)
     }
 }
 
@@ -1103,15 +1127,17 @@ mod tests {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let mut reporter = NullReporter;
         let config = Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap();
+        let auth = AuthSnapshot::configured_for_test("REVEL_SESSION=contest-create-test");
 
         create_contest_with(
             temp.path(),
             &destination,
             "abc466",
             &config,
+            &auth,
             &mut reporter,
             |language| crate::template::resolve_source_template_in(&templates_dir, language),
-            || Ok(atcoder::AtCoderClient::fixture(&fixtures)),
+            |_| Ok(atcoder::AtCoderClient::fixture(&fixtures)),
         )
         .unwrap();
 

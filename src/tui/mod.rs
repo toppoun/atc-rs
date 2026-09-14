@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_context::AppContext;
+use crate::auth::AuthSnapshot;
 use crate::config::Config;
 use crate::editor::{self, EditorLaunchMode, ResolvedEditor};
 use crate::error::AppError;
@@ -534,15 +535,22 @@ struct SubmitController {
     destination: PathBuf,
     default_language: Language,
     python_runtime: PythonRuntime,
+    auth: Arc<AuthSnapshot>,
     modal: Option<SubmitModal>,
 }
 
 impl SubmitController {
-    fn new(destination: &Path, default_language: Language, python_runtime: PythonRuntime) -> Self {
+    fn new(
+        destination: &Path,
+        default_language: Language,
+        python_runtime: PythonRuntime,
+        auth: Arc<AuthSnapshot>,
+    ) -> Self {
         Self {
             destination: destination.to_path_buf(),
             default_language,
             python_runtime,
+            auth,
             modal: None,
         }
     }
@@ -575,6 +583,11 @@ impl SubmitController {
             .ensure_start_allowed(&key)
             .err()
             .map(str::to_owned)
+            .or_else(|| {
+                self.auth
+                    .submission_unavailable_message()
+                    .map(str::to_owned)
+            })
             .or(inspection_error)
             .or_else(|| {
                 candidates
@@ -596,8 +609,9 @@ impl SubmitController {
     }
 
     fn handle_key(&mut self, key: KeyEvent, app: &WatchApp, hub: &mut SubmissionHub) -> bool {
-        self.handle_key_with_start(key, app, |key, problem_index, problem_title, plan| {
-            hub.start(key, problem_index, problem_title, plan)
+        let auth = Arc::clone(&self.auth);
+        self.handle_key_with_start(key, app, move |key, problem_index, problem_title, plan| {
+            hub.start(&auth, key, problem_index, problem_title, plan)
         })
     }
 
@@ -2596,6 +2610,7 @@ impl<'a> SessionChannels<'a> {
 pub(crate) struct SessionRuntime<'a> {
     current_destination: &'a Path,
     config: &'a Config,
+    auth: Arc<AuthSnapshot>,
     stress_setup: StressSetupContext<'a>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
@@ -2644,9 +2659,11 @@ impl<R> SessionFrontend<R> {
 }
 
 impl<'a> SessionRuntime<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         current_destination: &'a Path,
         config: &'a Config,
+        auth: Arc<AuthSnapshot>,
         contest: &'a Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
@@ -2656,6 +2673,7 @@ impl<'a> SessionRuntime<'a> {
         Self {
             current_destination,
             config,
+            auth,
             stress_setup: StressSetupContext::new(current_destination, contest),
             sample_counts,
             stress_cases,
@@ -3314,6 +3332,7 @@ where
     let SessionRuntime {
         current_destination,
         config,
+        auth,
         stress_setup,
         sample_counts,
         stress_cases,
@@ -3362,6 +3381,7 @@ where
         current_destination,
         config.defaults.language,
         config.submit.python_runtime,
+        auth,
     );
     let mut editor_targets = contest_editor_target_controller(
         current_destination,
@@ -5352,6 +5372,10 @@ mod tests {
     use std::sync::mpsc;
     use terminal::{PointerButton as MouseButton, PointerKind as MouseEventKind};
 
+    fn configured_auth() -> Arc<AuthSnapshot> {
+        AuthSnapshot::configured_for_test("REVEL_SESSION=tui-test-credential")
+    }
+
     fn app() -> WatchApp {
         app_with_problems(&[3])
     }
@@ -5892,8 +5916,12 @@ mod tests {
         let (run_tx, _run_rx) = mpsc::channel();
         let mut app = app();
         let mut hub = SubmissionHub::new();
-        let mut submit_controller =
-            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        let mut submit_controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
 
         let mut events = VecDeque::from([TerminalEvent::Key(key(
             KeyCode::Char('?'),
@@ -6813,8 +6841,12 @@ mod tests {
                 app.source_changed(0, path, current);
             }
             let hub = SubmissionHub::new();
-            let mut controller =
-                SubmitController::new(temp.path(), case.default, PythonRuntime::CPython);
+            let mut controller = SubmitController::new(
+                temp.path(),
+                case.default,
+                PythonRuntime::CPython,
+                configured_auth(),
+            );
             assert!(controller.open(&app, &hub));
             assert_eq!(
                 controller
@@ -6849,8 +6881,12 @@ mod tests {
             let source_current = source.modal().unwrap().current_language(&app);
 
             let hub = SubmissionHub::new();
-            let mut submit =
-                SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+            let mut submit = SubmitController::new(
+                temp.path(),
+                Language::Cpp,
+                PythonRuntime::CPython,
+                configured_auth(),
+            );
             assert!(submit.open(&app, &hub));
             let selected = submit
                 .modal()
@@ -6868,8 +6904,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let app = app();
         let hub = SubmissionHub::new();
-        let mut controller =
-            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        let mut controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
         assert!(controller.open(&app, &hub));
         assert!(controller.modal().unwrap().candidates.is_empty());
 
@@ -6890,13 +6930,48 @@ mod tests {
     }
 
     #[test]
+    fn submit_modal_distinguishes_missing_and_invalid_contest_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("A.cpp"), "int main() {}\n").unwrap();
+        let app = app();
+        let hub = SubmissionHub::new();
+        let invalid = AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "must remain redacted",
+        )));
+
+        for (auth, expected) in [
+            (
+                Arc::new(AuthSnapshot::Missing),
+                "Authentication is not configured.",
+            ),
+            (
+                Arc::new(invalid),
+                "Authentication configuration is invalid.",
+            ),
+        ] {
+            let mut controller =
+                SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython, auth);
+            assert!(controller.open(&app, &hub));
+            let error = controller.modal().unwrap().error.as_deref().unwrap();
+            assert!(error.contains(expected));
+            assert!(!error.contains("must remain redacted"));
+        }
+    }
+
+    #[test]
     fn submit_shortcut_opens_modal_and_modal_keys_require_press_to_submit() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
         fs::write(temp.path().join("A.py"), "python\n").unwrap();
         let mut app = app();
         let mut hub = SubmissionHub::new();
-        let mut controller = SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::PyPy);
+        let mut controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::PyPy,
+            configured_auth(),
+        );
         let (run_tx, _run_rx) = mpsc::channel();
         let mut submit = SubmitInputContext {
             controller: &mut controller,
@@ -6976,8 +7051,12 @@ mod tests {
         fs::write(&source, "exact\r\n").unwrap();
         let app = app();
         let mut hub = SubmissionHub::new();
-        let mut controller =
-            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        let mut controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
         assert!(controller.open(&app, &hub));
         fs::remove_file(source).unwrap();
 
@@ -7003,8 +7082,12 @@ mod tests {
         fs::write(&source, "before modal\n").unwrap();
         let app = app();
         let hub = SubmissionHub::new();
-        let mut controller =
-            SubmitController::new(temp.path(), Language::Cpp, PythonRuntime::CPython);
+        let mut controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
         assert!(controller.open(&app, &hub));
 
         let confirmed_snapshot = "after modal\r\nUnicode: 日本語\r\n";
@@ -7995,8 +8078,12 @@ mod tests {
         assert!(editor_targets.open_template(&app));
         assert!(editor_targets.modal_active());
 
-        let mut submit_controller =
-            SubmitController::new(&destination, Language::Cpp, PythonRuntime::CPython);
+        let mut submit_controller = SubmitController::new(
+            &destination,
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
         let mut submissions = SubmissionHub::new();
         let mut editor = RecordingSourceEditor::new(EditorLaunchMode::External);
         let mut events = VecDeque::from([TerminalEvent::Key(key(

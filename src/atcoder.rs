@@ -37,7 +37,7 @@ const MAX_429_RETRIES: usize = 3;
 #[derive(Debug)]
 pub enum AtCoderError {
     Http(reqwest::Error),
-    Auth(std::io::Error),
+    Auth(auth::AuthLoadError),
     InvalidStoredCookie,
     UnexpectedAuthenticationStatus(StatusCode),
     Fixture {
@@ -65,11 +65,14 @@ pub enum AuthenticationStatus {
 }
 
 pub fn authentication_status() -> Result<AuthenticationStatus, AtCoderError> {
-    let Some(cookie) = auth::load_cookie().map_err(AtCoderError::Auth)? else {
-        return Ok(AuthenticationStatus::NotConfigured);
+    let auth = auth::AuthSnapshot::load();
+    match auth.as_ref() {
+        auth::AuthSnapshot::Missing => return Ok(AuthenticationStatus::NotConfigured),
+        auth::AuthSnapshot::Invalid(error) => return Err(AtCoderError::Auth(*error)),
+        auth::AuthSnapshot::Configured(_) => {}
     };
 
-    let client = build_http_client(Some(cookie))?;
+    let client = build_http_client(credential_header(auth.credential())?)?;
 
     let response = client
         .get(format!("{BASE_URL}/settings"))
@@ -173,12 +176,12 @@ struct HttpSource {
 }
 
 struct LazySubmitClient {
-    cookie: Option<String>,
+    cookie: Option<HeaderValue>,
     client: Mutex<Option<Client>>,
 }
 
 impl LazySubmitClient {
-    fn new(cookie: Option<String>) -> Self {
+    fn new(cookie: Option<HeaderValue>) -> Self {
         Self {
             cookie,
             client: Mutex::new(None),
@@ -191,7 +194,7 @@ impl LazySubmitClient {
 
     fn get_or_try_init_with(
         &self,
-        build: impl FnOnce(Option<String>) -> Result<Client, AtCoderError>,
+        build: impl FnOnce(Option<HeaderValue>) -> Result<Client, AtCoderError>,
     ) -> Result<Client, AtCoderError> {
         let mut cached = self
             .client
@@ -208,7 +211,7 @@ impl LazySubmitClient {
 }
 
 impl HttpSource {
-    fn new(cookie: Option<String>) -> Result<Self, AtCoderError> {
+    fn new(cookie: Option<HeaderValue>) -> Result<Self, AtCoderError> {
         Ok(Self {
             client: build_http_client(cookie.clone())?,
             submit_client: LazySubmitClient::new(cookie),
@@ -248,16 +251,45 @@ impl From<&crate::model::Problem> for ProblemOutline {
 
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
-        let cookie = auth::load_cookie().map_err(AtCoderError::Auth)?;
+        let auth = auth::AuthSnapshot::load();
+        if let auth::AuthSnapshot::Invalid(error) = auth.as_ref() {
+            return Err(AtCoderError::Auth(*error));
+        }
+        Self::from_auth_snapshot(&auth)
+    }
 
+    pub(crate) fn from_auth_snapshot(auth: &auth::AuthSnapshot) -> Result<Self, AtCoderError> {
+        match auth.credential() {
+            Some(credential) => Ok(Self {
+                source: Source::Http(HttpSource::new(credential_header(Some(credential))?)?),
+            }),
+            None => Self::anonymous(),
+        }
+    }
+
+    pub(crate) fn anonymous() -> Result<Self, AtCoderError> {
         Ok(Self {
-            source: Source::Http(HttpSource::new(cookie)?),
+            source: Source::Http(HttpSource::new(None)?),
         })
     }
 
     pub fn fixture(root: impl Into<PathBuf>) -> Self {
         Self {
             source: Source::Fixture(root.into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn credential_matches_for_test(&self, expected: &str) -> bool {
+        match &self.source {
+            Source::Http(http) => {
+                http.submit_client
+                    .cookie
+                    .as_ref()
+                    .and_then(|cookie| cookie.to_str().ok())
+                    == Some(expected)
+            }
+            Source::Fixture(_) => false,
         }
     }
 
@@ -371,11 +403,24 @@ impl AtCoderClient {
     }
 }
 
-fn build_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
+fn credential_header(
+    credential: Option<&auth::Credential>,
+) -> Result<Option<HeaderValue>, AtCoderError> {
+    credential
+        .map(|credential| {
+            let mut header = HeaderValue::from_str(credential.as_str())
+                .map_err(|_| AtCoderError::InvalidStoredCookie)?;
+            header.set_sensitive(true);
+            Ok(header)
+        })
+        .transpose()
+}
+
+fn build_http_client(cookie: Option<HeaderValue>) -> Result<Client, AtCoderError> {
     Ok(http_client_builder(cookie)?.build()?)
 }
 
-fn build_submit_http_client(cookie: Option<String>) -> Result<Client, AtCoderError> {
+fn build_submit_http_client(cookie: Option<HeaderValue>) -> Result<Client, AtCoderError> {
     Ok(http_client_builder(cookie)?
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -383,7 +428,7 @@ fn build_submit_http_client(cookie: Option<String>) -> Result<Client, AtCoderErr
 }
 
 fn http_client_builder(
-    cookie: Option<String>,
+    cookie: Option<HeaderValue>,
 ) -> Result<reqwest::blocking::ClientBuilder, AtCoderError> {
     let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
     let authenticated = cookie.is_some();
@@ -404,12 +449,10 @@ fn http_client_builder(
     Ok(builder)
 }
 
-fn default_headers(cookie: Option<String>) -> Result<HeaderMap, AtCoderError> {
+fn default_headers(cookie: Option<HeaderValue>) -> Result<HeaderMap, AtCoderError> {
     let mut headers = HeaderMap::new();
 
-    if let Some(cookie) = cookie {
-        let mut cookie =
-            HeaderValue::from_str(&cookie).map_err(|_| AtCoderError::InvalidStoredCookie)?;
+    if let Some(mut cookie) = cookie {
         cookie.set_sensitive(true);
         headers.insert(COOKIE, cookie);
     }
@@ -816,7 +859,8 @@ mod tests {
     #[test]
     fn stored_cookie_header_is_sensitive_and_invalid_values_do_not_leak() {
         let secret = "REVEL_SESSION=do-not-print";
-        let headers = default_headers(Some(secret.to_string())).unwrap();
+        let auth = auth::AuthSnapshot::configured_for_test(secret);
+        let headers = default_headers(credential_header(auth.credential()).unwrap()).unwrap();
         let cookie = headers.get(COOKIE).unwrap();
 
         assert_eq!(cookie.to_str().unwrap(), secret);
@@ -824,7 +868,8 @@ mod tests {
         assert!(!format!("{headers:?}").contains(secret));
 
         let invalid = "REVEL_SESSION=secret\r\nX-Injected: yes";
-        let error = default_headers(Some(invalid.to_string())).unwrap_err();
+        let auth = auth::AuthSnapshot::configured_for_test(invalid);
+        let error = credential_header(auth.credential()).unwrap_err();
         assert!(matches!(error, AtCoderError::InvalidStoredCookie));
         assert!(!error.to_string().contains("secret"));
         assert!(!format!("{error:?}").contains("secret"));
@@ -834,6 +879,26 @@ mod tests {
     fn anonymous_default_headers_have_no_cookie() {
         let headers = default_headers(None).unwrap();
         assert!(!headers.contains_key(COOKIE));
+    }
+
+    #[test]
+    fn snapshot_construction_configures_or_omits_cookie_without_disk_loading() {
+        let marker = "REVEL_SESSION=snapshot-client-marker";
+        let configured = auth::AuthSnapshot::configured_for_test(marker);
+        let configured_client = AtCoderClient::from_auth_snapshot(&configured).unwrap();
+        assert!(configured_client.credential_matches_for_test(marker));
+
+        let missing_client =
+            AtCoderClient::from_auth_snapshot(&auth::AuthSnapshot::Missing).unwrap();
+        assert!(!missing_client.credential_matches_for_test(marker));
+        let invalid_client = AtCoderClient::from_auth_snapshot(&auth::AuthSnapshot::Invalid(
+            auth::AuthLoadError::from_io(&std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "test invalid cookie",
+            )),
+        ))
+        .unwrap();
+        assert!(!invalid_client.credential_matches_for_test(marker));
     }
 
     #[test]
@@ -883,24 +948,6 @@ mod tests {
         assert!(matches!(error, AtCoderError::InvalidStoredCookie));
         lazy.get_or_try_init_with(build_submit_http_client)
             .expect("a later submit client construction should still succeed");
-    }
-
-    #[test]
-    fn lazy_submit_client_initialization_failure_is_redacted_and_uncached() {
-        let secret = "REVEL_SESSION=submit-secret\r\ninvalid";
-        let lazy = LazySubmitClient::new(Some(secret.to_string()));
-        let error = lazy
-            .get()
-            .expect_err("submit client construction should reject an invalid cookie");
-        let cached = lazy
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
-        assert!(cached.is_none());
-        assert!(!error.to_string().contains(secret));
-        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

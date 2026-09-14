@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
 use crate::atcoder::AtCoderClient;
 use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
+use crate::auth::AuthSnapshot;
 use crate::commands::submit::{
     PreparedSubmit, SubmissionCompletion, SubmissionEvent, SubmitPlan,
     execute_prepared_with_client, prepare_submit,
@@ -399,39 +402,19 @@ impl SubmissionCancellation {
 trait SubmissionExecutor: Send + Sync {
     fn execute(
         &self,
+        atcoder: &AtCoderClient,
         prepared: PreparedSubmit,
         emit: &mut dyn FnMut(SubmissionEvent) -> bool,
         cancellation: &SubmissionCancellation,
     ) -> Result<SubmissionCompletion, AppError>;
 }
 
-#[derive(Default)]
-struct LazySharedAtCoderClient {
-    client: Mutex<Option<Arc<AtCoderClient>>>,
-}
-
-impl LazySharedAtCoderClient {
-    fn get(&self) -> Result<Arc<AtCoderClient>, AppError> {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(client) = client.as_ref() {
-            return Ok(Arc::clone(client));
-        }
-        let initialized = Arc::new(AtCoderClient::new()?);
-        *client = Some(Arc::clone(&initialized));
-        Ok(initialized)
-    }
-}
-
-struct AtCoderSubmissionExecutor {
-    client: Arc<LazySharedAtCoderClient>,
-}
+struct AtCoderSubmissionExecutor;
 
 impl SubmissionExecutor for AtCoderSubmissionExecutor {
     fn execute(
         &self,
+        atcoder: &AtCoderClient,
         prepared: PreparedSubmit,
         emit: &mut dyn FnMut(SubmissionEvent) -> bool,
         cancellation: &SubmissionCancellation,
@@ -439,13 +422,9 @@ impl SubmissionExecutor for AtCoderSubmissionExecutor {
         if !cancellation.should_continue() {
             return Ok(SubmissionCompletion::CancelledBeforeSubmit);
         }
-        let atcoder = self.client.get()?;
-        if !cancellation.should_continue() {
-            return Ok(SubmissionCompletion::CancelledBeforeSubmit);
-        }
         execute_prepared_with_client(
             prepared,
-            &atcoder,
+            atcoder,
             emit,
             &|| cancellation.should_continue(),
             &|| cancellation.try_begin_post(),
@@ -457,8 +436,6 @@ pub(crate) struct SubmissionHub {
     records: HashMap<SubmissionKey, SubmissionRecord>,
     history: Vec<SubmissionHistoryEntry>,
     next_generation: u64,
-    #[cfg(test)]
-    client: Arc<LazySharedAtCoderClient>,
     executor: Arc<dyn SubmissionExecutor>,
     event_tx: mpsc::Sender<WorkerEvent>,
     event_rx: mpsc::Receiver<WorkerEvent>,
@@ -479,14 +456,11 @@ impl Default for SubmissionHub {
 impl SubmissionHub {
     pub(crate) fn new() -> Self {
         let (event_tx, event_rx) = mpsc::channel();
-        let client = Arc::new(LazySharedAtCoderClient::default());
         Self {
             records: HashMap::new(),
             history: Vec::new(),
             next_generation: 1,
-            #[cfg(test)]
-            client: Arc::clone(&client),
-            executor: Arc::new(AtCoderSubmissionExecutor { client }),
+            executor: Arc::new(AtCoderSubmissionExecutor),
             event_tx,
             event_rx,
             workers: Vec::new(),
@@ -617,16 +591,25 @@ impl SubmissionHub {
 
     pub(crate) fn start(
         &mut self,
+        auth: &AuthSnapshot,
         key: SubmissionKey,
         problem_index: String,
         problem_title: String,
         plan: SubmitPlan,
     ) -> Result<u64, String> {
-        self.start_with_timestamp(key, problem_index, problem_title, plan, SystemTime::now())
+        self.start_with_timestamp(
+            auth,
+            key,
+            problem_index,
+            problem_title,
+            plan,
+            SystemTime::now(),
+        )
     }
 
     fn start_with_timestamp(
         &mut self,
+        auth: &AuthSnapshot,
         key: SubmissionKey,
         problem_index: String,
         problem_title: String,
@@ -637,6 +620,14 @@ impl SubmissionHub {
             return Err("Submission is unavailable while the TUI is stopping.".to_string());
         }
         self.ensure_start_allowed(&key).map_err(str::to_owned)?;
+        if let Some(message) = auth.submission_unavailable_message() {
+            return Err(message.to_string());
+        }
+        let atcoder = Arc::new(
+            AtCoderClient::from_auth_snapshot(auth)
+                .map_err(AppError::from)
+                .map_err(|error| error.to_string())?,
+        );
 
         let language_label = plan.receipt_language_label().to_string();
 
@@ -662,6 +653,7 @@ impl SubmissionHub {
                 run_worker(
                     thread_key,
                     generation,
+                    atcoder,
                     prepared,
                     executor,
                     thread_cancellation,
@@ -1173,9 +1165,11 @@ impl Drop for SubmissionHub {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     key: SubmissionKey,
     generation: u64,
+    atcoder: Arc<AtCoderClient>,
     prepared: PreparedSubmit,
     executor: Arc<dyn SubmissionExecutor>,
     cancellation: Arc<SubmissionCancellation>,
@@ -1186,6 +1180,7 @@ fn run_worker(
         run_worker_inner(
             &key,
             generation,
+            &atcoder,
             prepared,
             executor,
             &cancellation,
@@ -1208,9 +1203,11 @@ fn run_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker_inner(
     key: &SubmissionKey,
     generation: u64,
+    atcoder: &AtCoderClient,
     prepared: PreparedSubmit,
     executor: Arc<dyn SubmissionExecutor>,
     cancellation: &SubmissionCancellation,
@@ -1223,6 +1220,7 @@ fn run_worker_inner(
         return;
     }
     let result = executor.execute(
+        atcoder,
         prepared,
         &mut |event| {
             // AcceptedKnown is published only when the shared orchestration reports remote
@@ -1314,6 +1312,7 @@ mod tests {
     impl SubmissionExecutor for TestExecutor {
         fn execute(
             &self,
+            _atcoder: &AtCoderClient,
             prepared: PreparedSubmit,
             emit: &mut dyn FnMut(SubmissionEvent) -> bool,
             cancellation: &SubmissionCancellation,
@@ -1334,6 +1333,10 @@ mod tests {
 
     fn key() -> SubmissionKey {
         SubmissionKey::new("adt_easy_20260826_1", "abc430_a")
+    }
+
+    fn configured_auth() -> Arc<AuthSnapshot> {
+        AuthSnapshot::configured_for_test("REVEL_SESSION=submission-test-credential")
     }
 
     fn official_timestamp(second: u8) -> time::OffsetDateTime {
@@ -1410,6 +1413,7 @@ mod tests {
             PythonRuntime::CPython,
         );
         hub.start_with_timestamp(
+            &configured_auth(),
             key.clone(),
             problem_index.to_string(),
             format!("Problem {problem_index}"),
@@ -1779,8 +1783,14 @@ mod tests {
             PythonRuntime::CPython,
         );
         assert!(
-            hub.start(key.clone(), "A".to_string(), "Problem A".to_string(), plan,)
-                .is_err()
+            hub.start(
+                &configured_auth(),
+                key.clone(),
+                "A".to_string(),
+                "Problem A".to_string(),
+                plan,
+            )
+            .is_err()
         );
         assert_eq!(hub.next_generation, next_generation);
         assert_eq!(post_count.load(Ordering::Acquire), 1);
@@ -2420,6 +2430,215 @@ mod tests {
     }
 
     #[test]
+    fn missing_and_invalid_auth_fail_before_worker_or_network_executor() {
+        for (auth, expected) in [
+            (
+                Arc::new(AuthSnapshot::Missing),
+                "Authentication is not configured.",
+            ),
+            (
+                Arc::new(AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "distinctive-secret-must-not-escape",
+                    ),
+                ))),
+                "Authentication configuration is invalid.",
+            ),
+        ] {
+            let executor = TestExecutor::with_keyed_runs(Vec::new());
+            let mut hub =
+                SubmissionHub::with_executor(Arc::clone(&executor) as Arc<dyn SubmissionExecutor>);
+            let key = key();
+            let plan = SubmitPlan::for_selected_source(
+                key.contest_id.clone(),
+                key.task_id.clone(),
+                "A".to_string(),
+                std::path::PathBuf::from("source-must-not-be-read.cpp"),
+                Language::Cpp,
+                PythonRuntime::CPython,
+            );
+
+            let error = hub
+                .start(&auth, key, "A".to_string(), "Problem A".to_string(), plan)
+                .unwrap_err();
+
+            assert!(error.contains(expected));
+            assert!(!error.contains("distinctive-secret"));
+            assert_eq!(executor.calls.load(Ordering::Acquire), 0);
+            assert_eq!(hub.next_generation, 1);
+            assert!(hub.workers.is_empty());
+            assert!(hub.history.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_new_auth_generation_cannot_bypass_the_application_unknown_lock() {
+        let executor = TestExecutor::with_keyed_runs(Vec::new());
+        let mut hub =
+            SubmissionHub::with_executor(Arc::clone(&executor) as Arc<dyn SubmissionExecutor>);
+        let key = key();
+        hub.records.insert(
+            key.clone(),
+            SubmissionRecord {
+                unknown_generation: Some(41),
+                ..SubmissionRecord::default()
+            },
+        );
+        let plan = SubmitPlan::for_selected_source(
+            key.contest_id.clone(),
+            key.task_id.clone(),
+            "A".to_string(),
+            std::path::PathBuf::from("unknown-lock-source.cpp"),
+            Language::Cpp,
+            PythonRuntime::CPython,
+        );
+        let fresh_auth =
+            AuthSnapshot::configured_for_test("REVEL_SESSION=fresh-after-unknown-outcome");
+
+        let error = hub
+            .start(
+                &fresh_auth,
+                key,
+                "A".to_string(),
+                "Problem A".to_string(),
+                plan,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("outcome is unknown"));
+        assert_eq!(executor.calls.load(Ordering::Acquire), 0);
+        assert_eq!(hub.next_generation, 1);
+    }
+
+    #[test]
+    fn server_auth_failure_is_not_retried_or_refreshed_automatically() {
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let worker_posts = Arc::clone(&post_count);
+        let executor = TestExecutor::for_key(
+            key(),
+            vec![Box::new(move |_, _, cancellation| {
+                assert!(cancellation.try_begin_post());
+                worker_posts.fetch_add(1, Ordering::AcqRel);
+                Err(crate::atcoder::submit::SubmitError::AuthenticationRequired.into())
+            })],
+        );
+        let mut hub =
+            SubmissionHub::with_executor(Arc::clone(&executor) as Arc<dyn SubmissionExecutor>);
+        let key = key();
+        let generation = start_test_submission(&mut hub, &key, "A");
+        wait_for_hub(&mut hub, "server authentication failure", |hub| {
+            matches!(
+                hub.attempt_resolution(&key, generation),
+                Some(AttemptResolution::Failed(_))
+            ) && hub.workers.is_empty()
+        });
+
+        let _new_disk_generation =
+            AuthSnapshot::configured_for_test("REVEL_SESSION=changed-after-auth-failure");
+        for _ in 0..3 {
+            hub.handle_events();
+        }
+
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+        assert_eq!(post_count.load(Ordering::Acquire), 1);
+    }
+
+    struct AuthRecordingExecutor {
+        observed: mpsc::Sender<&'static str>,
+        release_old: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl SubmissionExecutor for AuthRecordingExecutor {
+        fn execute(
+            &self,
+            atcoder: &AtCoderClient,
+            _prepared: PreparedSubmit,
+            emit: &mut dyn FnMut(SubmissionEvent) -> bool,
+            cancellation: &SubmissionCancellation,
+        ) -> Result<SubmissionCompletion, AppError> {
+            let generation = if atcoder.credential_matches_for_test("REVEL_SESSION=attempt-auth-a")
+            {
+                "A"
+            } else if atcoder.credential_matches_for_test("REVEL_SESSION=attempt-auth-b") {
+                "B"
+            } else {
+                panic!("submission attempt received an unexpected authentication generation")
+            };
+            self.observed.send(generation).unwrap();
+            if generation == "A" {
+                self.release_old
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv()
+                    .unwrap();
+            }
+            assert!(cancellation.try_begin_post());
+            assert!(emit(SubmissionEvent::Accepted));
+            Ok(SubmissionCompletion::Accepted)
+        }
+    }
+
+    #[test]
+    fn in_flight_attempt_keeps_old_auth_while_new_attempt_uses_new_auth() {
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let executor = Arc::new(AuthRecordingExecutor {
+            observed: observed_tx,
+            release_old: Mutex::new(release_rx),
+        });
+        let mut hub = SubmissionHub::with_executor(executor);
+        let temp = tempfile::tempdir().unwrap();
+        let auth_a = AuthSnapshot::configured_for_test("REVEL_SESSION=attempt-auth-a");
+        let auth_b = AuthSnapshot::configured_for_test("REVEL_SESSION=attempt-auth-b");
+        let key_a = SubmissionKey::new("contest-a", "contest_a_task");
+        let key_b = SubmissionKey::new("contest-b", "contest_b_task");
+        for (auth, key, source) in [
+            (&auth_a, key_a.clone(), "A.cpp"),
+            (&auth_b, key_b.clone(), "B.cpp"),
+        ] {
+            let path = temp.path().join(source);
+            std::fs::write(&path, "int main() {}\n").unwrap();
+            let plan = SubmitPlan::for_selected_source(
+                key.contest_id.clone(),
+                key.task_id.clone(),
+                "A".to_string(),
+                path,
+                Language::Cpp,
+                PythonRuntime::CPython,
+            );
+            hub.start(auth, key, "A".to_string(), "Problem A".to_string(), plan)
+                .unwrap();
+            assert_eq!(
+                observed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                if source == "A.cpp" { "A" } else { "B" }
+            );
+        }
+        release_tx.send(()).unwrap();
+        wait_for_hub(&mut hub, "both auth generations", |hub| {
+            hub.workers.is_empty()
+        });
+
+        assert!(matches!(
+            hub.state(&key_a),
+            Some(SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Accepted),
+                attempt: None
+            })
+        ));
+        assert!(matches!(
+            hub.state(&key_b),
+            Some(SubmissionDisplayState {
+                current: Some(TuiSubmissionState::Accepted),
+                attempt: None
+            })
+        ));
+        let history_debug = format!("{:?}", hub.history);
+        assert!(!history_debug.contains("attempt-auth-a"));
+        assert!(!history_debug.contains("attempt-auth-b"));
+    }
+
+    #[test]
     fn worker_progress_is_monotonic_from_accepted_through_finished() {
         let progress = WorkerProgress::default();
         assert_eq!(progress.phase(), WorkerProgressPhase::PreAccepted);
@@ -2462,16 +2681,11 @@ mod tests {
     }
 
     #[test]
-    fn creating_the_memory_only_hub_does_not_initialize_an_atcoder_client() {
+    fn creating_the_memory_only_hub_has_no_contest_auth_state() {
         let hub = SubmissionHub::new();
-        assert!(
-            hub.client
-                .client
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
-        );
         assert!(hub.records.is_empty());
+        assert!(hub.history.is_empty());
+        assert!(hub.workers.is_empty());
     }
 
     #[test]
@@ -2871,8 +3085,14 @@ mod tests {
         );
 
         assert!(
-            hub.start(key.clone(), "A".to_string(), "Problem A".to_string(), plan,)
-                .is_err()
+            hub.start(
+                &configured_auth(),
+                key.clone(),
+                "A".to_string(),
+                "Problem A".to_string(),
+                plan,
+            )
+            .is_err()
         );
         assert!(old_cancellation.should_continue());
         assert!(hub.history.is_empty());
