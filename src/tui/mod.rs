@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_context::AppContext;
-use crate::auth::AuthSnapshot;
+use crate::auth::SessionAuth;
 use crate::config::Config;
 use crate::editor::{self, EditorLaunchMode, ResolvedEditor};
 use crate::error::AppError;
@@ -535,7 +535,7 @@ struct SubmitController {
     destination: PathBuf,
     default_language: Language,
     python_runtime: PythonRuntime,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
     modal: Option<SubmitModal>,
 }
 
@@ -544,7 +544,7 @@ impl SubmitController {
         destination: &Path,
         default_language: Language,
         python_runtime: PythonRuntime,
-        auth: Arc<AuthSnapshot>,
+        auth: Arc<SessionAuth>,
     ) -> Self {
         Self {
             destination: destination.to_path_buf(),
@@ -2610,7 +2610,7 @@ impl<'a> SessionChannels<'a> {
 pub(crate) struct SessionRuntime<'a> {
     current_destination: &'a Path,
     config: &'a Config,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
     stress_setup: StressSetupContext<'a>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
@@ -2663,7 +2663,7 @@ impl<'a> SessionRuntime<'a> {
     pub(crate) fn new(
         current_destination: &'a Path,
         config: &'a Config,
-        auth: Arc<AuthSnapshot>,
+        auth: Arc<SessionAuth>,
         contest: &'a Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
@@ -5372,8 +5372,8 @@ mod tests {
     use std::sync::mpsc;
     use terminal::{PointerButton as MouseButton, PointerKind as MouseEventKind};
 
-    fn configured_auth() -> Arc<AuthSnapshot> {
-        AuthSnapshot::configured_for_test("REVEL_SESSION=tui-test-credential")
+    fn configured_auth() -> Arc<SessionAuth> {
+        SessionAuth::configured_for_test("REVEL_SESSION=tui-test-credential")
     }
 
     fn app() -> WatchApp {
@@ -6935,18 +6935,17 @@ mod tests {
         fs::write(temp.path().join("A.cpp"), "int main() {}\n").unwrap();
         let app = app();
         let hub = SubmissionHub::new();
-        let invalid = AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(&io::Error::new(
-            io::ErrorKind::InvalidData,
-            "must remain redacted",
-        )));
+        let invalid = crate::auth::AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(
+            &io::Error::new(io::ErrorKind::InvalidData, "must remain redacted"),
+        ));
 
         for (auth, expected) in [
             (
-                Arc::new(AuthSnapshot::Missing),
+                SessionAuth::from_snapshot(&crate::auth::AuthSnapshot::Missing),
                 "Authentication is not configured.",
             ),
             (
-                Arc::new(invalid),
+                SessionAuth::from_snapshot(&invalid),
                 "Authentication configuration is invalid.",
             ),
         ] {

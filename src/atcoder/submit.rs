@@ -725,6 +725,9 @@ impl AtCoderClient {
     ) -> Result<SubmitExecutionOutcome, SubmitError> {
         match &self.source {
             Source::Http(http) => {
+                if http.auth.kind() != crate::auth::SessionAuthKind::Configured {
+                    return Err(SubmitError::AuthenticationRequired);
+                }
                 let mut transport = HttpSubmitTransport { http };
                 submit_with_transport_and_before_post_until(
                     &mut transport,
@@ -770,6 +773,7 @@ struct SubmitHttpResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmitTransportFailure {
     ClientInitialization,
+    AuthenticationRequired,
     Timeout,
     ConnectionReset,
     Other,
@@ -835,9 +839,8 @@ impl SubmitTransport for HttpSubmitTransport<'_> {
             return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
         }
         let response = self
-            .submit_page_client()
-            .get(format!("{BASE_URL}{path}"))
-            .send()
+            .http
+            .send(self.submit_page_client().get(format!("{BASE_URL}{path}")))
             .map_err(classify_transport_failure)?;
         if !should_continue() {
             return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
@@ -875,12 +878,20 @@ impl SubmitTransport for HttpSubmitTransport<'_> {
         if !should_continue() || !wait_for_request_slot_until(self.http, should_continue) {
             return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
         }
-        // This is the cancellation linearization point. A successful gate means the physical
-        // attempt has started; cancellation after it must not change the POST outcome semantics.
-        if !try_begin_post() {
-            return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
-        }
-        let response = request.send().map_err(classify_transport_failure)?;
+        // Authentication revalidation and the cancellation linearization point are inside the
+        // same session exchange as request-time Cookie injection. If authentication disappeared
+        // after the baseline, the POST gate remains untouched and no physical request starts.
+        let response = match self.http.send_authenticated_once(request, try_begin_post) {
+            super::AuthenticatedSendResult::AuthenticationRequired => {
+                return Err(SubmitTransportFailure::AuthenticationRequired);
+            }
+            super::AuthenticatedSendResult::CancelledBeforePost => {
+                return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
+            }
+            super::AuthenticatedSendResult::Sent(response) => {
+                response.map_err(classify_transport_failure)?
+            }
+        };
 
         Ok(SubmitTransportProgress::Completed(
             collect_submit_response_without_body(response),
@@ -1023,6 +1034,9 @@ fn submit_with_transport_and_before_post_until(
         }
         Err(SubmitTransportFailure::ClientInitialization) => {
             return Err(SubmitError::SubmitClientInitializationFailed);
+        }
+        Err(SubmitTransportFailure::AuthenticationRequired) => {
+            return Err(SubmitError::AuthenticationRequired);
         }
         Err(_) => {
             return Ok(SubmitExecutionOutcome::Submitted(
@@ -2377,8 +2391,10 @@ mod tests {
 
     #[test]
     fn production_transport_separates_normal_get_and_one_shot_post_clients() {
-        let http = super::super::HttpSource::new(None)
-            .expect("normal HTTP source should construct without making a request");
+        let http = super::super::HttpSource::new(crate::auth::SessionAuth::from_snapshot(
+            &crate::auth::AuthSnapshot::Missing,
+        ))
+        .expect("normal HTTP source should construct without making a request");
         let transport = HttpSubmitTransport { http: &http };
 
         assert!(std::ptr::eq(transport.submit_page_client(), &http.client));
@@ -2402,6 +2418,33 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn missing_invalid_and_server_deleted_auth_reject_before_any_http_exchange() {
+        let invalid = crate::auth::AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(
+            &std::io::Error::new(std::io::ErrorKind::InvalidData, "redacted test reason"),
+        ));
+        let deleted = crate::auth::SessionAuth::configured_for_test("REVEL_SESSION=deleted-a");
+        let deletion = [reqwest::header::HeaderValue::from_static(
+            "REVEL_SESSION=; Path=/",
+        )];
+        deleted.observe_set_cookie_batch(
+            deletion.iter(),
+            &reqwest::Url::parse("https://atcoder.jp/").unwrap(),
+        );
+
+        for session in [
+            crate::auth::SessionAuth::from_snapshot(&crate::auth::AuthSnapshot::Missing),
+            crate::auth::SessionAuth::from_snapshot(&invalid),
+            deleted,
+        ] {
+            let client = AtCoderClient::from_session_auth(session).unwrap();
+            let error = client
+                .submit(submit_request(Language::Cpp, "int main() {}"))
+                .unwrap_err();
+            assert_eq!(error, SubmitError::AuthenticationRequired);
+        }
     }
 
     #[test]

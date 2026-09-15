@@ -4,9 +4,9 @@
 
 ## ContestSession の設定境界
 
-新しい ContestSession を開始すると、その時点の Global Config と Authentication Cookie が snapshot として固定されます。Contest の Refresh は両方の snapshot を維持し、Switch Contest、Home からの再 entry、`atc contest` / `atc c` / TUI の `atc watch` は現在の Config と cookie から新しい snapshot を作ります。
+新しい ContestSession を開始すると、その時点の Global Config と外部 Authentication Cookie を snapshot として1回だけ読み込みます。Contest の Refresh は同じ Config と evolving session auth を維持し、Switch Contest、Home からの再 entry、`atc contest` / `atc c` / TUI の `atc watch` は現在の Config と外部 cookie から新しい session を作ります。
 
-Contest 中に Config や cookie file を変更しても、現在の session には反映されません。反映するには Home へ戻って入り直すか、Contest を Switch してください。Authentication Cookie の保存形式と安全な file policy は [AtCoder 認証](authentication.md) を参照してください。
+Contest 中に Config や cookie file を外部から変更しても、現在の session には反映されません。反映するには Home へ戻って入り直すか、Contest を Switch してください。ただし AtCoder が trusted HTTPS response で `REVEL_SESSION` を更新した場合は、active session が successor を引き継ぎます。Authentication Cookie の保存形式と安全な file policy は [AtCoder 認証](authentication.md) を参照してください。
 
 ## 設定ファイルを作る
 

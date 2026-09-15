@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use crate::atcoder::AtCoderClient;
 use crate::atcoder::submission_tracking::{SubmissionStatus, Verdict};
-use crate::auth::AuthSnapshot;
+use crate::auth::SessionAuth;
 use crate::commands::submit::{
     PreparedSubmit, SubmissionCompletion, SubmissionEvent, SubmitPlan,
     execute_prepared_with_client, prepare_submit,
@@ -591,7 +591,7 @@ impl SubmissionHub {
 
     pub(crate) fn start(
         &mut self,
-        auth: &AuthSnapshot,
+        auth: &Arc<SessionAuth>,
         key: SubmissionKey,
         problem_index: String,
         problem_title: String,
@@ -609,7 +609,7 @@ impl SubmissionHub {
 
     fn start_with_timestamp(
         &mut self,
-        auth: &AuthSnapshot,
+        auth: &Arc<SessionAuth>,
         key: SubmissionKey,
         problem_index: String,
         problem_title: String,
@@ -624,7 +624,7 @@ impl SubmissionHub {
             return Err(message.to_string());
         }
         let atcoder = Arc::new(
-            AtCoderClient::from_auth_snapshot(auth)
+            AtCoderClient::from_session_auth(Arc::clone(auth))
                 .map_err(AppError::from)
                 .map_err(|error| error.to_string())?,
         );
@@ -1335,8 +1335,8 @@ mod tests {
         SubmissionKey::new("adt_easy_20260826_1", "abc430_a")
     }
 
-    fn configured_auth() -> Arc<AuthSnapshot> {
-        AuthSnapshot::configured_for_test("REVEL_SESSION=submission-test-credential")
+    fn configured_auth() -> Arc<SessionAuth> {
+        SessionAuth::configured_for_test("REVEL_SESSION=submission-test-credential")
     }
 
     fn official_timestamp(second: u8) -> time::OffsetDateTime {
@@ -2433,16 +2433,16 @@ mod tests {
     fn missing_and_invalid_auth_fail_before_worker_or_network_executor() {
         for (auth, expected) in [
             (
-                Arc::new(AuthSnapshot::Missing),
+                SessionAuth::from_snapshot(&crate::auth::AuthSnapshot::Missing),
                 "Authentication is not configured.",
             ),
             (
-                Arc::new(AuthSnapshot::Invalid(crate::auth::AuthLoadError::from_io(
-                    &io::Error::new(
+                SessionAuth::from_snapshot(&crate::auth::AuthSnapshot::Invalid(
+                    crate::auth::AuthLoadError::from_io(&io::Error::new(
                         io::ErrorKind::InvalidData,
                         "distinctive-secret-must-not-escape",
-                    ),
-                ))),
+                    )),
+                )),
                 "Authentication configuration is invalid.",
             ),
         ] {
@@ -2494,7 +2494,7 @@ mod tests {
             PythonRuntime::CPython,
         );
         let fresh_auth =
-            AuthSnapshot::configured_for_test("REVEL_SESSION=fresh-after-unknown-outcome");
+            SessionAuth::configured_for_test("REVEL_SESSION=fresh-after-unknown-outcome");
 
         let error = hub
             .start(
@@ -2535,7 +2535,7 @@ mod tests {
         });
 
         let _new_disk_generation =
-            AuthSnapshot::configured_for_test("REVEL_SESSION=changed-after-auth-failure");
+            SessionAuth::configured_for_test("REVEL_SESSION=changed-after-auth-failure");
         for _ in 0..3 {
             hub.handle_events();
         }
@@ -2589,8 +2589,8 @@ mod tests {
         });
         let mut hub = SubmissionHub::with_executor(executor);
         let temp = tempfile::tempdir().unwrap();
-        let auth_a = AuthSnapshot::configured_for_test("REVEL_SESSION=attempt-auth-a");
-        let auth_b = AuthSnapshot::configured_for_test("REVEL_SESSION=attempt-auth-b");
+        let auth_a = SessionAuth::configured_for_test("REVEL_SESSION=attempt-auth-a");
+        let auth_b = SessionAuth::configured_for_test("REVEL_SESSION=attempt-auth-b");
         let key_a = SubmissionKey::new("contest-a", "contest_a_task");
         let key_b = SubmissionKey::new("contest-b", "contest_b_task");
         for (auth, key, source) in [

@@ -2881,8 +2881,10 @@ mod tests {
 
     #[test]
     fn production_tracking_transport_uses_only_the_normal_get_client() {
-        let http = HttpSource::new(None)
-            .expect("normal HTTP source should construct without making a request");
+        let http = HttpSource::new(crate::auth::SessionAuth::from_snapshot(
+            &crate::auth::AuthSnapshot::Missing,
+        ))
+        .expect("normal HTTP source should construct without making a request");
         let transport = HttpTrackingTransport { http: &http };
 
         assert!(std::ptr::eq(transport.client(), &http.client));

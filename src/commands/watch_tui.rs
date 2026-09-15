@@ -1,5 +1,5 @@
 use crate::app_context::AppContext;
-use crate::auth::AuthSnapshot;
+use crate::auth::{AuthSnapshot, SessionAuth};
 use crate::config::Config;
 #[cfg(test)]
 use crate::config::RunnerConfig;
@@ -426,7 +426,8 @@ pub(crate) fn watch_tui(cli_contest: Option<&str>) -> Result<(), AppError> {
         _ => workspace::resolve_contest_target(&cwd, cli_contest)?,
     };
     let config = Config::load()?;
-    let auth = AuthSnapshot::load();
+    let auth_snapshot = AuthSnapshot::load();
+    let auth = SessionAuth::from_snapshot(&auth_snapshot);
 
     watch_tui_at(&destination, cli_contest, app_context, config, auth)
 }
@@ -465,7 +466,7 @@ pub(super) fn watch_tui_at(
     expected_contest_id: Option<&str>,
     app_context: AppContext,
     config: Config,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
 ) -> Result<(), AppError> {
     let session = start_direct_contest_session_with_hooks(
         destination,
@@ -485,7 +486,7 @@ fn start_direct_contest_session_with_hooks(
     expected_contest_id: Option<&str>,
     app_context: &AppContext,
     config: Config,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
     before_final_revalidation: impl FnOnce(),
     after_start_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
 ) -> Result<ContestSession, AppError> {
@@ -1277,11 +1278,11 @@ fn rebuild_active_contest_session_after_refresh(
 #[derive(Debug, Clone)]
 struct ContestEnvironment {
     config: Box<Config>,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
 }
 
 impl ContestEnvironment {
-    fn from_snapshots(config: Config, auth: Arc<AuthSnapshot>) -> Self {
+    fn from_snapshots(config: Config, auth: Arc<SessionAuth>) -> Self {
         Self {
             config: Box::new(config),
             auth,
@@ -1292,7 +1293,7 @@ impl ContestEnvironment {
     fn new(config: Config) -> Self {
         Self::from_snapshots(
             config,
-            AuthSnapshot::configured_for_test("REVEL_SESSION=contest-test-credential"),
+            SessionAuth::configured_for_test("REVEL_SESSION=contest-test-credential"),
         )
     }
 }
@@ -1534,8 +1535,8 @@ fn prepare_workspace_contest_entry_with<L, A, C, R>(
 where
     L: FnOnce() -> Result<Config, AppError>,
     A: FnOnce() -> Arc<AuthSnapshot>,
-    C: FnOnce(&Path, &str, &Config, &AuthSnapshot, &mut dyn Reporter) -> Result<(), AppError>,
-    R: FnOnce(&Path, &str, &AuthSnapshot, &mut dyn Reporter) -> Result<(), AppError>,
+    C: FnOnce(&Path, &str, &Config, &Arc<SessionAuth>, &mut dyn Reporter) -> Result<(), AppError>,
+    R: FnOnce(&Path, &str, &Arc<SessionAuth>, &mut dyn Reporter) -> Result<(), AppError>,
 {
     // Establish the active workspace routing generation before loading Config or mutating the
     // contest. A second strict check is performed by the shared session finalization boundary.
@@ -1563,7 +1564,8 @@ where
             format!("Global Config invalid: {error}"),
         )
     })?;
-    let auth = load_auth();
+    let auth_snapshot = load_auth();
+    let auth = SessionAuth::from_snapshot(&auth_snapshot);
     let health = inspect_contest_target(&destination, &request.contest_id)?;
     match (request.mutation, health) {
         (crate::tui::ContestSwitchMutation::Open, ContestTargetHealth::Healthy) => {}
@@ -1632,7 +1634,7 @@ where
 fn contest_refresh_task(
     destination: PathBuf,
     contest_id: String,
-    auth: Arc<AuthSnapshot>,
+    auth: Arc<SessionAuth>,
     prepared_refresh: Arc<Mutex<Option<PreparedRefresh>>>,
 ) -> crate::tui::RefreshContestTask {
     Arc::new(move |reporter| {
@@ -2169,7 +2171,11 @@ mod tests {
     use crate::model::{Problem, Sample};
     use crate::tui::message::{RunKind, RunRequest, RunWorkerCommand, TestEvent};
 
-    fn configured_auth() -> Arc<AuthSnapshot> {
+    fn configured_auth() -> Arc<SessionAuth> {
+        SessionAuth::configured_for_test("REVEL_SESSION=watch-tui-test-credential")
+    }
+
+    fn configured_snapshot() -> Arc<AuthSnapshot> {
         AuthSnapshot::configured_for_test("REVEL_SESSION=watch-tui-test-credential")
     }
 
@@ -3815,7 +3821,7 @@ mod tests {
                 &request,
                 reporter,
                 || Config::load_from(&task_config),
-                configured_auth,
+                configured_snapshot,
                 |_, _, _, _, _| panic!("the repaired test contest already exists"),
                 |_, _, _, _| panic!("the repaired test contest is healthy"),
             )?;
@@ -3907,10 +3913,7 @@ mod tests {
             |destination, contest_id, config, auth, _| {
                 assert_eq!(config.defaults.language, Language::Python);
                 assert_eq!(config.runner.python, "python-a");
-                assert_eq!(
-                    auth.credential().map(crate::auth::Credential::as_str),
-                    Some("REVEL_SESSION=entry-auth-a")
-                );
+                assert!(auth.credential_matches_for_test("REVEL_SESSION=entry-auth-a"));
                 std::fs::write(
                     &config_path,
                     "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n",
@@ -3931,13 +3934,11 @@ mod tests {
             Language::Python
         );
         assert_eq!(prepared.environment.config.runner.python, "python-a");
-        assert_eq!(
+        assert!(
             prepared
                 .environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=entry-auth-a")
+                .credential_matches_for_test("REVEL_SESSION=entry-auth-a")
         );
         let disk = Config::load_from(&config_path).unwrap();
         assert_eq!(disk.defaults.language, Language::Cpp);
@@ -3950,13 +3951,11 @@ mod tests {
             Language::Python
         );
         assert_eq!(session.environment.config.runner.python, "python-a");
-        assert_eq!(
+        assert!(
             session
                 .environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=entry-auth-a")
+                .credential_matches_for_test("REVEL_SESSION=entry-auth-a")
         );
         session.shutdown().unwrap();
 
@@ -3988,13 +3987,62 @@ mod tests {
         assert_eq!(auth_loads.get(), 2, "each new entry loads one fresh auth");
         assert_eq!(next.environment.config.defaults.language, Language::Cpp);
         assert_eq!(next.environment.config.runner.python, "python-b");
-        assert_eq!(
+        assert!(
             next.environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=entry-auth-b")
+                .credential_matches_for_test("REVEL_SESSION=entry-auth-b")
         );
+    }
+
+    #[test]
+    fn contest_creation_rotation_is_retained_by_the_started_session() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let destination = root.path().join("abc509");
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Create,
+            contest_id: "abc509".to_string(),
+            destination: destination.clone(),
+        };
+        let mut reporter = crate::ui::NullReporter;
+
+        let prepared = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Ok(Config::default()),
+            || AuthSnapshot::configured_for_test("REVEL_SESSION=creation-a"),
+            |destination, contest_id, _, auth, _| {
+                assert!(auth.credential_matches_for_test("REVEL_SESSION=creation-a"));
+                let headers = [reqwest::header::HeaderValue::from_static(
+                    "REVEL_SESSION=creation-b; Path=/",
+                )];
+                auth.observe_set_cookie_batch(
+                    headers.iter(),
+                    &reqwest::Url::parse("https://atcoder.jp/contests/abc509/tasks").unwrap(),
+                );
+                save_healthy_contest(destination, contest_id);
+                Ok(())
+            },
+            |_, _, _, _| panic!("a missing contest must not enter repair"),
+        )
+        .unwrap();
+
+        assert!(
+            prepared
+                .environment
+                .auth
+                .credential_matches_for_test("REVEL_SESSION=creation-b")
+        );
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let session = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        assert!(
+            session
+                .environment
+                .auth
+                .credential_matches_for_test("REVEL_SESSION=creation-b")
+        );
+        session.shutdown().unwrap();
     }
 
     #[test]
@@ -4013,12 +4061,44 @@ mod tests {
         )
         .unwrap();
         let input = PreparedWatchInput::load(&destination, Some("abc466")).unwrap();
-        let auth_a = AuthSnapshot::configured_for_test("REVEL_SESSION=refresh-auth-a");
+        let auth_platform = root.path().join("auth-platform");
+        let auth_state = auth_platform.join("atc").join("state");
+        let auth_file = auth_state.join("cookie");
+        std::fs::create_dir_all(&auth_state).unwrap();
+        std::fs::write(&auth_file, "REVEL_SESSION=refresh-auth-b").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let auth_b = SessionAuth::load_from_location_for_test(&crate::paths::CookieLocation {
+            platform_base: auth_platform,
+            state_dir: auth_state,
+            file: auth_file.clone(),
+        });
         let session = ContestSession::start_entry(PreparedContestEntry {
             input,
-            environment: ContestEnvironment::from_snapshots(config_a, Arc::clone(&auth_a)),
+            environment: ContestEnvironment::from_snapshots(config_a, Arc::clone(&auth_b)),
         })
         .unwrap();
+        std::fs::write(&auth_file, "REVEL_SESSION=external-auth-x").unwrap();
+        let refresh_auth = Arc::clone(&session.environment.auth);
+        assert!(refresh_auth.credential_matches_for_test("REVEL_SESSION=refresh-auth-b"));
+        let headers = [reqwest::header::HeaderValue::from_static(
+            "REVEL_SESSION=refresh-auth-c; Path=/",
+        )];
+        refresh_auth.observe_set_cookie_batch(
+            headers.iter(),
+            &reqwest::Url::parse("https://atcoder.jp/contests/abc466/tasks").unwrap(),
+        );
+        assert_eq!(
+            refresh_auth.persist_pending(),
+            [crate::auth::AuthPersistenceWarning::Conflict]
+        );
+        assert!(
+            std::fs::read_to_string(&auth_file)
+                .is_ok_and(|value| value == "REVEL_SESSION=external-auth-x")
+        );
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let atcoder = crate::atcoder::AtCoderClient::fixture(fixtures);
         let mut reporter = crate::ui::NullReporter;
@@ -4042,15 +4122,13 @@ mod tests {
             rebuilt.session.environment.config.defaults.language,
             Language::Python
         );
-        assert!(Arc::ptr_eq(&rebuilt.session.environment.auth, &auth_a));
-        assert_eq!(
+        assert!(Arc::ptr_eq(&rebuilt.session.environment.auth, &auth_b));
+        assert!(
             rebuilt
                 .session
                 .environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=refresh-auth-a")
+                .credential_matches_for_test("REVEL_SESSION=refresh-auth-c")
         );
         assert_eq!(rebuilt.session.environment.config.runner.python, "python-a");
         assert_eq!(
@@ -4141,12 +4219,21 @@ mod tests {
         let config_a =
             Config::parse("[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n")
                 .unwrap();
-        let auth_a = AuthSnapshot::configured_for_test("REVEL_SESSION=switch-auth-a");
+        let auth_a = SessionAuth::configured_for_test("REVEL_SESSION=switch-auth-a");
+        let old_auth = Arc::clone(&auth_a);
         let old_session = ContestSession::start_entry(PreparedContestEntry {
             input: old_input,
             environment: ContestEnvironment::from_snapshots(config_a, auth_a),
         })
         .unwrap();
+        let old_rotation = [reqwest::header::HeaderValue::from_static(
+            "REVEL_SESSION=switch-auth-c; Path=/",
+        )];
+        old_auth.observe_set_cookie_batch(
+            old_rotation.iter(),
+            &reqwest::Url::parse("https://atcoder.jp/contests/abc500/tasks").unwrap(),
+        );
+        assert!(old_auth.credential_matches_for_test("REVEL_SESSION=switch-auth-c"));
 
         std::fs::write(
             crate::workspace::workspace_config_path(root.path()),
@@ -4172,7 +4259,7 @@ mod tests {
             &request,
             &mut reporter,
             || Config::load_from(&config_path),
-            || AuthSnapshot::configured_for_test("REVEL_SESSION=switch-auth-b"),
+            || AuthSnapshot::configured_for_test("REVEL_SESSION=external-auth-x"),
             |_, _, _, _, _| panic!("the freshly routed contest already exists"),
             |_, _, _, _| panic!("the freshly routed contest is healthy"),
         )
@@ -4187,13 +4274,12 @@ mod tests {
             Language::Cpp
         );
         assert_eq!(new_session.environment.config.runner.python, "python-b");
-        assert_eq!(
+        assert!(!Arc::ptr_eq(&new_session.environment.auth, &old_auth));
+        assert!(
             new_session
                 .environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=switch-auth-b")
+                .credential_matches_for_test("REVEL_SESSION=external-auth-x")
         );
         assert_eq!(
             new_session
@@ -4308,7 +4394,7 @@ mod tests {
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
         assert!(matches!(app_context, AppContext::Standalone { .. }));
         let start_stages = std::cell::Cell::new(0);
-        let auth = AuthSnapshot::configured_for_test("REVEL_SESSION=direct-entry-auth");
+        let auth = SessionAuth::configured_for_test("REVEL_SESSION=direct-entry-auth");
 
         let session = start_direct_contest_session_with_hooks(
             &destination,
@@ -4340,7 +4426,10 @@ mod tests {
             "secret-free test reason",
         )));
 
-        for auth in [Arc::new(AuthSnapshot::Missing), Arc::new(invalid)] {
+        for auth in [
+            SessionAuth::from_snapshot(&AuthSnapshot::Missing),
+            SessionAuth::from_snapshot(&invalid),
+        ] {
             let session = start_direct_contest_session_with_hooks(
                 &destination,
                 Some("abc507"),
@@ -4377,7 +4466,7 @@ mod tests {
             || Err(io::Error::new(io::ErrorKind::InvalidData, "malformed TOML").into()),
             || {
                 auth_loads.set(auth_loads.get() + 1);
-                configured_auth()
+                configured_snapshot()
             },
             |_, _, _, _, _| {
                 create_calls.set(create_calls.get() + 1);
@@ -4416,7 +4505,7 @@ mod tests {
                     loads.set(loads.get() + 1);
                     Ok(Config::default())
                 },
-                configured_auth,
+                configured_snapshot,
                 |_, _, _, _, _| panic!("invalid workspace routing must not create a contest"),
                 |_, _, _, _| panic!("invalid workspace routing must not repair a contest"),
             )
@@ -4447,7 +4536,7 @@ mod tests {
             &request,
             &mut reporter,
             || Ok(Config::parse("[defaults]\nlanguage = \"python\"\n")?),
-            configured_auth,
+            configured_snapshot,
             |destination, contest_id, config, auth, reporter| {
                 super::super::contest::create_contest_in_active_workspace_with_parent_hook(
                     root.path(),
@@ -5405,7 +5494,7 @@ mod tests {
         let destination = root.path().join("abc508");
         save_healthy_contest(&destination, "abc508");
         let input = PreparedWatchInput::load(&destination, Some("abc508")).unwrap();
-        let old_auth = AuthSnapshot::configured_for_test("REVEL_SESSION=back-home-auth-a");
+        let old_auth = SessionAuth::configured_for_test("REVEL_SESSION=back-home-auth-a");
         let session = ContestSession::start_entry(PreparedContestEntry {
             input,
             environment: ContestEnvironment::from_snapshots(Config::default(), old_auth),
@@ -5447,13 +5536,11 @@ mod tests {
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
         let reopened = start_prepared_contest_entry(prepared, &app_context).unwrap();
 
-        assert_eq!(
+        assert!(
             reopened
                 .environment
                 .auth
-                .credential()
-                .map(crate::auth::Credential::as_str),
-            Some("REVEL_SESSION=back-home-auth-b")
+                .credential_matches_for_test("REVEL_SESSION=back-home-auth-b")
         );
         reopened.shutdown().unwrap();
     }

@@ -2,15 +2,16 @@ use crate::auth;
 use crate::model::Sample;
 
 use reqwest::StatusCode;
-use reqwest::blocking::Client;
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::cookie::CookieStore;
+use reqwest::header::{HeaderValue, RETRY_AFTER};
 
 use scraper::{Html, Selector};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,6 @@ const MAX_429_RETRIES: usize = 3;
 pub enum AtCoderError {
     Http(reqwest::Error),
     Auth(auth::AuthLoadError),
-    InvalidStoredCookie,
     UnexpectedAuthenticationStatus(StatusCode),
     Fixture {
         path: PathBuf,
@@ -69,14 +69,15 @@ pub fn authentication_status() -> Result<AuthenticationStatus, AtCoderError> {
     match auth.as_ref() {
         auth::AuthSnapshot::Missing => return Ok(AuthenticationStatus::NotConfigured),
         auth::AuthSnapshot::Invalid(error) => return Err(AtCoderError::Auth(*error)),
-        auth::AuthSnapshot::Configured(_) => {}
+        auth::AuthSnapshot::Configured { .. } => {}
     };
 
-    let client = build_http_client(credential_header(auth.credential())?)?;
-
-    let response = client
-        .get(format!("{BASE_URL}/settings"))
-        .send()?
+    let client = AtCoderClient::from_session_auth(auth::SessionAuth::from_snapshot(&auth))?;
+    let Source::Http(http) = &client.source else {
+        unreachable!("authentication status always uses HTTP")
+    };
+    let response = http
+        .send(http.client.get(format!("{BASE_URL}/settings")))?
         .error_for_status()?;
 
     classify_authentication_response(response.status(), response.url())
@@ -114,9 +115,6 @@ impl fmt::Display for AtCoderError {
                 write!(formatter, "failed to load authentication cookie: {error}")
             }
 
-            Self::InvalidStoredCookie => {
-                write!(formatter, "stored authentication cookie is invalid")
-            }
             Self::UnexpectedAuthenticationStatus(status) => {
                 write!(
                     formatter,
@@ -148,8 +146,7 @@ impl std::error::Error for AtCoderError {
             Self::Http(error) => Some(error),
             Self::Auth(error) => Some(error),
             Self::Fixture { source, .. } => Some(source),
-            Self::InvalidStoredCookie
-            | Self::UnexpectedAuthenticationStatus(_)
+            Self::UnexpectedAuthenticationStatus(_)
             | Self::Parse(_)
             | Self::InvalidIdentifier { .. }
             | Self::InvalidProblemUrl(_)
@@ -172,18 +169,25 @@ enum Source {
 struct HttpSource {
     client: Client,
     submit_client: LazySubmitClient,
+    auth: Arc<auth::SessionAuth>,
     last_request: Mutex<Option<Instant>>,
 }
 
+enum AuthenticatedSendResult {
+    AuthenticationRequired,
+    CancelledBeforePost,
+    Sent(Result<Response, reqwest::Error>),
+}
+
 struct LazySubmitClient {
-    cookie: Option<HeaderValue>,
+    provider: Arc<SessionCookieProvider>,
     client: Mutex<Option<Client>>,
 }
 
 impl LazySubmitClient {
-    fn new(cookie: Option<HeaderValue>) -> Self {
+    fn new(provider: Arc<SessionCookieProvider>) -> Self {
         Self {
-            cookie,
+            provider,
             client: Mutex::new(None),
         }
     }
@@ -194,7 +198,7 @@ impl LazySubmitClient {
 
     fn get_or_try_init_with(
         &self,
-        build: impl FnOnce(Option<HeaderValue>) -> Result<Client, AtCoderError>,
+        build: impl FnOnce(Arc<SessionCookieProvider>) -> Result<Client, AtCoderError>,
     ) -> Result<Client, AtCoderError> {
         let mut cached = self
             .client
@@ -204,19 +208,176 @@ impl LazySubmitClient {
             return Ok(client.clone());
         }
 
-        let client = build(self.cookie.clone())?;
+        let client = build(Arc::clone(&self.provider))?;
         *cached = Some(client.clone());
         Ok(client)
     }
 }
 
 impl HttpSource {
-    fn new(cookie: Option<HeaderValue>) -> Result<Self, AtCoderError> {
+    fn new(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
+        let provider = Arc::new(SessionCookieProvider::for_atcoder(Arc::clone(&auth)));
+        Self::new_with_provider(auth, provider)
+    }
+
+    fn new_with_provider(
+        auth: Arc<auth::SessionAuth>,
+        provider: Arc<SessionCookieProvider>,
+    ) -> Result<Self, AtCoderError> {
         Ok(Self {
-            client: build_http_client(cookie.clone())?,
-            submit_client: LazySubmitClient::new(cookie),
+            client: build_http_client(Arc::clone(&provider))?,
+            submit_client: LazySubmitClient::new(provider),
+            auth,
             last_request: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test_origin(
+        auth: Arc<auth::SessionAuth>,
+        origin: &reqwest::Url,
+    ) -> Result<Self, AtCoderError> {
+        let provider = Arc::new(SessionCookieProvider::for_test_origin(
+            Arc::clone(&auth),
+            origin,
+        ));
+        Self::new_with_provider(auth, provider)
+    }
+
+    fn send(&self, request: RequestBuilder) -> Result<Response, reqwest::Error> {
+        self.exchange(|| request.send())
+    }
+
+    fn exchange<T>(&self, exchange: impl FnOnce() -> T) -> T {
+        self.exchange_with_warning_sink(exchange, emit_auth_persistence_warning)
+    }
+
+    fn exchange_with_warning_sink<T>(
+        &self,
+        exchange: impl FnOnce() -> T,
+        mut warning_sink: impl FnMut(auth::AuthPersistenceWarning),
+    ) -> T {
+        self.auth.with_exchange(|| {
+            let result = exchange();
+            for warning in self.auth.persist_pending() {
+                warning_sink(warning);
+            }
+            result
+        })
+    }
+
+    fn send_authenticated_once(
+        &self,
+        request: RequestBuilder,
+        try_begin_post: &dyn Fn() -> bool,
+    ) -> AuthenticatedSendResult {
+        self.exchange(|| {
+            if self.auth.kind() != auth::SessionAuthKind::Configured {
+                return AuthenticatedSendResult::AuthenticationRequired;
+            }
+            if !try_begin_post() {
+                return AuthenticatedSendResult::CancelledBeforePost;
+            }
+            AuthenticatedSendResult::Sent(request.send())
+        })
+    }
+}
+
+fn emit_auth_persistence_warning(warning: auth::AuthPersistenceWarning) {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    write_auth_persistence_warning(&mut stderr, warning);
+}
+
+fn write_auth_persistence_warning(
+    writer: &mut impl std::io::Write,
+    warning: auth::AuthPersistenceWarning,
+) {
+    let _ = writeln!(writer, "warning: {warning}");
+}
+
+struct SessionCookieProvider {
+    auth: Arc<auth::SessionAuth>,
+    origin: TrustedHttpOrigin,
+}
+
+struct TrustedHttpOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl TrustedHttpOrigin {
+    fn atcoder() -> Self {
+        Self {
+            scheme: "https".to_string(),
+            host: "atcoder.jp".to_string(),
+            port: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_url(url: &reqwest::Url) -> Self {
+        Self {
+            scheme: url.scheme().to_string(),
+            host: url
+                .host_str()
+                .expect("test origin must have a host")
+                .to_string(),
+            port: url.port(),
+        }
+    }
+
+    fn matches(&self, url: &reqwest::Url) -> bool {
+        url.scheme() == self.scheme
+            && url.host_str() == Some(self.host.as_str())
+            && url.port() == self.port
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+}
+
+impl SessionCookieProvider {
+    fn for_atcoder(auth: Arc<auth::SessionAuth>) -> Self {
+        Self {
+            auth,
+            origin: TrustedHttpOrigin::atcoder(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_origin(auth: Arc<auth::SessionAuth>, origin: &reqwest::Url) -> Self {
+        Self {
+            auth,
+            origin: TrustedHttpOrigin::from_url(origin),
+        }
+    }
+}
+
+impl fmt::Debug for SessionCookieProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionCookieProvider(<redacted>)")
+    }
+}
+
+impl CookieStore for SessionCookieProvider {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &HeaderValue>,
+        url: &reqwest::Url,
+    ) {
+        if self.origin.matches(url) {
+            self.auth
+                .observe_trusted_set_cookie_batch(cookie_headers, url);
+        }
+    }
+
+    fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+        if self.origin.matches(url) {
+            self.auth.cookie_header()
+        } else {
+            None
+        }
     }
 }
 
@@ -255,21 +416,17 @@ impl AtCoderClient {
         if let auth::AuthSnapshot::Invalid(error) = auth.as_ref() {
             return Err(AtCoderError::Auth(*error));
         }
-        Self::from_auth_snapshot(&auth)
+        Self::from_session_auth(auth::SessionAuth::from_snapshot(&auth))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_auth_snapshot(auth: &auth::AuthSnapshot) -> Result<Self, AtCoderError> {
-        match auth.credential() {
-            Some(credential) => Ok(Self {
-                source: Source::Http(HttpSource::new(credential_header(Some(credential))?)?),
-            }),
-            None => Self::anonymous(),
-        }
+        Self::from_session_auth(auth::SessionAuth::from_snapshot(auth))
     }
 
-    pub(crate) fn anonymous() -> Result<Self, AtCoderError> {
+    pub(crate) fn from_session_auth(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
         Ok(Self {
-            source: Source::Http(HttpSource::new(None)?),
+            source: Source::Http(HttpSource::new(auth)?),
         })
     }
 
@@ -282,13 +439,7 @@ impl AtCoderClient {
     #[cfg(test)]
     pub(crate) fn credential_matches_for_test(&self, expected: &str) -> bool {
         match &self.source {
-            Source::Http(http) => {
-                http.submit_client
-                    .cookie
-                    .as_ref()
-                    .and_then(|cookie| cookie.to_str().ok())
-                    == Some(expected)
-            }
+            Source::Http(http) => http.auth.credential_matches_for_test(expected),
             Source::Fixture(_) => false,
         }
     }
@@ -367,7 +518,7 @@ impl AtCoderClient {
             if !should_continue() {
                 return Ok(None);
             }
-            let response = http.client.get(url).send()?;
+            let response = http.send(http.client.get(url))?;
             if !should_continue() {
                 return Ok(None);
             }
@@ -403,61 +554,23 @@ impl AtCoderClient {
     }
 }
 
-fn credential_header(
-    credential: Option<&auth::Credential>,
-) -> Result<Option<HeaderValue>, AtCoderError> {
-    credential
-        .map(|credential| {
-            let mut header = HeaderValue::from_str(credential.as_str())
-                .map_err(|_| AtCoderError::InvalidStoredCookie)?;
-            header.set_sensitive(true);
-            Ok(header)
-        })
-        .transpose()
+fn build_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
+    Ok(http_client_builder(provider).build()?)
 }
 
-fn build_http_client(cookie: Option<HeaderValue>) -> Result<Client, AtCoderError> {
-    Ok(http_client_builder(cookie)?.build()?)
-}
-
-fn build_submit_http_client(cookie: Option<HeaderValue>) -> Result<Client, AtCoderError> {
-    Ok(http_client_builder(cookie)?
+fn build_submit_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
+    Ok(http_client_builder(provider)
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .build()?)
 }
 
-fn http_client_builder(
-    cookie: Option<HeaderValue>,
-) -> Result<reqwest::blocking::ClientBuilder, AtCoderError> {
+fn http_client_builder(provider: Arc<SessionCookieProvider>) -> reqwest::blocking::ClientBuilder {
     let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-    let authenticated = cookie.is_some();
-    let headers = default_headers(cookie)?;
-
-    let mut builder = Client::builder()
+    Client::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(10))
-        .default_headers(headers);
-
-    // Preserve the pre-authentication anonymous cookie-jar behavior. A
-    // manually stored Cookie header is deliberately authoritative instead of
-    // competing with a second in-memory cookie source.
-    if !authenticated {
-        builder = builder.cookie_store(true);
-    }
-
-    Ok(builder)
-}
-
-fn default_headers(cookie: Option<HeaderValue>) -> Result<HeaderMap, AtCoderError> {
-    let mut headers = HeaderMap::new();
-
-    if let Some(mut cookie) = cookie {
-        cookie.set_sensitive(true);
-        headers.insert(COOKIE, cookie);
-    }
-
-    Ok(headers)
+        .cookie_provider(provider)
 }
 
 fn read_fixture(path: PathBuf) -> Result<String, AtCoderError> {
@@ -849,36 +962,735 @@ fn statement_confidently_has_no_normal_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
+
+    struct ObservedWireRequest {
+        method: String,
+        path: String,
+        cookie_present: bool,
+        cookie_matches: bool,
+    }
+
+    fn read_wire_request(
+        stream: &mut TcpStream,
+        expected_cookie: Option<&str>,
+    ) -> ObservedWireRequest {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("request read failed");
+            assert!(read != 0, "request ended before its headers completed");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "request headers exceeded the test limit"
+            );
+        };
+        let head = std::str::from_utf8(&bytes[..header_end])
+            .expect("request headers were not valid UTF-8");
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines
+            .next()
+            .expect("request line missing")
+            .split_ascii_whitespace();
+        let method = request_line
+            .next()
+            .expect("request method missing")
+            .to_string();
+        let path = request_line
+            .next()
+            .expect("request path missing")
+            .to_string();
+        let mut cookie_present = false;
+        let mut cookie_matches = false;
+        let mut content_length = 0usize;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("cookie") {
+                cookie_present = true;
+                cookie_matches = expected_cookie.is_some_and(|expected| value.trim() == expected);
+            } else if name.eq_ignore_ascii_case("content-length") {
+                content_length = value
+                    .trim()
+                    .parse()
+                    .expect("Content-Length was not numeric");
+            }
+        }
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("request body read failed");
+            assert!(read != 0, "request body ended early");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        ObservedWireRequest {
+            method,
+            path,
+            cookie_present,
+            cookie_matches,
+        }
+    }
+
+    fn write_wire_response(stream: &mut TcpStream, status: &str, headers: &[&str]) {
+        let mut response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n");
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        stream
+            .write_all(response.as_bytes())
+            .expect("response write failed");
+    }
+
+    fn local_origin(listener: &TcpListener) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()
+    }
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
     }
 
-    #[test]
-    fn stored_cookie_header_is_sensitive_and_invalid_values_do_not_leak() {
-        let secret = "REVEL_SESSION=do-not-print";
-        let auth = auth::AuthSnapshot::configured_for_test(secret);
-        let headers = default_headers(credential_header(auth.credential()).unwrap()).unwrap();
-        let cookie = headers.get(COOKIE).unwrap();
+    fn anonymous_session() -> Arc<auth::SessionAuth> {
+        auth::SessionAuth::from_snapshot(&auth::AuthSnapshot::Missing)
+    }
 
-        assert_eq!(cookie.to_str().unwrap(), secret);
-        assert!(cookie.is_sensitive());
-        assert!(!format!("{headers:?}").contains(secret));
-
-        let invalid = "REVEL_SESSION=secret\r\nX-Injected: yes";
-        let auth = auth::AuthSnapshot::configured_for_test(invalid);
-        let error = credential_header(auth.credential()).unwrap_err();
-        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
-        assert!(!error.to_string().contains("secret"));
-        assert!(!format!("{error:?}").contains("secret"));
+    fn provider(session: Arc<auth::SessionAuth>) -> Arc<SessionCookieProvider> {
+        Arc::new(SessionCookieProvider::for_atcoder(session))
     }
 
     #[test]
-    fn anonymous_default_headers_have_no_cookie() {
-        let headers = default_headers(None).unwrap();
-        assert!(!headers.contains_key(COOKIE));
+    fn request_time_cookie_header_is_sensitive_and_redacted() {
+        let secret = "REVEL_SESSION=do-not-print";
+        let auth = auth::SessionAuth::configured_for_test(secret);
+        let cookie = auth.cookie_header().unwrap();
+
+        assert!(cookie.to_str().is_ok_and(|value| value == secret));
+        assert!(cookie.is_sensitive());
+        assert!(!format!("{cookie:?}").contains(secret));
+        assert!(!format!("{auth:?}").contains(secret));
+    }
+
+    #[test]
+    fn anonymous_provider_has_no_cookie() {
+        let provider = provider(anonymous_session());
+        let url = reqwest::Url::parse(BASE_URL).unwrap();
+        assert!(provider.cookies(&url).is_none());
+    }
+
+    fn observe_provider(provider: &SessionCookieProvider, values: &[&str], url: &str) {
+        let headers = values
+            .iter()
+            .map(|value| HeaderValue::from_str(value).unwrap())
+            .collect::<Vec<_>>();
+        provider.set_cookies(
+            &mut headers.iter(),
+            &reqwest::Url::parse(url).expect("valid provider test URL"),
+        );
+    }
+
+    #[test]
+    fn configured_provider_follows_rotation_for_the_next_physical_request() {
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=request-a");
+        let provider = provider(Arc::clone(&session));
+        let url = reqwest::Url::parse("https://atcoder.jp/contests/abc500/tasks").unwrap();
+
+        assert!(provider.cookies(&url).is_some_and(|cookie| {
+            cookie.as_bytes() == b"REVEL_SESSION=request-a" && cookie.is_sensitive()
+        }));
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=request-b; Path=/; Secure; HttpOnly"],
+            url.as_str(),
+        );
+        assert!(provider.cookies(&url).is_some_and(|cookie| {
+            cookie.as_bytes() == b"REVEL_SESSION=request-b" && cookie.is_sensitive()
+        }));
+        assert!(session.credential_matches_for_test("REVEL_SESSION=request-b"));
+    }
+
+    #[test]
+    fn transport_request_evolution_sends_a_then_b_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first = read_wire_request(&mut first_stream, Some("REVEL_SESSION=wire-a"));
+            write_wire_response(
+                &mut first_stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=wire-b; Path=/"],
+            );
+
+            let (mut second_stream, _) = listener.accept().unwrap();
+            let second = read_wire_request(&mut second_stream, Some("REVEL_SESSION=wire-b"));
+            write_wire_response(&mut second_stream, "200 OK", &[]);
+            (first, second)
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=wire-a");
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &origin).unwrap();
+
+        assert!(
+            http.send(http.client.get(origin.join("one").unwrap()))
+                .is_ok()
+        );
+        assert!(
+            http.send(http.client.get(origin.join("two").unwrap()))
+                .is_ok()
+        );
+
+        let (first, second) = server.join().unwrap();
+        assert_eq!(
+            (first.method.as_str(), first.path.as_str()),
+            ("GET", "/one")
+        );
+        assert!(first.cookie_present && first.cookie_matches);
+        assert_eq!(
+            (second.method.as_str(), second.path.as_str()),
+            ("GET", "/two")
+        );
+        assert!(second.cookie_present && second.cookie_matches);
+        assert!(session.credential_matches_for_test("REVEL_SESSION=wire-b"));
+    }
+
+    #[test]
+    fn transport_exchange_lock_holds_second_request_until_first_rotates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let (first_seen_tx, first_seen_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first = read_wire_request(&mut first_stream, Some("REVEL_SESSION=serial-wire-a"));
+            first_seen_tx.send(()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut early_second = None;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request =
+                            read_wire_request(&mut stream, Some("REVEL_SESSION=serial-wire-a"));
+                        write_wire_response(&mut stream, "500 Internal Server Error", &[]);
+                        early_second = Some(request);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("second accept failed: {error}"),
+                }
+                match release_first_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("release channel disconnected"),
+                }
+            }
+            write_wire_response(
+                &mut first_stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=serial-wire-b; Path=/"],
+            );
+            if early_second.is_some() {
+                return (first, early_second, None);
+            }
+
+            listener.set_nonblocking(false).unwrap();
+            let (mut second_stream, _) = listener.accept().unwrap();
+            let second = read_wire_request(&mut second_stream, Some("REVEL_SESSION=serial-wire-b"));
+            write_wire_response(&mut second_stream, "200 OK", &[]);
+            (first, None, Some(second))
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=serial-wire-a");
+        let http = Arc::new(HttpSource::new_for_test_origin(session, &origin).unwrap());
+        let first_http = Arc::clone(&http);
+        let first_url = origin.join("first").unwrap();
+        let first = std::thread::spawn(move || first_http.send(first_http.client.get(first_url)));
+        first_seen_rx.recv().unwrap();
+
+        let second_http = Arc::clone(&http);
+        let second_url = origin.join("second").unwrap();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = second_http.send(second_http.client.get(second_url));
+            second_done_tx.send(result.is_ok()).unwrap();
+            result
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        release_first_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.join().unwrap().is_ok());
+
+        let (first, early_second, second) = server.join().unwrap();
+        assert!(first.cookie_present && first.cookie_matches);
+        assert!(
+            early_second.is_none(),
+            "R2 reached the server before R1 completed"
+        );
+        let second = second.expect("R2 did not reach the server after R1 completed");
+        assert!(second.cookie_present && second.cookie_matches);
+    }
+
+    #[test]
+    fn same_origin_redirect_hop_uses_the_rotated_cookie_and_ignores_foreign_response() {
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=redirect-a");
+        let provider = provider(Arc::clone(&session));
+        let first_hop = reqwest::Url::parse("https://atcoder.jp/contests/abc500/redirect").unwrap();
+        assert!(
+            provider
+                .cookies(&first_hop)
+                .is_some_and(|cookie| { cookie.as_bytes() == b"REVEL_SESSION=redirect-a" })
+        );
+
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=redirect-b; Path=/"],
+            first_hop.as_str(),
+        );
+        let second_hop = reqwest::Url::parse("https://atcoder.jp/contests/abc500/tasks").unwrap();
+        assert!(
+            provider
+                .cookies(&second_hop)
+                .is_some_and(|cookie| { cookie.as_bytes() == b"REVEL_SESSION=redirect-b" })
+        );
+
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=foreign-c; Path=/"],
+            "https://example.com/redirect-target",
+        );
+        assert!(
+            provider
+                .cookies(&second_hop)
+                .is_some_and(|cookie| { cookie.as_bytes() == b"REVEL_SESSION=redirect-b" })
+        );
+    }
+
+    #[test]
+    fn transport_redirect_uses_b_on_same_origin_next_hop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first = read_wire_request(&mut first_stream, Some("REVEL_SESSION=redirect-wire-a"));
+            write_wire_response(
+                &mut first_stream,
+                "302 Found",
+                &[
+                    "Location: /next",
+                    "Set-Cookie: REVEL_SESSION=redirect-wire-b; Path=/",
+                ],
+            );
+
+            let (mut second_stream, _) = listener.accept().unwrap();
+            let second =
+                read_wire_request(&mut second_stream, Some("REVEL_SESSION=redirect-wire-b"));
+            write_wire_response(&mut second_stream, "200 OK", &[]);
+            (first, second)
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=redirect-wire-a");
+        let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+
+        let response = http
+            .send(http.client.get(origin.join("start").unwrap()))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.url().path(), "/next");
+
+        let (first, second) = server.join().unwrap();
+        assert_eq!(first.path, "/start");
+        assert!(first.cookie_present && first.cookie_matches);
+        assert_eq!(second.path, "/next");
+        assert!(second.cookie_present && second.cookie_matches);
+    }
+
+    #[test]
+    fn transport_foreign_redirect_sends_no_cookie_and_ignores_foreign_mutation() {
+        let trusted_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let trusted_origin = local_origin(&trusted_listener);
+        let foreign_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let foreign_origin = local_origin(&foreign_listener);
+        let foreign_target = foreign_origin.join("landing").unwrap().to_string();
+        let trusted_server = std::thread::spawn(move || {
+            let (mut start_stream, _) = trusted_listener.accept().unwrap();
+            let start = read_wire_request(&mut start_stream, Some("REVEL_SESSION=foreign-wire-a"));
+            let location = format!("Location: {foreign_target}");
+            write_wire_response(
+                &mut start_stream,
+                "302 Found",
+                &[
+                    location.as_str(),
+                    "Set-Cookie: REVEL_SESSION=foreign-wire-b; Path=/",
+                ],
+            );
+
+            let (mut after_stream, _) = trusted_listener.accept().unwrap();
+            let after = read_wire_request(&mut after_stream, Some("REVEL_SESSION=foreign-wire-b"));
+            write_wire_response(&mut after_stream, "200 OK", &[]);
+            (start, after)
+        });
+        let foreign_server = std::thread::spawn(move || {
+            let (mut stream, _) = foreign_listener.accept().unwrap();
+            let request = read_wire_request(&mut stream, None);
+            write_wire_response(
+                &mut stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=foreign-wire-c; Path=/"],
+            );
+            request
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=foreign-wire-a");
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &trusted_origin).unwrap();
+
+        assert!(
+            http.send(http.client.get(trusted_origin.join("start").unwrap()))
+                .is_ok()
+        );
+        assert!(
+            http.send(http.client.get(trusted_origin.join("after").unwrap()))
+                .is_ok()
+        );
+
+        let (start, after) = trusted_server.join().unwrap();
+        let foreign = foreign_server.join().unwrap();
+        assert!(start.cookie_present && start.cookie_matches);
+        assert!(!foreign.cookie_present);
+        assert!(after.cookie_present && after.cookie_matches);
+        assert!(session.credential_matches_for_test("REVEL_SESSION=foreign-wire-b"));
+    }
+
+    #[test]
+    fn transport_baseline_post_and_discovery_use_a_b_then_c_with_one_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut baseline_stream, _) = listener.accept().unwrap();
+            let baseline =
+                read_wire_request(&mut baseline_stream, Some("REVEL_SESSION=submit-wire-a"));
+            write_wire_response(
+                &mut baseline_stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=submit-wire-b; Path=/"],
+            );
+
+            let (mut post_stream, _) = listener.accept().unwrap();
+            let post = read_wire_request(&mut post_stream, Some("REVEL_SESSION=submit-wire-b"));
+            write_wire_response(
+                &mut post_stream,
+                "302 Found",
+                &[
+                    "Location: /contests/abc500/submissions/me",
+                    "Set-Cookie: REVEL_SESSION=submit-wire-c; Path=/",
+                ],
+            );
+
+            let (mut discovery_stream, _) = listener.accept().unwrap();
+            let discovery =
+                read_wire_request(&mut discovery_stream, Some("REVEL_SESSION=submit-wire-c"));
+            write_wire_response(&mut discovery_stream, "200 OK", &[]);
+            (baseline, post, discovery)
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=submit-wire-a");
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &origin).unwrap();
+        let post_request = http
+            .submit_client
+            .get()
+            .unwrap()
+            .post(origin.join("contests/abc500/submit").unwrap())
+            .form(&[("csrf_token", "redacted-test-token")]);
+        let post_gate = AtomicUsize::new(0);
+
+        assert!(
+            http.send(
+                http.client
+                    .get(origin.join("contests/abc500/submissions/me").unwrap())
+            )
+            .is_ok()
+        );
+        let post_response = match http.send_authenticated_once(post_request, &|| {
+            post_gate.fetch_add(1, Ordering::SeqCst);
+            true
+        }) {
+            AuthenticatedSendResult::Sent(Ok(response)) => response,
+            AuthenticatedSendResult::Sent(Err(_)) => panic!("physical POST transport failed"),
+            AuthenticatedSendResult::AuthenticationRequired => {
+                panic!("authentication disappeared before POST")
+            }
+            AuthenticatedSendResult::CancelledBeforePost => panic!("POST gate was cancelled"),
+        };
+        assert_eq!(post_response.status(), StatusCode::FOUND);
+        assert!(
+            http.send(
+                http.client
+                    .get(origin.join("contests/abc500/submissions/me").unwrap())
+            )
+            .is_ok()
+        );
+
+        let (baseline, post, discovery) = server.join().unwrap();
+        assert_eq!(
+            (baseline.method.as_str(), baseline.path.as_str()),
+            ("GET", "/contests/abc500/submissions/me")
+        );
+        assert!(baseline.cookie_present && baseline.cookie_matches);
+        assert_eq!(
+            (post.method.as_str(), post.path.as_str()),
+            ("POST", "/contests/abc500/submit")
+        );
+        assert!(post.cookie_present && post.cookie_matches);
+        assert_eq!(
+            (discovery.method.as_str(), discovery.path.as_str()),
+            ("GET", "/contests/abc500/submissions/me")
+        );
+        assert!(discovery.cookie_present && discovery.cookie_matches);
+        assert_eq!(post_gate.load(Ordering::SeqCst), 1);
+        assert!(session.credential_matches_for_test("REVEL_SESSION=submit-wire-c"));
+    }
+
+    #[test]
+    fn transport_baseline_deletion_rejects_post_without_consuming_its_gate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut baseline_stream, _) = listener.accept().unwrap();
+            let baseline =
+                read_wire_request(&mut baseline_stream, Some("REVEL_SESSION=delete-wire-a"));
+            write_wire_response(
+                &mut baseline_stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=; Path=/; Max-Age=0"],
+            );
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let mut unexpected_post = false;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        unexpected_post = true;
+                        let _ = read_wire_request(&mut stream, None);
+                        write_wire_response(&mut stream, "500 Internal Server Error", &[]);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected POST accept failed: {error}"),
+                }
+            }
+            (baseline, unexpected_post)
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=delete-wire-a");
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &origin).unwrap();
+        let post_request = http
+            .submit_client
+            .get()
+            .unwrap()
+            .post(origin.join("contests/abc500/submit").unwrap())
+            .form(&[("csrf_token", "redacted-test-token")]);
+        let post_gate = AtomicUsize::new(0);
+
+        assert!(
+            http.send(
+                http.client
+                    .get(origin.join("contests/abc500/submissions/me").unwrap())
+            )
+            .is_ok()
+        );
+        let result = http.send_authenticated_once(post_request, &|| {
+            post_gate.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        assert!(matches!(
+            result,
+            AuthenticatedSendResult::AuthenticationRequired
+        ));
+        assert_eq!(post_gate.load(Ordering::SeqCst), 0);
+        assert_eq!(session.kind(), auth::SessionAuthKind::ServerDeleted);
+        let (baseline, unexpected_post) = server.join().unwrap();
+        assert!(baseline.cookie_present && baseline.cookie_matches);
+        assert!(!unexpected_post, "a physical POST reached the server");
+    }
+
+    #[test]
+    fn persistence_and_warning_sink_failures_keep_outcome_and_do_not_repeat_exchange() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected warning sink failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected warning sink failure",
+                ))
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let platform_base = temp.path().join("platform-state");
+        let state_dir = platform_base.join("atc").join("state");
+        let cookie_file = state_dir.join("cookie");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(&cookie_file, "REVEL_SESSION=persist-a").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cookie_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let location = crate::paths::CookieLocation {
+            platform_base,
+            state_dir: state_dir.clone(),
+            file: cookie_file.clone(),
+        };
+        let session = auth::SessionAuth::load_from_location_for_test(&location);
+        std::fs::create_dir(state_dir.join(".cookie.lock")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_wire_request(&mut stream, Some("REVEL_SESSION=persist-a"));
+            write_wire_response(
+                &mut stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=persist-b; Path=/"],
+            );
+            request
+        });
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &origin).unwrap();
+        let exchanges = AtomicUsize::new(0);
+        let warnings = AtomicUsize::new(0);
+        let mut warning_writer = FailingWriter;
+
+        let outcome = http.exchange_with_warning_sink(
+            || {
+                exchanges.fetch_add(1, Ordering::SeqCst);
+                http.client.get(origin.join("warning").unwrap()).send()
+            },
+            |warning| {
+                warnings.fetch_add(1, Ordering::SeqCst);
+                write_auth_persistence_warning(&mut warning_writer, warning);
+            },
+        );
+
+        assert_eq!(outcome.unwrap().status(), StatusCode::OK);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(warnings.load(Ordering::SeqCst), 1);
+        let request = server.join().unwrap();
+        assert!(request.cookie_present && request.cookie_matches);
+        assert!(session.credential_matches_for_test("REVEL_SESSION=persist-b"));
+        assert!(
+            std::fs::read_to_string(cookie_file)
+                .is_ok_and(|value| value == "REVEL_SESSION=persist-a")
+        );
+    }
+
+    #[test]
+    fn post_builder_does_not_capture_cookie_before_baseline_rotation() {
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=baseline-a");
+        let provider = provider(Arc::clone(&session));
+        let client = build_submit_http_client(Arc::clone(&provider)).unwrap();
+        let request = client
+            .post("https://atcoder.jp/contests/abc500/submit")
+            .form(&[("csrf_token", "redacted-test-token")])
+            .build()
+            .unwrap();
+
+        assert!(request.headers().get(reqwest::header::COOKIE).is_none());
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=baseline-b; Path=/"],
+            "https://atcoder.jp/contests/abc500/submissions/me",
+        );
+        let post_url = request.url();
+        assert!(
+            provider
+                .cookies(post_url)
+                .is_some_and(|cookie| { cookie.as_bytes() == b"REVEL_SESSION=baseline-b" })
+        );
+    }
+
+    #[test]
+    fn post_rotation_is_visible_to_discovery_and_foreign_responses_are_ignored() {
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=post-b");
+        let provider = provider(Arc::clone(&session));
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=post-c; Path=/"],
+            "https://atcoder.jp/contests/abc500/submit",
+        );
+        observe_provider(
+            &provider,
+            &["REVEL_SESSION=foreign-x; Path=/"],
+            "https://example.com/redirect-target",
+        );
+
+        let discovery =
+            reqwest::Url::parse("https://atcoder.jp/contests/abc500/submissions/me").unwrap();
+        assert!(
+            provider
+                .cookies(&discovery)
+                .is_some_and(|cookie| { cookie.as_bytes() == b"REVEL_SESSION=post-c" })
+        );
+    }
+
+    #[test]
+    fn same_session_exchange_lock_serializes_read_response_update_cycles() {
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=serial-a");
+        let first_session = Arc::clone(&session);
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            first_session.with_exchange(|| {
+                assert!(first_session.credential_matches_for_test("REVEL_SESSION=serial-a"));
+                first_started_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                let headers = [HeaderValue::from_static("REVEL_SESSION=serial-b; Path=/")];
+                first_session.observe_set_cookie_batch(
+                    headers.iter(),
+                    &reqwest::Url::parse("https://atcoder.jp/").unwrap(),
+                );
+            });
+        });
+        first_started_rx.recv().unwrap();
+
+        let second_session = Arc::clone(&session);
+        let (second_observed_tx, second_observed_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            second_session.with_exchange(|| {
+                second_observed_tx
+                    .send(second_session.credential_matches_for_test("REVEL_SESSION=serial-b"))
+                    .unwrap();
+            });
+        });
+        assert!(
+            second_observed_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        release_first_tx.send(()).unwrap();
+        assert!(second_observed_rx.recv().unwrap());
+        first.join().unwrap();
+        second.join().unwrap();
     }
 
     #[test]
@@ -903,13 +1715,14 @@ mod tests {
 
     #[test]
     fn submit_client_builder_constructs_with_no_redirects_and_retries_disabled() {
-        build_submit_http_client(None)
+        build_submit_http_client(provider(anonymous_session()))
             .expect("submit client configuration should construct without making a request");
     }
 
     #[test]
     fn http_source_construction_leaves_submit_client_uninitialized() {
-        let http = HttpSource::new(None).expect("normal HTTP client should construct");
+        let http =
+            HttpSource::new(anonymous_session()).expect("normal HTTP client should construct");
         let cached = http
             .submit_client
             .client
@@ -921,17 +1734,17 @@ mod tests {
 
     #[test]
     fn lazy_submit_client_builds_once_and_reuses_the_cached_client() {
-        let lazy = LazySubmitClient::new(None);
+        let lazy = LazySubmitClient::new(provider(anonymous_session()));
         let builds = std::cell::Cell::new(0);
 
-        lazy.get_or_try_init_with(|cookie| {
+        lazy.get_or_try_init_with(|provider| {
             builds.set(builds.get() + 1);
-            build_submit_http_client(cookie)
+            build_submit_http_client(provider)
         })
         .expect("first access should build the submit client");
         lazy.get_or_try_init_with(|_| {
             builds.set(builds.get() + 1);
-            build_submit_http_client(None)
+            build_submit_http_client(provider(anonymous_session()))
         })
         .expect("later access should reuse the submit client");
 
@@ -940,12 +1753,12 @@ mod tests {
 
     #[test]
     fn lazy_submit_client_build_failure_does_not_poison_later_access() {
-        let lazy = LazySubmitClient::new(None);
+        let lazy = LazySubmitClient::new(provider(anonymous_session()));
         let error = lazy
-            .get_or_try_init_with(|_| Err(AtCoderError::InvalidStoredCookie))
+            .get_or_try_init_with(|_| Err(AtCoderError::Parse("injected failure".to_string())))
             .expect_err("injected submit client construction should fail");
 
-        assert!(matches!(error, AtCoderError::InvalidStoredCookie));
+        assert!(matches!(error, AtCoderError::Parse(_)));
         lazy.get_or_try_init_with(build_submit_http_client)
             .expect("a later submit client construction should still succeed");
     }

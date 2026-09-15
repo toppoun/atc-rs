@@ -1,7 +1,7 @@
 use super::{FetchedContestData, fetch_contest_data, fetch_samples_for_manifest, resolve_language};
 use crate::app_context::AppContext;
 use crate::atcoder;
-use crate::auth::AuthSnapshot;
+use crate::auth::{AuthSnapshot, SessionAuth};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{Contest, Sample};
@@ -56,7 +56,8 @@ pub(crate) fn contest(contest_id: &str, reporter: &mut dyn Reporter) -> Result<(
         AppContext::Standalone { .. } => workspace::resolve_contest_path(&cwd, contest_id)?,
     };
     let config = Config::load()?;
-    let auth = AuthSnapshot::load();
+    let auth_snapshot = AuthSnapshot::load();
+    let auth = SessionAuth::from_snapshot(&auth_snapshot);
 
     contest_at(
         &destination,
@@ -141,7 +142,7 @@ pub(super) fn create_contest(
     destination: &Path,
     contest_id: &str,
     config: &Config,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     create_contest_with(
@@ -161,7 +162,7 @@ pub(super) fn create_contest_in_active_workspace(
     destination: &Path,
     contest_id: &str,
     config: &Config,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     create_contest_with_install(
@@ -192,14 +193,14 @@ fn create_contest_with<R, C>(
     destination: &Path,
     contest_id: &str,
     config: &Config,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&Arc<SessionAuth>) -> Result<atcoder::AtCoderClient, AppError>,
 {
     create_contest_with_install(
         destination,
@@ -228,7 +229,7 @@ fn create_contest_with_install<R, C, I>(
     destination: &Path,
     contest_id: &str,
     config: &Config,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
@@ -236,7 +237,7 @@ fn create_contest_with_install<R, C, I>(
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&Arc<SessionAuth>) -> Result<atcoder::AtCoderClient, AppError>,
     I: FnOnce(
         &Path,
         &str,
@@ -267,7 +268,7 @@ pub(super) fn create_contest_in_active_workspace_with_parent_hook<R, C, H>(
     destination: &Path,
     contest_id: &str,
     config: &Config,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
     resolve_template: R,
     create_client: C,
@@ -275,7 +276,7 @@ pub(super) fn create_contest_in_active_workspace_with_parent_hook<R, C, H>(
 ) -> Result<(), AppError>
 where
     R: FnOnce(crate::language::Language) -> Result<String, AppError>,
-    C: FnOnce(&AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError>,
+    C: FnOnce(&Arc<SessionAuth>) -> Result<atcoder::AtCoderClient, AppError>,
     H: FnOnce(),
 {
     create_contest_with_install(
@@ -304,7 +305,7 @@ where
 pub(super) fn repair_contest(
     destination: &Path,
     contest_id: &str,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let atcoder = create_atcoder_client(auth)?;
@@ -316,7 +317,7 @@ pub(super) fn repair_contest_in_active_workspace(
     root: &Path,
     destination: &Path,
     contest_id: &str,
-    auth: &AuthSnapshot,
+    auth: &Arc<SessionAuth>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let atcoder = create_atcoder_client(auth)?;
@@ -542,11 +543,11 @@ fn repair_plan_changed_error() -> io::Error {
     )
 }
 
-fn create_atcoder_client(auth: &AuthSnapshot) -> Result<atcoder::AtCoderClient, AppError> {
+fn create_atcoder_client(auth: &Arc<SessionAuth>) -> Result<atcoder::AtCoderClient, AppError> {
     if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
         Ok(atcoder::AtCoderClient::fixture(path))
     } else {
-        Ok(atcoder::AtCoderClient::from_auth_snapshot(auth)?)
+        Ok(atcoder::AtCoderClient::from_session_auth(Arc::clone(auth))?)
     }
 }
 
@@ -1127,7 +1128,7 @@ mod tests {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let mut reporter = NullReporter;
         let config = Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap();
-        let auth = AuthSnapshot::configured_for_test("REVEL_SESSION=contest-create-test");
+        let auth = SessionAuth::configured_for_test("REVEL_SESSION=contest-create-test");
 
         create_contest_with(
             temp.path(),

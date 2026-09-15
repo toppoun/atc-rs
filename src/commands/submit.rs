@@ -913,6 +913,7 @@ mod tests {
         SubmissionResult, SubmissionTrackingErrorKind, Verdict,
     };
     use crate::atcoder::submit::{SubmitError, SubmitPageError};
+    use crate::auth::SessionAuth;
     use crate::config::Config;
     use crate::model::Contest;
 
@@ -1952,6 +1953,64 @@ mod tests {
             target: SubmissionTarget::Cpp,
             source_snapshot: "SOURCE_COOKIE_CSRF_SECRET\n".to_string(),
         }
+    }
+
+    fn rotate_session(session: &SessionAuth, value: &'static str) {
+        let headers = [reqwest::header::HeaderValue::from_static(value)];
+        session.observe_set_cookie_batch(
+            headers.iter(),
+            &reqwest::Url::parse("https://atcoder.jp/contests/abc473/submit").unwrap(),
+        );
+    }
+
+    #[test]
+    fn production_flow_carries_baseline_rotation_into_post_and_post_rotation_into_discovery() {
+        let session = SessionAuth::configured_for_test("REVEL_SESSION=flow-a");
+        let physical_posts = Cell::new(0usize);
+        let mut diagnostics = AttemptDiagnostics::for_test(
+            None,
+            false,
+            false,
+            "abc473",
+            "abc473_c",
+            SubmissionTarget::Cpp,
+        );
+        let completion = execute_prepared_with_tracking_diagnostics(
+            diagnostic_prepared(),
+            &mut diagnostics,
+            |_, _, _, _| {
+                assert!(session.credential_matches_for_test("REVEL_SESSION=flow-a"));
+                rotate_session(&session, "REVEL_SESSION=flow-b; Path=/");
+                Ok(())
+            },
+            |_, before_post| {
+                before_post("5001");
+                assert!(session.credential_matches_for_test("REVEL_SESSION=flow-b"));
+                physical_posts.set(physical_posts.get() + 1);
+                rotate_session(&session, "REVEL_SESSION=flow-c; Path=/");
+                Ok(SubmitExecutionOutcome::Submitted(SubmitOutcome::Accepted))
+            },
+            |_, _| {
+                assert!(session.credential_matches_for_test("REVEL_SESSION=flow-c"));
+                Ok(SubmissionDiscovery {
+                    submission_id: SubmissionId::for_test(42),
+                    submitted_at: None,
+                    official_language_label: None,
+                })
+            },
+            |_, _, on_status, _| {
+                on_status(&SubmissionStatus::Finished(SubmissionResult::new(
+                    Verdict::Accepted,
+                )));
+                Ok(())
+            },
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(completion, SubmissionCompletion::Accepted);
+        assert_eq!(physical_posts.get(), 1);
+        assert!(session.credential_matches_for_test("REVEL_SESSION=flow-c"));
     }
 
     fn run_successful_diagnostic_attempt(

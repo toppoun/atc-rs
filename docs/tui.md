@@ -277,9 +277,9 @@ mode = "external"
 
 ## Contest の Refresh / Switch
 
-Command Palette の `Refresh Contest` で、現在の contest の問題情報と sample を更新できます。更新処理は開始後に cancel できません。source は上書きしません。Refresh は新しい settings 境界ではなく、現在の ContestSession Config / Authentication snapshot を維持します。cookie file が変更されていても、Refresh の public fetch と以後の submit は現在の Authentication snapshot を使います。
+Command Palette の `Refresh Contest` で、現在の contest の問題情報と sample を更新できます。更新処理は開始後に cancel できません。source は上書きしません。Refresh は新しい settings 境界ではなく、現在の ContestSession Config と evolving session auth を維持します。cookie file が外部で変更されていても再読込せず、AtCoder の trusted HTTPS response が `REVEL_SESSION` を更新した場合だけ current session の successor を以後の fetch / submit に使用します。
 
-workspace から起動した Contest 画面では、`c` または Command Palette の `Switch Contest` を利用できます。Switch は新しい ContestSession の開始なので、最新の Workspace Config routing、Global Config、Authentication Cookie を読み直します。存在しない contest は確認後に作成され、その fetch と開始後の session は同じ Authentication snapshot を使います。Home へ戻って `c` で入り直す場合や、`atc contest` / `atc c` / TUI の `atc watch` で直接起動する場合も同じ entry 時 snapshot semantics です。Authentication が missing または invalid でも Contest は開始でき、public fetch は anonymous で行われますが、submit は network request 前に利用不可になります。
+workspace から起動した Contest 画面では、`c` または Command Palette の `Switch Contest` を利用できます。Switch は新しい ContestSession の開始なので、最新の Workspace Config routing、Global Config、Authentication Cookie を読み直します。存在しない contest は確認後に作成され、その fetch と開始後の session は同じ SessionAuth を共有するため、作成中に AtCoder が cookie を更新しても continuity が保たれます。Home へ戻って `c` で入り直す場合や、`atc contest` / `atc c` / TUI の `atc watch` で直接起動する場合も同じ entry 時 snapshot semantics です。Authentication が missing または invalid でも Contest は開始でき、public fetch は anonymous で行われますが、submit は network request 前に利用不可になります。
 
 ## マウス操作
 
