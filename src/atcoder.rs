@@ -64,6 +64,80 @@ pub enum AuthenticationStatus {
     Unauthenticated,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum AuthenticationVerification {
+    Authenticated {
+        username: Option<String>,
+        warnings: Vec<auth::AuthPersistenceWarning>,
+        lineage: auth::AuthenticationLineage,
+    },
+    Rejected {
+        warnings: Vec<auth::AuthPersistenceWarning>,
+        lineage: auth::AuthenticationLineage,
+    },
+    Unavailable {
+        warnings: Vec<auth::AuthPersistenceWarning>,
+        lineage: auth::AuthenticationLineage,
+    },
+}
+
+impl AuthenticationVerification {
+    pub(crate) fn matches_snapshot(&self, snapshot: &auth::AuthSnapshot) -> bool {
+        let lineage = match self {
+            Self::Authenticated { lineage, .. }
+            | Self::Rejected { lineage, .. }
+            | Self::Unavailable { lineage, .. } => lineage,
+        };
+        lineage.matches_snapshot(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authenticated_for_test(
+        snapshot: &auth::AuthSnapshot,
+        username: Option<String>,
+    ) -> Self {
+        let session = auth::SessionAuth::from_snapshot(snapshot);
+        Self::Authenticated {
+            username,
+            warnings: Vec::new(),
+            lineage: session
+                .authentication_lineage()
+                .expect("test verification snapshot must be configured"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authenticated_for_session_test(
+        session: &auth::SessionAuth,
+        username: Option<String>,
+        warnings: Vec<auth::AuthPersistenceWarning>,
+    ) -> Self {
+        Self::Authenticated {
+            username,
+            warnings,
+            lineage: session
+                .authentication_lineage()
+                .expect("test verification session must have a configured lineage"),
+        }
+    }
+}
+
+pub(crate) fn verify_authentication(
+    snapshot: Arc<auth::AuthSnapshot>,
+) -> AuthenticationVerification {
+    let session = auth::SessionAuth::from_snapshot(&snapshot);
+    let lineage = session
+        .authentication_lineage()
+        .expect("authentication verification requires a configured snapshot");
+    let Ok(client) = AtCoderClient::from_session_auth(session) else {
+        return AuthenticationVerification::Unavailable {
+            warnings: Vec::new(),
+            lineage,
+        };
+    };
+    client.verify_authentication()
+}
+
 pub fn authentication_status() -> Result<AuthenticationStatus, AtCoderError> {
     let auth = auth::AuthSnapshot::load();
     match auth.as_ref() {
@@ -244,8 +318,36 @@ impl HttpSource {
         Self::new_with_provider(auth, provider)
     }
 
+    #[cfg(test)]
+    fn new_for_test_origin_with_timeout(
+        auth: Arc<auth::SessionAuth>,
+        origin: &reqwest::Url,
+        timeout: Duration,
+    ) -> Result<Self, AtCoderError> {
+        let provider = Arc::new(SessionCookieProvider::for_test_origin(
+            Arc::clone(&auth),
+            origin,
+        ));
+        Ok(Self {
+            client: http_client_builder(Arc::clone(&provider))
+                .timeout(timeout)
+                .build()?,
+            submit_client: LazySubmitClient::new(provider),
+            auth,
+            last_request: Mutex::new(None),
+        })
+    }
+
     fn send(&self, request: RequestBuilder) -> Result<Response, reqwest::Error> {
         self.exchange(|| request.send())
+    }
+
+    fn send_with_warning_sink(
+        &self,
+        request: RequestBuilder,
+        warning_sink: impl FnMut(auth::AuthPersistenceWarning),
+    ) -> Result<Response, reqwest::Error> {
+        self.exchange_with_warning_sink(|| request.send(), warning_sink)
     }
 
     fn exchange<T>(&self, exchange: impl FnOnce() -> T) -> T {
@@ -430,6 +532,15 @@ impl AtCoderClient {
         })
     }
 
+    fn verify_authentication(&self) -> AuthenticationVerification {
+        let Source::Http(http) = &self.source else {
+            unreachable!("authentication verification always uses HTTP")
+        };
+        let settings = reqwest::Url::parse(&format!("{BASE_URL}/settings"))
+            .expect("the static AtCoder settings URL must be valid");
+        verify_authentication_http(http, settings)
+    }
+
     pub fn fixture(root: impl Into<PathBuf>) -> Self {
         Self {
             source: Source::Fixture(root.into()),
@@ -552,6 +663,91 @@ impl AtCoderClient {
             url: url.to_string(),
         })
     }
+}
+
+fn verify_authentication_http(
+    http: &HttpSource,
+    settings_url: reqwest::Url,
+) -> AuthenticationVerification {
+    let mut warnings = Vec::new();
+    let response = match http
+        .send_with_warning_sink(http.client.get(settings_url.clone()), |warning| {
+            warnings.push(warning)
+        }) {
+        Ok(response) => response,
+        Err(_) => {
+            return AuthenticationVerification::Unavailable {
+                warnings,
+                lineage: http
+                    .auth
+                    .authentication_lineage()
+                    .expect("authentication verification requires a configured session"),
+            };
+        }
+    };
+
+    let lineage = http
+        .auth
+        .authentication_lineage()
+        .expect("authentication verification requires a configured session");
+
+    if !response.status().is_success() {
+        return AuthenticationVerification::Unavailable { warnings, lineage };
+    }
+    if response.url() == &settings_url {
+        // Reaching the exact settings endpoint establishes authentication. Body failures and
+        // navigation markup changes affect only the optional account label.
+        let username = response
+            .text()
+            .ok()
+            .and_then(|body| parse_authenticated_username(&body));
+        return AuthenticationVerification::Authenticated {
+            username,
+            warnings,
+            lineage,
+        };
+    }
+    if is_canonical_login_redirect(response.url(), &settings_url) {
+        return AuthenticationVerification::Rejected { warnings, lineage };
+    }
+    AuthenticationVerification::Unavailable { warnings, lineage }
+}
+
+fn is_canonical_login_redirect(final_url: &reqwest::Url, settings_url: &reqwest::Url) -> bool {
+    final_url.scheme() == settings_url.scheme()
+        && final_url.host_str() == settings_url.host_str()
+        && final_url.port() == settings_url.port()
+        && final_url.username().is_empty()
+        && final_url.password().is_none()
+        && final_url.path() == "/login"
+        && final_url.fragment().is_none()
+        && {
+            let pairs = final_url.query_pairs().collect::<Vec<_>>();
+            pairs.len() == 1 && pairs[0].0 == "continue" && pairs[0].1 == settings_url.as_str()
+        }
+}
+
+fn parse_authenticated_username(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector =
+        Selector::parse("nav.navbar #navbar-collapse ul.nav.navbar-nav.navbar-right a[href]")
+            .expect("static authenticated-navigation selector must be valid");
+
+    document.select(&selector).find_map(|link| {
+        let href = link.value().attr("href")?;
+        let username = href.strip_prefix("/users/")?;
+        if username.is_empty()
+            || username.contains('/')
+            || username.contains('?')
+            || username.contains('#')
+            || !username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return None;
+        }
+        Some(username.to_string())
+    })
 }
 
 fn build_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
@@ -1054,6 +1250,27 @@ mod tests {
             .expect("response write failed");
     }
 
+    fn write_wire_response_with_body(
+        stream: &mut TcpStream,
+        status: &str,
+        headers: &[&str],
+        body: &str,
+    ) {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        stream
+            .write_all(response.as_bytes())
+            .expect("response write failed");
+    }
+
     fn local_origin(listener: &TcpListener) -> reqwest::Url {
         reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()
     }
@@ -1064,6 +1281,25 @@ mod tests {
 
     fn anonymous_session() -> Arc<auth::SessionAuth> {
         auth::SessionAuth::from_snapshot(&auth::AuthSnapshot::Missing)
+    }
+
+    fn managed_auth_location(root: &std::path::Path, value: &str) -> crate::paths::CookieLocation {
+        let platform_base = root.join("platform-state");
+        let state_dir = platform_base.join("atc").join("state");
+        let location = crate::paths::CookieLocation {
+            platform_base,
+            file: state_dir.join("cookie"),
+            state_dir,
+        };
+        std::fs::create_dir_all(&location.state_dir).unwrap();
+        std::fs::write(&location.file, value).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&location.file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        location
     }
 
     fn provider(session: Arc<auth::SessionAuth>) -> Arc<SessionCookieProvider> {
@@ -2146,5 +2382,294 @@ mod tests {
                 StatusCode::FOUND
             ))
         ));
+    }
+
+    #[test]
+    fn authenticated_username_comes_only_from_the_authenticated_navigation_fixture() {
+        let fixture =
+            std::fs::read_to_string(fixture_root().join("authentication").join("settings.html"))
+                .unwrap();
+        assert_eq!(
+            parse_authenticated_username(&fixture).as_deref(),
+            Some("toppoun")
+        );
+
+        let unrelated = r#"
+            <nav class="navbar"><div id="navbar-collapse">
+              <ul class="nav navbar-nav navbar-right"><li><a href="/settings">Settings</a></li></ul>
+            </div></nav>
+            <main><a class="username" href="/users/contest_author">contest_author</a></main>
+        "#;
+        assert_eq!(parse_authenticated_username(unrelated), None);
+
+        for invalid in [
+            "/users/",
+            "/users/name/extra",
+            "/users/name?x=1",
+            "/users/name#fragment",
+            "/users/non_ascii_é",
+        ] {
+            let html = format!(
+                r#"<nav class="navbar"><div id="navbar-collapse"><ul class="nav navbar-nav navbar-right"><li><a href="{invalid}">account</a></li></ul></div></nav>"#
+            );
+            assert_eq!(parse_authenticated_username(&html), None);
+        }
+    }
+
+    #[test]
+    fn verification_transport_reports_authenticated_username_and_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = managed_auth_location(temp.path(), "REVEL_SESSION=verify-a");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let body =
+            std::fs::read_to_string(fixture_root().join("authentication").join("settings.html"))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_wire_request(&mut stream, Some("REVEL_SESSION=verify-a"));
+            write_wire_response_with_body(
+                &mut stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=verify-b; Path=/"],
+                &body,
+            );
+            request
+        });
+        let snapshot = auth::AuthSnapshot::load_from(&location);
+        let session = auth::SessionAuth::from_snapshot(&snapshot);
+        let http = HttpSource::new_for_test_origin(Arc::clone(&session), &origin).unwrap();
+
+        let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+
+        let rotated = auth::AuthSnapshot::load_from(&location);
+        assert!(result.matches_snapshot(&rotated));
+        let unrelated = auth::AuthSnapshot::configured_for_test("REVEL_SESSION=external-x");
+        assert!(!result.matches_snapshot(&unrelated));
+        assert!(matches!(
+            result,
+            AuthenticationVerification::Authenticated {
+                username: Some(ref username),
+                ref warnings,
+                ..
+            } if username == "toppoun" && warnings.is_empty()
+        ));
+        assert_eq!(server.join().unwrap().path, "/settings");
+        assert!(session.credential_matches_for_test("REVEL_SESSION=verify-b"));
+        assert!(
+            std::fs::read_to_string(&location.file)
+                .unwrap()
+                .starts_with("REVEL_SESSION=verify-b")
+        );
+    }
+
+    #[test]
+    fn verification_keeps_authentication_when_username_body_is_unusable() {
+        for body in ["<html><body>no navigation</body></html>", ""] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = local_origin(&listener);
+            let owned_body = body.to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=no-name"));
+                write_wire_response_with_body(&mut stream, "200 OK", &[], &owned_body);
+            });
+            let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=no-name");
+            let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+            let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+            server.join().unwrap();
+            assert!(matches!(
+                result,
+                AuthenticationVerification::Authenticated { username: None, .. }
+            ));
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=broken-body"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .unwrap();
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=broken-body");
+        let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+        let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            AuthenticationVerification::Authenticated { username: None, .. }
+        ));
+    }
+
+    #[test]
+    fn verification_distinguishes_rejection_and_unavailable_responses() {
+        fn verify_redirect(final_path: &str, canonical: bool) -> AuthenticationVerification {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = local_origin(&listener);
+            let settings = origin.join("settings").unwrap();
+            let location = if canonical {
+                let mut login = origin.join("login").unwrap();
+                login
+                    .query_pairs_mut()
+                    .append_pair("continue", settings.as_str());
+                login.path().to_string() + "?" + login.query().unwrap()
+            } else {
+                final_path.to_string()
+            };
+            let redirect = format!("Location: {location}");
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let _ = read_wire_request(&mut first, Some("REVEL_SESSION=classification"));
+                write_wire_response(&mut first, "302 Found", &[&redirect]);
+                let (mut second, _) = listener.accept().unwrap();
+                let _ = read_wire_request(&mut second, Some("REVEL_SESSION=classification"));
+                write_wire_response_with_body(&mut second, "200 OK", &[], "login or other");
+            });
+            let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=classification");
+            let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+            let result = verify_authentication_http(&http, settings);
+            server.join().unwrap();
+            result
+        }
+
+        assert!(matches!(
+            verify_redirect("/login", true),
+            AuthenticationVerification::Rejected { .. }
+        ));
+        assert!(matches!(
+            verify_redirect("/unexpected", false),
+            AuthenticationVerification::Unavailable { .. }
+        ));
+
+        for status in ["429 Too Many Requests", "500 Internal Server Error"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = local_origin(&listener);
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=status"));
+                write_wire_response(&mut stream, status, &[]);
+            });
+            let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=status");
+            let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+            let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+            server.join().unwrap();
+            assert!(matches!(
+                result,
+                AuthenticationVerification::Unavailable { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn verification_timeout_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=timeout"));
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let session = auth::SessionAuth::configured_for_test("REVEL_SESSION=timeout");
+        let http = HttpSource::new_for_test_origin_with_timeout(
+            session,
+            &origin,
+            Duration::from_millis(30),
+        )
+        .unwrap();
+
+        let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            AuthenticationVerification::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn verification_server_deletion_removes_store_without_changing_http_classification() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = managed_auth_location(temp.path(), "REVEL_SESSION=delete-a");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=delete-a"));
+            write_wire_response_with_body(
+                &mut stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=; Path=/; Max-Age=0"],
+                "<html><body>settings</body></html>",
+            );
+        });
+        let snapshot = auth::AuthSnapshot::load_from(&location);
+        let session = auth::SessionAuth::from_snapshot(&snapshot);
+        let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+
+        let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+        server.join().unwrap();
+
+        let missing = auth::AuthSnapshot::load_from(&location);
+        assert!(result.matches_snapshot(&missing));
+        assert!(matches!(
+            result,
+            AuthenticationVerification::Authenticated {
+                username: None,
+                ref warnings,
+                ..
+            } if warnings.is_empty()
+        ));
+        assert!(!location.file.exists());
+        assert!(matches!(
+            auth::AuthSnapshot::load_from(&location).as_ref(),
+            auth::AuthSnapshot::Missing
+        ));
+    }
+
+    #[test]
+    fn verification_persistence_warning_does_not_change_authenticated_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = managed_auth_location(temp.path(), "REVEL_SESSION=warning-a");
+        std::fs::create_dir(location.state_dir.join(".cookie.lock")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = local_origin(&listener);
+        let body =
+            std::fs::read_to_string(fixture_root().join("authentication").join("settings.html"))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_wire_request(&mut stream, Some("REVEL_SESSION=warning-a"));
+            write_wire_response_with_body(
+                &mut stream,
+                "200 OK",
+                &["Set-Cookie: REVEL_SESSION=warning-b; Path=/"],
+                &body,
+            );
+        });
+        let snapshot = auth::AuthSnapshot::load_from(&location);
+        let session = auth::SessionAuth::from_snapshot(&snapshot);
+        let http = HttpSource::new_for_test_origin(session, &origin).unwrap();
+
+        let result = verify_authentication_http(&http, origin.join("settings").unwrap());
+        server.join().unwrap();
+
+        let unchanged = auth::AuthSnapshot::load_from(&location);
+        assert!(result.matches_snapshot(&unchanged));
+        assert!(matches!(
+            result,
+            AuthenticationVerification::Authenticated {
+                username: Some(ref username),
+                ref warnings,
+                ..
+            } if username == "toppoun" && warnings == &[auth::AuthPersistenceWarning::Unsafe]
+        ));
+        assert!(
+            std::fs::read_to_string(&location.file)
+                .unwrap()
+                .starts_with("REVEL_SESSION=warning-a")
+        );
     }
 }

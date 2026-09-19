@@ -64,12 +64,12 @@ atc
 
 workspace 外で `atc` を起動したときに開く補助的な入口です。Explorer で directory を探して既存 workspace を開けます。
 通常の directory を選んで Open すると、確認後にその場所を Init Here して workspace 化し、Workspace Home を開けます。
-`G` で global config、`t` で C++ / Python の user source template を editor で開けます。`a` は authentication cookie を開かず、安全なinspectionによる設定状態とpathを表示します。`?` は Explorer Shortcuts を表示します。
+`G` で global config、`t` で C++ / Python の user source template を editor で開けます。`a` ではAuthenticationを開き、cookieのPaste / Replace / Repair / Resetと認証確認ができます。`?` は Explorer Shortcuts を表示します。
 
 ### Workspace Home
 
 workspace root で `atc` を起動すると直接開きます。contest を開く、または作成して Contest 画面へ進む入口です。
-`w` で workspace config、`G` で global config、`t` で global な C++ / Python source template を editor で開けます。`a` はauthentication cookieの安全な設定状態とpathを表示します。
+`w` で workspace config、`G` で global config、`t` で global な C++ / Python source template を editor で開けます。`a` はGlobal Homeと共通のAuthenticationを開きます。
 Contest 画面からも Command Palette の `Back to Workspace Home` で戻れます。
 
 現在、Workspace Home から別 workspace への切り替えはできません。別 workspace へ移る場合は、一度終了して移動先で `atc` を起動してください。
@@ -117,14 +117,13 @@ User Input の作成・編集・保存・実行・削除、Submit modal、submis
 
 Contest の source template は Command Palette の `Open Template` から開きます。Contest の `t` は引き続き Submit です。
 
-Global Config と Workspace Config の編集は Home から行います。新しい ContestSession は entry 時に外部の Authentication Cookie を1回だけ読み込みます。Contest 中に cookie file を変更しても active session には反映されませんが、AtCoder が trusted HTTPS response で `REVEL_SESSION` を更新した場合は、その session が successor を引き継ぎ、安全な CAS で cookie file への反映も試みます。Refresh Contest は同じ evolving session auth を維持し、Switch Contest や Home からの再 entry では最新の外部 cookie を読み直します。template file の内容だけは snapshot せず、次に source/template を利用するときの filesystem 内容を使います。
+Global ConfigとWorkspace Configの編集、Authentication Cookieの管理はHomeから行います。開いているContestは途中でcookie fileを再読込しませんが、AtCoderがHTTPS responseで`REVEL_SESSION`を更新した場合は更新後のcookieを引き継ぎ、安全に保存を試みます。Refresh Contestは同じ認証状態を維持し、Switch ContestやHomeからの再entryでは最新のcookieを読み直します。template fileの内容だけは、次にsource/templateを利用するときのfilesystem内容を使います。
 
 ## Submit と AtCoder 認証
 
 解答は CLI の `atc submit <problem>` または Contest TUI の `t` から提出できます。C++ / Python source を選択でき、Python は設定または CLI の `--runtime` で runtime を選べます。提出後は AtCoder の submission status を追跡し、TUI では最新 receipt と history も表示します。
 
-提出には AtCoder の `REVEL_SESSION` cookie を atc の cookie file へ手動で配置する必要があります。file には `REVEL_SESSION=<value>` の1行だけを保存します。
-Home の Authentication Cookie action は credential file を開かず、安全なinspectionによる設定状態とpathだけを表示します。missing file は自動生成しません。
+提出には AtCoder の `REVEL_SESSION` cookie が必要です。Homeで`a`を押し、valueまたは`REVEL_SESSION=<value>`をPasteすると安全に保存し、そのcookieで認証確認します。Replace / Repair / Resetも同じ画面から行えます。account名はAtCoderの応答から取得できた場合だけ表示します。
 
 ```bash
 atc login

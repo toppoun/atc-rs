@@ -37,7 +37,7 @@ workspace 外で引数なしの `atc` を起動すると Global Home が開き�
 | `g` | Go to Path を開き、入力した directory を Explorer root にする |
 | `G` | Global Config を editor で開く |
 | `t` | C++ / Python の global source template を開く |
-| `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
+| `a` | 共通のAuthentication modalを開く |
 | `?` | Explorer Shortcuts を表示 |
 | `q` | 終了 |
 
@@ -45,7 +45,7 @@ workspace 外で引数なしの `atc` を起動すると Global Home が開き�
 
 Global Config が missing の場合は、確認後に comments-only default を初期化して editor で開けます。既存 file は parse error があっても、通常の Config に依存しない repair editor で開けます。Template は開くたびに Global Config を厳密に読み込み、invalid の場合は開始せず Global Config の修復を促します。
 
-Authentication Cookie は credential file です。Home actionはeditorを起動せず、credential内容も読みません。既存authと同じ安全なinspectionで Configured / Not configured / Invalid、期待path、`REVEL_SESSION=<value>` 形式を表示します。missing fileは作成せず、Unixではgroup / otherからアクセス可能なfile、symlink、不正なfile typeをInvalidとして扱います。
+Authenticationでは保存状態、認証確認結果、account名（取得できた場合）、cookie fileのpathを表示します。`p`でPaste / Replace / Repair、`r`でResetできます。入力値は表示しません。保存後の認証確認がnetwork errorなどで利用できない場合も、保存自体は成功していることがあります。詳しくは[AtCoder 認証](authentication.md)を参照してください。
 
 ### Open / Init Here
 
@@ -63,7 +63,7 @@ workspace root で `atc` を起動すると直接 Workspace Home へ入ります
 | `w` | active workspace root の Workspace Config を editor で開く |
 | `G` | Global Config を editor で開く |
 | `t` | C++ / Python の global source template を開く |
-| `a` | Authentication Cookie の安全なstatus / setup案内を表示 |
+| `a` | 共通のAuthentication modalを開く |
 | `q` | 終了 |
 
 `c` で contest ID を入力します。既存 contest なら `Enter` で Open し、存在しなければ `Enter` で Create & Open します。修復が必要な contest は、確認後に Repair & Open できます。`Esc` で cancel します。
@@ -277,9 +277,9 @@ mode = "external"
 
 ## Contest の Refresh / Switch
 
-Command Palette の `Refresh Contest` で、現在の contest の問題情報と sample を更新できます。更新処理は開始後に cancel できません。source は上書きしません。Refresh は新しい settings 境界ではなく、現在の ContestSession Config と evolving session auth を維持します。cookie file が外部で変更されていても再読込せず、AtCoder の trusted HTTPS response が `REVEL_SESSION` を更新した場合だけ current session の successor を以後の fetch / submit に使用します。
+Command Paletteの`Refresh Contest`で、現在のcontestの問題情報とsampleを更新できます。更新処理は開始後にcancelできません。sourceは上書きしません。Refreshでは設定と認証状態を読み直しません。cookie fileがHomeや別processで変更されていても、AtCoderがHTTPS responseで`REVEL_SESSION`を更新した場合を除き、現在のContestでは変更前の認証状態を使います。
 
-workspace から起動した Contest 画面では、`c` または Command Palette の `Switch Contest` を利用できます。Switch は新しい ContestSession の開始なので、最新の Workspace Config routing、Global Config、Authentication Cookie を読み直します。存在しない contest は確認後に作成され、その fetch と開始後の session は同じ SessionAuth を共有するため、作成中に AtCoder が cookie を更新しても continuity が保たれます。Home へ戻って `c` で入り直す場合や、`atc contest` / `atc c` / TUI の `atc watch` で直接起動する場合も同じ entry 時 snapshot semantics です。Authentication が missing または invalid でも Contest は開始でき、public fetch は anonymous で行われますが、submit は network request 前に利用不可になります。
+workspaceから起動したContest画面では、`c`またはCommand Paletteの`Switch Contest`を利用できます。Switchでは最新のWorkspace Config、Global Config、Authentication Cookieを読み直します。存在しないcontestは確認後に作成され、作成中にAtCoderがcookieを更新した場合も更新後のcookieを引き継ぎます。Homeへ戻って`c`で入り直す場合や、`atc contest` / `atc c` / TUIの`atc watch`で直接起動する場合も、開始時の設定とcookieを使います。AuthenticationがmissingまたはinvalidでもContestは開始でき、公開情報は認証なしで取得できますが、submitはnetwork request前に利用不可になります。
 
 ## マウス操作
 

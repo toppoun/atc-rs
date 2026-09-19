@@ -221,10 +221,12 @@ atc doctor
 
 ## AtCoder 認証を確認したい
 
+Workspace HomeまたはGlobal Homeで`a`を押すと、保存状態と認証確認結果を表示できます。`Verification unavailable`はnetwork errorやAtCoder側の一時的な障害を示し、cookieの保存失敗を意味するとは限りません。一度modalを閉じ、networkを確認してから開き直してください。
+
 ```bash
 atc login
 ```
 
-`login` は認証情報を書き込むコマンドではなく、現在のセッションが有効かを確認するコマンドです。
+`login` は認証情報を書き込むコマンドではなく、現在のセッションが有効かを確認するコマンドです。cookieのPaste / Replace / Repair / ResetはHomeのAuthenticationから行います。
 
 詳しくは [AtCoder 認証](authentication.md) を参照してください。

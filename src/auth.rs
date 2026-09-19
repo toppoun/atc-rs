@@ -50,6 +50,44 @@ impl Credential {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PastedCredentialError;
+
+impl fmt::Debug for PastedCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PastedCredentialError(<redacted>)")
+    }
+}
+
+impl fmt::Display for PastedCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("enter one valid REVEL_SESSION value")
+    }
+}
+
+impl std::error::Error for PastedCredentialError {}
+
+/// Parse input copied by a user. This is deliberately separate from both the on-disk record
+/// parser and Set-Cookie parsing: only a bare value or one optional REVEL_SESSION prefix is
+/// accepted, and no general whitespace normalization is performed.
+pub(crate) fn parse_pasted_credential(input: &str) -> Result<Credential, PastedCredentialError> {
+    let input = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\n'))
+        .unwrap_or(input);
+    let value = input.strip_prefix(SESSION_COOKIE_PREFIX).unwrap_or(input);
+
+    if input
+        .get(.."Cookie:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Cookie:"))
+        || value.starts_with(SESSION_COOKIE_PREFIX)
+    {
+        return Err(PastedCredentialError);
+    }
+
+    Credential::from_cookie_value(value).map_err(|_| PastedCredentialError)
+}
+
 impl fmt::Debug for Credential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Credential(<redacted>)")
@@ -110,6 +148,70 @@ pub(crate) enum AuthSnapshot {
     Invalid(AuthLoadError),
 }
 
+#[derive(Clone)]
+pub(crate) struct CredentialIdentity(Arc<Credential>);
+
+impl fmt::Debug for CredentialIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialIdentity(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+enum AuthenticationRuntimeIdentity {
+    Configured(CredentialIdentity),
+    ServerDeleted,
+}
+
+impl fmt::Debug for AuthenticationRuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Configured(_) => "Configured(<redacted>)",
+            Self::ServerDeleted => "ServerDeleted",
+        })
+    }
+}
+
+/// Opaque identity for the credential lineage observed by one authentication request.
+///
+/// This deliberately keeps the credential itself private and redacted. A verification result may
+/// be applied to either its bootstrap credential or the final server-driven successor. That also
+/// covers a rotation whose persistence failed and left the bootstrap credential on disk.
+#[derive(Clone)]
+pub(crate) struct AuthenticationLineage {
+    bootstrap: CredentialIdentity,
+    runtime: AuthenticationRuntimeIdentity,
+}
+
+impl fmt::Debug for AuthenticationLineage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticationLineage")
+            .field("bootstrap", &self.bootstrap)
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+impl AuthenticationLineage {
+    pub(crate) fn matches_snapshot(&self, snapshot: &AuthSnapshot) -> bool {
+        match snapshot {
+            AuthSnapshot::Configured { credential, .. } => {
+                credential.same_value(&self.bootstrap.0)
+                    || matches!(
+                        &self.runtime,
+                        AuthenticationRuntimeIdentity::Configured(identity)
+                            if credential.same_value(&identity.0)
+                    )
+            }
+            AuthSnapshot::Missing => {
+                matches!(self.runtime, AuthenticationRuntimeIdentity::ServerDeleted)
+            }
+            AuthSnapshot::Invalid(_) => false,
+        }
+    }
+}
+
 impl fmt::Debug for AuthSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -132,6 +234,10 @@ impl AuthSnapshot {
         Arc::new(snapshot)
     }
 
+    pub(crate) fn load_from(location: &CookieLocation) -> Arc<Self> {
+        Arc::new(load_auth_snapshot_from(location))
+    }
+
     #[cfg(test)]
     pub(crate) fn credential(&self) -> Option<&Credential> {
         match self {
@@ -143,6 +249,13 @@ impl AuthSnapshot {
     fn store(&self) -> Option<Arc<AuthStore>> {
         match self {
             Self::Configured { store, .. } => store.clone(),
+            Self::Missing | Self::Invalid(_) => None,
+        }
+    }
+
+    fn credential_identity(&self) -> Option<CredentialIdentity> {
+        match self {
+            Self::Configured { credential, .. } => Some(CredentialIdentity(Arc::clone(credential))),
             Self::Missing | Self::Invalid(_) => None,
         }
     }
@@ -271,6 +384,7 @@ pub(crate) struct SessionAuth {
     inner: Mutex<SessionAuthInner>,
     exchange: Mutex<()>,
     store: Option<Arc<AuthStore>>,
+    bootstrap: Option<CredentialIdentity>,
 }
 
 impl fmt::Debug for SessionAuth {
@@ -304,7 +418,20 @@ impl SessionAuth {
             }),
             exchange: Mutex::new(()),
             store: snapshot.store(),
+            bootstrap: snapshot.credential_identity(),
         })
+    }
+
+    pub(crate) fn authentication_lineage(&self) -> Option<AuthenticationLineage> {
+        let bootstrap = self.bootstrap.clone()?;
+        let runtime = match &self.lock_inner().state {
+            SessionAuthState::Configured { current, .. } => {
+                AuthenticationRuntimeIdentity::Configured(CredentialIdentity(Arc::clone(current)))
+            }
+            SessionAuthState::ServerDeleted { .. } => AuthenticationRuntimeIdentity::ServerDeleted,
+            SessionAuthState::Missing | SessionAuthState::Invalid(_) => return None,
+        };
+        Some(AuthenticationLineage { bootstrap, runtime })
     }
 
     #[cfg(test)]
@@ -604,6 +731,12 @@ impl AuthStore {
         Ok(open_state_directory(location)?.map(|directory| Self { directory }))
     }
 
+    fn open_or_create(location: &CookieLocation) -> io::Result<Self> {
+        Ok(Self {
+            directory: open_or_create_state_directory(location)?,
+        })
+    }
+
     fn load_current(&self) -> io::Result<Option<Credential>> {
         load_credential_from_directory(&self.directory)
     }
@@ -669,6 +802,85 @@ impl AuthStore {
         }
         Ok(AuthStoreMutationOutcome::Applied)
     }
+
+    fn write_explicit(&self, credential: &Credential) -> io::Result<Credential> {
+        self.write_explicit_with(credential, replace_cookie_file)
+    }
+
+    fn write_explicit_with(
+        &self,
+        credential: &Credential,
+        replace: impl FnOnce(&Dir, &Credential) -> io::Result<()>,
+    ) -> io::Result<Credential> {
+        let _process_lock = PROCESS_AUTH_STORE_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("process-local authentication storage lock poisoned"))?;
+        let lock = open_auth_store_lock(&self.directory)?;
+        lock.lock()
+            .map_err(|_| io::Error::other("authentication storage lock failed"))?;
+        validate_cookie_entry_for_explicit_mutation(&self.directory)?;
+        replace(&self.directory, credential)?;
+        let read_back = self.load_current()?.ok_or_else(|| {
+            io::Error::other("authentication credential disappeared during locked read-back")
+        })?;
+        if !read_back.same_value(credential) {
+            return Err(io::Error::other(
+                "authentication credential changed during locked read-back",
+            ));
+        }
+        Ok(read_back)
+    }
+
+    fn reset_explicit(&self) -> io::Result<ExplicitResetOutcome> {
+        let _process_lock = PROCESS_AUTH_STORE_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("process-local authentication storage lock poisoned"))?;
+        let lock = open_auth_store_lock(&self.directory)?;
+        lock.lock()
+            .map_err(|_| io::Error::other("authentication storage lock failed"))?;
+        match validate_cookie_entry_for_explicit_mutation(&self.directory)? {
+            CookieFileState::Missing => Ok(ExplicitResetOutcome::AlreadyMissing),
+            CookieFileState::Existing => {
+                self.directory.remove_file("cookie")?;
+                sync_directory(&self.directory)?;
+                Ok(ExplicitResetOutcome::Removed)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitResetOutcome {
+    Removed,
+    AlreadyMissing,
+}
+
+/// Store a credential supplied by an explicit user action, then read it back through the normal
+/// parser and permission checks. Unlike the server CAS APIs, this operation intentionally replaces
+/// any safe regular cookie entry even when the value is unchanged or malformed.
+pub(crate) fn write_explicit_credential(
+    location: &CookieLocation,
+    credential: &Credential,
+) -> io::Result<Arc<AuthSnapshot>> {
+    validate_cookie_location(location)?;
+    let store = Arc::new(AuthStore::open_or_create(location)?);
+    let credential = store.write_explicit(credential)?;
+    Ok(Arc::new(AuthSnapshot::Configured {
+        credential: Arc::new(credential),
+        store: Some(store),
+    }))
+}
+
+/// Remove the cookie entry without parsing its contents. A wholly missing hierarchy remains
+/// missing; no directory or lock file is created in that case.
+pub(crate) fn reset_explicit_credential(
+    location: &CookieLocation,
+) -> io::Result<ExplicitResetOutcome> {
+    validate_cookie_location(location)?;
+    let Some(store) = AuthStore::open(location)? else {
+        return Ok(ExplicitResetOutcome::AlreadyMissing);
+    };
+    store.reset_explicit()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +894,7 @@ pub(crate) enum CookieFileState {
 /// The file is opened with the same path-hierarchy, no-follow, regular-file, and permission checks
 /// used by authentication. This is intended for status and setup guidance only: the result does
 /// not make a later pathname reopen safe or guarantee that it would refer to the inspected object.
+#[cfg(test)]
 pub(crate) fn inspect_cookie_file(location: &CookieLocation) -> io::Result<CookieFileState> {
     match open_validated_cookie_file(location)? {
         Some(_) => Ok(CookieFileState::Existing),
@@ -750,10 +963,12 @@ fn validate_cookie_location(location: &CookieLocation) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn open_cookie_file(location: &CookieLocation) -> io::Result<Option<fs::File>> {
     open_cookie_file_with(location, || {})
 }
 
+#[cfg(test)]
 fn open_validated_cookie_file(location: &CookieLocation) -> io::Result<Option<fs::File>> {
     validate_cookie_location(location)?;
     let Some(file) = open_cookie_file(location)? else {
@@ -767,6 +982,7 @@ fn open_validated_cookie_file(location: &CookieLocation) -> io::Result<Option<fs
     Ok(Some(file))
 }
 
+#[cfg(test)]
 fn open_cookie_file_with(
     location: &CookieLocation,
     before_cookie_open: impl FnOnce(),
@@ -815,6 +1031,44 @@ fn open_state_directory(location: &CookieLocation) -> io::Result<Option<Dir>> {
         validate_state_directory(&directory)?;
     }
     Ok(Some(directory))
+}
+
+fn open_or_create_state_directory(location: &CookieLocation) -> io::Result<Dir> {
+    let state_directories = application_state_directories(location)?;
+
+    match fs::create_dir_all(&location.platform_base) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let mut directory = Dir::open_ambient_dir(&location.platform_base, ambient_authority())?;
+
+    for path in state_directories {
+        let component = path
+            .file_name()
+            .ok_or_else(|| unsafe_path_error("cookie state path is invalid"))?;
+        match directory.create_dir(component) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        directory = directory.open_dir_nofollow(component)?;
+        validate_state_directory(&directory)?;
+    }
+    Ok(directory)
+}
+
+fn validate_cookie_entry_for_explicit_mutation(directory: &Dir) -> io::Result<CookieFileState> {
+    match directory.symlink_metadata("cookie") {
+        Ok(metadata) => {
+            if metadata_is_reparse(&metadata) || !metadata.file_type().is_file() {
+                return Err(unsafe_path_error("cookie path is not a regular file"));
+            }
+            Ok(CookieFileState::Existing)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CookieFileState::Missing),
+        Err(error) => Err(error),
+    }
 }
 
 fn load_credential_from_directory(directory: &Dir) -> io::Result<Option<Credential>> {
@@ -1318,6 +1572,45 @@ mod tests {
                 parse_cookie_file(invalid).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
+        }
+    }
+
+    #[test]
+    fn pasted_credential_accepts_only_a_bare_or_single_prefixed_value() {
+        for accepted in [
+            "paste-value",
+            "REVEL_SESSION=paste-value",
+            "paste-value\n",
+            "REVEL_SESSION=paste-value\r\n",
+        ] {
+            let credential = parse_pasted_credential(accepted).unwrap();
+            assert_eq!(credential.as_str(), "REVEL_SESSION=paste-value");
+        }
+
+        let oversized = "x".repeat(MAX_COOKIE_LINE_BYTES);
+        for rejected in [
+            "".to_string(),
+            "REVEL_SESSION=".to_string(),
+            "REVEL_SESSION=REVEL_SESSION=nested".to_string(),
+            "Cookie: REVEL_SESSION=value".to_string(),
+            "Cookie:REVEL_SESSION=value".to_string(),
+            "cookie:REVEL_SESSION=value".to_string(),
+            "REVEL_SESSION=value; Path=/; HttpOnly".to_string(),
+            "REVEL_SESSION=value; OTHER=value".to_string(),
+            " value".to_string(),
+            "value ".to_string(),
+            "value\ninside".to_string(),
+            "value\n\n".to_string(),
+            "value\r\n\r\n".to_string(),
+            "bad value".to_string(),
+            "non-ascii-é".to_string(),
+            oversized,
+        ] {
+            let error = parse_pasted_credential(&rejected).unwrap_err();
+            let debug = format!("{error:?}");
+            if !rejected.is_empty() {
+                assert!(!debug.contains(&rejected));
+            }
         }
     }
 
@@ -1900,6 +2193,278 @@ mod tests {
             assert!(session.credential_matches_for_test("REVEL_SESSION=type-b"));
             assert!(location.state_dir.join(entry).is_dir());
         }
+    }
+
+    #[test]
+    fn explicit_write_creates_replaces_and_repairs_regular_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = location(temp.path());
+        let first = parse_pasted_credential("created-a").unwrap();
+        let second = parse_pasted_credential("REVEL_SESSION=replaced-b\n").unwrap();
+
+        let snapshot = write_explicit_credential(&location, &first).unwrap();
+        assert!(matches!(snapshot.as_ref(), AuthSnapshot::Configured { .. }));
+        assert!(location.file.is_file());
+        assert!(
+            fs::read_to_string(&location.file)
+                .unwrap()
+                .starts_with("REVEL_SESSION=created-a")
+        );
+
+        write_explicit_credential(&location, &second).unwrap();
+        assert!(
+            fs::read_to_string(&location.file)
+                .unwrap()
+                .starts_with("REVEL_SESSION=replaced-b")
+        );
+
+        for malformed in [b"malformed".as_slice(), b"", &[0xff]] {
+            write_cookie_file(&location.file, malformed);
+            write_explicit_credential(&location, &first).unwrap();
+            assert!(matches!(
+                load_auth_snapshot_from(&location),
+                AuthSnapshot::Configured { .. }
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_write_repairs_permissions_even_when_value_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let location = location(temp.path());
+        fs::create_dir_all(&location.state_dir).unwrap();
+        fs::write(&location.file, "REVEL_SESSION=same-value").unwrap();
+        fs::set_permissions(&location.file, fs::Permissions::from_mode(0o644)).unwrap();
+        let credential = parse_pasted_credential("same-value").unwrap();
+
+        write_explicit_credential(&location, &credential).unwrap();
+
+        assert_eq!(
+            fs::metadata(&location.file).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+
+    #[test]
+    fn explicit_reset_removes_any_regular_contents_and_keeps_missing_hierarchy_missing() {
+        for contents in [
+            b"REVEL_SESSION=valid".as_slice(),
+            b"malformed",
+            b"",
+            &[0xff],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let location = location(temp.path());
+            fs::create_dir_all(&location.state_dir).unwrap();
+            write_cookie_file(&location.file, contents);
+            assert_eq!(
+                reset_explicit_credential(&location).unwrap(),
+                ExplicitResetOutcome::Removed
+            );
+            assert!(!location.file.exists());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let location = location(temp.path());
+        assert_eq!(
+            reset_explicit_credential(&location).unwrap(),
+            ExplicitResetOutcome::AlreadyMissing
+        );
+        assert!(!location.platform_base.exists());
+    }
+
+    #[test]
+    fn explicit_mutations_reject_unsafe_cookie_and_lock_entries() {
+        let credential = parse_pasted_credential("safe-new").unwrap();
+        for entry in ["cookie", AUTH_LOCK_FILE] {
+            let temp = tempfile::tempdir().unwrap();
+            let location = location(temp.path());
+            fs::create_dir_all(&location.state_dir).unwrap();
+            fs::create_dir(location.state_dir.join(entry)).unwrap();
+
+            assert!(write_explicit_credential(&location, &credential).is_err());
+            assert!(reset_explicit_credential(&location).is_err());
+            assert!(location.state_dir.join(entry).is_dir());
+        }
+    }
+
+    #[test]
+    fn explicit_mutations_reject_symlinks_and_unsafe_parent_hierarchy() {
+        let credential = parse_pasted_credential("explicit-safe").unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        write_cookie_file(external.path(), "REVEL_SESSION=external-safe");
+        let symlink_location = location(temp.path());
+        fs::create_dir_all(&symlink_location.state_dir).unwrap();
+        if create_file_symlink(external.path(), &symlink_location.file) {
+            assert!(write_explicit_credential(&symlink_location, &credential).is_err());
+            assert!(reset_explicit_credential(&symlink_location).is_err());
+            assert!(
+                fs::read_to_string(external.path())
+                    .unwrap()
+                    .starts_with("REVEL_SESSION=external-safe")
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let parent_location = location(temp.path());
+        fs::create_dir_all(parent_location.state_dir.parent().unwrap()).unwrap();
+        if create_directory_symlink(external.path(), &parent_location.state_dir) {
+            assert!(write_explicit_credential(&parent_location, &credential).is_err());
+            assert!(reset_explicit_credential(&parent_location).is_err());
+            assert!(!external.path().join("cookie").exists());
+        }
+    }
+
+    #[test]
+    fn concurrent_explicit_writers_publish_complete_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = location(temp.path());
+        let initial = parse_pasted_credential("explicit-initial").unwrap();
+        write_explicit_credential(&location, &initial).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for value in ["explicit-one", "explicit-two"] {
+            let location = location.clone();
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                let credential = parse_pasted_credential(value).unwrap();
+                barrier.wait();
+                write_explicit_credential(&location, &credential).unwrap();
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let final_value = fs::read_to_string(&location.file).unwrap();
+        assert!(matches!(
+            final_value.as_str(),
+            "REVEL_SESSION=explicit-one" | "REVEL_SESSION=explicit-two"
+        ));
+        assert_no_auth_staging_files(&location.state_dir);
+    }
+
+    #[test]
+    fn explicit_write_returns_its_own_locked_read_back_before_a_competing_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = location(temp.path());
+        let first_location = location.clone();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let store = AuthStore::open_or_create(&first_location).unwrap();
+            let credential = parse_pasted_credential("atomic-first").unwrap();
+            let read_back = store
+                .write_explicit_with(&credential, |directory, credential| {
+                    replace_cookie_file(directory, credential)?;
+                    published_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            read_back.same_value(&credential)
+        });
+
+        published_rx.recv().unwrap();
+        let second_location = location.clone();
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let credential = parse_pasted_credential("atomic-second").unwrap();
+            let result = write_explicit_credential(&second_location, &credential);
+            second_done_tx.send(result.is_ok()).unwrap();
+        });
+
+        let second_was_blocked = second_done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err();
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap());
+        assert!(second_was_blocked);
+        assert!(second_done_rx.recv().unwrap());
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_write_faults_before_publish_preserve_the_old_credential() {
+        for injected in [
+            AuthStoreWriteStage::StagingCreate,
+            AuthStoreWriteStage::Write,
+            AuthStoreWriteStage::FileSync,
+            AuthStoreWriteStage::Publish,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (location, _) = managed_session(temp.path(), "REVEL_SESSION=explicit-old");
+            let store = AuthStore::open(&location).unwrap().unwrap();
+            let replacement = parse_pasted_credential("explicit-new").unwrap();
+
+            let result = store.write_explicit_with(&replacement, |directory, credential| {
+                replace_cookie_file_with_hook(directory, credential, |stage, _, _| {
+                    if stage == injected {
+                        Err(io::Error::other("injected explicit write failure"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
+
+            assert!(result.is_err());
+            assert!(
+                fs::read_to_string(&location.file)
+                    .unwrap()
+                    .starts_with("REVEL_SESSION=explicit-old")
+            );
+            assert_no_auth_staging_files(&location.state_dir);
+        }
+    }
+
+    #[test]
+    fn explicit_write_and_server_cas_share_the_same_lock_and_preserve_explicit_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (location, session) = managed_session(temp.path(), "REVEL_SESSION=race-a");
+        let explicit_location = location.clone();
+        let writer = std::thread::spawn(move || {
+            let credential = parse_pasted_credential("explicit-c").unwrap();
+            write_explicit_credential(&explicit_location, &credential).unwrap();
+        });
+
+        observe(
+            &session,
+            &["REVEL_SESSION=server-b; Path=/"],
+            "https://atcoder.jp/settings",
+        );
+        let _ = session.persist_pending();
+        writer.join().unwrap();
+
+        assert!(
+            fs::read_to_string(&location.file)
+                .unwrap()
+                .starts_with("REVEL_SESSION=explicit-c")
+        );
+    }
+
+    #[test]
+    fn reset_prevents_an_old_server_cas_from_recreating_the_cookie() {
+        let temp = tempfile::tempdir().unwrap();
+        let (location, session) = managed_session(temp.path(), "REVEL_SESSION=reset-a");
+        observe(
+            &session,
+            &["REVEL_SESSION=server-b; Path=/"],
+            "https://atcoder.jp/settings",
+        );
+        assert_eq!(
+            reset_explicit_credential(&location).unwrap(),
+            ExplicitResetOutcome::Removed
+        );
+
+        assert_eq!(session.persist_pending(), [AuthPersistenceWarning::Missing]);
+        assert!(!location.file.exists());
     }
 
     #[test]

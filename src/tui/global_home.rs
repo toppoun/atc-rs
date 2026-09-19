@@ -12,6 +12,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::authentication_modal::{self, AuthenticationModalController};
 use super::explorer::{self, ExplorerState};
 use super::home::{
     centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
@@ -62,7 +63,6 @@ enum GlobalHomeErrorKind {
     WorkspaceInitializedOpen,
     GoToPath,
     GlobalConfig,
-    AuthenticationCookie,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +86,7 @@ enum GlobalHomeFileAction {
     OpenGlobalConfig,
     OpenTemplate,
     Template(TemplateRequest),
-    ShowAuthenticationCookie,
+    OpenAuthentication,
     InitializeGlobalConfig(PathBuf),
 }
 
@@ -182,6 +182,7 @@ pub(crate) struct GlobalHomeState {
     initialize_workspace: Option<InitializeWorkspaceModal>,
     initialize_global_config: Option<InitializeGlobalConfigModal>,
     template: Option<ActiveTemplateModal>,
+    authentication: AuthenticationModalController,
     file_action: Option<GlobalHomeFileAction>,
     shortcut_help_visible: bool,
     explorer_overlay_visible: bool,
@@ -197,6 +198,7 @@ impl GlobalHomeState {
             initialize_workspace: None,
             initialize_global_config: None,
             template: None,
+            authentication: AuthenticationModalController::default(),
             file_action: None,
             shortcut_help_visible: false,
             explorer_overlay_visible: false,
@@ -376,6 +378,10 @@ impl GlobalHomeState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<GlobalHomeExit> {
+        if self.authentication.is_active() {
+            let _ = self.authentication.handle_event(TerminalEvent::Key(key));
+            return None;
+        }
         if self.error.is_some() {
             if key.kind == KeyEventKind::Press
                 && matches!(key.code, KeyCode::Enter | KeyCode::Escape)
@@ -487,7 +493,7 @@ impl GlobalHomeState {
                     None
                 }
                 KeyCode::Char('a') if has_plain_modifiers(key) => {
-                    self.file_action = Some(GlobalHomeFileAction::ShowAuthenticationCookie);
+                    self.file_action = Some(GlobalHomeFileAction::OpenAuthentication);
                     None
                 }
                 KeyCode::Char('q') if has_plain_modifiers(key) => Some(GlobalHomeExit::Quit),
@@ -502,6 +508,12 @@ impl GlobalHomeState {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        if self.authentication.is_active() {
+            let _ = self
+                .authentication
+                .handle_event(TerminalEvent::Paste(text.to_string()));
+            return;
+        }
         if self.error.is_some()
             || self.initialize_workspace.is_some()
             || self.initialize_global_config.is_some()
@@ -621,6 +633,7 @@ fn run_with_terminal_and_paths(
     let mut dirty = true;
 
     loop {
+        dirty |= state.authentication.poll();
         if dirty {
             terminal.draw_global_home(&mut |frame| render(frame, state))?;
             terminal.finish_global_home_redraw()?;
@@ -817,11 +830,8 @@ fn handle_file_action(
             }
             Ok(())
         }
-        GlobalHomeFileAction::ShowAuthenticationCookie => {
-            state.show_home_action_error(
-                GlobalHomeErrorKind::AuthenticationCookie,
-                super::authentication_cookie_status(paths),
-            );
+        GlobalHomeFileAction::OpenAuthentication => {
+            state.authentication.open(paths.authentication_target());
             Ok(())
         }
     }
@@ -1043,6 +1053,9 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     if let Some(modal) = state.template.as_ref() {
         view::render_open_template_modal(frame, modal);
     }
+    if state.authentication.is_active() {
+        authentication_modal::render(frame, &state.authentication);
+    }
 }
 
 fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspaceModal) {
@@ -1208,8 +1221,7 @@ fn prefixed_text_line(prefix: &str, value: &str, width: usize) -> String {
 fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
     let height = match error.kind {
         GlobalHomeErrorKind::WorkspaceInitialization
-        | GlobalHomeErrorKind::WorkspaceInitializedOpen
-        | GlobalHomeErrorKind::AuthenticationCookie => 13,
+        | GlobalHomeErrorKind::WorkspaceInitializedOpen => 13,
         GlobalHomeErrorKind::WorkspaceOpen | GlobalHomeErrorKind::GoToPath => 9,
         GlobalHomeErrorKind::GlobalConfig => 11,
     };
@@ -1220,7 +1232,6 @@ fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
         GlobalHomeErrorKind::WorkspaceInitializedOpen => " Workspace Initialized, Open Failed ",
         GlobalHomeErrorKind::GoToPath => " Go to Path Failed ",
         GlobalHomeErrorKind::GlobalConfig => " Global Config Failed ",
-        GlobalHomeErrorKind::AuthenticationCookie => " Authentication Cookie ",
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -1240,6 +1251,8 @@ fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
@@ -1262,6 +1275,30 @@ mod tests {
 
     fn buffer_text(buffer: &Buffer) -> String {
         buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn wait_for_authentication_text(state: &mut GlobalHomeState, expected: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let _ = state.authentication.poll();
+            let rendered = buffer_text(&draw(state, 100, 30));
+            if rendered.contains(expected) {
+                return rendered;
+            }
+            std::thread::yield_now();
+        }
+        panic!("authentication modal did not render the expected state");
+    }
+
+    fn wait_for_worker_start(started: &AtomicBool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if started.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("authentication worker did not start");
     }
 
     struct ScriptedGlobalTerminal {
@@ -1337,6 +1374,9 @@ mod tests {
                 std::fs::write(path, contents)?;
             }
             self.active_batch = batch;
+            if self.active_batch.is_empty() {
+                std::thread::sleep(wait.min(Duration::from_millis(10)));
+            }
             Ok(!self.active_batch.is_empty())
         }
 
@@ -1699,12 +1739,12 @@ mod tests {
     }
 
     #[test]
-    fn authentication_cookie_reports_a_safe_existing_path_without_opening_or_rendering_its_value() {
+    fn authentication_modal_reports_invalid_regular_file_without_rendering_its_value() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
         let cookie = cookie_location(temp.path());
         std::fs::create_dir_all(&cookie.state_dir).unwrap();
-        let secret = "REVEL_SESSION=super-secret-cookie-value";
+        let secret = "super-secret-invalid-cookie-value";
         write_cookie(&cookie.file, secret);
         let paths = HomeActionPaths::for_test(config, cookie.clone());
         let mut state = GlobalHomeState::new(temp.path().to_path_buf());
@@ -1713,6 +1753,7 @@ mod tests {
             30,
             [
                 vec![event(KeyCode::Char('a'))],
+                vec![],
                 vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
@@ -1724,8 +1765,8 @@ mod tests {
         );
         assert!(terminal.editor_targets.is_empty());
         assert!(terminal.frames.iter().any(|frame| {
-            frame.contains("Status: Configured")
-                && frame.contains("REVEL_SESSION=<value>")
+            frame.contains("Status   Invalid")
+                && frame.contains("Repair Cookie")
                 && frame.contains("cookie")
         }));
         assert!(terminal.frames.iter().all(|frame| !frame.contains(secret)));
@@ -1742,6 +1783,7 @@ mod tests {
             30,
             [
                 vec![event(KeyCode::Char('a'))],
+                vec![],
                 vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
@@ -1754,11 +1796,134 @@ mod tests {
         assert!(!cookie.file.exists());
         assert!(terminal.editor_targets.is_empty());
         assert!(terminal.frames.iter().any(|frame| {
-            frame.contains("Status: Not configured")
-                && frame.contains("REVEL_SESSION=<value>")
-                && frame.contains("Path:")
+            frame.contains("Status   Not configured")
+                && frame.contains("Paste Cookie")
+                && frame.contains("Path")
                 && frame.contains("cookie")
         }));
+    }
+
+    #[test]
+    fn global_home_production_loop_keeps_authentication_paste_out_of_path_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let cookie = cookie_location(temp.path());
+        let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie.clone());
+        let root = temp.path().to_path_buf();
+        let secret = "global-loop-secret";
+        let mut state = GlobalHomeState::new(root.clone());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('a'))],
+                vec![],
+                vec![event(KeyCode::Char('p'))],
+                vec![TerminalEvent::Paste(secret.to_string())],
+                vec![TerminalEvent::Resize(
+                    super::super::terminal::TerminalSize {
+                        columns: 101,
+                        rows: 31,
+                    },
+                )],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(state.explorer.root(), root);
+        assert!(!cookie.file.exists());
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("REVEL_SESSION=<hidden>"))
+        );
+        assert!(terminal.frames.iter().all(|frame| !frame.contains(secret)));
+    }
+
+    #[test]
+    fn global_home_dispatch_blocks_close_during_save_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let cookie = cookie_location(temp.path());
+        let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie.clone());
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        state.authentication = AuthenticationModalController::new_with_verifier(|snapshot| {
+            crate::atcoder::AuthenticationVerification::authenticated_for_test(
+                &snapshot,
+                Some("global_user".to_string()),
+            )
+        });
+        state.authentication.open(paths.authentication_target());
+        wait_for_authentication_text(&mut state, "Not configured");
+
+        let save_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let save_started = Arc::new(AtomicBool::new(false));
+        let hook_gate = Arc::clone(&save_gate);
+        let hook_started = Arc::clone(&save_started);
+        state
+            .authentication
+            .set_worker_hook_for_test(move |purpose, stage| {
+                if purpose == authentication_modal::WorkerPurpose::Write
+                    && stage == authentication_modal::WorkerTestStage::BeforeWork
+                {
+                    hook_started.store(true, Ordering::SeqCst);
+                    let (released, wake) = &*hook_gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+            });
+        assert_eq!(state.handle_key(key(KeyCode::Char('p'))), None);
+        state.handle_paste("global-close-safe");
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+        wait_for_worker_start(&save_started);
+        for code in [KeyCode::Escape, KeyCode::Char('q'), KeyCode::Char('a')] {
+            assert_eq!(state.handle_key(key(code)), None);
+            assert!(state.authentication.is_active());
+        }
+        assert!(buffer_text(&draw(&mut state, 100, 30)).contains("Saving..."));
+        let (released, wake) = &*save_gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        wait_for_authentication_text(&mut state, "Authenticated");
+
+        let reset_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let reset_started = Arc::new(AtomicBool::new(false));
+        let hook_gate = Arc::clone(&reset_gate);
+        let hook_started = Arc::clone(&reset_started);
+        state
+            .authentication
+            .set_worker_hook_for_test(move |purpose, stage| {
+                if purpose == authentication_modal::WorkerPurpose::Reset
+                    && stage == authentication_modal::WorkerTestStage::BeforeWork
+                {
+                    hook_started.store(true, Ordering::SeqCst);
+                    let (released, wake) = &*hook_gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+            });
+        state.handle_key(key(KeyCode::Char('r')));
+        state.handle_key(key(KeyCode::Enter));
+        wait_for_worker_start(&reset_started);
+        for code in [KeyCode::Escape, KeyCode::Char('q'), KeyCode::Char('a')] {
+            assert_eq!(state.handle_key(key(code)), None);
+            assert!(state.authentication.is_active());
+        }
+        assert!(buffer_text(&draw(&mut state, 100, 30)).contains("Resetting..."));
+        let (released, wake) = &*reset_gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        wait_for_authentication_text(&mut state, "Not configured");
+        assert!(!cookie.file.exists());
     }
 
     #[test]
@@ -1779,6 +1944,7 @@ mod tests {
             30,
             [
                 vec![event(KeyCode::Char('a'))],
+                vec![],
                 vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
@@ -1793,7 +1959,7 @@ mod tests {
             terminal
                 .frames
                 .iter()
-                .any(|frame| frame.contains("Status: Invalid"))
+                .any(|frame| frame.contains("Status   Invalid"))
         );
         assert!(terminal.frames.iter().all(|frame| !frame.contains(secret)));
         assert_eq!(std::fs::read_to_string(external.path()).unwrap(), secret);

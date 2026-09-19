@@ -1,4 +1,5 @@
 pub mod app;
+mod authentication_modal;
 #[cfg(debug_assertions)]
 pub(crate) mod demo;
 mod detail;
@@ -913,6 +914,13 @@ impl HomeActionPaths {
         Ok((file, location))
     }
 
+    pub(crate) fn authentication_target(
+        &self,
+    ) -> Result<(PathBuf, crate::paths::CookieLocation), String> {
+        self.cookie()
+            .map(|(path, location)| (path.to_path_buf(), location.clone()))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         global_config: PathBuf,
@@ -940,32 +948,6 @@ impl HomeActionPaths {
             templates_dir: Ok(templates_dir),
             cookie_file: Ok(cookie_location.file.clone()),
             cookie_location: Ok(cookie_location),
-        }
-    }
-}
-
-pub(crate) fn authentication_cookie_status(paths: &HomeActionPaths) -> String {
-    const FORMAT: &str = "REVEL_SESSION=<value>";
-    const PERMISSIONS: &str = "On Unix, group/other access must be denied (0600 is recommended).";
-
-    let (target, location) = match paths.cookie() {
-        Ok(cookie) => cookie,
-        Err(error) => {
-            return format!(
-                "Status: Invalid\nPath: unavailable\nFormat: {FORMAT}\n\n{error}\n\n{PERMISSIONS}"
-            );
-        }
-    };
-    let path = target.display();
-    match crate::auth::inspect_cookie_file(location) {
-        Ok(crate::auth::CookieFileState::Existing) => format!(
-            "Status: Configured\nPath: {path}\nFormat: {FORMAT}\n\nCredential contents are not displayed.\n{PERMISSIONS}"
-        ),
-        Ok(crate::auth::CookieFileState::Missing) => format!(
-            "Status: Not configured\nPath: {path}\nFormat: {FORMAT}\n\nRun `atc login` to set it up. The file was not created.\n{PERMISSIONS}"
-        ),
-        Err(error) => {
-            format!("Status: Invalid\nPath: {path}\nFormat: {FORMAT}\n\n{error}\n\n{PERMISSIONS}")
         }
     }
 }

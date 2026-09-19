@@ -2178,13 +2178,25 @@ impl Drop for TerminaSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum TerminalEvent {
     Key(KeyEvent),
     Paste(String),
     Pointer(PointerEvent),
     Resize(TerminalSize),
     Ignored,
+}
+
+impl std::fmt::Debug for TerminalEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key(key) => formatter.debug_tuple("Key").field(key).finish(),
+            Self::Paste(_) => formatter.write_str("Paste(<redacted>)"),
+            Self::Pointer(pointer) => formatter.debug_tuple("Pointer").field(pointer).finish(),
+            Self::Resize(size) => formatter.debug_tuple("Resize").field(size).finish(),
+            Self::Ignored => formatter.write_str("Ignored"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

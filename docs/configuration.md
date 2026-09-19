@@ -2,11 +2,11 @@
 
 `atc` は設定ファイルがなくても動作します。変更したい項目だけを `config.toml` に追加する方式です。
 
-## ContestSession の設定境界
+## Contestを開いたときに読み込まれる設定
 
-新しい ContestSession を開始すると、その時点の Global Config と外部 Authentication Cookie を snapshot として1回だけ読み込みます。Contest の Refresh は同じ Config と evolving session auth を維持し、Switch Contest、Home からの再 entry、`atc contest` / `atc c` / TUI の `atc watch` は現在の Config と外部 cookie から新しい session を作ります。
+新しいContestを開始すると、その時点のGlobal ConfigとAuthentication Cookieを1回だけ読み込みます。ContestのRefreshは同じ設定と認証状態を維持し、Switch Contest、Homeからの再entry、`atc contest` / `atc c` / TUIの`atc watch`は現在の設定とcookieを読み直します。
 
-Contest 中に Config や cookie file を外部から変更しても、現在の session には反映されません。反映するには Home へ戻って入り直すか、Contest を Switch してください。ただし AtCoder が trusted HTTPS response で `REVEL_SESSION` を更新した場合は、active session が successor を引き継ぎます。Authentication Cookie の保存形式と安全な file policy は [AtCoder 認証](authentication.md) を参照してください。
+Contest中にConfigを編集したりHomeでcookieをPaste / Replace / Repair / Resetしたりしても、現在のContestには反映されません。反映するにはHomeへ戻って入り直すか、ContestをSwitchしてください。ただしAtCoderがHTTPS responseで`REVEL_SESSION`を更新した場合は、開いているContestが更新後のcookieを引き継ぎます。Authentication Cookieの保存形式と操作は[AtCoder 認証](authentication.md)を参照してください。
 
 ## 設定ファイルを作る
 
