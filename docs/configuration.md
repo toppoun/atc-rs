@@ -1,12 +1,6 @@
 # 設定
 
-`atc` は設定ファイルがなくても動作します。変更したい項目だけを `config.toml` に追加する方式です。
-
-## Contestを開いたときに読み込まれる設定
-
-新しいContestを開始すると、その時点のGlobal ConfigとAuthentication Cookieを1回だけ読み込みます。ContestのRefreshは同じ設定と認証状態を維持し、Switch Contest、Homeからの再entry、`atc contest` / `atc c` / TUIの`atc watch`は現在の設定とcookieを読み直します。
-
-Contest中にConfigを編集したりHomeでcookieをPaste / Replace / Repair / Resetしたりしても、現在のContestには反映されません。反映するにはHomeへ戻って入り直すか、ContestをSwitchしてください。ただしAtCoderがHTTPS responseで`REVEL_SESSION`を更新した場合は、開いているContestが更新後のcookieを引き継ぎます。Authentication Cookieの保存形式と操作は[AtCoder 認証](authentication.md)を参照してください。
+`atc` は設定ファイルを作らなくても動作します。デフォルト言語、実行コマンド、timeout、editor、Python の提出 runtime を変えたい場合だけ、必要な項目を `config.toml` に追加します。
 
 ## 設定ファイルを作る
 
@@ -17,6 +11,8 @@ atc config init
 このコマンドは、設定ファイルがまだない場合だけ作成します。既存の設定ファイルは上書きしません。
 
 初期状態のファイルはコメントのみで、組み込みのデフォルト設定がそのまま使われます。
+
+Global Home または Workspace Home の `G` から、同じファイルをエディタで開けます。
 
 ## 保存場所
 
@@ -67,6 +63,26 @@ mode = "terminal"
 ```
 
 必要な項目だけを書けばよく、書かれていない項目には組み込みのデフォルト値が使われます。
+
+## 最初に変更することが多い設定
+
+Python を普段使う場合は、デフォルト言語を変更します。macOS など Python のコマンドが `python3` の環境では、runner も合わせて指定します。
+
+```toml
+[defaults]
+language = "python"
+
+[runner]
+python = "python3"
+```
+
+C++ を使う場合は、通常は設定なしで `g++` と `-std=c++23 -O2 -Wall -Wextra` が使われます。別の compiler や option が必要な場合だけ `[runner]` を変更してください。
+
+## 変更が反映されるタイミング
+
+設定は Contest を開くときに読み込まれます。開いている Contest の途中で設定ファイルを編集した場合は、Workspace Home へ戻って開き直すか、`Switch Contest` で入り直してください。`Refresh Contest` だけでは新しい設定を読み直しません。
+
+Home で変更した認証情報も、同様に次に Contest を開いたときに反映されます。詳しくは[AtCoder 認証](authentication.md#変更が反映されるタイミング)を参照してください。
 
 ## 設定項目と組み込みデフォルト
 
@@ -288,3 +304,5 @@ atc doctor
 ```
 
 `doctor` では、各設定が組み込み値かユーザー設定かも確認できます。
+
+`doctor` は設定やファイルを変更しません。runner については設定したコマンドの `--version` を確認しますが、C++23 の個々の機能に対応しているかまでは検査しません。実際の compile は `atc test` で確認してください。

@@ -1,8 +1,8 @@
 # テンプレート
 
-`atc` は C++ / Python の組み込みテンプレートを持っているため、設定なしでもソースを作成できます。
+`atc` は C++ / Python の組み込みテンプレートを持っているため、通常は設定なしで使い始められます。
 
-自分用に変更したい場合だけ、ユーザーテンプレートを初期化します。
+include、macro、入力用関数などを自分用に変えたくなった場合だけ、ユーザーテンプレートを作成します。
 
 ## テンプレートを作る
 
@@ -67,11 +67,14 @@ ${XDG_CONFIG_HOME:-~/.config}/atc/templates/python.py
 atc new abc466
 atc contest abc466   # コンテストがまだない場合
 atc create A
+atc create memo -l python
 ```
 
 TUI の `Open Source` からまだ存在しないソースを作る場合も同じテンプレートを使います。
 
 作成先に同名のソースファイルが既にある場合、その内容は上書きしません。
+
+テンプレートを編集した内容は、次に新しいソースを作成するときに使われます。すでに存在する `A.cpp` や `A.py` は変更されません。
 
 ## Stress Helper とは別
 
@@ -94,6 +97,10 @@ atc stress init A
 
 ## TUI から編集する
 
-Command Palette の `Open Template` から C++ / Python のテンプレートを開けます。
+Global Home / Workspace Home の `t`、または Contest の Command Palette にある `Open Template` から、C++ / Python のテンプレートを開けます。
 
-まだ初期化していない言語は `i` で作成して、そのままエディタで開けます。
+`Ready` のテンプレートは `Enter` の `Open` で開きます。まだ作成していない言語は `Missing` と表示され、`Enter` の `Initialize & Open` で作成してそのままエディタで開けます。`Esc` で戻ります。
+
+`Invalid` と表示された場合は、通常のファイルとして安全に編集できるときだけ `Enter` の `Open to Repair` で開けます。ディレクトリや安全に扱えないファイルを、atc-rs が勝手に置き換えることはありません。
+
+TUI からエディタを開けない場合は、上記の保存場所にあるファイルを直接編集するか、[editor 設定](configuration.md#editor)を追加してください。

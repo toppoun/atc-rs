@@ -1,6 +1,6 @@
 # ワークスペース
 
-ワークスペースを使うと、ABC / ARC / AGC などのコンテストを1つのディレクトリ以下へ整理できます。
+ワークスペースを使うと、ABC / ARC / AGC などの Contest を1つのフォルダ以下へ整理できます。Contest ID に応じて保存先を振り分けられますが、初期設定のままでも利用できます。
 
 ## ワークスペースを作る
 
@@ -19,6 +19,18 @@ atc init
 ```
 
 既に有効なファイルがある場合は上書きしません。不正な既存ファイルも勝手に置き換えず、エラーを返します。
+
+## Contest の保存先
+
+初期設定では、Contest は次の場所へ作成されます。
+
+```text
+<workspace>/ABC/abc123
+<workspace>/ARC/arc123
+<workspace>/AGC/agc123
+```
+
+どのルールにも一致しない Contest は `<workspace>/<contest-id>` に作成されます。保存先を変更する場合だけ `.atc-workspace.toml` を編集します。
 
 ## workspace config
 
@@ -124,15 +136,24 @@ path = "ADT"
 
 ADT は contest ID の種類が変わることがあるため、この例では `adt_` で始まる ID をまとめて `ADT` へ振り分けています。
 
-## コンテストを開く
+## Contest を開く・切り替える
+
+workspace ルートで `atc` を起動し、Workspace Home で `c` を押す方法が基本です。Contest ID を入力して `Enter` を押すと、既存の Contest を開くか、新しく作成します。
+
+Contest 画面から別の Contest へ移るには、`:` の Command Palette で `Switch Contest` を選びます。Workspace Home へ戻る場合は `Back to Workspace Home` を選びます。
+
+コマンドから直接開くこともできます。
 
 ワークスペースのルートで:
 
 ```bash
 atc contest abc466
+atc c abc466
 ```
 
-`abc466` がまだなければ、AtCoder から問題情報とサンプルを取得して作成します。既に存在すればそのコンテストを使い、そのまま TUI を起動します。
+`atc c` は `atc contest` の短い別名です。
+
+`abc466` がまだなければ、AtCoder から問題情報とサンプルを取得し、設定したデフォルト言語のソースを作成します。既に存在すればその Contest を使い、そのまま TUI を起動します。
 
 `.atc-workspace.toml` がない場合も利用でき、その場合は実行ディレクトリ直下の `abc466` を対象にします。既存データに修復が必要な場合は確認を求め、ユーザーが同意したときだけ `atc` 管理部分を修復します。
 
@@ -142,6 +163,7 @@ TUI を起動せず、コンテストを作成するコマンドです。
 
 ```bash
 atc new abc466
+atc new abc466 -l python
 ```
 
 `atc new` は `.atc-workspace.toml` の routing を使わず、常に**実行したディレクトリの直下**へ `<contest-id>` を作ります。上の例を `atcoder/` で実行すると、保存先は `atcoder/abc466` です。
@@ -160,6 +182,7 @@ atc watch -c abc466
 atc refresh -c abc466
 atc stress A -c abc466
 atc stress init A -c abc466
+atc submit A -c abc466
 ```
 
 ## 親ディレクトリは自動検索しない
@@ -183,13 +206,14 @@ atcoder/
 
 ## コンテストディレクトリの中身
 
-作成されたコンテストは、おおむね次の構成になります。
+作成された Contest は、おおむね次の構成になります。Stress Test や User Input のフォルダは、必要になったときに作成されます。
 
 ```text
 abc466/
 ├── .atc/
 │   ├── contest.toml
-│   └── stress/
+│   ├── stress/
+│   └── user-inputs/
 ├── tests/
 │   ├── A/
 │   │   ├── sample-1.in
@@ -221,7 +245,11 @@ atc refresh -c abc466
 
 `tests/` の中に `atc` が管理していないファイルやディレクトリがある場合は、それらを勝手に削除せず、更新を停止してエラーにします。
 
-更新の準備中に contest のディレクトリや metadata、管理対象の samples が変わった場合も、安全のため処理を停止します。エラーに recovery data の保存先が表示された場合は、その内容を確認してから再実行してください。
+更新中に Contest の管理ファイルやサンプルが別の操作で変わった場合も、エラーを表示して処理を終了します。
+
+エラーに `installed new data` と表示された場合は、新しい問題メタデータと `tests/` がすでに反映されている可能性があります。以前の `tests/` は、エラーに表示された recovery path へ保持されている場合があります。再実行する前に、現在の Contest の `.atc/contest.toml` と `tests/`、案内された recovery path の両方を確認してください。エラーだけを見て、現在のファイルや recovery data を削除・上書きしないでください。
+
+それ以外でも recovery path が表示された場合は、その内容を確認してから再実行してください。
 
 ## 壊れたコンテストの修復
 

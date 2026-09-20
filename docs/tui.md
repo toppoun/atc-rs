@@ -1,293 +1,250 @@
-# TUI
+# TUI の使い方
 
-`atc` の TUI は、workspace を探す Global Home、workspace 内の入口となる Workspace Home、contest 作業を行う Contest 画面の3層で構成されます。
+atc-rs の TUI は、workspace を選ぶ Home 画面と、問題を解く Contest 画面で構成されます。
 
 ```text
 Global Home
-    ↓ Open / Init Here
-Workspace Home
-    ↓ Open / Create Contest
-Contest
-    ↓ Back to Workspace Home
-Workspace Home
+  └─ Workspace Home
+       └─ Contest
 ```
 
-workspace root で `atc` を起動した場合は Workspace Home から、workspace 外で起動した場合は Global Home から始まります。判定対象は正確な現在ディレクトリだけで、親 workspace は自動探索しません。
+`atc` を引数なしで起動すると、正確な現在のフォルダだけを確認します。
 
-`atc contest <contest-id>` / `atc c <contest-id>` と `atc watch` は、従来どおり Contest 画面を直接起動できます。
+- workspace のルートで起動した場合: `Workspace Home`
+- それ以外で起動した場合: `Global Home`
+
+親フォルダにある workspace は自動では探しません。
+
+Contest を直接開く場合は、workspace ルートまたは通常のフォルダで次を実行します。
+
+```bash
+atc contest abc466
+```
+
+既存の Contest フォルダから直接 TUI を開く場合は `atc watch`、workspace ルートから Contest を指定する場合は `atc watch -c abc466` も利用できます。
 
 ## Global Home
 
-workspace 外で引数なしの `atc` を起動すると Global Home が開きます。Explorer で directory を選択し、既存 workspace を Workspace Home で開くための画面です。
+Global Home は、フォルダを探して workspace を開くための画面です。
 
-幅の広い terminal では Explorer が左 pane に表示されます。狭い terminal では `o` で Explorer overlay を開き、directory を選んでもう一度 `o` を押します。
+左側の Explorer でフォルダを選び、`o` の `Open` で開きます。通常のフォルダを開いた場合は `Initialize Workspace` が表示されるため、`Enter` の `Init Here` でその場所を workspace にできます。初期化せずに戻るには `Esc` を押します。
 
-### Explorer
+画面の幅が狭い場合は、`o` で Explorer の選択画面が開きます。その中でもう一度 `o` を押すと、選択中のフォルダを開きます。`Esc` で閉じます。
 
 | キー | 操作 |
 | --- | --- |
-| `j` / `↓` | 次の directory を選択 |
-| `k` / `↑` | 前の directory を選択 |
-| `Enter` | 選択 directory を展開 / 折りたたみ |
-| `l` / `→` | 展開する。展開済みなら最初の子 directory へ移動 |
-| `h` / `←` | 折りたたむ。折りたたみ済みなら表示上の親 directory へ移動 |
-| `Backspace` | Explorer root を1つ上の directory へ移動 |
-| `r` | 選択 directory を再読み込み |
-| `o` | 選択 directory を Open |
-| `g` | Go to Path を開き、入力した directory を Explorer root にする |
-| `G` | Global Config を editor で開く |
-| `t` | C++ / Python の global source template を開く |
-| `a` | 共通のAuthentication modalを開く |
-| `?` | Explorer Shortcuts を表示 |
+| `j` / `↓` | 次の項目へ移動 |
+| `k` / `↑` | 前の項目へ移動 |
+| `l` / `→` | フォルダを展開、または子へ移動 |
+| `h` / `←` | フォルダを閉じる、または表示中の親へ移動 |
+| `Enter` | フォルダの展開・折りたたみ |
+| `Backspace` | Explorer の起点を親フォルダへ移動 |
+| `r` | Explorer を再読み込み |
+| `o` | 選択中のフォルダを開く |
+| `g` | `Go to Path` を開く |
+| `G` | Global Config をエディタで開く |
+| `t` | Template を開く |
+| `a` | Authentication を開く |
+| `?` | `Explorer Shortcuts` を表示 |
 | `q` | 終了 |
 
-`Go to Path` では `Enter` で移動し、`Esc` で cancel します。Explorer Shortcuts は展開・移動・折りたたみ・親への移動・再読み込みの操作を案内します。Global Home に Command Palette はありません。
+`Go to Path` ではフォルダの path を入力し、`Enter` で移動します。`Esc` でキャンセルします。
 
-Global Config が missing の場合は、確認後に comments-only default を初期化して editor で開けます。既存 file は parse error があっても、通常の Config に依存しない repair editor で開けます。Template は開くたびに Global Config を厳密に読み込み、invalid の場合は開始せず Global Config の修復を促します。
-
-Authenticationでは保存状態、認証確認結果、account名（取得できた場合）、cookie fileのpathを表示します。`p`でPaste / Replace / Repair、`r`でResetできます。入力値は表示しません。保存後の認証確認がnetwork errorなどで利用できない場合も、保存自体は成功していることがあります。詳しくは[AtCoder 認証](authentication.md)を参照してください。
-
-### Open / Init Here
-
-既存 workspace を選択して `o` を押すと、その workspace の Workspace Home が開きます。
-
-ordinary directory を選択して Open した場合は、`Initialize Workspace` confirmation が表示されます。`Enter` で Init Here すると workspace を初期化し、そのまま Workspace Home を開きます。`Esc` で cancel すると Global Home へ戻ります。
+Global Config がまだない場合は `Initialize & Open` が表示されます。`Enter` でコメントだけの設定ファイルを作成して開き、`Esc` で戻ります。既存ファイルは上書きしません。
 
 ## Workspace Home
 
-workspace root で `atc` を起動すると直接 Workspace Home へ入ります。Global Home で workspace を Open または Init Here した場合も、この画面へ進みます。
+Workspace Home は、現在の workspace で Contest を開くための入口です。
 
 | キー | 操作 |
 | --- | --- |
-| `c` | Open / Create Contest modal を開く |
-| `w` | active workspace root の Workspace Config を editor で開く |
-| `G` | Global Config を editor で開く |
-| `t` | C++ / Python の global source template を開く |
-| `a` | 共通のAuthentication modalを開く |
+| `c` | Contest を開く、または作成する |
+| `w` | Workspace Config をエディタで開く |
+| `G` | Global Config をエディタで開く |
+| `t` | Template を開く |
+| `a` | Authentication を開く |
 | `q` | 終了 |
 
-`c` で contest ID を入力します。既存 contest なら `Enter` で Open し、存在しなければ `Enter` で Create & Open します。修復が必要な contest は、確認後に Repair & Open できます。`Esc` で cancel します。
+`c` を押したら Contest ID を入力し、`Enter` を押します。既存の Contest はそのまま開き、まだない Contest は AtCoder から問題情報とサンプルを取得して作成します。
 
-Workspace Home に Command Palette と shortcut modal はありません。画面上の action 一覧から直接操作します。Workspace Config が session 中に missing になった場合は再作成せず、recoverable error を表示します。Global Config と Authentication Cookie の file policy は Global Home と同じです。
+Workspace Home の `G` でも、Global Config がまだない場合は `Initialize & Open` で作成できます。
 
-安全な `.atc-workspace.toml` が存在すれば、内容が malformed でも Workspace Home を開いて `w` から修復できます。Global Config が invalid でも Workspace Home 自体は起動できます。`c` で Contest に入るときは Workspace Config と Global Config を厳密に読み直し、どちらかが invalid なら Home に留まります。
+Workspace Config は異なります。Workspace Home を開いた後に `.atc-workspace.toml` がなくなった場合、`w` を押すと `Workspace Config Unavailable` と `Workspace config is missing and was not recreated` が表示されます。`Enter` または `Esc` で閉じられますが、marker は自動再作成されません。
 
-現在、Workspace Home から別 workspace へ切り替える機能はありません。別 workspace へ移るには `q` で終了し、移動先の workspace root で `atc` を起動してください。
+元の `.atc-workspace.toml` を復元できる場合は復元してください。復元できず、初期設定の振り分けでよい場合は、TUI を終了し、正確な workspace ルートで `atc init` を実行してから `atc` を起動し直します。`atc init` は marker がない場合だけ既定ファイルを作成し、既存の不正なファイルやディレクトリを上書きしません。カスタムした振り分けは自動では戻らないため、Contest を開く前に[workspace config](workspace.md#workspace-config)を確認してください。
 
-## Contest 画面
+Contest の管理ファイルやサンプルが不足している場合は、修復の確認が表示されます。ソースは上書きされません。`Esc` でキャンセルできます。
 
-Contest 画面では、問題ごとの実行状態、公式 sample、保存済み Stress case、User Input、Expected / Actual / stderr、提出状況を確認できます。
+Workspace Home から別の workspace へは切り替えられません。`q` で終了し、移動先の workspace ルートで `atc` を起動してください。
 
-起動方法の例:
+## Authentication
 
-```bash
-# Workspace Home から c で contest を開く
-atc
+Global Home または Workspace Home で `a` を押すと、AtCoder へ提出するための Cookie を管理できます。
 
-# workspace root または ordinary directory から contest を直接開く
-atc contest abc466
-atc c abc466
+| キー | 表示される操作 |
+| --- | --- |
+| `p` | `Paste Cookie` / `Replace Cookie` / `Repair Cookie` |
+| `r` | `Reset Authentication` |
+| `Esc` | Home へ戻る |
 
-# contest directory から起動
-atc watch
+Cookie の入力画面には `Paste the REVEL_SESSION value.` と表示されます。値だけ、または `REVEL_SESSION=<value>` の形式で貼り付け、`Enter` の `Save` で保存します。`Esc` の `Cancel` では変更しません。
 
-# workspace root から contest を指定
-atc watch -c abc466
-```
+状態は `Authenticated`、`Not configured`、`Invalid`、`Not authenticated`、`Verification unavailable` などで表示されます。詳しい意味と対処は[AtCoder 認証](authentication.md)を参照してください。
 
-TUI が使いにくい terminal では、plain 表示を利用できます。
+## Template
 
-```bash
-atc watch --plain
-```
+Global Home または Workspace Home で `t`、Contest の Command Palette で `Open Template` を選ぶと、C++ / Python のテンプレートを選択できます。
 
-### 画面構成
+`↑` / `↓` または `j` / `k` で言語を選びます。
 
-- header: contest ID、選択中の source / language、C++ Debug、実行状態
-- problem row: 各問題の sample test または submission status と現在選択中の問題
-- side pane: Samples または Submissions
-- detail pane: 選択 case の Input / Expected / Actual / stderr、User Input editor、compile / Stress の詳細
-- footer: 最新 submission receipt。`?` で表示する help には現在利用できる主な shortcut
+- `Ready`: `Enter` の `Open` でエディタに開く
+- `Missing`: `Enter` の `Initialize & Open` で作成して開く
+- `Invalid`: 通常のファイルとして修復できる場合は `Enter` の `Open to Repair` で開く
 
-`s` で side pane を表示 / 非表示にし、`v` で Samples / Submissions mode を切り替えます。terminal 幅が狭い場合は side pane を表示せず、detail pane を優先します。
+安全に扱えないファイルの場合は開けません。`Esc` で戻ります。詳細は[テンプレート](templates.md)を参照してください。
 
-### キー操作
+## Contest
 
-次の shortcut は、modal や User Input editor を開いていない通常状態で有効です。
+Contest 画面では、問題、テストケース、実行結果を確認できます。
+
+画面には次の情報が表示されます。
+
+- header: Contest ID、選択中の source / language、C++ Debug、実行状態
+- problem row: 問題ごとの sample test または submission status
+- side pane: `Samples` または `Submissions`
+- detail pane: Input / Expected / Actual / stderr、compile や Stress Test の詳細
+- footer: 最新の submission receipt と、現在利用できる主なキー
+
+terminal の幅が狭い場合は side pane を表示せず、detail pane を優先します。
+
+### 問題とケースを移動する
 
 | キー | 操作 |
 | --- | --- |
-| `q` | application を終了 |
 | `h` / `←` | 前の問題 |
 | `l` / `→` | 次の問題 |
-| `j` / `↓` | 次の sample / Stress case / User Input |
-| `k` / `↑` | 前の sample / Stress case / User Input |
-| `r` | 選択中の問題の公式 sample と保存済み Stress case を再実行 |
-| `t` | Submit modal を開く |
-| `d` | C++ Debug を切り替え |
-| `s` | side pane を表示 / 非表示 |
-| `v` | side pane を Samples / Submissions へ切り替え |
-| `S` | Stress Helper を確認し、準備済みなら Stress Test を開始 |
-| `i` | 必要な Stress Helper を作成 |
-| `c` | Switch Contest modal を開く（workspace 内のみ） |
+| `j` / `↓` | 次のテストケース |
+| `k` / `↑` | 前のテストケース |
+| `r` | 選択中の問題をテスト |
+| `t` | Submit を開く |
+| `S` | Stress Test の準備状態を確認し、準備済みなら開始 |
+| `i` | 不足している Stress Helper を作成 |
+| `c` | `Switch Contest` を開く（workspace 内のみ） |
 | `:` | Command Palette を開く |
-| `?` | shortcut help を表示 |
+| `?` | ショートカットを表示 |
+| `q` | 終了 |
 
-## User Input
+`r` は公式サンプルと保存済みの Stress Test の反例を実行します。User Input は 1 件ずつ画面から実行します。
 
-User Input は、公式 sample とは別に任意の stdin を作成し、選択中の source へ1件ずつ渡して実行する機能です。Expected output を持たないため AC / WA の比較は行わず、終了 status、Output、stderr を detail pane へ表示します。`r` で実行する公式 sample / 保存済み Stress case のテストには含まれません。
+modal や入力欄を開いている間は、そちらの操作が通常のショートカットより優先されます。原則として `Esc` で閉じ、`Enter` で選択を確定します。
 
-User Input は Samples mode の side pane に表示されます。
+### 表示を切り替える
 
-1. `+ New Input` を click すると、新しい Draft と inline editor が開きます。
-2. 文字、改行、tab を入力し、矢印、`Home`、`End`、`Backspace`、`Delete` で編集します。
-3. `Ctrl+S` または `[Save]` の click で保存します。新しい Draft は保存済みの `Input N` になります。
-4. 保存済み User Input を選択して `[Edit]` を click すると再編集できます。
-5. `[Run]` を click すると、保存済み内容または編集中 buffer の現在内容を個別実行します。
-6. 保存済み User Input の `×` を2回 click すると削除します。1回目の `×?` は削除確認です。
+| キー | 操作 |
+| --- | --- |
+| `s` | side pane の表示・非表示 |
+| `v` | side pane の `Samples` / `Submissions` を切り替える |
+| `d` | C++ の Debug mode を切り替える |
 
-case の選択には `j` / `k`、`↑` / `↓`、row の click を利用できます。編集中は `Esc` または `[Cancel]` で編集を cancel します。通常 shortcut より inline editor の入力が優先されるため、たとえば編集中の `j` や `q` は stdin text として入力されます。
+Debug mode は C++ にだけ適用され、`LOCAL` macro と debug header を有効にします。
 
-問題を移動したときや、保存済み入力を編集・実行するときは、外部で変更された User Input を再読み込みします。外部削除や同期失敗があれば problem row 付近に notice を表示し、編集中の内容は勝手に置き換えません。
+### Command Palette
 
-User Input の作成、編集、保存、実行、削除は現在 Command Palette 項目ではなく、Samples / detail pane 上の click action です。
+`:` で Command Palette を開きます。文字を入力して絞り込み、`↑` / `↓` で選び、`Enter` で実行します。`j` / `k` を含む文字キーは検索 query へ入力されます。`Backspace` で入力を消し、`Esc` で閉じます。
 
-## Submit
+利用できる操作は次のとおりです。
 
-Contest 画面で `t`、または Command Palette の `Submit` を実行すると Submit modal が開きます。
+| 操作 | 内容 |
+| --- | --- |
+| `Run Tests` | 選択中の問題をテスト |
+| `Submit` | 提出画面を開く |
+| `Open Source` | ソースを選んでエディタで開く |
+| `Open Template` | テンプレートを開く |
+| `Toggle Debug` | C++ Debug mode を切り替える |
+| `Toggle Side Pane` | side pane の表示を切り替える |
+| `Change Side Pane Mode` | `Samples` / `Submissions` を切り替える |
+| `Start Stress` | Stress Test を開始 |
+| `Stop Stress` | 実行中の Stress Test を停止 |
+| `Initialize Stress` | Stress Helper を作成 |
+| `Refresh Contest` | 問題情報と公式サンプルを更新 |
+| `Switch Contest` | workspace 内の別 Contest を開く |
+| `Back to Workspace Home` | Workspace Home へ戻る |
 
-- `↑` / `↓` または `j` / `k`: 存在する C++ / Python source を選択
-- `Enter`: 選択した source / language で提出を確定
-- `Esc`: 提出せず modal を閉じる
+`Switch Contest` と `Back to Workspace Home` は workspace から開いた Contest でのみ利用できます。
+現在の状態で使えない操作は、理由とともに unavailable と表示されます。
 
-modal には problem、source file、language と提出 policy が表示されます。Python runtime は `config.toml` の `[submit].python_runtime` に従います。CLI では `atc submit <problem> --runtime <runtime>` で override できます。
+`Refresh Contest` は AtCoder から問題情報と公式サンプルを更新し、ソースは上書きしません。開始後は途中でキャンセルできません。詳しいファイルの扱いは[ワークスペースの refresh](workspace.md#refresh)を参照してください。
 
-提出開始後は AtCoder 上の submission を特定し、Waiting for Judge、Judging、AC / WA などの verdict を追跡します。Submit modal を閉じても追跡は継続します。
+### ソースを開く
 
-### 最新 receipt と Submissions pane
+Command Palette の `Open Source` では、`↑` / `↓` または `j` / `k` で C++ / Python を選びます。
 
-通常の footer には、最新 submission の problem、language、status などを含む receipt が表示されます。
+- ソースがある場合: `Enter` で開く
+- ソースがない場合: `i` の `Create & Open` でテンプレートから作成して開く
+- 戻る場合: `Esc`
 
-`v` を押すと side pane が Submissions mode へ切り替わり、現在の application session で行った submission history と各 status を新しい順に確認できます。problem row も submission status 表示へ切り替わります。もう一度 `v` を押すと Samples mode へ戻ります。
+既存のソースは上書きされません。エディタを自動で開けない場合は、Contest フォルダの `A.cpp` や `A.py` を直接編集してください。
 
-### Unknown outcome
+## Testing と User Input
 
-提出結果を確定できない場合は `Unknown` と表示し、安全のため自動再送しません。同じ application session では同じ contest / task への再送もブロックします。
+`r` または `Run Tests` を実行すると、画面下部に compile、実行、判定の状態が表示されます。`Accepted`、`Wrong Answer`、`Runtime Error`、`Time Limit Exceeded`、`Compile Error` などの結果を確認できます。
 
-AtCoder の My Submissions を確認し、実際に提出されていないことを確認してから、必要なら atc を再起動して再試行してください。
+任意の入力を試すには、`Samples` pane の `+ New Input` をクリックします。
 
-## Back to Workspace Home
+1. 入力欄へ stdin を入力する
+2. `Ctrl+S` または `[Save]` で保存する
+3. `[Run]` でその入力だけを実行する
+4. 後から変更する場合は `[Edit]` を選ぶ
+5. 編集を取り消す場合は `Esc` または `[Cancel]`
 
-workspace から開いた Contest 画面では、Command Palette の `Back to Workspace Home` で現在の contest を閉じ、Workspace Home へ戻れます。この action に直接の keyboard shortcut はありません。
+編集中は文字、改行、tab のほか、矢印、`Home`、`End`、`Backspace`、`Delete` を使えます。`[Run]` は、編集中なら現在の内容をそのまま実行します。
 
-`atc contest` や `atc watch` を workspace 外から直接起動した Standalone Contest では、この action は unavailable です。Workspace Home から Global Home へ戻る workspace switching も現在は実装されていません。
+User Input には expected output がないため、AC / WA の比較は行いません。終了状態、stdout、stderr を確認してください。
 
-## Command Palette
+削除するには `×` をクリックし、確認のためもう一度 `×` をクリックします。保存した入力ファイル自体が削除されます。
 
-Contest 画面で `:` を押すと Command Palette が開きます。文字を入力して action を絞り込み、`↑` / `↓` で選択、`Enter` で実行します。`Backspace` で query を消し、`Esc` で閉じます。
+外部エディタで User Input を変更した場合は、問題を開いたとき、編集を始めたとき、または実行するときに読み直します。TUI で編集中の内容は外部の変更で置き換えません。
 
-Contest 画面の現在の action:
-
-- Run Tests
-- Submit
-- Open Source
-- Open Template
-- Toggle Debug
-- Toggle Side Pane
-- Change Side Pane Mode（Samples / Submissions）
-- Start Stress
-- Stop Stress
-- Initialize Stress
-- Refresh Contest
-- Switch Contest
-- Back to Workspace Home
-
-現在の状態で実行できない action は、理由付きで unavailable と表示されます。`Switch Contest` と `Back to Workspace Home` は workspace 外の Standalone Contest では利用できません。Global Config と Workspace Config の編集は Home から行います。
-
-## Modal の操作
-
-modal または Command Palette の表示中は、その操作が通常 shortcut より優先されます。原則として `Esc` で cancel / close し、`Enter` で選択や確認を確定します。
-
-たとえば Submit modal の表示中に `q` を押しても application は終了せず、Submit modal が先に入力を処理します。modal を閉じてから通常 shortcut を利用してください。
-
-## Open Source
-
-Command Palette の `Open Source` から、選択中の問題の source を editor で開けます。
-
-C++ / Python を選択でき、source がまだ存在しない場合は `i` で作成してから開けます。
-
-```text
-Enter  既存 file を開く
-i      file を作成して開く
-↑/↓    language を選択
-j/k    language を選択
-Esc    閉じる
-```
-
-新しく作る source には通常の source template が使われます。
-
-## Open Template
-
-`Open Template` は Global Home / Workspace Home の `t`、または Contest の Command Palette から開く共通 modal です。Contest の `t` は Submit のままです。
-
-各 language row には user template の状態を表示します。`Ready` は有効な user override、`Missing` は未初期化で built-in fallback を使用中、`Invalid` は存在する path を template として読み込めない状態です。`Default` は全画面で `Config.defaults.language` だけを表し、Contest の current source language とは独立しています。Path 欄は built-in fallback ではなく、選択中 language の user template path を表示します。
-
-- Ready: `Enter` で Open
-- Missing: `Enter` で選択中 language だけを Initialize & Open
-- Invalid かつ regular file として修復可能: `Enter` で Open to Repair
-- directory、dangling symlink など安全に開けない Invalid path: Enter action なし
-
-`↑` / `↓` または `j` / `k` で language を選び、`Esc` で閉じます。Global Home と Workspace Home は modal を開くたびに Global Config を厳密に読み込み、その modal を閉じるまで同じ snapshot を使います。Contest は entry 時の ContestSession Config snapshot を使います。Config が invalid の場合に normal Template action を default Config で続行しません。source template の保存先は全contextでglobalで、template file の内容は snapshot せず次の利用時に filesystem から読みます。
-
-詳しくは [設定](configuration.md) を参照してください。
-
-## Editor 連携
-
-editor は次の順で決定されます。
-
-1. `config.toml`の`[editor]`
-2. Windows / macOS で VS Code / Cursor の統合 terminal を自動検出
-3. `VISUAL`
-4. `EDITOR`
-
-Vim / Neovim などは通常 `terminal` mode で起動します。
-
-```toml
-[editor]
-command = "nvim"
-mode = "terminal"
-```
-
-TUI の terminal 制御を一時的に戻して editor を起動し、終了後に TUI を復元します。
-
-VS Code などは `external` mode で起動できます。
-
-```toml
-[editor]
-command = "code"
-args = ["-r"]
-mode = "external"
-```
+詳しい判定方法と保存先は[テストと Watch](testing.md)を参照してください。
 
 ## Stress Test
 
-`S` を押したとき、Stress Helper がなければセットアップが必要な状態として表示されます。`i` で Helper を作成し、編集後にもう一度 `S` を押して開始します。Helper を作成しただけでは Stress Test は自動開始されません。
+| キー | 操作 |
+| --- | --- |
+| `S` | Stress Test を開始 |
+| `i` | 不足している Stress Helper を作成 |
 
-詳しくは [ストレステスト](stress.md) を参照してください。
+初回は Generator と Brute Force の準備が必要です。`i` で作成し、エディタで内容を書いてから `S` を押します。実行中は `S` で再度開始するのではなく、Command Palette の `Stop Stress` で停止します。
 
-## Contest の Refresh / Switch
+反例が見つかると保存され、以後の `r` でも公式サンプルの後に実行されます。詳しくは[ストレステスト](stress.md)を参照してください。
 
-Command Paletteの`Refresh Contest`で、現在のcontestの問題情報とsampleを更新できます。更新処理は開始後にcancelできません。sourceは上書きしません。Refreshでは設定と認証状態を読み直しません。cookie fileがHomeや別processで変更されていても、AtCoderがHTTPS responseで`REVEL_SESSION`を更新した場合を除き、現在のContestでは変更前の認証状態を使います。
+## Submission
 
-workspaceから起動したContest画面では、`c`またはCommand Paletteの`Switch Contest`を利用できます。Switchでは最新のWorkspace Config、Global Config、Authentication Cookieを読み直します。存在しないcontestは確認後に作成され、作成中にAtCoderがcookieを更新した場合も更新後のcookieを引き継ぎます。Homeへ戻って`c`で入り直す場合や、`atc contest` / `atc c` / TUIの`atc watch`で直接起動する場合も、開始時の設定とcookieを使います。AuthenticationがmissingまたはinvalidでもContestは開始でき、公開情報は認証なしで取得できますが、submitはnetwork request前に利用不可になります。
+`t` または Command Palette の `Submit` で提出画面を開きます。
+
+1. `↑` / `↓` または `j` / `k` で提出するソースを選ぶ
+2. `Enter` で提出する
+3. 提出しない場合は `Esc` で戻る
+
+提出後は画面を閉じても status の確認が続き、最新の結果が footer に表示されます。`v` で `Submissions` pane に切り替えると、現在の起動中に行った提出の履歴を確認できます。
+
+Python の runtime は設定の `submit.python_runtime` を使用します。TUI から一時的に変更することはできません。
+
+提出には AtCoder 認証が必要です。提出結果を確定できなかった場合は自動で再送しません。AtCoder の My Submissions で確認してから次の操作を行ってください。
 
 ## マウス操作
 
-- Samples pane の row を click: case を選択
-- Samples pane 上で wheel: case を移動
-- `+ New Input`、`[Edit]`、`[Save]`、`[Run]`、`[Cancel]`、`×`: User Input 操作
-- Detail pane 上で wheel: 詳細を scroll
-- Detail の scrollbar を click / drag: scroll 位置を変更
-- Detail の section heading を click: section を折りたたみ / 展開
+- `Samples` pane の行をクリック: ケースを選択
+- `Samples` pane 上で wheel: ケースを移動
+- `+ New Input`、`[Edit]`、`[Save]`、`[Run]`、`[Cancel]`、`×` をクリック: User Input を操作
+- detail pane 上で wheel: 詳細を scroll
+- detail の scrollbar をクリックまたは drag: scroll 位置を変更
+- detail の section heading をクリック: section を折りたたみ・展開
 
-modal や Command Palette を開いている間は、背後のマウス操作を処理しません。
+modal や Command Palette を開いている間は、背後のマウス操作を受け付けません。
+
+## 設定変更が反映されるタイミング
+
+Global Config または Workspace Config を変更した場合は、Contest を開き直すと反映されます。`Refresh Contest` だけでは実行設定や認証情報を読み直しません。
+
+テンプレートの内容は、次に新しいソースを作成するときのファイル内容が使われます。既存のソースは変更されません。

@@ -2,6 +2,16 @@
 
 Stress Test では、小さいランダムケースを生成し、自分の解答と愚直解の出力を比較して反例を探します。
 
+問題 A なら、基本の流れは次のとおりです。
+
+```bash
+atc stress init A
+# A_gen.py と A_brute.py を編集
+atc stress A
+```
+
+Generator と Brute Force は常に Python で実行します。Candidate が C++ の場合でも Python が必要です。
+
 ## 準備
 
 問題 A の Helper を作成します。
@@ -18,6 +28,12 @@ A_brute.py
 ```
 
 既に存在する Helper は上書きしません。
+
+workspace ルートから指定する場合:
+
+```bash
+atc stress init A -c abc466
+```
 
 ## Generator
 
@@ -69,6 +85,12 @@ atc stress A
 
 デフォルトでは最大 100 ケース実行します。
 
+workspace ルートから指定する場合:
+
+```bash
+atc stress A -c abc466
+```
+
 ### ケース数を指定
 
 ```bash
@@ -119,6 +141,8 @@ C++ では Debug も使用できます。
 atc stress A --debug
 ```
 
+`--debug`（`-d`）は C++ でのみ利用できます。`-l` を省略した場合は、設定のデフォルト言語を使います。指定した言語のソースがない場合、別の言語へ自動では切り替えません。
+
 ## 反例が見つかったとき
 
 候補プログラムが次のいずれかになった場合、Stress Test を停止して反例を保存します。
@@ -132,8 +156,10 @@ atc stress A --debug
 保存先:
 
 ```text
-.atc/stress/<INDEX>/
+.atc/stress/<PROBLEM>/
 ```
+
+問題 A の場合は `.atc/stress/A/` です。同じ問題で次の反例が見つかると、このフォルダには最新の反例が安全に保存されます。
 
 主なファイル:
 
