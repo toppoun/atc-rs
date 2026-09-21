@@ -12,6 +12,7 @@ mod home;
 pub mod message;
 mod mouse;
 pub mod reporter;
+mod settings_screen;
 mod submission;
 mod template_modal;
 mod termina_adapter;

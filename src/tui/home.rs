@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::authentication_modal::{self, AuthenticationModalController};
+use super::settings_screen::{self, SettingsPage, SettingsTransition};
 use super::template_modal::{
     OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
 };
@@ -25,9 +26,10 @@ use super::{
 use crate::{branding, config::Config};
 
 const HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const HOME_ACTIONS: [Option<(&str, &str)>; 8] = [
+const HOME_ACTIONS: [Option<(&str, &str)>; 9] = [
     Some(("Open / Create Contest", "c")),
     None,
+    Some(("Settings", "s")),
     Some(("Workspace Config", "w")),
     Some(("Global Config", "G")),
     Some(("Template", "t")),
@@ -43,6 +45,7 @@ const WORKSPACE_PREFIX: &str = "Workspace  ";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HomeAction {
     None,
+    OpenSettings,
     OpenWorkspaceConfig,
     OpenGlobalConfig,
     OpenTemplate,
@@ -206,6 +209,7 @@ impl<'a> HomeState<'a> {
                 self.open_contest.open();
                 HomeAction::None
             }
+            KeyCode::Char('s') => HomeAction::OpenSettings,
             KeyCode::Char('w') => HomeAction::OpenWorkspaceConfig,
             KeyCode::Char('G') => HomeAction::OpenGlobalConfig,
             KeyCode::Char('t') => HomeAction::OpenTemplate,
@@ -372,6 +376,9 @@ pub(crate) fn run_with_terminal_and_paths<T>(
     paths: &HomeActionPaths,
 ) -> io::Result<HomeExit<T>> {
     let mut state = HomeState::new(resolve, task);
+    let mut settings = None;
+    let mut suspended_settings = None;
+    let mut reload_suspended_settings = false;
     let mut dirty = true;
 
     loop {
@@ -386,7 +393,13 @@ pub(crate) fn run_with_terminal_and_paths<T>(
         }
 
         if dirty {
-            terminal.draw_home(&mut |frame| render(frame, &state, workspace_root))?;
+            terminal.draw_home(&mut |frame| {
+                if let Some(page) = settings.as_mut() {
+                    settings_screen::render_page(frame, page);
+                } else {
+                    render(frame, &state, workspace_root);
+                }
+            })?;
             terminal.finish_home_redraw()?;
             dirty = false;
         }
@@ -394,9 +407,40 @@ pub(crate) fn run_with_terminal_and_paths<T>(
         if !terminal.poll_home(HOME_POLL_INTERVAL)? {
             continue;
         }
-        match terminal.read_home()? {
+        let event = terminal.read_home()?;
+        if let Some(page) = settings.as_mut() {
+            if matches!(event, TerminalEvent::Resize(_)) {
+                terminal.note_home_resize();
+            }
+            match page.handle_event(event) {
+                SettingsTransition::None => {}
+                SettingsTransition::Back => settings = None,
+                SettingsTransition::OpenEditor => {
+                    open_global_config(terminal, &mut state, paths)?;
+                    if state.error.is_some() || state.initialize_global_config.is_some() {
+                        suspended_settings = settings.take();
+                        reload_suspended_settings = false;
+                    } else if let Some(page) = settings.as_mut() {
+                        page.reload_after_editor();
+                    }
+                }
+            }
+            dirty = true;
+            continue;
+        }
+
+        match event {
             TerminalEvent::Key(key) => match state.handle_key(key) {
                 HomeAction::None => dirty = true,
+                HomeAction::OpenSettings => {
+                    match paths.global_config() {
+                        Ok(path) => settings = Some(SettingsPage::load(path.to_path_buf())),
+                        Err(error) => {
+                            state.show_error(HomeActionErrorKind::GlobalConfig, error.to_string())
+                        }
+                    }
+                    dirty = true;
+                }
                 HomeAction::OpenWorkspaceConfig => {
                     open_workspace_config(terminal, &mut state, workspace_root, paths)?;
                     dirty = true;
@@ -426,6 +470,7 @@ pub(crate) fn run_with_terminal_and_paths<T>(
                 }
                 HomeAction::InitializeGlobalConfig(target) => {
                     initialize_and_open_global_config(terminal, &mut state, &target)?;
+                    reload_suspended_settings = suspended_settings.is_some();
                     dirty = true;
                 }
                 HomeAction::Quit => return Ok(HomeExit::Quit),
@@ -438,6 +483,20 @@ pub(crate) fn run_with_terminal_and_paths<T>(
                 dirty |= state.handle_paste(text);
             }
             TerminalEvent::Pointer(_) | TerminalEvent::Ignored => {}
+        }
+
+        if suspended_settings.is_some()
+            && state.error.is_none()
+            && state.initialize_global_config.is_none()
+        {
+            let mut page = suspended_settings
+                .take()
+                .expect("suspended Settings page must remain available");
+            if reload_suspended_settings {
+                page.reload_after_editor();
+            }
+            reload_suspended_settings = false;
+            settings = Some(page);
         }
     }
 }
@@ -1106,6 +1165,7 @@ mod tests {
         active_batch: VecDeque<TerminalEvent>,
         frames: Vec<String>,
         targets: Vec<PathBuf>,
+        editor_file_contents: Option<String>,
         reads: usize,
     }
 
@@ -1116,6 +1176,7 @@ mod tests {
                 active_batch: VecDeque::new(),
                 frames: Vec::new(),
                 targets: Vec::new(),
+                editor_file_contents: None,
                 reads: 0,
             }
         }
@@ -1175,6 +1236,9 @@ mod tests {
             target: &Path,
         ) -> io::Result<HomeEditorOutcome> {
             self.targets.push(target.to_path_buf());
+            if let Some(contents) = self.editor_file_contents.as_ref() {
+                std::fs::write(target, contents)?;
+            }
             Ok(HomeEditorOutcome {
                 result: HomeEditorResult::Launched,
                 discard_input_batch: false,
@@ -1519,6 +1583,121 @@ mod tests {
     }
 
     #[test]
+    fn workspace_home_settings_reloads_after_direct_editor_and_returns_to_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut terminal = ScriptedHomeTerminal::new([
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('s'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('e'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+        ]);
+        terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
+        let mut submissions = SubmissionHub::new();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+
+        let exit = run_with_terminal_and_paths(
+            &mut terminal,
+            temp.path(),
+            &mut submissions,
+            &mut resolve,
+            Arc::new(|_, _| Ok(())),
+            || Ok::<(), String>(()),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(matches!(exit, HomeExit::Quit));
+        assert_eq!(terminal.targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Global Settings"))
+        );
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Default language")
+                && frame.contains("Python")
+                && frame.contains("Modified")
+        }));
+    }
+
+    #[test]
+    fn workspace_home_settings_missing_editor_confirmation_can_cancel_without_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut terminal = ScriptedHomeTerminal::new([
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('s'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('e'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+        ]);
+        let mut submissions = SubmissionHub::new();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+
+        let exit = run_with_terminal_and_paths(
+            &mut terminal,
+            temp.path(),
+            &mut submissions,
+            &mut resolve,
+            Arc::new(|_, _| Ok(())),
+            || Ok::<(), String>(()),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(matches!(exit, HomeExit::Quit));
+        assert!(!config.exists());
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Initialize Global Config"))
+        );
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .filter(|frame| frame.contains("Global Settings"))
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
     fn workspace_home_production_loop_isolates_authentication_input_and_resize() {
         let temp = tempfile::tempdir().unwrap();
         let cookie = cookie_location(temp.path());
@@ -1807,6 +1986,10 @@ mod tests {
         let mut home = state(&mut resolve);
 
         assert_eq!(
+            home.handle_key(key(KeyCode::Char('s'), KeyEventKind::Press)),
+            HomeAction::OpenSettings
+        );
+        assert_eq!(
             home.handle_key(key(KeyCode::Char(':'), KeyEventKind::Press)),
             HomeAction::None
         );
@@ -1993,6 +2176,7 @@ mod tests {
         for expected in branding::ascii_logo_lines().chain([
             SUBTITLE,
             "Open / Create Contest",
+            "Settings",
             "Workspace Config",
             "Global Config",
             "Template",
@@ -2083,7 +2267,7 @@ mod tests {
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let home = state(&mut resolve);
         let width = 30;
-        let height = 9;
+        let height = 10;
         let workspace_area = home_layout(Rect::new(0, 0, width, height))
             .workspace
             .expect("workspace row should fit");

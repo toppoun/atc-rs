@@ -3995,6 +3995,72 @@ mod tests {
     }
 
     #[test]
+    fn reopening_from_home_after_settings_save_loads_a_fresh_config_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let destination = root.path().join("abc504");
+        save_healthy_contest(&destination, "abc504");
+        let config_path = root.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n",
+        )
+        .unwrap();
+        let request = crate::tui::ContestSwitchRequest {
+            mutation: crate::tui::ContestSwitchMutation::Open,
+            contest_id: "abc504".to_string(),
+            destination: destination.clone(),
+        };
+        let mut reporter = crate::ui::NullReporter;
+        let prepared = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Config::load_from(&config_path),
+            configured_snapshot,
+            |_, _, _, _, _| panic!("the test contest already exists"),
+            |_, _, _, _| panic!("the test contest is healthy"),
+        )
+        .unwrap();
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let first = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        assert_eq!(first.environment.config.defaults.language, Language::Python);
+
+        let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::DefaultLanguage,
+                crate::settings::SettingValue::Language(Language::Cpp),
+            )
+            .unwrap();
+        assert_eq!(
+            settings.save().unwrap(),
+            crate::settings_store::SaveOutcome::Saved
+        );
+        assert_eq!(
+            first.environment.config.defaults.language,
+            Language::Python,
+            "an open contest keeps its original Settings snapshot"
+        );
+        first.shutdown().unwrap();
+
+        let reopened = prepare_workspace_contest_entry_with(
+            root.path(),
+            &request,
+            &mut reporter,
+            || Config::load_from(&config_path),
+            configured_snapshot,
+            |_, _, _, _, _| panic!("the test contest already exists"),
+            |_, _, _, _| panic!("the test contest is healthy"),
+        )
+        .unwrap();
+        let reopened = start_prepared_contest_entry(reopened, &app_context).unwrap();
+        assert_eq!(reopened.environment.config.defaults.language, Language::Cpp);
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
     fn contest_creation_rotation_is_retained_by_the_started_session() {
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
@@ -4051,15 +4117,9 @@ mod tests {
         let destination = root.path().join("abc466");
         save_healthy_contest(&destination, "abc466");
         let config_path = root.path().join("config.toml");
-        let config_a = Config::parse(
-            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n[editor]\ncommand = \"editor-a\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &config_path,
-            "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n[editor]\ncommand = \"editor-b\"\n",
-        )
-        .unwrap();
+        let config_a_text = "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n[editor]\ncommand = \"editor-a\"\n";
+        let config_a = Config::parse(config_a_text).unwrap();
+        std::fs::write(&config_path, config_a_text).unwrap();
         let input = PreparedWatchInput::load(&destination, Some("abc466")).unwrap();
         let auth_platform = root.path().join("auth-platform");
         let auth_state = auth_platform.join("atc").join("state");
@@ -4081,6 +4141,38 @@ mod tests {
             environment: ContestEnvironment::from_snapshots(config_a, Arc::clone(&auth_b)),
         })
         .unwrap();
+        let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::DefaultLanguage,
+                crate::settings::SettingValue::Language(Language::Cpp),
+            )
+            .unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::RunnerPython,
+                crate::settings::SettingValue::String("python-b".to_string()),
+            )
+            .unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::EditorCommand,
+                crate::settings::SettingValue::String("editor-b".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            settings.save().unwrap(),
+            crate::settings_store::SaveOutcome::Saved
+        );
+        assert_eq!(
+            session.environment.config.defaults.language,
+            Language::Python,
+            "saving Settings must not mutate the active contest snapshot"
+        );
+        assert_eq!(session.environment.config.runner.python, "python-a");
         std::fs::write(&auth_file, "REVEL_SESSION=external-auth-x").unwrap();
         let refresh_auth = Arc::clone(&session.environment.auth);
         assert!(refresh_auth.credential_matches_for_test("REVEL_SESSION=refresh-auth-b"));
@@ -4219,6 +4311,12 @@ mod tests {
         let config_a =
             Config::parse("[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n")
                 .unwrap();
+        let config_path = root.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nlanguage = \"python\"\n[runner]\npython = \"python-a\"\n",
+        )
+        .unwrap();
         let auth_a = SessionAuth::configured_for_test("REVEL_SESSION=switch-auth-a");
         let old_auth = Arc::clone(&auth_a);
         let old_session = ContestSession::start_entry(PreparedContestEntry {
@@ -4240,12 +4338,38 @@ mod tests {
             "version = 1\n\n[[paths]]\npattern = \"^abc503$\"\npath = \"fresh-routing\"\n",
         )
         .unwrap();
-        let config_path = root.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[defaults]\nlanguage = \"cpp\"\n[runner]\npython = \"python-b\"\n[editor]\ncommand = \"editor-b\"\n",
-        )
-        .unwrap();
+        let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::DefaultLanguage,
+                crate::settings::SettingValue::Language(Language::Cpp),
+            )
+            .unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::RunnerPython,
+                crate::settings::SettingValue::String("python-b".to_string()),
+            )
+            .unwrap();
+        settings
+            .document_mut()
+            .set(
+                crate::settings::SettingKey::EditorCommand,
+                crate::settings::SettingValue::String("editor-b".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            settings.save().unwrap(),
+            crate::settings_store::SaveOutcome::Saved
+        );
+        assert_eq!(
+            old_session.environment.config.defaults.language,
+            Language::Python,
+            "saving Settings must not mutate the contest being switched away from"
+        );
+        assert_eq!(old_session.environment.config.runner.python, "python-a");
         let new_destination = root.path().join("fresh-routing/abc503");
         save_healthy_contest(&new_destination, "abc503");
         let request = crate::tui::ContestSwitchRequest {

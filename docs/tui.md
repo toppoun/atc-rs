@@ -42,6 +42,7 @@ Global Home は、フォルダを探して workspace を開くための画面で
 | `r` | Explorer を再読み込み |
 | `o` | 選択中のフォルダを開く |
 | `g` | `Go to Path` を開く |
+| `s` | Global Settings を開く |
 | `G` | Global Config をエディタで開く |
 | `t` | Template を開く |
 | `a` | Authentication を開く |
@@ -59,6 +60,7 @@ Workspace Home は、現在の workspace で Contest を開くための入口で
 | キー | 操作 |
 | --- | --- |
 | `c` | Contest を開く、または作成する |
+| `s` | Global Settings を開く |
 | `w` | Workspace Config をエディタで開く |
 | `G` | Global Config をエディタで開く |
 | `t` | Template を開く |
@@ -76,6 +78,20 @@ Workspace Config は異なります。Workspace Home を開いた後に `.atc-wo
 Contest の管理ファイルやサンプルが不足している場合は、修復の確認が表示されます。ソースは上書きされません。`Esc` でキャンセルできます。
 
 Workspace Home から別の workspace へは切り替えられません。`q` で終了し、移動先の workspace ルートで `atc` を起動してください。
+
+## Global Settings
+
+Global Home または Workspace Home で `s` を押すと、Global Config の全項目を表示・編集できます。Workspace Config のrouting設定は対象外です。
+
+一覧では `↑` / `↓` または `j` / `k` で移動し、`Enter` で編集、`r` で選択中のキーをreset、`e` でTOMLをエディタに開き、`Esc` で戻ります。resetは組み込み値を書き込む操作ではなく、対象キーをTOMLから削除する操作です。
+
+文字列入力では貼り付け、Unicode、`Home`、`End`、左右キー、`Backspace`、`Delete` を利用できます。複数行の貼り付けは1行へ結合せず拒否します。timeoutは秒単位で、0より大きい有限値だけを保存できます。
+
+配列の編集では、`a` で追加、`d` で削除、`J` / `K` で並べ替え、`Enter` で1要素を編集、`s` で配列全体を保存します。`Esc` は最も内側の編集だけをキャンセルします。
+
+外部変更との競合、読み取り専用のファイル、不正なConfig、保存結果を確定できないエラーがある場合、Settingsは元ファイルを自動上書きしません。競合画面の `Esc` は編集中の値を保持し、`r Reload` はdiskを読み直したうえで編集中の値を画面に残します。確認後に保存するか、`Esc`で取り消してください。Reloadだけでは自動保存されません。詳しい保存契約は[設定](configuration.md#tui-の-settings-で編集する)を参照してください。
+
+`e` で外部エディタから戻ると、Settingsは`config.toml`を再読込します。不正な内容になった場合は以前の値を現在値として表示せず、`Invalid Config`画面から再度エディタを開くか`r`で再読込できます。
 
 ## Authentication
 
@@ -245,6 +261,6 @@ modal や Command Palette を開いている間は、背後のマウス操作を
 
 ## 設定変更が反映されるタイミング
 
-Global Config または Workspace Config を変更した場合は、Contest を開き直すと反映されます。`Refresh Contest` だけでは実行設定や認証情報を読み直しません。
+Global Settings、Global Config、Workspace Configを変更した場合は、Contestを開き直すと反映されます。Settingsの一覧は保存直後に更新されますが、開いているContestのsnapshotは変わりません。`Refresh Contest`だけでは実行設定や認証情報を読み直しません。
 
 テンプレートの内容は、次に新しいソースを作成するときのファイル内容が使われます。既存のソースは変更されません。

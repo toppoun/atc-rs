@@ -23,6 +23,8 @@ mod model;
 mod paths;
 mod runner;
 mod safe_file;
+mod settings;
+mod settings_store;
 mod stress;
 mod template;
 mod tui;

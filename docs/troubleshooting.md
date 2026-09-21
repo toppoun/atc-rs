@@ -218,6 +218,22 @@ atc refresh
 
 atc-rs は不正な設定を推測で無視したり、`atc config init` で既存ファイルを置き換えたりしません。[設定項目の一覧](configuration.md#設定項目と組み込みデフォルト)と比較して修正してください。
 
+## Settingsから設定を保存できない
+
+**症状:** `Conflict`、`Read-only`、`Invalid Config`、`Save Failed`、`Saved; Finalization Failed`、`Previous Settings Confirmed`、`Save State Uncertain`のいずれかが表示される。
+
+**対処方法:** 表示によって対応を分けます。
+
+- `Conflict`: Settingsを開いた後で`config.toml`が変更されています。`r Reload`でディスク上の最新版を読み直しても、編集中の値は残ります。新しい設定を確認してから保存するか、`Esc`で編集を取り消してください。Reloadだけでは保存されず、自動マージや自動上書きも行われません。
+- `Read-only`: symlink、Windows reparse point、特殊ファイル、または元の書式を安全に保持できない文書です。`e`でTOMLを直接編集します。
+- `Invalid Config`: disk上の設定が不正です。古い値は現在値として表示されません。`e`でエラー箇所を修正し、戻った後に再読込します。
+- `Save Failed`: ファイルを置き換える前に失敗したため、元のファイルは維持されています。権限、空き容量、security softwareによるblockを確認します。
+- `Saved; Finalization Failed`: 保存内容はdisk上で確認できましたが、syncなどの最終処理に失敗しました。耐久性は保証できないため、`config.toml`を確認してください。
+- `Previous Settings Confirmed`: 保存候補は反映されず、以前の内容がdisk上で確認できました。編集中の値は保持されるため、必要なら確認後に保存してください。
+- `Save State Uncertain`: 置き換え後のsyncや再確認で失敗し、disk上の状態を判定できません。自動retryせず、`r Reload`で再確認するか、`Esc`でSettingsを離れて`config.toml`を直接確認してください。
+
+Settingsは元の内容とファイルの実体を保存前に確認します。外部エディタを同時に開いている場合は片方の編集を完了してからReloadしてください。末尾改行がないTOMLや改行形式が混在するTOMLは、意図しない全体整形を防ぐため読み取り専用になることがあります。
+
 ## Cookie を設定できない
 
 **症状:** `Invalid`、`Not authenticated`、`Verification unavailable` になる。

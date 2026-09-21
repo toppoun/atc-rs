@@ -17,6 +17,7 @@ use super::explorer::{self, ExplorerState};
 use super::home::{
     centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
 };
+use super::settings_screen::{self, SettingsPage, SettingsTransition};
 use super::template_modal::{
     OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
 };
@@ -30,10 +31,11 @@ use crate::{branding, config::Config};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 9] = [
+const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 10] = [
     Some(("Open", "o")),
     Some(("Go to Path", "g")),
     None,
+    Some(("Settings", "s")),
     Some(("Global Config", "G")),
     Some(("Template", "t")),
     Some(("Authentication Cookie", "a")),
@@ -83,6 +85,7 @@ struct InitializeGlobalConfigModal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalHomeFileAction {
+    OpenSettings,
     OpenGlobalConfig,
     OpenTemplate,
     Template(TemplateRequest),
@@ -488,6 +491,10 @@ impl GlobalHomeState {
                     self.file_action = Some(GlobalHomeFileAction::OpenGlobalConfig);
                     None
                 }
+                KeyCode::Char('s') if has_plain_modifiers(key) => {
+                    self.file_action = Some(GlobalHomeFileAction::OpenSettings);
+                    None
+                }
                 KeyCode::Char('t') if has_plain_modifiers(key) => {
                     self.file_action = Some(GlobalHomeFileAction::OpenTemplate);
                     None
@@ -630,12 +637,21 @@ fn run_with_terminal_and_paths(
     state: &mut GlobalHomeState,
     paths: &HomeActionPaths,
 ) -> io::Result<GlobalHomeExit> {
+    let mut settings = None;
+    let mut suspended_settings = None;
+    let mut reload_suspended_settings = false;
     let mut dirty = true;
 
     loop {
         dirty |= state.authentication.poll();
         if dirty {
-            terminal.draw_global_home(&mut |frame| render(frame, state))?;
+            terminal.draw_global_home(&mut |frame| {
+                if let Some(page) = settings.as_mut() {
+                    settings_screen::render_page(frame, page);
+                } else {
+                    render(frame, state);
+                }
+            })?;
             terminal.finish_global_home_redraw()?;
             dirty = false;
         }
@@ -644,7 +660,34 @@ fn run_with_terminal_and_paths(
             continue;
         }
 
-        let exit = match terminal.read_global_home()? {
+        let event = terminal.read_global_home()?;
+        if let Some(page) = settings.as_mut() {
+            if matches!(event, TerminalEvent::Resize(_)) {
+                terminal.note_global_home_resize();
+            }
+            match page.handle_event(event) {
+                SettingsTransition::None => {}
+                SettingsTransition::Back => settings = None,
+                SettingsTransition::OpenEditor => {
+                    handle_file_action(
+                        terminal,
+                        state,
+                        paths,
+                        GlobalHomeFileAction::OpenGlobalConfig,
+                    )?;
+                    if state.error.is_some() || state.initialize_global_config.is_some() {
+                        suspended_settings = settings.take();
+                        reload_suspended_settings = false;
+                    } else if let Some(page) = settings.as_mut() {
+                        page.reload_after_editor();
+                    }
+                }
+            }
+            dirty = true;
+            continue;
+        }
+
+        let exit = match event {
             TerminalEvent::Key(key) => state.handle_key(key),
             TerminalEvent::Paste(text) => {
                 state.handle_paste(&text);
@@ -660,7 +703,33 @@ fn run_with_terminal_and_paths(
             return Ok(exit);
         }
         if let Some(action) = state.take_file_action() {
-            handle_file_action(terminal, state, paths, action)?;
+            if action == GlobalHomeFileAction::OpenSettings {
+                match paths.global_config() {
+                    Ok(path) => settings = Some(SettingsPage::load(path.to_path_buf())),
+                    Err(error) => state.show_home_action_error(
+                        GlobalHomeErrorKind::GlobalConfig,
+                        error.to_string(),
+                    ),
+                }
+            } else {
+                let initialized_from_settings = suspended_settings.is_some()
+                    && matches!(action, GlobalHomeFileAction::InitializeGlobalConfig(_));
+                handle_file_action(terminal, state, paths, action)?;
+                reload_suspended_settings |= initialized_from_settings;
+            }
+        }
+        if suspended_settings.is_some()
+            && state.error.is_none()
+            && state.initialize_global_config.is_none()
+        {
+            let mut page = suspended_settings
+                .take()
+                .expect("suspended Settings page must remain available");
+            if reload_suspended_settings {
+                page.reload_after_editor();
+            }
+            reload_suspended_settings = false;
+            settings = Some(page);
         }
         dirty = true;
     }
@@ -720,6 +789,9 @@ fn handle_file_action(
     action: GlobalHomeFileAction,
 ) -> io::Result<()> {
     match action {
+        GlobalHomeFileAction::OpenSettings => {
+            unreachable!("Settings is opened by the Global Home event loop")
+        }
         GlobalHomeFileAction::OpenGlobalConfig => {
             let target = match paths.global_config() {
                 Ok(target) => target,
@@ -1316,6 +1388,7 @@ mod tests {
         editor_outcome: HomeEditorOutcome,
         discarded_events: usize,
         batch_file_writes: VecDeque<Option<(PathBuf, String)>>,
+        editor_file_contents: Option<String>,
     }
 
     impl ScriptedGlobalTerminal {
@@ -1342,6 +1415,7 @@ mod tests {
                 },
                 discarded_events: 0,
                 batch_file_writes: VecDeque::new(),
+                editor_file_contents: None,
             }
         }
     }
@@ -1415,6 +1489,9 @@ mod tests {
         ) -> io::Result<HomeEditorOutcome> {
             self.launched_editors.push(editor.clone());
             self.editor_targets.push(target.to_path_buf());
+            if let Some(contents) = self.editor_file_contents.as_ref() {
+                std::fs::write(target, contents)?;
+            }
             Ok(self.editor_outcome.clone())
         }
 
@@ -1532,6 +1609,43 @@ mod tests {
                 .iter()
                 .any(|frame| frame.contains("Initialize & Open"))
         );
+    }
+
+    #[test]
+    fn global_home_settings_reloads_after_direct_editor_and_returns_to_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.editor_targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Global Settings"))
+        );
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Default language")
+                && frame.contains("Python")
+                && frame.contains("Modified")
+        }));
     }
 
     #[test]
@@ -2042,6 +2156,7 @@ mod tests {
             "Explorer",
             "Open",
             "Go to Path",
+            "Settings",
             "Global Config",
             "Template",
             "Authentication Cookie",
@@ -2127,6 +2242,11 @@ mod tests {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
         assert_eq!(state.handle_key(key(KeyCode::Char(':'))), None);
         assert!(state.take_file_action().is_none());
+        assert_eq!(state.handle_key(key(KeyCode::Char('s'))), None);
+        assert_eq!(
+            state.take_file_action(),
+            Some(GlobalHomeFileAction::OpenSettings)
+        );
         assert_eq!(state.handle_key(key(KeyCode::Char('G'))), None);
         assert_eq!(
             state.take_file_action(),

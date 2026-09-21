@@ -93,36 +93,83 @@ pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> io::Result<
     })
 }
 
+/// Atomically replaces an existing regular file with a staged file in the same
+/// directory. The caller is responsible for validating the destination and for
+/// syncing both the staged file and its parent directory.
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    replace_file_platform(source, destination)
+}
+
+#[cfg(windows)]
+fn resolved_parent_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file path has no final component: {}", path.display()),
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file path contains a NUL character: {}", path.display()),
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn replace_file_platform(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let source = wide_path(&resolved_parent_path(source)?)?;
+    let destination = wide_path(&resolved_parent_path(destination)?)?;
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            source.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn replace_file_platform(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn replace_file_platform(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic file replacement is not implemented on this platform",
+    ))
+}
+
 #[cfg(windows)]
 fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
-    fn resolved_parent_path(path: &Path) -> io::Result<PathBuf> {
-        let name = path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("move path has no final component: {}", path.display()),
-            )
-        })?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        Ok(fs::canonicalize(parent)?.join(name))
-    }
-
-    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if wide.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("move path contains a NUL character: {}", path.display()),
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
 
     let source = wide_path(&resolved_parent_path(source)?)?;
     let destination = wide_path(&resolved_parent_path(destination)?)?;
