@@ -43,15 +43,14 @@ Global Home は、フォルダを探して workspace を開くための画面で
 | `o` | 選択中のフォルダを開く |
 | `g` | `Go to Path` を開く |
 | `s` | Global Settings を開く |
-| `G` | Global Config をエディタで開く |
 | `t` | Template を開く |
 | `a` | Authentication を開く |
-| `?` | `Explorer Shortcuts` を表示 |
+| `?` | `Help` を表示 |
 | `q` | 終了 |
 
 `Go to Path` ではフォルダの path を入力し、`Enter` で移動します。`Esc` でキャンセルします。
 
-Global Config がまだない場合は `Initialize & Open` が表示されます。`Enter` でコメントだけの設定ファイルを作成して開き、`Esc` で戻ります。既存ファイルは上書きしません。
+Global Config をエディタで開くには、`s` で Settings を開いて `e` を押します。ファイルがまだない場合は `Initialize & Open` が表示されます。`Enter` でコメントだけの設定ファイルを作成して開き、`Esc` で戻ります。既存ファイルは上書きしません。
 
 ## Workspace Home
 
@@ -62,14 +61,14 @@ Workspace Home は、現在の workspace で Contest を開くための入口で
 | `c` | Contest を開く、または作成する |
 | `s` | Global Settings を開く |
 | `w` | Workspace Config をエディタで開く |
-| `G` | Global Config をエディタで開く |
 | `t` | Template を開く |
 | `a` | Authentication を開く |
+| `?` | `Help` を表示 |
 | `q` | 終了 |
 
 `c` を押したら Contest ID を入力し、`Enter` を押します。既存の Contest はそのまま開き、まだない Contest は AtCoder から問題情報とサンプルを取得して作成します。
 
-Workspace Home の `G` でも、Global Config がまだない場合は `Initialize & Open` で作成できます。
+Workspace Home でも `s` で Settings を開き、`e` で Global Config をエディタで開けます。ファイルがまだない場合は `Initialize & Open` で作成できます。
 
 Workspace Config は異なります。Workspace Home を開いた後に `.atc-workspace.toml` がなくなった場合、`w` を押すと `Workspace Config Unavailable` と `Workspace config is missing and was not recreated` が表示されます。`Enter` または `Esc` で閉じられますが、marker は自動再作成されません。
 

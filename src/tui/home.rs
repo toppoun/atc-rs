@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -26,28 +26,24 @@ use super::{
 use crate::{branding, config::Config};
 
 const HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const HOME_ACTIONS: [Option<(&str, &str)>; 9] = [
+const HOME_ACTIONS: [Option<(&str, &str)>; 6] = [
     Some(("Open / Create Contest", "c")),
     None,
     Some(("Settings", "s")),
     Some(("Workspace Config", "w")),
-    Some(("Global Config", "G")),
     Some(("Template", "t")),
     Some(("Authentication Cookie", "a")),
-    None,
-    Some(("Quit", "q")),
 ];
 const MENU_WIDTH: u16 = 23;
 const MENU_HEIGHT: u16 = HOME_ACTIONS.len() as u16;
-const SUBTITLE: &str = "AtCoder workspace";
-const WORKSPACE_PREFIX: &str = "Workspace  ";
+const ROOT_PREFIX: &str = "Root  ";
+const HOME_FOOTER_ACTIONS: &str = "[?] Help   [q] Quit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HomeAction {
     None,
     OpenSettings,
     OpenWorkspaceConfig,
-    OpenGlobalConfig,
     OpenTemplate,
     Template(TemplateRequest),
     OpenAuthentication,
@@ -99,6 +95,7 @@ struct HomeState<'a> {
     initialize_global_config: Option<InitializeGlobalConfigModal>,
     template: Option<ActiveTemplateModal>,
     authentication: AuthenticationModalController,
+    shortcut_help_visible: bool,
     open_contest: ContestOpenController<'a>,
 }
 
@@ -112,6 +109,7 @@ impl<'a> HomeState<'a> {
             initialize_global_config: None,
             template: None,
             authentication: AuthenticationModalController::default(),
+            shortcut_help_visible: false,
             open_contest: ContestOpenController::new(resolve, task),
         }
     }
@@ -204,6 +202,21 @@ impl<'a> HomeState<'a> {
         if key.modifiers.control || key.modifiers.alt || key.modifiers.super_key {
             return HomeAction::None;
         }
+        match super::shortcut_help_transition(self.shortcut_help_visible, key) {
+            super::ShortcutHelpTransition::KeepAndConsume => return HomeAction::None,
+            super::ShortcutHelpTransition::DismissAndConsume => {
+                self.shortcut_help_visible = false;
+                return HomeAction::None;
+            }
+            super::ShortcutHelpTransition::DismissAndPassThrough => {
+                self.shortcut_help_visible = false;
+            }
+            super::ShortcutHelpTransition::PassThrough => {}
+        }
+        if super::is_shortcut_help_key(key) {
+            self.shortcut_help_visible = true;
+            return HomeAction::None;
+        }
         match key.code {
             KeyCode::Char('c') => {
                 self.open_contest.open();
@@ -211,7 +224,6 @@ impl<'a> HomeState<'a> {
             }
             KeyCode::Char('s') => HomeAction::OpenSettings,
             KeyCode::Char('w') => HomeAction::OpenWorkspaceConfig,
-            KeyCode::Char('G') => HomeAction::OpenGlobalConfig,
             KeyCode::Char('t') => HomeAction::OpenTemplate,
             KeyCode::Char('a') => HomeAction::OpenAuthentication,
             KeyCode::Char('q') => HomeAction::Quit,
@@ -443,10 +455,6 @@ pub(crate) fn run_with_terminal_and_paths<T>(
                 }
                 HomeAction::OpenWorkspaceConfig => {
                     open_workspace_config(terminal, &mut state, workspace_root, paths)?;
-                    dirty = true;
-                }
-                HomeAction::OpenGlobalConfig => {
-                    open_global_config(terminal, &mut state, paths)?;
                     dirty = true;
                 }
                 HomeAction::OpenTemplate => {
@@ -706,9 +714,8 @@ pub(super) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HomeLayout {
     logo: Option<Rect>,
-    subtitle: Option<Rect>,
     menu: Rect,
-    workspace: Option<Rect>,
+    footer: Option<Rect>,
 }
 
 pub(super) fn logo_size() -> (u16, u16) {
@@ -737,40 +744,25 @@ fn home_layout(area: Rect) -> HomeLayout {
     if area.width == 0 || area.height == 0 {
         return HomeLayout {
             logo: None,
-            subtitle: None,
             menu: Rect::new(area.x, area.y, 0, 0),
-            workspace: None,
+            footer: None,
         };
     }
 
-    let show_workspace = area.height >= MENU_HEIGHT.saturating_add(1);
-    let bottom_margin = u16::from(show_workspace && area.height >= MENU_HEIGHT.saturating_add(4));
-    let workspace_y = area
-        .y
-        .saturating_add(area.height)
-        .saturating_sub(1)
-        .saturating_sub(bottom_margin);
-    let body_height = if show_workspace {
-        workspace_y.saturating_sub(area.y)
+    let (logo_width, logo_height) = logo_size();
+    let full_content_height = logo_height.saturating_add(1).saturating_add(MENU_HEIGHT);
+    let show_footer = area.height >= MENU_HEIGHT.saturating_add(1);
+    let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
+    let body_height = if show_footer {
+        footer_y.saturating_sub(area.y)
     } else {
         area.height
     };
 
-    let subtitle_width = u16::try_from(UnicodeWidthStr::width(SUBTITLE)).unwrap_or(u16::MAX);
-    let show_subtitle =
-        area.width >= subtitle_width && body_height >= MENU_HEIGHT.saturating_add(2);
-    let (logo_width, logo_height) = logo_size();
-    let full_content_height = logo_height
-        .saturating_add(1)
-        .saturating_add(1)
-        .saturating_add(1)
-        .saturating_add(MENU_HEIGHT);
-    let show_logo = show_subtitle && area.width >= logo_width && body_height >= full_content_height;
+    let show_logo = area.width >= logo_width && body_height >= full_content_height;
 
     let content_height = if show_logo {
         full_content_height
-    } else if show_subtitle {
-        MENU_HEIGHT.saturating_add(2)
     } else {
         MENU_HEIGHT.min(body_height)
     };
@@ -778,32 +770,20 @@ fn home_layout(area: Rect) -> HomeLayout {
         .y
         .saturating_add(body_height.saturating_sub(content_height) / 2);
 
-    let (logo, subtitle, menu_y) = if show_logo {
+    let (logo, menu_y) = if show_logo {
         (
             Some(centered_row(area, content_y, logo_width, logo_height)),
-            Some(centered_row(
-                area,
-                content_y.saturating_add(logo_height).saturating_add(1),
-                subtitle_width,
-                1,
-            )),
-            content_y.saturating_add(logo_height).saturating_add(3),
-        )
-    } else if show_subtitle {
-        (
-            None,
-            Some(centered_row(area, content_y, subtitle_width, 1)),
-            content_y.saturating_add(2),
+            content_y.saturating_add(logo_height).saturating_add(1),
         )
     } else {
-        (None, None, content_y)
+        (None, content_y)
     };
 
-    let workspace = show_workspace.then(|| {
+    let footer = show_footer.then(|| {
         let margin = u16::from(area.width >= 4);
         Rect::new(
             area.x.saturating_add(margin),
-            workspace_y,
+            footer_y,
             area.width.saturating_sub(margin.saturating_mul(2)),
             1,
         )
@@ -811,9 +791,8 @@ fn home_layout(area: Rect) -> HomeLayout {
 
     HomeLayout {
         logo,
-        subtitle,
         menu: centered_row(area, menu_y, MENU_WIDTH, MENU_HEIGHT.min(body_height)),
-        workspace,
+        footer,
     }
 }
 
@@ -871,22 +850,27 @@ pub(super) fn truncate_start_with_ellipsis(text: &str, width: usize) -> String {
     fitted
 }
 
-fn workspace_line(workspace_root: &Path, width: usize) -> String {
-    let path = workspace_root.to_string_lossy();
-    let full = format!("{WORKSPACE_PREFIX}{path}");
-    if UnicodeWidthStr::width(full.as_str()) <= width {
-        return full;
+pub(super) fn home_footer_line(prefix: &str, path: &Path, width: usize) -> Line<'static> {
+    let left_width = UnicodeWidthStr::width(HOME_FOOTER_ACTIONS);
+    if width <= left_width {
+        return Line::raw(view::clip_text_with_ellipsis(HOME_FOOTER_ACTIONS, width));
     }
 
-    let prefix_width = UnicodeWidthStr::width(WORKSPACE_PREFIX);
-    if width <= prefix_width {
-        truncate_start_with_ellipsis(&full, width)
-    } else {
-        format!(
-            "{WORKSPACE_PREFIX}{}",
-            truncate_start_with_ellipsis(&path, width - prefix_width)
-        )
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let status_width = width.saturating_sub(left_width).saturating_sub(2);
+    if status_width <= prefix_width {
+        return Line::raw(HOME_FOOTER_ACTIONS);
     }
+
+    let path = path.to_string_lossy();
+    let path = truncate_start_with_ellipsis(&path, status_width - prefix_width);
+    let status = format!("{prefix}{path}");
+    let padding = width - left_width - UnicodeWidthStr::width(status.as_str());
+    Line::from(vec![
+        Span::raw(HOME_FOOTER_ACTIONS),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
@@ -903,14 +887,6 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
         });
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), area);
     }
-    if let Some(area) = layout.subtitle {
-        frame.render_widget(
-            Paragraph::new(SUBTITLE)
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
-            area,
-        );
-    }
     if layout.menu.width > 0 && layout.menu.height > 0 {
         let lines = HOME_ACTIONS.iter().map(|action| match action {
             Some((label, shortcut)) => menu_line(label, shortcut, usize::from(layout.menu.width)),
@@ -918,13 +894,18 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
         });
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
     }
-    if let Some(area) = layout.workspace {
+    if let Some(area) = layout.footer {
         frame.render_widget(
-            Paragraph::new(workspace_line(workspace_root, usize::from(area.width)))
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
+            Paragraph::new(home_footer_line(
+                ROOT_PREFIX,
+                workspace_root,
+                usize::from(area.width),
+            )),
             area,
         );
+    }
+    if state.shortcut_help_visible {
+        super::global_home::render_shortcuts(frame, true);
     }
 
     if let Some(modal) = state.open_contest.modal() {
@@ -1698,6 +1679,122 @@ mod tests {
     }
 
     #[test]
+    fn workspace_home_settings_initializes_missing_config_and_returns_to_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut terminal = ScriptedHomeTerminal::new([
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('s'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('e'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(KeyCode::Enter, KeyEventKind::Press))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+        ]);
+        let mut submissions = SubmissionHub::new();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+
+        let exit = run_with_terminal_and_paths(
+            &mut terminal,
+            temp.path(),
+            &mut submissions,
+            &mut resolve,
+            Arc::new(|_, _| Ok(())),
+            || Ok::<(), String>(()),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(matches!(exit, HomeExit::Quit));
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            crate::config::INITIAL_CONFIG
+        );
+        assert_eq!(terminal.targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Initialize & Open"))
+        );
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .filter(|frame| frame.contains("Global Settings"))
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn workspace_home_settings_repairs_invalid_config_with_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "invalid = [\n").unwrap();
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut terminal = ScriptedHomeTerminal::new([
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('s'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('e'),
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Escape,
+                KeyEventKind::Press,
+            ))],
+            vec![TerminalEvent::Key(key(
+                KeyCode::Char('q'),
+                KeyEventKind::Press,
+            ))],
+        ]);
+        terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
+        let mut submissions = SubmissionHub::new();
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+
+        let exit = run_with_terminal_and_paths(
+            &mut terminal,
+            temp.path(),
+            &mut submissions,
+            &mut resolve,
+            Arc::new(|_, _| Ok(())),
+            || Ok::<(), String>(()),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(matches!(exit, HomeExit::Quit));
+        assert_eq!(terminal.targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Invalid Config"))
+        );
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Default language")
+                && frame.contains("Python")
+                && frame.contains("Modified")
+        }));
+    }
+
+    #[test]
     fn workspace_home_production_loop_isolates_authentication_input_and_resize() {
         let temp = tempfile::tempdir().unwrap();
         let cookie = cookie_location(temp.path());
@@ -1980,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn colon_and_question_mark_are_ignored_while_direct_actions_still_work() {
+    fn home_help_opens_and_global_config_key_is_ignored() {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let mut home = state(&mut resolve);
@@ -1997,6 +2094,12 @@ mod tests {
             home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press)),
             HomeAction::None
         );
+        assert!(home.shortcut_help_visible);
+        assert_eq!(
+            home.handle_key(key(KeyCode::Escape, KeyEventKind::Press)),
+            HomeAction::None
+        );
+        assert!(!home.shortcut_help_visible);
         assert!(!home.open_contest.modal_active());
         assert_eq!(
             home.handle_key(key(KeyCode::Char('w'), KeyEventKind::Press)),
@@ -2004,7 +2107,7 @@ mod tests {
         );
         assert_eq!(
             home.handle_key(key(KeyCode::Char('G'), KeyEventKind::Press)),
-            HomeAction::OpenGlobalConfig
+            HomeAction::None
         );
         assert_eq!(
             home.handle_key(key(KeyCode::Char('a'), KeyEventKind::Press)),
@@ -2174,21 +2277,21 @@ mod tests {
         let rendered = buffer_text(&buffer);
 
         for expected in branding::ascii_logo_lines().chain([
-            SUBTITLE,
             "Open / Create Contest",
             "Settings",
             "Workspace Config",
-            "Global Config",
             "Template",
             "Authentication Cookie",
-            "Quit",
+            "[?] Help   [q] Quit",
+            r"Root  D:\competitive-programming\atcoder",
         ]) {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}\n{rendered}"
             );
         }
-        assert!(rendered.contains(r"Workspace  D:\competitive-programming\atcoder"));
+        assert!(!rendered.contains("AtCoder workspace"));
+        assert!(!rendered.contains("Global Config"));
         assert!(
             !rendered.contains('┌'),
             "Home unexpectedly has an outer border"
@@ -2241,7 +2344,7 @@ mod tests {
 
         let rendered = buffer_text(&draw_home(&home, explicit_root, 120, 24));
 
-        assert!(rendered.contains("Workspace  selected-workspace-marker/root"));
+        assert!(rendered.contains("Root  selected-workspace-marker/root"));
         assert!(!rendered.contains(cwd.to_string_lossy().as_ref()));
     }
 
@@ -2251,14 +2354,51 @@ mod tests {
             r"C:\Users\someone\projects\very-long-parent\competitive-programming\atcoder",
         );
 
-        let fitted = workspace_line(workspace, 40);
+        let fitted = home_footer_line(ROOT_PREFIX, workspace, 50).to_string();
 
-        assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 40);
-        assert!(fitted.starts_with(WORKSPACE_PREFIX));
+        assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 50);
+        assert!(fitted.starts_with(HOME_FOOTER_ACTIONS));
+        assert!(fitted.contains("Root  …"));
         assert!(fitted.contains('…'));
         assert!(fitted.ends_with(r"programming\atcoder"));
-        assert_eq!(workspace_line(workspace, 0), "");
-        assert_eq!(workspace_line(workspace, 1), "…");
+        assert_eq!(home_footer_line(ROOT_PREFIX, workspace, 0).to_string(), "");
+        assert_eq!(home_footer_line(ROOT_PREFIX, workspace, 1).to_string(), "[");
+    }
+
+    #[test]
+    fn footer_keeps_help_and_quit_before_the_root_status_at_every_width() {
+        let root = Path::new(r"C:\very-long-parent\projects\atcoder\abc500");
+        let left_width = UnicodeWidthStr::width(HOME_FOOTER_ACTIONS);
+        let minimum_status_width = left_width + 2 + UnicodeWidthStr::width(ROOT_PREFIX) + 1;
+
+        for width in 0..=80 {
+            let line = home_footer_line(ROOT_PREFIX, root, width).to_string();
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= width,
+                "{width}: {line:?}"
+            );
+            assert!(!line.contains('\n'));
+            if width >= left_width {
+                assert!(line.starts_with(HOME_FOOTER_ACTIONS), "{width}: {line:?}");
+            }
+            assert_eq!(line.contains(ROOT_PREFIX), width >= minimum_status_width);
+        }
+    }
+
+    #[test]
+    fn workspace_home_help_uses_the_existing_help_modal_behavior() {
+        let mut resolve =
+            |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
+        let mut home = state(&mut resolve);
+        home.handle_key(key(KeyCode::Char('?'), KeyEventKind::Press));
+        let rendered = buffer_text(&draw_home(&home, Path::new("workspace"), 80, 24));
+        assert!(rendered.contains(" Help "));
+        assert!(rendered.contains("w Workspace Config"));
+        assert_eq!(
+            home.handle_key(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            HomeAction::Quit
+        );
+        assert!(!home.shortcut_help_visible);
     }
 
     #[test]
@@ -2266,11 +2406,11 @@ mod tests {
         let mut resolve =
             |_: &str| ContestSwitchResolution::rejected(None, "enter a contest".into());
         let home = state(&mut resolve);
-        let width = 30;
+        let width = 60;
         let height = 10;
         let workspace_area = home_layout(Rect::new(0, 0, width, height))
-            .workspace
-            .expect("workspace row should fit");
+            .footer
+            .expect("footer row should fit");
 
         for (workspace, expected_tail) in [
             (
@@ -2287,7 +2427,8 @@ mod tests {
                 .trim()
                 .to_string();
 
-            assert!(rendered.starts_with("Workspace  …"), "{rendered:?}");
+            assert!(rendered.starts_with(HOME_FOOTER_ACTIONS), "{rendered:?}");
+            assert!(rendered.contains("Root  …"), "{rendered:?}");
             assert!(rendered.ends_with(expected_tail), "{rendered:?}");
             assert!(
                 UnicodeWidthStr::width(rendered.as_str()) <= usize::from(workspace_area.width),
@@ -2303,18 +2444,31 @@ mod tests {
         let narrow = home_layout(Rect::new(0, 0, 20, 24));
         assert_eq!(narrow.logo, None);
         assert_eq!(narrow.menu.height, MENU_HEIGHT);
-        assert!(narrow.workspace.is_some());
+        assert!(narrow.footer.is_some());
 
         let short = home_layout(Rect::new(0, 0, 80, 12));
         assert_eq!(short.logo, None);
         assert_eq!(short.menu.height, MENU_HEIGHT);
-        assert!(short.workspace.is_some());
+        assert!(short.footer.is_some());
 
         let menu_only = home_layout(Rect::new(0, 0, 80, 4));
         assert_eq!(menu_only.logo, None);
-        assert_eq!(menu_only.subtitle, None);
-        assert_eq!(menu_only.workspace, None);
+        assert_eq!(menu_only.footer, None);
         assert_eq!(menu_only.menu.height, 4);
+    }
+
+    #[test]
+    fn logo_appears_as_soon_as_menu_and_footer_fit() {
+        let (logo_width, logo_height) = logo_size();
+        let full_height = logo_height + 1 + MENU_HEIGHT + 1;
+        let too_short = home_layout(Rect::new(0, 0, logo_width, full_height - 1));
+        let just_enough = home_layout(Rect::new(0, 0, logo_width, full_height));
+        assert!(too_short.logo.is_none());
+        assert!(just_enough.logo.is_some());
+        assert!(just_enough.footer.is_some());
+        assert_eq!(just_enough.footer.unwrap().y, full_height - 1);
+        assert!(just_enough.menu.y > just_enough.logo.unwrap().bottom());
+        assert!(just_enough.footer.unwrap().y >= just_enough.menu.bottom());
     }
 
     #[test]

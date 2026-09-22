@@ -12,7 +12,7 @@ atc config init
 
 初期状態のファイルはコメントのみで、組み込みのデフォルト設定がそのまま使われます。
 
-Global Home または Workspace Home の `s` から Settings を開いて編集できます。`G` から同じファイルをエディタで直接開く従来の方法も利用できます。
+Global Home または Workspace Home の `s` から Settings を開いて編集できます。ファイルをエディタで直接開くには、Settings で `e` を押します。ファイルがまだない場合は `Initialize & Open` を選べます。
 
 ## TUI の Settings で編集する
 
@@ -36,9 +36,9 @@ Settings は変更するキーだけを TOML 文書上で更新し、無関係�
 
 保存前には、Settingsを開いた時点からファイルの内容や実体が変わっていないか確認します。外部エディタなどによる変更を検出した場合は `Conflict` となり、編集中の値を保持したまま保存を中止します。`r Reload` はディスク上の内容を読み直しますが、編集中の値は画面に残ります。内容を確認してから改めて保存するか、`Esc`で取り消してください。Reloadだけで以前の編集を自動適用・保存することはありません。自動マージ、自動上書き、自動再試行も行いません。
 
-macOSでは、ファイルのアクセス権（mode・ACL）と拡張属性（xattr）も保存前に確認し、保存時に保持します。これらだけが外部から変更された場合も保存を中止します。読み取り権限の不足や大きすぎる拡張属性などにより安全に確認できない場合は、元の設定ファイルを置き換えません。ファイルの権限や属性を確認してからSettingsを開き直すか、`e` またはHomeの `G` で直接編集してください。
+macOSでは、ファイルのアクセス権（mode・ACL）と拡張属性（xattr）も保存前に確認し、保存時に保持します。これらだけが外部から変更された場合も保存を中止します。読み取り権限の不足や大きすぎる拡張属性などにより安全に確認できない場合は、元の設定ファイルを置き換えません。ファイルの権限や属性を確認してからSettingsを開き直すか、Settings の `e` で直接編集してください。
 
-symlink、Windows reparse point、directory、通常ファイルではない対象はSettingsから書き換えません。symlinkまたはreparse pointは読み込める場合に限って表示できます。修復や特殊な書式の編集には `e` またはHomeの `G` を使ってください。
+symlink、Windows reparse point、directory、通常ファイルではない対象はSettingsから書き換えません。symlinkまたはreparse pointは読み込める場合に限って表示できます。修復や特殊な書式の編集には Settings の `e` を使ってください。
 
 任意の外部エディタはatc-rsの保存処理と協調しないため、あらゆる瞬間の変更を完全に検出できるわけではありません。保存直前にも再確認して競合する時間を短くしていますが、同時変更を完全に防げるとは保証しません。
 
@@ -247,7 +247,7 @@ atc submit A -l python --runtime cpython
 
 ## `[editor]`
 
-Contest の `Open Source` / `Open Template` と、Home の Global Config / Workspace Config / Template action から起動するエディタを指定できます。
+Contest の `Open Source` / `Open Template`、Settings の `e`、Home の Workspace Config / Template action から起動するエディタを指定できます。
 
 ### Vim / Neovim
 

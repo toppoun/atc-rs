@@ -15,7 +15,8 @@ use unicode_width::UnicodeWidthStr;
 use super::authentication_modal::{self, AuthenticationModalController};
 use super::explorer::{self, ExplorerState};
 use super::home::{
-    centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
+    centered_rect, centered_row, home_footer_line, logo_size, menu_line,
+    truncate_start_with_ellipsis,
 };
 use super::settings_screen::{self, SettingsPage, SettingsTransition};
 use super::template_modal::{
@@ -31,21 +32,16 @@ use crate::{branding, config::Config};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 10] = [
+const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 6] = [
     Some(("Open", "o")),
     Some(("Go to Path", "g")),
     None,
     Some(("Settings", "s")),
-    Some(("Global Config", "G")),
     Some(("Template", "t")),
     Some(("Authentication Cookie", "a")),
-    None,
-    Some(("Explorer Shortcuts", "?")),
-    Some(("Quit", "q")),
 ];
 const MENU_WIDTH: u16 = 23;
 const MENU_HEIGHT: u16 = GLOBAL_HOME_ACTIONS.len() as u16;
-const SUBTITLE: &str = "AtCoder workspace launcher";
 const SELECTED_PREFIX: &str = "Selected  ";
 const EXPLORER_MIN_WIDTH: u16 = 32;
 const EXPLORER_MAX_WIDTH: u16 = 48;
@@ -487,10 +483,6 @@ impl GlobalHomeState {
                     self.open_path_input();
                     None
                 }
-                KeyCode::Char('G') if has_plain_modifiers(key) => {
-                    self.file_action = Some(GlobalHomeFileAction::OpenGlobalConfig);
-                    None
-                }
                 KeyCode::Char('s') if has_plain_modifiers(key) => {
                     self.file_action = Some(GlobalHomeFileAction::OpenSettings);
                     None
@@ -912,7 +904,6 @@ fn handle_file_action(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GlobalHomeLayout {
     logo: Option<Rect>,
-    subtitle: Option<Rect>,
     menu: Rect,
     footer: Option<Rect>,
 }
@@ -948,40 +939,25 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
     if area.width == 0 || area.height == 0 {
         return GlobalHomeLayout {
             logo: None,
-            subtitle: None,
             menu: Rect::new(area.x, area.y, 0, 0),
             footer: None,
         };
     }
 
+    let (logo_width, logo_height) = logo_size();
+    let full_content_height = logo_height.saturating_add(1).saturating_add(MENU_HEIGHT);
     let show_footer = area.height >= MENU_HEIGHT.saturating_add(1);
-    let bottom_margin = u16::from(show_footer && area.height >= MENU_HEIGHT.saturating_add(4));
-    let footer_y = area
-        .y
-        .saturating_add(area.height)
-        .saturating_sub(1)
-        .saturating_sub(bottom_margin);
+    let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
     let body_height = if show_footer {
         footer_y.saturating_sub(area.y)
     } else {
         area.height
     };
 
-    let subtitle_width = u16::try_from(UnicodeWidthStr::width(SUBTITLE)).unwrap_or(u16::MAX);
-    let show_subtitle =
-        area.width >= subtitle_width && body_height >= MENU_HEIGHT.saturating_add(2);
-    let (logo_width, logo_height) = logo_size();
-    let full_content_height = logo_height
-        .saturating_add(1)
-        .saturating_add(1)
-        .saturating_add(1)
-        .saturating_add(MENU_HEIGHT);
-    let show_logo = show_subtitle && area.width >= logo_width && body_height >= full_content_height;
+    let show_logo = area.width >= logo_width && body_height >= full_content_height;
 
     let content_height = if show_logo {
         full_content_height
-    } else if show_subtitle {
-        MENU_HEIGHT.saturating_add(2)
     } else {
         MENU_HEIGHT.min(body_height)
     };
@@ -989,25 +965,13 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
         .y
         .saturating_add(body_height.saturating_sub(content_height) / 2);
 
-    let (logo, subtitle, menu_y) = if show_logo {
+    let (logo, menu_y) = if show_logo {
         (
             Some(centered_row(area, content_y, logo_width, logo_height)),
-            Some(centered_row(
-                area,
-                content_y.saturating_add(logo_height).saturating_add(1),
-                subtitle_width,
-                1,
-            )),
-            content_y.saturating_add(logo_height).saturating_add(3),
-        )
-    } else if show_subtitle {
-        (
-            None,
-            Some(centered_row(area, content_y, subtitle_width, 1)),
-            content_y.saturating_add(2),
+            content_y.saturating_add(logo_height).saturating_add(1),
         )
     } else {
-        (None, None, content_y)
+        (None, content_y)
     };
 
     let footer = show_footer.then(|| {
@@ -1022,7 +986,6 @@ fn global_home_layout(area: Rect) -> GlobalHomeLayout {
 
     GlobalHomeLayout {
         logo,
-        subtitle,
         menu: centered_row(area, menu_y, MENU_WIDTH, MENU_HEIGHT.min(body_height)),
         footer,
     }
@@ -1075,14 +1038,6 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
         });
         frame.render_widget(Paragraph::new(Text::from_iter(lines)), area);
     }
-    if let Some(area) = layout.subtitle {
-        frame.render_widget(
-            Paragraph::new(SUBTITLE)
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
-            area,
-        );
-    }
     if layout.menu.width > 0 && layout.menu.height > 0 {
         let lines = GLOBAL_HOME_ACTIONS.iter().map(|action| match action {
             Some((label, shortcut)) => menu_line(label, shortcut, usize::from(layout.menu.width)),
@@ -1092,13 +1047,11 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
     if let Some(area) = layout.footer {
         frame.render_widget(
-            Paragraph::new(prefixed_path_line(
+            Paragraph::new(home_footer_line(
                 SELECTED_PREFIX,
                 state.explorer.selected_path(),
                 usize::from(area.width),
-            ))
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center),
+            )),
             area,
         );
     }
@@ -1108,7 +1061,7 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
 
     if state.shortcut_help_visible {
-        render_shortcuts(frame, state.explorer_pane_visible);
+        render_shortcuts(frame, false);
     }
     if let Some(input) = state.path_input.as_ref() {
         render_path_input(frame, state.explorer.root(), input);
@@ -1163,24 +1116,33 @@ fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspac
     );
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, _explorer_pane_visible: bool) {
+pub(super) fn render_shortcuts(frame: &mut Frame<'_>, workspace_home: bool) {
     let area = centered_rect(frame.area(), 46, 11);
-    let lines = vec![
-        Line::raw("Enter     Expand / Collapse"),
-        Line::raw("↑↓ jk     Navigate"),
-        Line::raw("←→ hl     Collapse / Expand"),
-        Line::raw("Backspace Parent"),
-        Line::raw("r         Reload"),
-        Line::raw(""),
-        Line::raw("? keep open   Esc close"),
-    ];
+    let lines = if workspace_home {
+        vec![
+            Line::raw("c Open / Create Contest"),
+            Line::raw("s Settings"),
+            Line::raw("w Workspace Config"),
+            Line::raw("t Template"),
+            Line::raw("a Authentication"),
+            Line::raw(""),
+            Line::raw("? keep open   Esc close"),
+        ]
+    } else {
+        vec![
+            Line::raw("Enter     Expand / Collapse"),
+            Line::raw("↑↓ jk     Navigate"),
+            Line::raw("←→ hl     Collapse / Expand"),
+            Line::raw("Backspace Parent"),
+            Line::raw("r         Reload"),
+            Line::raw(""),
+            Line::raw("? keep open   Esc close"),
+        ]
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .title(" Explorer Shortcuts ")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().title(" Help ").borders(Borders::ALL)),
         area,
     );
 }
@@ -1556,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn global_config_actions_open_invalid_existing_and_initialize_missing_files() {
+    fn settings_editor_opens_invalid_existing_and_initializes_missing_global_config() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
         let cookie = cookie_location(temp.path());
@@ -1567,7 +1529,9 @@ mod tests {
             100,
             30,
             [
-                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -1589,8 +1553,10 @@ mod tests {
             100,
             30,
             [
-                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
                 vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -1649,6 +1615,43 @@ mod tests {
     }
 
     #[test]
+    fn global_home_settings_repairs_invalid_config_with_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "invalid = [\n").unwrap();
+        let paths = HomeActionPaths::for_test(config.clone(), cookie_location(temp.path()));
+        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+        let mut terminal = ScriptedGlobalTerminal::new(
+            100,
+            30,
+            [
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
+                vec![event(KeyCode::Escape)],
+                vec![event(KeyCode::Char('q'))],
+            ],
+        );
+        terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
+
+        assert_eq!(
+            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            GlobalHomeExit::Quit
+        );
+        assert_eq!(terminal.editor_targets, [config]);
+        assert!(
+            terminal
+                .frames
+                .iter()
+                .any(|frame| frame.contains("Invalid Config"))
+        );
+        assert!(terminal.frames.iter().any(|frame| {
+            frame.contains("Default language")
+                && frame.contains("Python")
+                && frame.contains("Modified")
+        }));
+    }
+
+    #[test]
     fn valid_global_config_editor_uses_the_fresh_configured_editor() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
@@ -1663,7 +1666,9 @@ mod tests {
             100,
             30,
             [
-                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -1830,9 +1835,11 @@ mod tests {
             100,
             30,
             [
-                vec![event(KeyCode::Char('G'))],
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e'))],
                 vec![event(KeyCode::Enter)],
                 vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -2090,7 +2097,9 @@ mod tests {
             100,
             30,
             [
-                vec![event(KeyCode::Char('G')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Char('s'))],
+                vec![event(KeyCode::Char('e')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -2104,7 +2113,7 @@ mod tests {
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.discarded_events, 1);
-        assert_eq!(terminal.reads, 3);
+        assert_eq!(terminal.reads, 5);
     }
 
     #[test]
@@ -2118,12 +2127,14 @@ mod tests {
             100,
             30,
             [
+                vec![event(KeyCode::Char('s'))],
                 vec![
-                    event(KeyCode::Char('G')),
+                    event(KeyCode::Char('e')),
                     event(KeyCode::Enter),
                     event(KeyCode::Char('q')),
                 ],
                 vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
@@ -2137,7 +2148,7 @@ mod tests {
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.discarded_events, 2);
-        assert_eq!(terminal.reads, 5);
+        assert_eq!(terminal.reads, 7);
         assert!(
             terminal
                 .frames
@@ -2152,23 +2163,22 @@ mod tests {
         let rendered = buffer_text(&draw(&mut state, 80, 24));
 
         for expected in branding::ascii_logo_lines().chain([
-            SUBTITLE,
             "Explorer",
             "Open",
             "Go to Path",
             "Settings",
-            "Global Config",
             "Template",
             "Authentication Cookie",
-            "Explorer Shortcuts",
-            "Quit",
-            r"Selected  D:\current\directory",
+            "[?] Help   [q] Quit",
+            "Selected  …rent\\directory",
         ]) {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}\n{rendered}"
             );
         }
+        assert!(!rendered.contains("AtCoder workspace launcher"));
+        assert!(!rendered.contains("Global Config"));
         assert!(!rendered.contains("Browse Directories"));
         assert!(!rendered.contains("Recent Workspaces"));
     }
@@ -2248,10 +2258,7 @@ mod tests {
             Some(GlobalHomeFileAction::OpenSettings)
         );
         assert_eq!(state.handle_key(key(KeyCode::Char('G'))), None);
-        assert_eq!(
-            state.take_file_action(),
-            Some(GlobalHomeFileAction::OpenGlobalConfig)
-        );
+        assert!(state.take_file_action().is_none());
         assert_eq!(state.handle_key(key(KeyCode::Char('g'))), None);
         assert!(state.path_input.is_some());
     }
@@ -2430,7 +2437,7 @@ mod tests {
         state.handle_key(key(KeyCode::Char('?')));
         let rendered = buffer_text(&draw(&mut state, 80, 24));
         for expected in [
-            "Explorer Shortcuts",
+            "Help",
             "Enter     Expand / Collapse",
             "↑↓ jk     Navigate",
             "←→ hl     Collapse / Expand",
@@ -2461,8 +2468,9 @@ mod tests {
             let _ = draw(&mut state, width, height);
         }
 
-        let line = prefixed_path_line(SELECTED_PREFIX, state.explorer.selected_path(), 30);
-        assert!(UnicodeWidthStr::width(line.as_str()) <= 30);
+        let line =
+            home_footer_line(SELECTED_PREFIX, state.explorer.selected_path(), 60).to_string();
+        assert!(UnicodeWidthStr::width(line.as_str()) <= 60);
         assert!(line.ends_with(r"\競プロ\atcoder"));
         assert!(!line.contains('\u{fffd}'));
     }
@@ -2513,7 +2521,11 @@ mod tests {
             let mut state = GlobalHomeState::new(PathBuf::from("selected-root"));
             let buffer = draw(&mut state, width, 24);
             let text = buffer_text(&buffer);
-            assert!(text.contains("Selected  selected-root"));
+            if width == 62 {
+                assert!(!text.contains("Selected"));
+            } else {
+                assert!(text.contains("Selected  selected-root"));
+            }
             if let Some(explorer_width) = expected_explorer {
                 assert!(state.explorer_pane_visible);
                 assert_eq!(buffer.cell((explorer_width - 1, 0)).unwrap().symbol(), "│");
@@ -2521,6 +2533,39 @@ mod tests {
                 assert!(!state.explorer_pane_visible);
             }
         }
+    }
+
+    #[test]
+    fn selected_footer_tracks_explorer_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("selected-child");
+        std::fs::create_dir(&child).unwrap();
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+
+        let initial = buffer_text(&draw(&mut state, 120, 24));
+        assert!(initial.contains(&format!("Selected  {}", root.path().display())));
+
+        state.handle_key(key(KeyCode::Enter));
+        state.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(state.explorer.selected_path(), child);
+        let selected = buffer_text(&draw(&mut state, 120, 24));
+        assert!(selected.contains("Selected  …"));
+        assert!(selected.contains("selected-child"));
+        assert!(!initial.contains("selected-child"));
+    }
+
+    #[test]
+    fn logo_appears_as_soon_as_menu_and_footer_fit() {
+        let (logo_width, logo_height) = logo_size();
+        let full_height = logo_height + 1 + MENU_HEIGHT + 1;
+        let too_short = global_home_layout(Rect::new(0, 0, logo_width, full_height - 1));
+        let just_enough = global_home_layout(Rect::new(0, 0, logo_width, full_height));
+        assert!(too_short.logo.is_none());
+        assert!(just_enough.logo.is_some());
+        assert!(just_enough.footer.is_some());
+        assert_eq!(just_enough.footer.unwrap().y, full_height - 1);
+        assert!(just_enough.menu.y > just_enough.logo.unwrap().bottom());
+        assert!(just_enough.footer.unwrap().y >= just_enough.menu.bottom());
     }
 
     #[test]
@@ -2532,7 +2577,7 @@ mod tests {
 
         let dashboard = buffer_text(&draw(&mut state, 61, 12));
         assert!(!state.explorer_pane_visible);
-        assert!(dashboard.contains("Explorer Shortcuts"));
+        assert!(dashboard.contains("[?] Help   [q] Quit"));
         assert_eq!(state.handle_key(key(KeyCode::Char('o'))), None);
         assert!(state.explorer_overlay_visible);
 
@@ -2611,7 +2656,7 @@ mod tests {
             run_with_terminal(&mut terminal, &mut state).unwrap(),
             GlobalHomeExit::Quit
         );
-        let visible_relative = prefixed_path_line(SELECTED_PREFIX, &relative, 66);
+        let visible_relative = home_footer_line(SELECTED_PREFIX, &relative, 66).to_string();
         assert!(
             terminal
                 .frames
