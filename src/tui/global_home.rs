@@ -2471,6 +2471,7 @@ mod tests {
         let line =
             home_footer_line(SELECTED_PREFIX, state.explorer.selected_path(), 60).to_string();
         assert!(UnicodeWidthStr::width(line.as_str()) <= 60);
+        assert!(line.contains("Selected  …"));
         assert!(line.ends_with(r"\競プロ\atcoder"));
         assert!(!line.contains('\u{fffd}'));
     }
@@ -2541,16 +2542,16 @@ mod tests {
         let child = root.path().join("selected-child");
         std::fs::create_dir(&child).unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        let width = u16::try_from(120 + child.to_string_lossy().len()).unwrap();
 
-        let initial = buffer_text(&draw(&mut state, 120, 24));
+        let initial = buffer_text(&draw(&mut state, width, 24));
         assert!(initial.contains(&format!("Selected  {}", root.path().display())));
 
         state.handle_key(key(KeyCode::Enter));
         state.handle_key(key(KeyCode::Char('j')));
         assert_eq!(state.explorer.selected_path(), child);
-        let selected = buffer_text(&draw(&mut state, 120, 24));
-        assert!(selected.contains("Selected  …"));
-        assert!(selected.contains("selected-child"));
+        let selected = buffer_text(&draw(&mut state, width, 24));
+        assert!(selected.contains(&format!("Selected  {}", child.display())));
         assert!(!initial.contains("selected-child"));
     }
 
