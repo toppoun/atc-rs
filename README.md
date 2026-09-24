@@ -106,20 +106,8 @@ atc submit --help
 
 ## やりたいことから探す
 
-<table>
-  <tr>
-    <td width="32">
-      <img src="docs/assets/icons/download.svg" width="18" height="18" alt="">
-    </td>
-    <td>
-      <a href="docs/installation.md"><strong>インストールして使い始める</strong></a><br>
-      <sub>導入方法・必要なツール・最初のコンテスト</sub>
-    </td>
-    <td width="24">
-      <img src="docs/assets/icons/chevron-right.svg" width="16" height="16" alt="">
-    </td>
-  </tr>
-</table>
+<img src="docs/assets/icons/download.svg" width="24" height="24" alt=""> **[インストールして使い始める](docs/installation.md)**  
+導入方法・必要なツール・最初のコンテスト
 
 ## License
 
