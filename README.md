@@ -106,8 +106,13 @@ atc submit --help
 
 ## やりたいことから探す
 
-<img src="docs/assets/icons/download.svg" width="24" height="24" alt=""> **[インストールして使い始める](docs/installation.md)**  
-導入方法・必要なツール・最初のコンテスト
+<p>
+  <img src="docs/assets/icons/download.svg" align="left" width="32" height="32" alt="">
+  &nbsp;<a href="docs/installation.md"><strong>インストールして使い始める</strong></a><br>
+  &nbsp;<sub>導入方法・必要なツール・最初のコンテスト</sub>
+</p>
+
+<br clear="all">
 
 ## License
 
