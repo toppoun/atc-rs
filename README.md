@@ -39,16 +39,31 @@ Scoop / Homebrew の準備、C++ compiler や Python の選び方、ソースか
 
 ## クイックスタート
 
-作業用フォルダを作成し、atc-rs の workspace として初期化します。
+### 1. Workspace を作る
+
+AtCoder のファイルを保存したい場所で、作業用フォルダを作成します。
 
 ```bash
 mkdir atcoder
 cd atcoder
 atc init
+```
+
+`atc init` は、現在のフォルダを Workspace として初期化します。
+
+Workspace は、複数のコンテストをまとめて管理するためのフォルダです。
+
+初期設定では、ABC / ARC / AGC ごとに保存先が振り分けられます。すべてのコンテストを Workspace 直下に置きたい場合は、[Contest の保存先を変更する](docs/workspace.md#contest-の保存先)を参照してください。
+
+### 2. atc を起動する
+
+```bash
 atc
 ```
 
-Workspace Home が開いたら、次の順に操作します。
+Workspace Home が開きます。
+
+### 3. コンテストを開く
 
 1. `c` を押す
 2. `abc123` のような Contest ID を入力して `Enter`
@@ -56,9 +71,13 @@ Workspace Home が開いたら、次の順に操作します。
 4. `r` を押して、選択中の問題をテストする
 5. 提出するときは `t` を押す
 
-提出には AtCoder の `REVEL_SESSION` Cookie が必要です。Workspace Home で `a` を押すと設定できます。
+ソースを保存すると、自動テストも利用できます。
 
-初回の環境準備からテストまでを順に進めたい場合は、[インストールガイド](docs/installation.md)から始めてください。
+**提出には AtCoder の認証が必要です。** Workspace Home で `a` を押すと Authentication を開けます。
+
+Cookie の取得方法は[AtCoder 認証ガイド](docs/authentication.md)を参照してください。
+
+認証を設定しなくても、問題の取得やローカルでのテストは利用できます。
 
 ## よく使う操作
 
@@ -75,7 +94,9 @@ Contest 画面では、次のキーをよく使います。
 | `?` | ショートカットを表示 |
 | `q` | 終了 |
 
-すべての画面と操作は [TUI ガイド](docs/tui.md)で確認できます。コマンド一覧と option は、ターミナルでも表示できます。
+画面の移動やその他の操作は、[TUI ガイド](docs/tui.md)で確認できます。
+
+CLI のコマンド一覧とオプションは、ターミナルからも確認できます。
 
 ```bash
 atc --help
@@ -83,24 +104,26 @@ atc test --help
 atc submit --help
 ```
 
-## ガイド
+## やりたいことから探す
 
-- [インストール](docs/installation.md) — 導入、必要な外部ツール、最初の Contest
-- [TUI](docs/tui.md) — 画面ごとの操作とショートカット
-- [ワークスペース](docs/workspace.md) — Contest の保存先、作成、切り替え、更新
-- [テストと Watch](docs/testing.md) — サンプルテスト、User Input、自動テスト
-- [ストレステスト](docs/stress.md) — Generator / Brute Force と反例の保存
-- [AtCoder 認証](docs/authentication.md) — Cookie の設定、確認、置換、リセット
-- [テンプレート](docs/templates.md) — 新しく作るソースのひな形
-- [設定](docs/configuration.md) — 言語、実行環境、timeout、editor、提出 runtime
-- [トラブルシューティング](docs/troubleshooting.md) — 症状から対処方法を探す
-
-`atc` は設定ファイルを作らなくても使い始められます。環境に問題がありそうな場合は、変更を加えない診断コマンドを実行してください。
-
-```bash
-atc doctor
-```
+<table>
+  <tr>
+    <td width="32">
+      <img src="docs/assets/icons/download.svg" width="18" height="18" alt="">
+    </td>
+    <td>
+      <a href="docs/installation.md"><strong>インストールして使い始める</strong></a><br>
+      <sub>導入方法・必要なツール・最初のコンテスト</sub>
+    </td>
+    <td width="24">
+      <img src="docs/assets/icons/chevron-right.svg" width="16" height="16" alt="">
+    </td>
+  </tr>
+</table>
 
 ## License
 
-[MIT License](LICENSE)
+atc-rs is licensed under the [MIT License](LICENSE).
+
+Icons are provided by [Lucide](https://lucide.dev/).
+See the [Lucide License](docs/assets/licenses/LUCIDE-LICENSE).
