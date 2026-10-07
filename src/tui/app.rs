@@ -889,6 +889,7 @@ pub struct RunState {
     pub accepted: usize,
     pub total_cases: usize,
     pub error: Option<Arc<String>>,
+    pub warning: Option<Arc<String>>,
     pub cases: Vec<CaseState>,
 }
 
@@ -904,6 +905,7 @@ impl Default for RunState {
             accepted: 0,
             total_cases: 0,
             error: None,
+            warning: None,
 
             cases: Vec::new(),
         }
@@ -916,6 +918,17 @@ fn case_mut(run: &mut RunState, number: usize) -> Option<&mut CaseState> {
 }
 
 impl WatchApp {
+    pub(crate) fn set_saved_stress_load_error(&mut self, problem: usize, error: String) {
+        let Some(state) = self.problems.get_mut(problem) else {
+            return;
+        };
+        state.run.phase = RunPhase::Failed;
+        state.run.error = Some(Arc::new(error));
+        if self.selected_problem == problem {
+            self.invalidate_detail();
+        }
+    }
+
     #[cfg(test)]
     pub fn new(contest: &Contest, sample_counts: Vec<usize>) -> io::Result<Self> {
         let stress_cases = vec![None; contest.problems.len()];
@@ -2221,6 +2234,7 @@ impl WatchApp {
             accepted: 0,
             total_cases,
             error: None,
+            warning: None,
             cases: vec![CaseState::default(); total_cases],
         };
         if self.selected_problem == problem {
@@ -2404,6 +2418,7 @@ impl WatchApp {
         run.accepted = 0;
         run.total_cases = total_cases;
         run.error = None;
+        run.warning = None;
         run.cases = vec![CaseState::default(); total_cases];
 
         if self.selected_problem == problem {
@@ -2498,6 +2513,13 @@ impl WatchApp {
         };
 
         let changed = match event {
+            TestEvent::SavedStressCaseSkipped { reason }
+                if !run.test_run_started
+                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
+            {
+                run.warning = Some(Arc::new(format!("Saved Stress case skipped: {reason}")));
+                true
+            }
             TestEvent::NoSamples
                 if !run.test_run_started
                     && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>

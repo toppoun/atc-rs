@@ -5,6 +5,7 @@ use crate::auth::{AuthSnapshot, SessionAuth};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{Contest, Sample};
+use crate::safe_file::{self, FileSnapshot};
 use crate::template::resolve_source_template;
 use crate::ui::{Event, Reporter};
 use crate::workspace::{self, ContestDataReplacement, ContestMetadataHealth, TestsHealth};
@@ -28,7 +29,14 @@ pub(super) fn inspect_contest_target(
         return Ok(ContestTargetHealth::MissingDirectory);
     }
 
-    match workspace::inspect_contest_metadata(destination)? {
+    let metadata_health = workspace::inspect_contest_metadata(destination)?;
+    if !matches!(
+        metadata_health,
+        ContestMetadataHealth::UnsupportedVersion(_)
+    ) {
+        workspace::validate_existing_contest_identity(destination, contest_id)?;
+    }
+    match metadata_health {
         ContestMetadataHealth::Healthy(contest) => {
             workspace::validate_contest_identity(&contest, contest_id)?;
             workspace::validate_contest_paths(&contest)?;
@@ -36,6 +44,10 @@ pub(super) fn inspect_contest_target(
                 TestsHealth::Healthy => Ok(ContestTargetHealth::Healthy),
                 TestsHealth::Broken => Ok(ContestTargetHealth::RepairRequired),
             }
+        }
+        ContestMetadataHealth::DuplicateTaskIds(contest) => {
+            workspace::validate_contest_identity(&contest, contest_id)?;
+            Ok(ContestTargetHealth::RepairRequired)
         }
         ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
             Ok(ContestTargetHealth::RepairRequired)
@@ -332,6 +344,7 @@ pub(super) fn repair_contest_in_active_workspace(
             workspace::ensure_active_workspace_contest_parent(root, contest_id, destination)
                 .map_err(AppError::from)
         },
+        || {},
     )
 }
 
@@ -353,6 +366,8 @@ struct RepairPlan {
     metadata: RepairComponent,
     tests: RepairComponent,
     basis: RepairBasis,
+    duplicate_manifest: Option<Contest>,
+    metadata_snapshot: Option<FileSnapshot>,
 }
 
 fn repair_at(
@@ -378,6 +393,7 @@ fn repair_at_with_before_install(
         reporter,
         before_install,
         || Ok(()),
+        || {},
     )
 }
 
@@ -388,6 +404,7 @@ fn repair_at_with_before_install_and_validation(
     reporter: &mut dyn Reporter,
     before_install: impl FnOnce(),
     mut validate_workspace: impl FnMut() -> Result<(), AppError>,
+    after_final_validation: impl FnOnce(),
 ) -> Result<(), AppError> {
     workspace::validate_refresh_destination(destination, contest_id, true)?;
     let plan = plan_repair(destination, contest_id, atcoder, reporter)?;
@@ -395,9 +412,11 @@ fn repair_at_with_before_install_and_validation(
     // Active-workspace callers revalidate after the network-bound plan and before even creating
     // temporary managed data. Revalidate again below immediately before the live replacement.
     validate_workspace()?;
-    let staging = tempfile::Builder::new()
-        .prefix(".atc-repair-")
-        .tempdir_in(destination)?;
+    let staging = crate::safe_file::PreservedTempDir::new(
+        tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(destination)?,
+    );
     workspace::save_metadata(staging.path(), &plan.contest)?;
     if plan.tests == RepairComponent::Restore {
         for (problem, samples) in plan.contest.problems.iter().zip(&plan.samples_by_problem) {
@@ -408,6 +427,7 @@ fn repair_at_with_before_install_and_validation(
     before_install();
     validate_workspace()?;
     revalidate_repair_plan(destination, contest_id, &plan)?;
+    after_final_validation();
 
     let replacement = match (plan.metadata, plan.tests) {
         (RepairComponent::Restore, RepairComponent::Keep) => ContestDataReplacement::MetadataOnly,
@@ -420,7 +440,13 @@ fn repair_at_with_before_install_and_validation(
         }
     };
 
-    workspace::replace_contest_data(destination, staging, true, replacement)?;
+    workspace::replace_contest_data_with_snapshot(
+        destination,
+        staging.into_temp_dir(),
+        true,
+        replacement,
+        plan.metadata_snapshot,
+    )?;
 
     match inspect_contest_target(destination, contest_id)? {
         ContestTargetHealth::Healthy => {
@@ -451,6 +477,9 @@ fn plan_repair(
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<RepairPlan, AppError> {
+    workspace::validate_existing_contest_identity(destination, contest_id)?;
+    let metadata_snapshot =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
     match workspace::inspect_contest_metadata(destination)? {
         ContestMetadataHealth::Healthy(contest) => {
             workspace::validate_contest_identity(&contest, contest_id)?;
@@ -467,9 +496,20 @@ fn plan_repair(
                 metadata: RepairComponent::Keep,
                 tests: RepairComponent::Restore,
                 basis: RepairBasis::HealthyManifest,
+                duplicate_manifest: None,
+                metadata_snapshot,
             })
         }
-        ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
+        health @ (ContestMetadataHealth::Missing
+        | ContestMetadataHealth::Invalid
+        | ContestMetadataHealth::DuplicateTaskIds(_)) => {
+            let duplicate_manifest =
+                if let ContestMetadataHealth::DuplicateTaskIds(contest) = health {
+                    workspace::validate_contest_identity(&contest, contest_id)?;
+                    Some(contest)
+                } else {
+                    None
+                };
             let FetchedContestData {
                 contest,
                 samples_by_problem,
@@ -490,6 +530,8 @@ fn plan_repair(
                 metadata: RepairComponent::Restore,
                 tests,
                 basis: RepairBasis::MissingOrInvalidManifest,
+                duplicate_manifest,
+                metadata_snapshot,
             })
         }
         ContestMetadataHealth::UnsupportedVersion(version) => Err(io::Error::new(
@@ -508,6 +550,13 @@ fn revalidate_repair_plan(
     plan: &RepairPlan,
 ) -> Result<(), AppError> {
     workspace::validate_refresh_destination(destination, contest_id, true)?;
+    let current =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))
+            .map_err(|_| repair_plan_changed_error())?;
+    if current != plan.metadata_snapshot {
+        return Err(repair_plan_changed_error().into());
+    }
+    workspace::validate_existing_contest_identity(destination, contest_id)?;
     match (
         plan.basis,
         workspace::inspect_contest_metadata(destination)?,
@@ -517,7 +566,11 @@ fn revalidate_repair_plan(
         (
             RepairBasis::MissingOrInvalidManifest,
             ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid,
-        ) => {}
+        ) if plan.duplicate_manifest.is_none() => {}
+        (
+            RepairBasis::MissingOrInvalidManifest,
+            ContestMetadataHealth::DuplicateTaskIds(current),
+        ) if plan.duplicate_manifest.as_ref() == Some(&current) => {}
         _ => return Err(repair_plan_changed_error().into()),
     }
 
@@ -631,10 +684,7 @@ mod tests {
         let invalid = tempfile::tempdir().unwrap();
         std::fs::create_dir(invalid.path().join(".atc")).unwrap();
         std::fs::write(invalid.path().join(".atc/contest.toml"), "invalid").unwrap();
-        assert!(matches!(
-            inspect_contest_target(invalid.path(), "abc466").unwrap(),
-            ContestTargetHealth::RepairRequired
-        ));
+        assert!(inspect_contest_target(invalid.path(), "abc466").is_err());
 
         let old_schema = tempfile::tempdir().unwrap();
         std::fs::create_dir(old_schema.path().join(".atc")).unwrap();
@@ -751,6 +801,236 @@ mod tests {
     }
 
     #[test]
+    fn unknown_metadata_owner_cannot_offer_repair_or_change_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = temp.path().join(".atc/contest.toml");
+        std::fs::create_dir(metadata.parent().unwrap()).unwrap();
+        let original = b"version = ???\n";
+        std::fs::write(&metadata, original).unwrap();
+        let mut reporter = NullReporter;
+        let error = contest_at(
+            temp.path(),
+            "abc466",
+            &mut reporter,
+            |_| panic!("unknown owner must not reach confirmation"),
+            |_, _, _| panic!("existing directory must not be created"),
+            |_, _, _| panic!("unknown owner must not be repaired"),
+            |_, _, _| panic!("unknown owner must not open TUI"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot confirm ownership"));
+        assert!(std::fs::read(metadata).unwrap() == original);
+    }
+
+    #[test]
+    fn duplicate_task_ids_reach_repair_confirmation_and_cancel_preserves_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        let metadata = concat!(
+            "version = 1\ncontest_id = \"abc466\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+            "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+        );
+        let path = destination.join(".atc/contest.toml");
+        std::fs::write(&path, metadata).unwrap();
+        assert!(workspace::load_metadata(&destination).is_err());
+        assert!(matches!(
+            inspect_contest_target(&destination, "abc466").unwrap(),
+            ContestTargetHealth::RepairRequired
+        ));
+        let mut reporter = NullReporter;
+        let mut confirmations = 0;
+        contest_at(
+            &destination,
+            "abc466",
+            &mut reporter,
+            |_| {
+                confirmations += 1;
+                Ok(false)
+            },
+            |_, _, _| panic!("existing contest must not be recreated"),
+            |_, _, _| panic!("cancelled repair must not run"),
+            |_, _, _| panic!("cancelled repair must not open TUI"),
+        )
+        .unwrap();
+        assert_eq!(confirmations, 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), metadata);
+    }
+
+    #[test]
+    fn duplicate_task_repair_replaces_only_proven_owned_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        std::fs::create_dir_all(destination.join("tests/Z")).unwrap();
+        std::fs::write(destination.join("tests/Z/sample-1.in"), "old input\n").unwrap();
+        std::fs::write(destination.join("tests/Z/sample-1.out"), "old output\n").unwrap();
+        std::fs::write(destination.join("Z.cpp"), "user source\n").unwrap();
+        std::fs::write(
+            destination.join(".atc/contest.toml"),
+            concat!(
+                "version = 1\ncontest_id = \"abc466\"\n",
+                "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 3\n",
+                "[[problems]]\nindex = \"Z\"\ntitle = \"Z\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 1\n",
+            ),
+        )
+        .unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixture);
+        let mut reporter = NullReporter;
+
+        repair_at(&destination, "abc466", &client, &mut reporter).unwrap();
+
+        assert_eq!(
+            workspace::load_metadata(&destination).unwrap(),
+            abc466_snapshot().contest
+        );
+        assert_eq!(
+            workspace::inspect_tests_health(&destination, &abc466_snapshot().contest).unwrap(),
+            TestsHealth::Healthy
+        );
+        assert!(!destination.join("tests/Z").exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("Z.cpp")).unwrap(),
+            "user source\n"
+        );
+    }
+
+    #[test]
+    fn forced_refresh_uses_duplicate_manifest_ownership_but_refuses_unknown_tests() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+        let mut reporter = NullReporter;
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        std::fs::create_dir_all(destination.join("tests/Z")).unwrap();
+        std::fs::write(destination.join("tests/Z/sample-1.in"), "old input\n").unwrap();
+        std::fs::write(destination.join("tests/Z/sample-1.out"), "old output\n").unwrap();
+        let metadata_path = destination.join(".atc/contest.toml");
+        let duplicate = concat!(
+            "version = 1\ncontest_id = \"abc466\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 3\n",
+            "[[problems]]\nindex = \"Z\"\ntitle = \"Z\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 1\n",
+        );
+        std::fs::write(&metadata_path, duplicate).unwrap();
+        super::super::refresh::refresh_at(&destination, "abc466", true, &client, &mut reporter)
+            .unwrap();
+        assert_eq!(
+            workspace::load_metadata(&destination).unwrap(),
+            abc466_snapshot().contest
+        );
+        assert!(!destination.join("tests/Z").exists());
+
+        std::fs::write(&metadata_path, "invalid metadata").unwrap();
+        let sample_before = std::fs::read(destination.join("tests/A/sample-1.in")).unwrap();
+        let unknown_error =
+            super::super::refresh::refresh_at(&destination, "abc466", true, &client, &mut reporter)
+                .unwrap_err();
+        assert!(
+            unknown_error
+                .to_string()
+                .contains("cannot confirm ownership")
+        );
+        assert_eq!(
+            std::fs::read(destination.join("tests/A/sample-1.in")).unwrap(),
+            sample_before
+        );
+
+        std::fs::create_dir_all(destination.join("tests/Z")).unwrap();
+        std::fs::write(destination.join("tests/Z/sample-1.in"), "user input\n").unwrap();
+        let before = std::fs::read(&metadata_path).unwrap();
+        let error =
+            super::super::refresh::refresh_at(&destination, "abc466", true, &client, &mut reporter)
+                .unwrap_err();
+        assert!(error.to_string().contains("cannot confirm ownership"));
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(destination.join("tests/Z/sample-1.in")).unwrap(),
+            "user input\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_task_manifest_with_wrong_contest_id_cannot_offer_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        std::fs::write(
+            destination.join(".atc/contest.toml"),
+            concat!(
+                "version = 1\ncontest_id = \"abc467\"\n",
+                "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+                "task_id = \"abc467_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc467/tasks/abc467_a\"\n",
+                "sample_count = 0\n",
+                "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+                "task_id = \"abc467_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc467/tasks/abc467_a\"\n",
+                "sample_count = 0\n",
+            ),
+        )
+        .unwrap();
+        assert!(inspect_contest_target(&destination, "abc466").is_err());
+        let error =
+            super::super::refresh::resolve_refresh_contest_id(&destination, Some("abc466"), false)
+                .unwrap_err();
+        assert!(error.to_string().contains("contest ID mismatch"));
+    }
+
+    #[test]
+    fn duplicate_task_repair_rechecks_the_original_manifest_before_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        let metadata_path = destination.join(".atc/contest.toml");
+        let original = concat!(
+            "version = 1\ncontest_id = \"abc466\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+            "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+        );
+        std::fs::write(&metadata_path, original).unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+        let mut reporter = NullReporter;
+        let changed = format!("{original}# edited during fetch\n");
+
+        let error =
+            repair_at_with_before_install(&destination, "abc466", &client, &mut reporter, || {
+                std::fs::write(&metadata_path, &changed).unwrap()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("changed while repair"));
+        assert_eq!(std::fs::read_to_string(&metadata_path).unwrap(), changed);
+        assert!(!destination.join("tests").exists());
+    }
+
+    #[test]
     fn healthy_workflow_watches_without_create_or_repair() {
         let temp = tempfile::tempdir().unwrap();
         save_contest(temp.path(), "abc466");
@@ -805,6 +1085,45 @@ mod tests {
             TestsHealth::Healthy
         );
         assert!(!destination.join("tests/C").exists());
+    }
+
+    #[test]
+    fn duplicate_repair_preserves_comment_changed_after_final_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir_all(destination.join(".atc")).unwrap();
+        let metadata_path = destination.join(".atc/contest.toml");
+        let original = concat!(
+            "version = 1\ncontest_id = \"abc466\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+            "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+        );
+        std::fs::write(&metadata_path, original).unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+        let mut reporter = NullReporter;
+        let changed = format!("{original}# edited after validation\n");
+
+        let result = repair_at_with_before_install_and_validation(
+            &destination,
+            "abc466",
+            &client,
+            &mut reporter,
+            || {},
+            || Ok(()),
+            || std::fs::write(&metadata_path, &changed).unwrap(),
+        );
+        assert!(
+            result.is_err(),
+            "a late comment edit must block replacement"
+        );
+        assert_eq!(std::fs::read_to_string(&metadata_path).unwrap(), changed);
     }
 
     #[test]
@@ -886,7 +1205,11 @@ mod tests {
         std::fs::write(&edited_sample, "local structural edit\n").unwrap();
         std::fs::write(destination.join("tests/memo.txt"), "unrelated").unwrap();
         std::fs::create_dir(destination.join(".atc")).unwrap();
-        std::fs::write(destination.join(".atc/contest.toml"), "invalid metadata").unwrap();
+        std::fs::write(
+            destination.join(".atc/contest.toml"),
+            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
+        )
+        .unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let client = atcoder::AtCoderClient::fixture(fixtures);
         let mut reporter = NullReporter;
@@ -913,7 +1236,11 @@ mod tests {
         let destination = temp.path().join("abc466");
         std::fs::create_dir(&destination).unwrap();
         std::fs::create_dir(destination.join(".atc")).unwrap();
-        std::fs::write(destination.join(".atc/contest.toml"), "invalid metadata").unwrap();
+        std::fs::write(
+            destination.join(".atc/contest.toml"),
+            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
+        )
+        .unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let client = atcoder::AtCoderClient::fixture(fixtures);
         let mut reporter = NullReporter;
@@ -936,7 +1263,8 @@ mod tests {
         std::fs::create_dir(&destination).unwrap();
         std::fs::create_dir(destination.join(".atc")).unwrap();
         let metadata = destination.join(".atc/contest.toml");
-        std::fs::write(&metadata, "invalid metadata").unwrap();
+        let original = "version = 1\ncontest_id = \"abc466\"\nproblems = []\n";
+        std::fs::write(&metadata, original).unwrap();
         std::fs::create_dir_all(destination.join("tests/A")).unwrap();
         let memo = destination.join("tests/A/memo.txt");
         std::fs::write(&memo, "keep me").unwrap();
@@ -948,10 +1276,7 @@ mod tests {
             .expect_err("unmanaged tests content must refuse repair before mutation");
 
         assert!(error.to_string().contains("memo.txt"));
-        assert_eq!(
-            std::fs::read_to_string(metadata).unwrap(),
-            "invalid metadata"
-        );
+        assert_eq!(std::fs::read_to_string(metadata).unwrap(), original);
         assert_eq!(std::fs::read_to_string(memo).unwrap(), "keep me");
     }
 
@@ -1023,7 +1348,8 @@ mod tests {
         save_snapshot_tests(&metadata_only, &fetched);
         std::fs::create_dir(metadata_only.join(".atc")).unwrap();
         let invalid_metadata = metadata_only.join(".atc/contest.toml");
-        std::fs::write(&invalid_metadata, "invalid metadata").unwrap();
+        let original = "version = 1\ncontest_id = \"abc466\"\nproblems = []\n";
+        std::fs::write(&invalid_metadata, original).unwrap();
         let removed_sample = metadata_only.join("tests/A/sample-1.in");
         let client = atcoder::AtCoderClient::fixture(fixtures);
         let error =
@@ -1032,10 +1358,7 @@ mod tests {
             })
             .expect_err("tests changing from healthy to broken must abort metadata-only repair");
         assert!(error.to_string().contains("retry repair"));
-        assert_eq!(
-            std::fs::read_to_string(invalid_metadata).unwrap(),
-            "invalid metadata"
-        );
+        assert_eq!(std::fs::read_to_string(invalid_metadata).unwrap(), original);
     }
 
     #[test]
@@ -1046,7 +1369,7 @@ mod tests {
                 std::fs::create_dir(temp.path().join(".atc")).unwrap();
                 std::fs::write(
                     temp.path().join(".atc").join("contest.toml"),
-                    "version = ???",
+                    "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
                 )
                 .unwrap();
             }

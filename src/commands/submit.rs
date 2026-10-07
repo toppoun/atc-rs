@@ -88,10 +88,34 @@ pub(crate) struct SubmitPlan {
     problem_index: String,
     source: ResolvedSource,
     target: SubmissionTarget,
+    metadata_destination: Option<PathBuf>,
 }
 
 impl SubmitPlan {
+    #[cfg(test)]
     pub(crate) fn for_selected_source(
+        contest_id: String,
+        task_id: String,
+        problem_index: String,
+        path: PathBuf,
+        language: Language,
+        python_runtime: PythonRuntime,
+    ) -> Self {
+        let mut plan = Self::for_selected_source_in_workspace(
+            PathBuf::new(),
+            contest_id,
+            task_id,
+            problem_index,
+            path,
+            language,
+            python_runtime,
+        );
+        plan.metadata_destination = None;
+        plan
+    }
+
+    pub(crate) fn for_selected_source_in_workspace(
+        destination: PathBuf,
         contest_id: String,
         task_id: String,
         problem_index: String,
@@ -109,7 +133,26 @@ impl SubmitPlan {
             problem_index,
             source: ResolvedSource { language, path },
             target,
+            metadata_destination: Some(destination),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_metadata_destination(mut self, destination: PathBuf) -> Self {
+        self.metadata_destination = Some(destination);
+        self
+    }
+
+    pub(crate) fn verify_metadata_identity(&self) -> Result<(), AppError> {
+        if let Some(destination) = &self.metadata_destination {
+            verify_submit_identity(
+                destination,
+                &self.contest_id,
+                &self.problem_index,
+                &self.task_id,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn receipt_language_label(&self) -> &'static str {
@@ -128,6 +171,57 @@ pub(crate) struct PreparedSubmit {
     problem_index: String,
     target: SubmissionTarget,
     source_snapshot: String,
+    metadata_destination: Option<PathBuf>,
+}
+
+impl PreparedSubmit {
+    pub(crate) fn verify_metadata_identity(&self) -> Result<(), AppError> {
+        if let Some(destination) = &self.metadata_destination {
+            verify_submit_identity(
+                destination,
+                &self.contest_id,
+                &self.problem_index,
+                &self.task_id,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_submit_identity(
+    destination: &Path,
+    contest_id: &str,
+    problem_index: &str,
+    task_id: &str,
+) -> Result<(), AppError> {
+    let contest = workspace::load_metadata(destination)?;
+    workspace::validate_contest_identity(&contest, contest_id)?;
+    let problem = find_problem(&contest, problem_index)?;
+    if problem.task_id != task_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("task ID changed for problem {problem_index}: submission cancelled"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verified_post_gate(
+    metadata_destination: Option<&Path>,
+    contest_id: &str,
+    problem_index: &str,
+    task_id: &str,
+    gate_error: &RefCell<Option<AppError>>,
+    try_begin_post: &dyn Fn() -> bool,
+) -> bool {
+    if let Some(destination) = metadata_destination
+        && let Err(error) = verify_submit_identity(destination, contest_id, problem_index, task_id)
+    {
+        *gate_error.borrow_mut() = Some(error);
+        return false;
+    }
+    try_begin_post()
 }
 
 #[cfg(test)]
@@ -295,6 +389,7 @@ fn resolve_submit_plan(
         problem_index: problem.index.clone(),
         source,
         target,
+        metadata_destination: Some(destination),
     })
 }
 
@@ -352,6 +447,7 @@ where
         problem_index,
         source,
         target,
+        metadata_destination,
     } = plan;
 
     // read_source is FnOnce and is called immediately before creating the owned request.
@@ -371,6 +467,7 @@ where
         problem_index,
         target,
         source_snapshot,
+        metadata_destination,
     })
 }
 
@@ -392,6 +489,7 @@ where
         problem_index,
         target,
         source_snapshot,
+        metadata_destination: _,
     } = prepared;
 
     let request = SubmitRequest::new(contest_id.clone(), task_id.clone(), target, source_snapshot);
@@ -468,6 +566,7 @@ where
         problem_index: _,
         target,
         source_snapshot,
+        metadata_destination: _,
     } = prepared;
     let baseline = Rc::new(RefCell::new(None));
     let baseline_before_post = Rc::clone(&baseline);
@@ -545,9 +644,15 @@ pub(crate) fn execute_prepared_with_client(
     should_continue: &dyn Fn() -> bool,
     try_begin_post: &dyn Fn() -> bool,
 ) -> Result<SubmissionCompletion, AppError> {
+    prepared.verify_metadata_identity()?;
+    let metadata_destination = prepared.metadata_destination.clone();
+    let contest_id = prepared.contest_id.clone();
+    let problem_index = prepared.problem_index.clone();
+    let task_id = prepared.task_id.clone();
+    let gate_error = RefCell::new(None);
     let mut diagnostics =
         AttemptDiagnostics::from_env(&prepared.contest_id, &prepared.task_id, prepared.target);
-    execute_prepared_with_tracking_diagnostics(
+    let result = execute_prepared_with_tracking_diagnostics(
         prepared,
         &mut diagnostics,
         |contest_id, task_id, language_id, observer| {
@@ -564,7 +669,16 @@ pub(crate) fn execute_prepared_with_client(
                 request,
                 |language_id| before_post(language_id),
                 should_continue,
-                try_begin_post,
+                &|| {
+                    verified_post_gate(
+                        metadata_destination.as_deref(),
+                        &contest_id,
+                        &problem_index,
+                        &task_id,
+                        &gate_error,
+                        try_begin_post,
+                    )
+                },
             )
         },
         |baseline, observer| {
@@ -580,7 +694,11 @@ pub(crate) fn execute_prepared_with_client(
             )
         },
         emit,
-    )
+    );
+    if let Some(error) = gate_error.into_inner() {
+        return Err(error);
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -619,6 +737,7 @@ where
         problem_index: _,
         target,
         source_snapshot,
+        metadata_destination: _,
     } = prepared;
     let baseline = RefCell::new(None);
     let mut capture_baseline = Some(capture_baseline);
@@ -1334,6 +1453,90 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_task_id_metadata_never_reaches_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = concat!(
+            "version = 1\ncontest_id = \"abc430\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc430_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc430/tasks/abc430_a\"\n",
+            "sample_count = 0\n",
+            "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+            "task_id = \"abc430_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc430/tasks/abc430_a\"\n",
+            "sample_count = 0\n",
+        );
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        fs::write(temp.path().join(".atc/contest.toml"), metadata).unwrap();
+        write_source(temp.path(), "B", Language::Cpp, "int main() {}\n");
+        let calls = Cell::new(0);
+        let error = submit_at(
+            temp.path(),
+            "B",
+            None,
+            None,
+            &mut Vec::new(),
+            read_source_file,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(SubmitOutcome::Accepted)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate task ID"));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".atc/contest.toml")).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn metadata_change_at_post_gate_prevents_mock_send() {
+        let temp = tempfile::tempdir().unwrap();
+        contest(temp.path(), "abc430", "A", "abc430_a");
+        let calls = Cell::new(0);
+        let gate_error = RefCell::new(None);
+        let mock_send = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        assert!(verified_post_gate(
+            Some(temp.path()),
+            "abc430",
+            "A",
+            "abc430_a",
+            &gate_error,
+            &mock_send,
+        ));
+        assert_eq!(calls.get(), 1);
+
+        contest(temp.path(), "abc430", "A", "abc430_changed");
+        let before = fs::read(temp.path().join(".atc/contest.toml")).unwrap();
+        assert!(!verified_post_gate(
+            Some(temp.path()),
+            "abc430",
+            "A",
+            "abc430_a",
+            &gate_error,
+            &mock_send,
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(
+            gate_error
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("task ID changed")
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".atc/contest.toml")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
     fn explicit_contest_uses_existing_workspace_routing() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
@@ -1952,6 +2155,7 @@ mod tests {
             problem_index: "C".to_string(),
             target: SubmissionTarget::Cpp,
             source_snapshot: "SOURCE_COOKIE_CSRF_SECRET\n".to_string(),
+            metadata_destination: None,
         }
     }
 

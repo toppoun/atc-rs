@@ -64,6 +64,7 @@ struct ContestMetadataHeader {
 
 pub enum ContestMetadataHealth {
     Healthy(Contest),
+    DuplicateTaskIds(Contest),
     Missing,
     Invalid,
     UnsupportedVersion(u32),
@@ -672,6 +673,11 @@ pub fn save_metadata(destination: &Path, contest: &Contest) -> io::Result<()> {
 }
 
 pub fn load_metadata(destination: &Path) -> io::Result<Contest> {
+    ensure_contest_recovery_state(destination)?;
+    load_metadata_unchecked(destination)
+}
+
+fn load_metadata_unchecked(destination: &Path) -> io::Result<Contest> {
     validate_workspace_marker(destination)?;
     let path = destination.join(".atc").join("contest.toml");
 
@@ -697,10 +703,12 @@ pub fn load_metadata(destination: &Path) -> io::Result<Contest> {
         ));
     }
 
-    Ok(Contest {
+    let contest = Contest {
         contest_id: metadata.contest_id,
         problems: metadata.problems,
-    })
+    };
+    validate_contest_paths(&contest)?;
+    Ok(contest)
 }
 
 pub fn contest_directory_exists(destination: &Path) -> io::Result<bool> {
@@ -741,7 +749,63 @@ pub fn ensure_contest_parent(destination: &Path) -> io::Result<()> {
     }
 }
 
+fn ensure_contest_recovery_state(destination: &Path) -> io::Result<()> {
+    validate_contest_directory(destination)?;
+    for entry in fs::read_dir(destination)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let is_staging = name.starts_with(".atc-refresh-") || name.starts_with(".atc-repair-");
+        let is_recovery = name.starts_with(".atc-recovery-");
+        if !is_staging && !is_recovery {
+            continue;
+        }
+        let path = entry.path();
+        if !existing_real_directory(&path, "contest recovery directory")? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("contest recovery directory disappeared: {}", path.display()),
+            ));
+        }
+        if is_recovery {
+            let identity = safe_file::read_completed_recovery(&path)?;
+            if !identity.is_contest() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "contest recovery area has invalid ownership: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        } else if safe_file::recovery_intent_exists(&path)?
+            || path_entry_exists(&path.join("previous-tests"))?
+            || path_entry_exists(&path.join("previous-contest.toml"))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("contest update requires recovery check: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
+    ensure_contest_recovery_state(destination)?;
+    inspect_contest_metadata_unchecked(destination)
+}
+
+fn inspect_contest_metadata_unchecked(destination: &Path) -> io::Result<ContestMetadataHealth> {
     validate_contest_directory(destination)?;
     let marker = destination.join(".atc");
 
@@ -779,13 +843,57 @@ pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadat
         contest_id: metadata.contest_id,
         problems: metadata.problems,
     };
-    validate_contest_path_components(&contest)?;
+    validate_contest_index_components(&contest)?;
     if inspect_contest_manifest_semantics(&contest)? == ContestManifestSemantics::RepairableInvalid
     {
         return Ok(ContestMetadataHealth::Invalid);
     }
+    if duplicate_task_id(&contest).is_some() {
+        return Ok(ContestMetadataHealth::DuplicateTaskIds(contest));
+    }
 
     Ok(ContestMetadataHealth::Healthy(contest))
+}
+
+pub(crate) fn validate_existing_contest_identity(
+    destination: &Path,
+    expected_contest_id: &str,
+) -> io::Result<()> {
+    match inspect_contest_metadata(destination)? {
+        ContestMetadataHealth::Missing => Ok(()),
+        ContestMetadataHealth::Healthy(contest)
+        | ContestMetadataHealth::DuplicateTaskIds(contest) => {
+            validate_contest_identity(&contest, expected_contest_id)
+        }
+        ContestMetadataHealth::Invalid => {
+            let path = destination.join(".atc/contest.toml");
+            let bytes = safe_file::read_regular_file_snapshot(&path)?.bytes;
+            let content = std::str::from_utf8(&bytes).map_err(|_| unknown_contest_owner_error())?;
+            // Ownership must be checked independently of schema and URL repairability.
+            // TOML parsing still rejects duplicate keys; only the root contest_id is trusted.
+            let metadata: toml::Value =
+                toml::from_str(content).map_err(|_| unknown_contest_owner_error())?;
+            let contest_id = metadata
+                .get("contest_id")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(unknown_contest_owner_error)?;
+            validate_contest_identity(
+                &Contest {
+                    contest_id: contest_id.to_owned(),
+                    problems: Vec::new(),
+                },
+                expected_contest_id,
+            )
+        }
+        ContestMetadataHealth::UnsupportedVersion(_) => Err(unknown_contest_owner_error()),
+    }
+}
+
+fn unknown_contest_owner_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "cannot confirm ownership of existing contest metadata; back it up and restore it manually before retrying",
+    )
 }
 
 pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -> io::Result<()> {
@@ -958,6 +1066,22 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
         samples.push(Sample { input, output });
     }
 
+    Ok(samples)
+}
+
+pub fn load_verified_samples(destination: &Path, problem: &Problem) -> io::Result<Vec<Sample>> {
+    let samples = load_samples(destination, &problem.index)?;
+    if samples.len() != problem.sample_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "problem {} has {} local samples, but contest metadata requires {}",
+                problem.index,
+                samples.len(),
+                problem.sample_count
+            ),
+        ));
+    }
     Ok(samples)
 }
 
@@ -1192,7 +1316,7 @@ fn inspect_contest_manifest_semantics(contest: &Contest) -> io::Result<ContestMa
     })
 }
 
-fn validate_contest_path_components(contest: &Contest) -> io::Result<()> {
+fn validate_contest_index_components(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
     let mut problem_indices = HashSet::new();
     for problem in &contest.problems {
@@ -1206,6 +1330,26 @@ fn validate_contest_path_components(contest: &Contest) -> io::Result<()> {
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn duplicate_task_id(contest: &Contest) -> Option<&str> {
+    let mut task_ids = HashSet::new();
+    contest
+        .problems
+        .iter()
+        .map(|problem| problem.task_id.as_str())
+        .find(|task_id| !task_ids.insert(*task_id))
+}
+
+fn validate_contest_path_components(contest: &Contest) -> io::Result<()> {
+    validate_contest_index_components(contest)?;
+    if let Some(task_id) = duplicate_task_id(contest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("duplicate task ID: {task_id:?}"),
+        ));
     }
     Ok(())
 }
@@ -1535,44 +1679,95 @@ pub(crate) fn preflight_tests_replacement(destination: &Path, contest: &Contest)
         return Ok(());
     }
 
-    let indices = contest
+    let mut indices = contest
         .problems
         .iter()
         .map(|problem| problem.index.to_ascii_lowercase())
         .collect::<HashSet<_>>();
+    let previous_indices =
+        existing_owned_problem_indices(destination, &contest.contest_id, &indices)?;
+    indices.extend(previous_indices);
     validate_refresh_owned_tests(&tests, &indices)
 }
 
+#[cfg(test)]
 pub(crate) fn replace_contest_data(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
     replacement: ContestDataReplacement,
 ) -> io::Result<()> {
-    replace_contest_data_with_hooks(
+    let expected_metadata =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
+    replace_contest_data_with_snapshot(
         destination,
         staging,
         allow_missing_marker,
         replacement,
+        expected_metadata,
+    )
+}
+
+pub(crate) fn replace_contest_data_with_snapshot(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    replacement: ContestDataReplacement,
+    expected_metadata: Option<safe_file::FileSnapshot>,
+) -> io::Result<()> {
+    replace_contest_data_with_hooks_and_snapshot(
+        destination,
+        staging,
+        allow_missing_marker,
+        replacement,
+        expected_metadata,
         || {},
         || {},
         || {},
     )
 }
 
+#[cfg(test)]
 pub fn replace_refresh_data(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
 ) -> io::Result<()> {
-    replace_contest_data(
+    let expected_metadata =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
+    replace_refresh_data_with_snapshot(
         destination,
         staging,
         allow_missing_marker,
-        ContestDataReplacement::MetadataAndTests,
+        expected_metadata,
     )
 }
 
+pub(crate) fn replace_refresh_data_with_snapshot(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    expected_metadata: Option<safe_file::FileSnapshot>,
+) -> io::Result<()> {
+    let staging = safe_file::PreservedTempDir::new(staging);
+    let staged_contest = match load_metadata(staging.path()) {
+        Ok(contest) => contest,
+        Err(error) => return Err(refresh_update_error(staging, error, Vec::new())),
+    };
+    if let Err(error) = validate_existing_contest_identity(destination, &staged_contest.contest_id)
+    {
+        return Err(refresh_update_error(staging, error, Vec::new()));
+    }
+    replace_contest_data_with_snapshot(
+        destination,
+        staging.into_temp_dir(),
+        allow_missing_marker,
+        ContestDataReplacement::MetadataAndTests,
+        expected_metadata,
+    )
+}
+
+#[cfg(test)]
 fn replace_contest_data_with_hooks(
     destination: &Path,
     staging: TempDir,
@@ -1582,26 +1777,58 @@ fn replace_contest_data_with_hooks(
     before_tests_install: impl FnOnce(),
     before_recovery_cleanup: impl FnOnce(),
 ) -> io::Result<()> {
+    let expected_metadata =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
+    replace_contest_data_with_hooks_and_snapshot(
+        destination,
+        staging,
+        allow_missing_marker,
+        replacement,
+        expected_metadata,
+        before_tests_backup,
+        before_tests_install,
+        before_recovery_cleanup,
+    )
+}
+
+fn replace_contest_data_with_hooks_and_snapshot(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    replacement: ContestDataReplacement,
+    expected_metadata: Option<safe_file::FileSnapshot>,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+) -> io::Result<()> {
     match replacement {
-        ContestDataReplacement::MetadataOnly => {
-            replace_metadata_only(destination, staging, allow_missing_marker)
-        }
+        ContestDataReplacement::MetadataOnly => replace_metadata_only(
+            destination,
+            staging,
+            allow_missing_marker,
+            expected_metadata,
+        ),
         ContestDataReplacement::TestsOnly => replace_tests_only_with_hooks(
             destination,
             staging,
             allow_missing_marker,
+            expected_metadata,
             before_tests_backup,
             before_tests_install,
             before_recovery_cleanup,
         ),
-        ContestDataReplacement::MetadataAndTests => replace_refresh_data_with_hooks(
-            destination,
-            staging,
-            allow_missing_marker,
-            before_tests_backup,
-            before_tests_install,
-            before_recovery_cleanup,
-        ),
+        ContestDataReplacement::MetadataAndTests => {
+            replace_refresh_data_with_cleanup_hook_and_snapshot(
+                destination,
+                staging,
+                allow_missing_marker,
+                before_tests_backup,
+                before_tests_install,
+                before_recovery_cleanup,
+                || {},
+                expected_metadata,
+            )
+        }
     }
 }
 
@@ -1609,7 +1836,9 @@ fn replace_metadata_only(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
+    expected_metadata: Option<safe_file::FileSnapshot>,
 ) -> io::Result<()> {
+    let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
 
     let staging_root = staging.path();
@@ -1634,11 +1863,34 @@ fn replace_metadata_only(
             format!("staged metadata not found: {}", staged_metadata.display()),
         ));
     }
-
     let had_destination_metadata = had_destination_marker
         && existing_regular_file(&destination_metadata, "existing metadata path")?;
+    if safe_file::read_optional_regular_file_snapshot(&destination_metadata)? != expected_metadata {
+        return Err(changed_contest_metadata_error());
+    }
+    let staged_contest = load_metadata(staging_root)?;
+    let recovery_identity =
+        safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
+    safe_file::write_recovery_intent(staging_root, &recovery_identity)?;
     if had_destination_metadata {
         safe_file::rename_noclobber(&destination_metadata, &backup_metadata)?;
+        if safe_file::read_regular_file_snapshot(&backup_metadata)
+            .ok()
+            .as_ref()
+            != expected_metadata.as_ref()
+        {
+            let rollback_errors =
+                safe_file::rename_noclobber(&backup_metadata, &destination_metadata)
+                    .err()
+                    .map(|error| format!("failed to restore changed metadata: {error}"))
+                    .into_iter()
+                    .collect();
+            return Err(refresh_update_error(
+                staging,
+                changed_contest_metadata_error(),
+                rollback_errors,
+            ));
+        }
     }
 
     let created_destination_marker = if had_destination_marker {
@@ -1671,6 +1923,25 @@ fn replace_metadata_only(
         return Err(refresh_update_error(staging, error, rollback_errors));
     }
 
+    let recovery_path = staging.path().to_path_buf();
+    if let Err(error) = complete_contest_staging(
+        staging,
+        false,
+        had_destination_metadata,
+        false,
+        &HashSet::new(),
+        None,
+        expected_metadata.as_ref(),
+        &recovery_identity,
+    ) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "contest metadata installed, but recovery completion failed: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1678,10 +1949,12 @@ fn replace_tests_only_with_hooks(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
+    expected_metadata: Option<safe_file::FileSnapshot>,
     before_tests_backup: impl FnOnce(),
     before_tests_install: impl FnOnce(),
     before_recovery_cleanup: impl FnOnce(),
 ) -> io::Result<()> {
+    let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
 
     let staging_root = staging.path().to_path_buf();
@@ -1700,6 +1973,7 @@ fn replace_tests_only_with_hooks(
     let staged_tests = staging_root.join("tests");
     let backup_tests = staging_root.join("previous-tests");
     let staged_contest = load_metadata(&staging_root)?;
+    validate_metadata_snapshot(&destination_marker.join("contest.toml"), &expected_metadata)?;
     validate_live_tests_manifest(destination, &staged_contest)?;
     let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")?;
     let has_staged_tests = existing_real_directory(&staged_tests, "staged tests path")?;
@@ -1710,11 +1984,27 @@ fn replace_tests_only_with_hooks(
     } else {
         HashSet::new()
     };
+    let previous_tests_snapshot = if had_destination_tests {
+        Some(safe_file::read_tree_snapshot(&destination_tests)?)
+    } else {
+        None
+    };
+
+    let recovery_identity =
+        safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
+    safe_file::write_recovery_intent(&staging_root, &recovery_identity)?;
 
     before_tests_backup();
     if had_destination_tests {
         safe_file::rename_noclobber(&destination_tests, &backup_tests)?;
-        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices) {
+        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+            .and_then(|()| {
+                validate_previous_tests_snapshot(
+                    &backup_tests,
+                    previous_tests_snapshot.as_ref().unwrap(),
+                )
+            })
+        {
             let rollback_errors = rollback_tests(
                 &destination_tests,
                 &staged_tests,
@@ -1727,7 +2017,10 @@ fn replace_tests_only_with_hooks(
     }
 
     before_tests_install();
-    if let Err(error) = validate_live_tests_manifest(destination, &staged_contest) {
+    if let Err(error) =
+        validate_metadata_snapshot(&destination_marker.join("contest.toml"), &expected_metadata)
+            .and_then(|()| validate_live_tests_manifest(destination, &staged_contest))
+    {
         let rollback_errors = rollback_tests(
             &destination_tests,
             &staged_tests,
@@ -1751,7 +2044,10 @@ fn replace_tests_only_with_hooks(
     }
 
     before_recovery_cleanup();
-    if let Err(error) = validate_live_tests_manifest(destination, &staged_contest) {
+    if let Err(error) =
+        validate_metadata_snapshot(&destination_marker.join("contest.toml"), &expected_metadata)
+            .and_then(|()| validate_live_tests_manifest(destination, &staged_contest))
+    {
         let rollback_errors = rollback_tests(
             &destination_tests,
             &staged_tests,
@@ -1774,6 +2070,12 @@ fn replace_tests_only_with_hooks(
     }
     if had_destination_tests
         && let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+            .and_then(|()| {
+                validate_previous_tests_snapshot(
+                    &backup_tests,
+                    previous_tests_snapshot.as_ref().unwrap(),
+                )
+            })
     {
         let kind = error.kind();
         let recovery_path = staging.keep();
@@ -1786,11 +2088,30 @@ fn replace_tests_only_with_hooks(
         ));
     }
 
+    let recovery_path = staging.path().to_path_buf();
+    if let Err(error) = complete_contest_staging(
+        staging,
+        had_destination_tests,
+        false,
+        true,
+        &owned_problem_indices,
+        previous_tests_snapshot.as_ref(),
+        None,
+        &recovery_identity,
+    ) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "tests replacement installed new data, but recovery completion failed: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
     Ok(())
 }
 
 fn validate_live_tests_manifest(destination: &Path, staged_contest: &Contest) -> io::Result<()> {
-    match inspect_contest_metadata(destination)? {
+    match inspect_contest_metadata_unchecked(destination)? {
         ContestMetadataHealth::Healthy(current) if current == *staged_contest => Ok(()),
         _ => Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -1799,6 +2120,17 @@ fn validate_live_tests_manifest(destination: &Path, staged_contest: &Contest) ->
     }
 }
 
+fn validate_metadata_snapshot(
+    path: &Path,
+    expected: &Option<safe_file::FileSnapshot>,
+) -> io::Result<()> {
+    if &safe_file::read_optional_regular_file_snapshot(path)? != expected {
+        return Err(changed_contest_metadata_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn replace_refresh_data_with_hooks(
     destination: &Path,
     staging: TempDir,
@@ -1807,6 +2139,55 @@ fn replace_refresh_data_with_hooks(
     before_tests_install: impl FnOnce(),
     before_recovery_cleanup: impl FnOnce(),
 ) -> io::Result<()> {
+    let expected_metadata =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
+    replace_refresh_data_with_cleanup_hook_and_snapshot(
+        destination,
+        staging,
+        allow_missing_marker,
+        before_tests_backup,
+        before_tests_install,
+        before_recovery_cleanup,
+        || {},
+        expected_metadata,
+    )
+}
+
+#[cfg(test)]
+fn replace_refresh_data_with_cleanup_hook(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+    before_staging_cleanup: impl FnOnce(),
+) -> io::Result<()> {
+    let expected_metadata =
+        safe_file::read_optional_regular_file_snapshot(&destination.join(".atc/contest.toml"))?;
+    replace_refresh_data_with_cleanup_hook_and_snapshot(
+        destination,
+        staging,
+        allow_missing_marker,
+        before_tests_backup,
+        before_tests_install,
+        before_recovery_cleanup,
+        before_staging_cleanup,
+        expected_metadata,
+    )
+}
+
+fn replace_refresh_data_with_cleanup_hook_and_snapshot(
+    destination: &Path,
+    staging: TempDir,
+    allow_missing_marker: bool,
+    before_tests_backup: impl FnOnce(),
+    before_tests_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+    before_staging_cleanup: impl FnOnce(),
+    expected_metadata: Option<safe_file::FileSnapshot>,
+) -> io::Result<()> {
+    let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
 
     let staging_root = staging.path().to_path_buf();
@@ -1840,6 +2221,9 @@ fn replace_refresh_data_with_hooks(
         ));
     }
 
+    if safe_file::read_optional_regular_file_snapshot(&destination_metadata)? != expected_metadata {
+        return Err(changed_contest_metadata_error());
+    }
     let owned_problem_indices = if had_destination_tests {
         let indices = refresh_owned_problem_indices(destination, &staging_root)?;
         validate_refresh_owned_tests(&destination_tests, &indices)?;
@@ -1847,12 +2231,29 @@ fn replace_refresh_data_with_hooks(
     } else {
         HashSet::new()
     };
+    let previous_tests_snapshot = if had_destination_tests {
+        Some(safe_file::read_tree_snapshot(&destination_tests)?)
+    } else {
+        None
+    };
+
+    let staged_contest = load_metadata(&staging_root)?;
+    let recovery_identity =
+        safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
+    safe_file::write_recovery_intent(&staging_root, &recovery_identity)?;
 
     before_tests_backup();
 
     if had_destination_tests {
         safe_file::rename_noclobber(&destination_tests, &backup_tests)?;
-        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices) {
+        if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+            .and_then(|()| {
+                validate_previous_tests_snapshot(
+                    &backup_tests,
+                    previous_tests_snapshot.as_ref().unwrap(),
+                )
+            })
+        {
             let rollback_errors = rollback_tests(
                 &destination_tests,
                 &staged_tests,
@@ -1890,6 +2291,29 @@ fn replace_refresh_data_with_hooks(
             had_destination_tests,
         );
         return Err(refresh_update_error(staging, error, rollback_errors));
+    }
+    if had_destination_metadata
+        && safe_file::read_regular_file_snapshot(&backup_metadata)
+            .ok()
+            .as_ref()
+            != expected_metadata.as_ref()
+    {
+        let mut rollback_errors = Vec::new();
+        if let Err(error) = safe_file::rename_noclobber(&backup_metadata, &destination_metadata) {
+            rollback_errors.push(format!("failed to restore changed metadata: {error}"));
+        }
+        rollback_errors.extend(rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            has_staged_tests,
+            had_destination_tests,
+        ));
+        return Err(refresh_update_error(
+            staging,
+            changed_contest_metadata_error(),
+            rollback_errors,
+        ));
     }
 
     let created_destination_marker = if had_destination_marker {
@@ -1939,6 +2363,12 @@ fn replace_refresh_data_with_hooks(
     before_recovery_cleanup();
     if had_destination_tests
         && let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
+            .and_then(|()| {
+                validate_previous_tests_snapshot(
+                    &backup_tests,
+                    previous_tests_snapshot.as_ref().unwrap(),
+                )
+            })
     {
         let kind = error.kind();
         let recovery_path = staging.keep();
@@ -1951,7 +2381,133 @@ fn replace_refresh_data_with_hooks(
         ));
     }
 
+    before_staging_cleanup();
+    let recovery_path = staging.path().to_path_buf();
+    if let Err(error) = complete_contest_staging(
+        staging,
+        had_destination_tests,
+        had_destination_metadata,
+        false,
+        &owned_problem_indices,
+        previous_tests_snapshot.as_ref(),
+        expected_metadata.as_ref(),
+        &recovery_identity,
+    ) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "refresh installed new data, but recovery completion failed: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn complete_contest_staging(
+    staging: safe_file::PreservedTempDir,
+    had_previous_tests: bool,
+    had_previous_metadata: bool,
+    staged_metadata_remains: bool,
+    owned_problem_indices: &HashSet<String>,
+    expected_previous_tests: Option<&safe_file::TreeSnapshot>,
+    expected_previous_metadata: Option<&safe_file::FileSnapshot>,
+    identity: &safe_file::RecoveryIdentity,
+) -> io::Result<()> {
+    let root = staging.path().to_path_buf();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != ".atc"
+            && name != safe_file::RECOVERY_INTENT
+            && !(had_previous_tests && name == "previous-tests")
+            && !(had_previous_metadata && name == "previous-contest.toml")
+        {
+            return Err(unowned_refresh_test_error(&entry.path()));
+        }
+    }
+    let marker = root.join(".atc");
+    if !existing_real_directory(&marker, "staging metadata directory")? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staging metadata directory changed before cleanup: {}",
+                marker.display()
+            ),
+        ));
+    }
+    for entry in fs::read_dir(&marker)? {
+        let entry = entry?;
+        if !staged_metadata_remains || entry.file_name() != "contest.toml" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "staging metadata directory contains an unowned entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    let remaining_metadata = marker.join("contest.toml");
+    if staged_metadata_remains
+        && !existing_regular_file(&remaining_metadata, "staged contest metadata")?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged contest metadata disappeared before cleanup",
+        ));
+    }
+    let previous_tests = root.join("previous-tests");
+    if had_previous_tests {
+        if !existing_real_directory(&previous_tests, "previous tests directory")? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "previous tests disappeared before cleanup",
+            ));
+        }
+        validate_refresh_owned_tests(&previous_tests, owned_problem_indices)?;
+        if let Some(expected) = expected_previous_tests {
+            validate_previous_tests_snapshot(&previous_tests, expected)?;
+        }
+    }
+    let previous_metadata = root.join("previous-contest.toml");
+    if had_previous_metadata
+        && !existing_regular_file(&previous_metadata, "previous contest metadata")?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "previous contest metadata disappeared before cleanup",
+        ));
+    }
+    if had_previous_metadata
+        && safe_file::read_regular_file_snapshot(&previous_metadata)
+            .ok()
+            .as_ref()
+            != expected_previous_metadata
+    {
+        return Err(changed_contest_metadata_error());
+    }
+
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "contest staging name is not Unicode",
+            )
+        })?;
+    let suffix = name
+        .strip_prefix(".atc-")
+        .filter(|suffix| suffix.starts_with("refresh-") || suffix.starts_with("repair-"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected contest staging name",
+            )
+        })?;
+    let completed = root.with_file_name(format!(".atc-recovery-{suffix}"));
+    safe_file::complete_recovery(staging, &completed, identity).map(|_| ())
 }
 
 fn refresh_owned_problem_indices(
@@ -1967,19 +2523,47 @@ fn refresh_owned_problem_indices(
         .map(|problem| problem.index.to_ascii_lowercase())
         .collect::<HashSet<_>>();
 
-    if let ContestMetadataHealth::Healthy(previous_contest) = inspect_contest_metadata(destination)?
-        && validate_contest_paths(&previous_contest).is_ok()
-        && validate_contest_identity(&previous_contest, &staged_contest.contest_id).is_ok()
-    {
-        indices.extend(
-            previous_contest
-                .problems
-                .iter()
-                .map(|problem| problem.index.to_ascii_lowercase()),
-        );
-    }
+    let previous_indices =
+        existing_owned_problem_indices(destination, &staged_contest.contest_id, &indices)?;
+    indices.extend(previous_indices);
 
     Ok(indices)
+}
+
+fn existing_owned_problem_indices(
+    destination: &Path,
+    expected_contest_id: &str,
+    replacement_indices: &HashSet<String>,
+) -> io::Result<HashSet<String>> {
+    let inspection = inspect_contest_metadata(destination);
+    let previous = match inspection {
+        Ok(
+            ContestMetadataHealth::Healthy(contest)
+            | ContestMetadataHealth::DuplicateTaskIds(contest),
+        ) => {
+            if let Err(error) = validate_contest_identity(&contest, expected_contest_id) {
+                validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
+                return Err(error);
+            }
+            contest
+        }
+        Ok(_) => {
+            validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot confirm ownership of existing tests from contest metadata; move tests to a safe location and restore metadata manually before retrying",
+            ));
+        }
+        Err(error) => {
+            validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
+            return Err(error);
+        }
+    };
+    Ok(previous
+        .problems
+        .iter()
+        .map(|problem| problem.index.to_ascii_lowercase())
+        .collect())
 }
 
 fn validate_refresh_owned_tests(
@@ -2014,6 +2598,22 @@ fn validate_refresh_owned_tests(
         }
     }
 
+    Ok(())
+}
+
+fn validate_previous_tests_snapshot(
+    path: &Path,
+    expected: &safe_file::TreeSnapshot,
+) -> io::Result<()> {
+    if &safe_file::read_tree_snapshot(path)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "previous tests changed during replacement: {}",
+                path.display()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -2112,16 +2712,21 @@ fn rollback_tests(
 }
 
 fn refresh_update_error(
-    staging: TempDir,
+    staging: safe_file::PreservedTempDir,
     original: io::Error,
     rollback_errors: Vec<String>,
 ) -> io::Error {
-    if rollback_errors.is_empty() {
-        return original;
-    }
-
     let kind = original.kind();
     let recovery_path = staging.keep();
+    if rollback_errors.is_empty() {
+        return io::Error::new(
+            kind,
+            format!(
+                "contest data update failed: {original}; staging data kept at {}",
+                recovery_path.display()
+            ),
+        );
+    }
     io::Error::new(
         kind,
         format!(
@@ -2129,6 +2734,13 @@ fn refresh_update_error(
             rollback_errors.join("; "),
             recovery_path.display()
         ),
+    )
+}
+
+fn changed_contest_metadata_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "contest metadata changed during replacement; original file retained for recovery review",
     )
 }
 
@@ -3175,6 +3787,31 @@ mod tests {
     }
 
     #[test]
+    fn loaded_metadata_rejects_duplicate_task_ids_across_indices() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = concat!(
+            "version = 1\ncontest_id = \"abc466\"\n",
+            "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+            "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+            "task_id = \"abc466_a\"\n",
+            "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+            "sample_count = 0\n",
+        );
+        write_metadata_text(temp.path(), metadata);
+
+        let error = load_metadata(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate task ID"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".atc/contest.toml")).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
     fn contest_paths_reject_case_insensitive_problem_index_collisions() {
         let contest = Contest {
             contest_id: "abc466".to_string(),
@@ -3259,6 +3896,35 @@ mod tests {
 
         fs::create_dir_all(temp.path().join("tests").join("A")).unwrap();
         assert!(load_samples(temp.path(), "A").unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_samples_keep_zero_count_and_ignore_user_and_stress_data() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        crate::user_input::create_user_input(temp.path(), "A", "custom input\n").unwrap();
+        let stress_dir = temp.path().join(".atc/stress/A");
+        fs::create_dir_all(&stress_dir).unwrap();
+        fs::write(stress_dir.join("failed.in"), "stress input\n").unwrap();
+
+        let zero = problem_with_sample_count("A", 0);
+        assert!(
+            load_verified_samples(temp.path(), &zero)
+                .unwrap()
+                .is_empty()
+        );
+        let one = problem_with_sample_count("A", 1);
+        let error = load_verified_samples(temp.path(), &one).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("0 local samples"));
+        assert_eq!(
+            crate::user_input::load_user_inputs(temp.path(), "A").unwrap()[0].content,
+            "custom input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(stress_dir.join("failed.in")).unwrap(),
+            "stress input\n"
+        );
     }
 
     #[test]
@@ -3939,7 +4605,67 @@ mod tests {
         .expect_err("metadata changing after backup must abort and restore old tests");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(
+            load_metadata_unchecked(&destination).unwrap(),
+            changed_contest
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn tests_only_rolls_back_when_metadata_comment_changes_after_old_tests_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let metadata_path = destination.join(".atc/contest.toml");
+        let original = fs::read(&metadata_path).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-repair-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_contest_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            ContestDataReplacement::TestsOnly,
+            || {},
+            || {
+                let mut changed = original.clone();
+                changed.extend_from_slice(b"# edited while repair was running\n");
+                fs::write(&metadata_path, changed).unwrap();
+            },
+            || {},
+        )
+        .expect_err("comment-only changes must abort tests replacement");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            fs::read(&metadata_path)
+                .unwrap()
+                .ends_with(b"# edited while repair was running\n")
+        );
         assert_eq!(
             fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
             "old\n"
@@ -3987,7 +4713,11 @@ mod tests {
         .expect_err("metadata changing after install must roll new tests back");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(
+            load_metadata_unchecked(&destination).unwrap(),
+            changed_contest
+        );
         assert_eq!(
             fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
             "old\n"
@@ -4038,7 +4768,11 @@ mod tests {
         .expect_err("late metadata change must retain the modified installed generation");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(
+            load_metadata_unchecked(&destination).unwrap(),
+            changed_contest
+        );
         assert_eq!(
             fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
             "old\n"
@@ -4303,6 +5037,45 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_task_manifest_contributes_safe_old_indices_to_refresh_ownership() {
+        let destination = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        fs::create_dir(destination.path().join(".atc")).unwrap();
+        fs::write(
+            destination.path().join(".atc/contest.toml"),
+            concat!(
+                "version = 1\ncontest_id = \"abc466\"\n",
+                "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 0\n",
+                "[[problems]]\nindex = \"Z\"\ntitle = \"Z\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 0\n",
+            ),
+        )
+        .unwrap();
+        save_metadata(
+            staging.path(),
+            &Contest {
+                contest_id: "abc466".to_string(),
+                problems: vec![Problem {
+                    index: "A".to_string(),
+                    title: "A".to_string(),
+                    task_id: "abc466_a".to_string(),
+                    url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+                    sample_count: 0,
+                }],
+            },
+        )
+        .unwrap();
+
+        let indices = refresh_owned_problem_indices(destination.path(), staging.path()).unwrap();
+        assert_eq!(indices, HashSet::from(["a".to_string(), "z".to_string()]));
+    }
+
+    #[test]
     fn refresh_replacement_does_not_claim_a_noncanonical_sample_name() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
@@ -4441,7 +5214,7 @@ mod tests {
             .expect_err("wrong-contest metadata must not claim the LOCAL test namespace");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("LOCAL"));
+        assert!(error.to_string().contains("contest ID mismatch"));
         assert_eq!(
             fs::read_to_string(local_tests.join("sample-1.in")).unwrap(),
             "user input\n"
@@ -4464,11 +5237,13 @@ mod tests {
                 "title = \"Local\"\n",
                 "task_id = \"local\"\n",
                 "url = \"https://example.invalid/local\"\n",
+                "sample_count = 0\n",
                 "[[problems]]\n",
                 "index = \"local\"\n",
                 "title = \"Duplicate\"\n",
                 "task_id = \"duplicate\"\n",
                 "url = \"https://example.invalid/duplicate\"\n",
+                "sample_count = 0\n",
             ),
         )
         .unwrap();
@@ -4491,7 +5266,7 @@ mod tests {
             .expect_err("duplicate prior indices must invalidate all prior ownership claims");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("LOCAL"));
+        assert!(error.to_string().contains("duplicate problem index"));
         assert_eq!(
             fs::read_to_string(local_tests.join("sample-1.in")).unwrap(),
             "user input\n"
@@ -4547,14 +5322,22 @@ mod tests {
             fs::read_to_string(old_tests.join("sample-1.in")).unwrap(),
             "old input\n"
         );
-        assert_eq!(load_metadata(&destination).unwrap(), contest);
-        assert!(fs::read_dir(&destination).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".atc-refresh-")
-        }));
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(load_metadata_unchecked(&destination).unwrap(), contest);
+        let retained_staging = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-refresh-")
+            })
+            .expect("failed replacement retains staged files for recovery review");
+        assert_eq!(
+            fs::read_to_string(retained_staging.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
     }
 
     #[test]
@@ -4632,7 +5415,410 @@ mod tests {
             fs::read_to_string(recovery.join("tests").join("A").join("sample-1.in")).unwrap(),
             "new input\n"
         );
-        assert_eq!(load_metadata(&destination).unwrap(), contest);
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(load_metadata_unchecked(&destination).unwrap(), contest);
+    }
+
+    #[test]
+    fn refresh_cleanup_preserves_a_late_unowned_staging_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let old_tests = destination.join("tests/A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let inserted = staging_path.join("user-note.txt");
+
+        let result = replace_refresh_data_with_cleanup_hook(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {},
+            || {},
+            || fs::write(&inserted, "keep me\n").unwrap(),
+        );
+        assert!(
+            result.is_err(),
+            "unknown staging content must prevent success"
+        );
+        assert_eq!(fs::read_to_string(&inserted).unwrap(), "keep me\n");
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
+    }
+
+    #[test]
+    fn completed_contest_refresh_retains_previous_metadata_and_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &old).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let old_metadata = fs::read(destination.join(".atc/contest.toml")).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let new = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("B", 1)],
+        };
+        save_metadata(staging.path(), &new).unwrap();
+        save_samples(
+            staging.path(),
+            &new.problems[0],
+            &[Sample {
+                input: "new\n".to_string(),
+                output: "new\n".to_string(),
+            }],
+        )
+        .unwrap();
+        replace_refresh_data(&destination, staging, false).unwrap();
+
+        let recovery = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-recovery-")
+            })
+            .expect("completed refresh must retain previous files");
+        assert_eq!(
+            fs::read(recovery.join("previous-contest.toml")).unwrap(),
+            old_metadata
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous-tests/A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(load_metadata(&destination).unwrap(), new);
+    }
+
+    #[test]
+    fn valid_external_edit_of_previous_tests_aborts_refresh_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let old = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &old).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &old).unwrap();
+        save_samples(
+            staging.path(),
+            &old.problems[0],
+            &[Sample {
+                input: "new\n".to_string(),
+                output: "new\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let result = replace_refresh_data_with_cleanup_hook(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {},
+            || {},
+            || {
+                fs::write(
+                    staging_path.join("previous-tests/A/sample-1.in"),
+                    "external\n",
+                )
+                .unwrap()
+            },
+        );
+        assert!(result.is_err(), "external edit must stop completion");
+        assert_eq!(
+            fs::read_to_string(staging_path.join("previous-tests/A/sample-1.in")).unwrap(),
+            "external\n"
+        );
+    }
+
+    #[test]
+    fn same_content_tests_directory_replacement_is_detected_by_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        write_sample_pair(&destination, "A", 1, "old\n");
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new\n".to_string(),
+                output: "new\n".to_string(),
+            }],
+        )
+        .unwrap();
+        let moved_original = temp.path().join("original-tests");
+        let result = replace_refresh_data_with_cleanup_hook(
+            &destination,
+            staging,
+            false,
+            || {
+                fs::rename(destination.join("tests"), &moved_original).unwrap();
+                write_sample_pair(&destination, "A", 1, "old\n");
+            },
+            || {},
+            || {},
+            || {},
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(moved_original.join("A/sample-1.in")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn incomplete_contest_staging_is_not_a_completed_recovery_area() {
+        for stage in ["prepared", "old-moved", "new-installed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("abc466");
+            fs::create_dir(&destination).unwrap();
+            let old = Contest {
+                contest_id: "abc466".to_string(),
+                problems: vec![problem("A")],
+            };
+            save_metadata(&destination, &old).unwrap();
+            let old_bytes = fs::read(destination.join(".atc/contest.toml")).unwrap();
+            let staging = destination.join(".atc-refresh-interrupted");
+            fs::create_dir(&staging).unwrap();
+            safe_file::write_recovery_intent(
+                &staging,
+                &safe_file::RecoveryIdentity::new("contest", "abc466", None),
+            )
+            .unwrap();
+            if stage != "prepared" {
+                fs::write(staging.join("previous-contest.toml"), &old_bytes).unwrap();
+            }
+            if stage == "new-installed" {
+                let new = Contest {
+                    contest_id: "abc466".to_string(),
+                    problems: vec![problem("B")],
+                };
+                save_metadata(&destination, &new).unwrap();
+            }
+            assert!(load_metadata(&destination).is_err(), "{stage}");
+            assert!(fs::read(staging.join("recovery-intent.toml")).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_contest_completion_record_preserves_staging_and_blocks_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        save_metadata(staging.path(), &contest).unwrap();
+        let error = replace_refresh_data_with_cleanup_hook(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {},
+            || {},
+            || fs::write(staging_path.join("recovery-complete.toml"), "partial\n").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("recovery completion failed"));
+        assert_eq!(
+            fs::read_to_string(staging_path.join("recovery-complete.toml")).unwrap(),
+            "partial\n"
+        );
+        assert!(load_metadata(&destination).is_err());
+    }
+
+    #[test]
+    fn refresh_preflight_failure_preserves_unowned_staging_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        fs::create_dir(staging_path.join(".atc")).unwrap();
+        fs::write(staging_path.join(".atc/contest.toml"), "broken = [\n").unwrap();
+        let note = staging_path.join("user-note.txt");
+        fs::write(&note, "keep me\n").unwrap();
+
+        let error = replace_refresh_data_with_snapshot(&destination, staging, true, None)
+            .expect_err("invalid staged metadata must stop refresh");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&staging_path.display().to_string())
+        );
+        assert_eq!(fs::read_to_string(&note).unwrap(), "keep me\n");
+    }
+
+    #[test]
+    fn metadata_replacement_detects_a_late_same_bytes_file_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let metadata_path = destination.join(".atc/contest.toml");
+        let original = fs::read(&metadata_path).unwrap();
+        let moved_by_editor = destination.join("editor-original.toml");
+        let old_tests = destination.join("tests/A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let error = replace_refresh_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {
+                fs::rename(&metadata_path, &moved_by_editor).unwrap();
+                fs::write(&metadata_path, &original).unwrap();
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&metadata_path).unwrap(), original);
+        assert_eq!(fs::read(&moved_by_editor).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(old_tests.join("sample-1.in")).unwrap(),
+            "old input\n"
+        );
+    }
+
+    #[test]
+    fn metadata_replacement_preserves_a_previous_file_edited_after_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("A")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let old_tests = destination.join("tests/A");
+        fs::create_dir_all(&old_tests).unwrap();
+        fs::write(old_tests.join("sample-1.in"), "old input\n").unwrap();
+        fs::write(old_tests.join("sample-1.out"), "old output\n").unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        save_metadata(staging.path(), &contest).unwrap();
+        save_samples(
+            staging.path(),
+            &contest.problems[0],
+            &[Sample {
+                input: "new input\n".to_string(),
+                output: "new output\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let previous = staging_path.join("previous-contest.toml");
+        let error = replace_refresh_data_with_hooks(
+            &destination,
+            staging,
+            false,
+            || {},
+            || {},
+            || {
+                let mut metadata = fs::read(&previous).unwrap();
+                metadata.extend_from_slice(b"# concurrent comment\n");
+                fs::write(&previous, metadata).unwrap();
+            },
+        )
+        .expect_err("changed previous metadata must remain available for recovery");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("recovery data kept at"));
+        assert!(
+            fs::read(&previous)
+                .unwrap()
+                .ends_with(b"# concurrent comment\n")
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
     }
 
     #[test]
@@ -4715,6 +5901,7 @@ mod tests {
             fs::read_to_string(destination.join("tests").join("B").join("sample-1.in")).unwrap(),
             "new input\n"
         );
-        assert_eq!(load_metadata(&destination).unwrap(), new_contest);
+        assert!(load_metadata(&destination).is_err());
+        assert_eq!(load_metadata_unchecked(&destination).unwrap(), new_contest);
     }
 }

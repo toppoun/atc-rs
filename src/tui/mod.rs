@@ -658,13 +658,14 @@ impl SubmitController {
                 true
             }
             KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                Self::confirm_with(modal, app, start)
+                Self::confirm_with(&self.destination, modal, app, start)
             }
             _ => false,
         }
     }
 
     fn confirm_with(
+        destination: &Path,
         modal: &mut SubmitModal,
         app: &WatchApp,
         start: impl FnOnce(
@@ -689,7 +690,8 @@ impl SubmitController {
             modal.error = Some("Selected problem metadata is no longer available.".to_string());
             return true;
         };
-        let plan = crate::commands::submit::SubmitPlan::for_selected_source(
+        let plan = crate::commands::submit::SubmitPlan::for_selected_source_in_workspace(
+            destination.to_path_buf(),
             modal.key.contest_id.clone(),
             problem.task_id.clone(),
             problem.index.clone(),
@@ -697,6 +699,10 @@ impl SubmitController {
             candidate.language,
             modal.python_runtime,
         );
+        if let Err(error) = plan.verify_metadata_identity() {
+            modal.error = Some(error.to_string());
+            return true;
+        }
         match start(
             modal.key.clone(),
             problem.index.clone(),
@@ -2597,6 +2603,7 @@ pub(crate) struct SessionRuntime<'a> {
     stress_setup: StressSetupContext<'a>,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
+    stress_load_errors: Vec<Option<String>>,
     user_inputs: Vec<app::UserInputState>,
     execution: SessionExecution<'a>,
 }
@@ -2650,6 +2657,7 @@ impl<'a> SessionRuntime<'a> {
         contest: &'a Contest,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<crate::model::Sample>>,
+        stress_load_errors: Vec<Option<String>>,
         user_inputs: Vec<app::UserInputState>,
         execution: SessionExecution<'a>,
     ) -> Self {
@@ -2660,6 +2668,7 @@ impl<'a> SessionRuntime<'a> {
             stress_setup: StressSetupContext::new(current_destination, contest),
             sample_counts,
             stress_cases,
+            stress_load_errors,
             user_inputs,
             execution,
         }
@@ -3319,6 +3328,7 @@ where
         stress_setup,
         sample_counts,
         stress_cases,
+        stress_load_errors,
         user_inputs,
         execution:
             SessionExecution {
@@ -3338,6 +3348,11 @@ where
         stress_cases,
         user_inputs,
     )?;
+    for (problem, error) in stress_load_errors.into_iter().enumerate() {
+        if let Some(error) = error {
+            app.set_saved_stress_load_error(problem, error);
+        }
+    }
     preferences.apply(&mut app);
     let initial_refresh_error = refresh_frontend_state
         .as_ref()
@@ -5388,6 +5403,23 @@ mod tests {
         }
     }
 
+    fn write_valid_submit_metadata(destination: &Path) {
+        crate::workspace::save_metadata(
+            destination,
+            &Contest {
+                contest_id: "abc123".to_string(),
+                problems: vec![Problem {
+                    index: "A".to_string(),
+                    title: "Problem 0".to_string(),
+                    task_id: "abc123_0".to_string(),
+                    url: "https://atcoder.jp/contests/abc123/tasks/abc123_0".to_string(),
+                    sample_count: 3,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
     fn handle_stress_setup_key(
         app: &mut WatchApp,
         code: KeyCode,
@@ -6944,6 +6976,7 @@ mod tests {
     #[test]
     fn submit_shortcut_opens_modal_and_modal_keys_require_press_to_submit() {
         let temp = tempfile::tempdir().unwrap();
+        write_valid_submit_metadata(temp.path());
         fs::write(temp.path().join("A.cpp"), "cpp\n").unwrap();
         fs::write(temp.path().join("A.py"), "python\n").unwrap();
         let mut app = app();
@@ -7029,6 +7062,7 @@ mod tests {
     #[test]
     fn source_deleted_between_modal_open_and_enter_never_starts_submission() {
         let temp = tempfile::tempdir().unwrap();
+        write_valid_submit_metadata(temp.path());
         let source = temp.path().join("A.cpp");
         fs::write(&source, "exact\r\n").unwrap();
         let app = app();
@@ -7058,8 +7092,147 @@ mod tests {
     }
 
     #[test]
+    fn changed_contest_metadata_after_modal_open_never_starts_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("A.cpp"), "int main() {}\n").unwrap();
+        let app = app();
+        let mut metadata = Contest {
+            contest_id: app.contest_id().to_string(),
+            problems: vec![Problem {
+                index: "A".to_string(),
+                title: "Problem 0".to_string(),
+                task_id: "abc123_0".to_string(),
+                url: "https://atcoder.jp/contests/abc123/tasks/abc123_0".to_string(),
+                sample_count: 3,
+            }],
+        };
+        crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+        let hub = SubmissionHub::new();
+        let mut controller = SubmitController::new(
+            temp.path(),
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
+        assert!(controller.open(&app, &hub));
+        metadata.problems[0].task_id = "abc123_changed".to_string();
+        metadata.problems[0].url =
+            "https://atcoder.jp/contests/abc123/tasks/abc123_changed".to_string();
+        crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+
+        let calls = Cell::new(0);
+        assert!(controller.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(1)
+            },
+        ));
+        assert_eq!(
+            calls.get(),
+            0,
+            "changed task ID must not reach the submit worker"
+        );
+        assert!(controller.modal().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn submit_confirmation_rechecks_all_metadata_states_without_changing_files() {
+        for scenario in [
+            "valid",
+            "changed_task",
+            "swapped_tasks",
+            "duplicate_task",
+            "invalid_toml",
+            "missing_file",
+            "changed_contest",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("A.cpp"), "int main() {}\n").unwrap();
+            let app = app_with_problems(&[3, 0]);
+            let mut metadata = Contest {
+                contest_id: "abc123".to_string(),
+                problems: vec![
+                    Problem {
+                        index: "A".to_string(),
+                        title: "Problem 0".to_string(),
+                        task_id: "abc123_0".to_string(),
+                        url: "https://atcoder.jp/contests/abc123/tasks/abc123_0".to_string(),
+                        sample_count: 3,
+                    },
+                    Problem {
+                        index: "B".to_string(),
+                        title: "Problem 1".to_string(),
+                        task_id: "abc123_1".to_string(),
+                        url: "https://atcoder.jp/contests/abc123/tasks/abc123_1".to_string(),
+                        sample_count: 0,
+                    },
+                ],
+            };
+            crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+            let hub = SubmissionHub::new();
+            let mut controller = SubmitController::new(
+                temp.path(),
+                Language::Cpp,
+                PythonRuntime::CPython,
+                configured_auth(),
+            );
+            assert!(controller.open(&app, &hub), "{scenario}");
+            let metadata_path = temp.path().join(".atc/contest.toml");
+            match scenario {
+                "valid" => {}
+                "changed_task" => {
+                    metadata.problems[0].task_id = "abc123_changed".to_string();
+                    metadata.problems[0].url =
+                        "https://atcoder.jp/contests/abc123/tasks/abc123_changed".to_string();
+                    crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+                }
+                "swapped_tasks" => {
+                    metadata.problems.swap(0, 1);
+                    metadata.problems[0].index = "A".to_string();
+                    metadata.problems[1].index = "B".to_string();
+                    crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+                }
+                "duplicate_task" => {
+                    let original = fs::read_to_string(&metadata_path).unwrap();
+                    fs::write(&metadata_path, original.replace("abc123_1", "abc123_0")).unwrap();
+                }
+                "invalid_toml" => fs::write(&metadata_path, "version = ???").unwrap(),
+                "missing_file" => fs::remove_file(&metadata_path).unwrap(),
+                "changed_contest" => {
+                    metadata.contest_id = "abc124".to_string();
+                    for problem in &mut metadata.problems {
+                        problem.url = problem.url.replace("/abc123/", "/abc124/");
+                    }
+                    crate::workspace::save_metadata(temp.path(), &metadata).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = fs::read(&metadata_path).ok();
+            let calls = Cell::new(0);
+            assert!(controller.handle_key_with_start(
+                key(KeyCode::Enter, KeyEventKind::Press),
+                &app,
+                |_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(1)
+                },
+            ));
+            assert_eq!(calls.get(), usize::from(scenario == "valid"), "{scenario}");
+            assert_eq!(
+                controller.modal().unwrap().error.is_some(),
+                scenario != "valid",
+                "{scenario}"
+            );
+            assert_eq!(fs::read(&metadata_path).ok(), before, "{scenario}");
+        }
+    }
+
+    #[test]
     fn submit_confirmation_reads_the_exact_source_after_modal_open() {
         let temp = tempfile::tempdir().unwrap();
+        write_valid_submit_metadata(temp.path());
         let source = temp.path().join("A.cpp");
         fs::write(&source, "before modal\n").unwrap();
         let app = app();

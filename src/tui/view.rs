@@ -2287,13 +2287,31 @@ fn run_summary(problem: &ProblemState) -> String {
         RunPhase::Queued => "Queued".to_string(),
         RunPhase::Compiling => "Compiling...".to_string(),
         RunPhase::Running => "Running...".to_string(),
+        RunPhase::Finished if run.warning.is_some() => {
+            format!(
+                "{}/{} AC · Stress unverified",
+                run.accepted, run.total_cases
+            )
+        }
         RunPhase::Finished => format!("{}/{} AC", run.accepted, run.total_cases),
         RunPhase::CompileError => "CE".to_string(),
         RunPhase::CompileTimedOut => "Compile TLE".to_string(),
+        RunPhase::NoSamples if run.warning.is_some() => {
+            "No Samples · Stress unverified".to_string()
+        }
         RunPhase::NoSamples => "No Samples".to_string(),
         RunPhase::Cancelled => "Cancelled".to_string(),
         RunPhase::Failed => "Failed".to_string(),
     }
+}
+
+fn skipped_stress_with_no_failed_cases(problem: &ProblemState) -> bool {
+    let run = &problem.run;
+    run.warning.is_some()
+        && (run.phase == RunPhase::NoSamples
+            || (run.phase == RunPhase::Finished
+                && run.total_cases > 0
+                && run.accepted == run.total_cases))
 }
 
 fn stress_setup_summary(problem: &ProblemState) -> Option<String> {
@@ -2349,6 +2367,10 @@ fn summary_style(problem: Option<&ProblemState>) -> Style {
         if let Some(style) = setup_style {
             return style;
         }
+    }
+
+    if skipped_stress_with_no_failed_cases(problem) {
+        return Style::default().fg(Color::Yellow);
     }
 
     match problem.run.phase {
@@ -2538,6 +2560,10 @@ fn problem_symbol(problem: &ProblemState) -> &'static str {
 
     let run = &problem.run;
 
+    if skipped_stress_with_no_failed_cases(problem) {
+        return "!";
+    }
+
     match run.phase {
         RunPhase::Idle | RunPhase::Cancelled => "·",
         RunPhase::Queued | RunPhase::Compiling | RunPhase::Running => "…",
@@ -2566,6 +2592,10 @@ fn problem_style(problem: &ProblemState) -> Style {
             StressPhase::Finished => Style::default().fg(Color::Green),
             StressPhase::Idle | StressPhase::Cancelled => Style::default().fg(Color::DarkGray),
         };
+    }
+
+    if skipped_stress_with_no_failed_cases(problem) {
+        return Style::default().fg(Color::Yellow);
     }
 
     match problem.run.phase {
@@ -3649,6 +3679,83 @@ mod tests {
         assert_eq!(run_summary(problem), "STRESS Initialized");
         assert_eq!(problem_symbol(problem), "✓");
         assert_eq!(problem_style(problem).fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn skipped_legacy_stress_case_keeps_the_test_summary_visibly_partial() {
+        let mut app = app();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::SavedStressCaseSkipped {
+                reason: "legacy v1 runtime-error has no expected.out".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 1,
+                total_cases: 1,
+            },
+        ));
+        let problem = app.current_problem().unwrap();
+        assert_eq!(run_summary(problem), "1/1 AC · Stress unverified");
+        assert_eq!(summary_style(Some(problem)).fg, Some(Color::Yellow));
+        assert_eq!(problem_symbol(problem), "!");
+        assert_eq!(problem_style(problem).fg, Some(Color::Yellow));
+
+        let failed_run = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, failed_run.run_id));
+        assert!(app.run_event(
+            0,
+            failed_run.run_id,
+            TestEvent::SavedStressCaseSkipped {
+                reason: "legacy v1 runtime-error has no expected.out".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            failed_run.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            failed_run.run_id,
+            TestEvent::TestCaseWrongAnswer {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            failed_run.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 0,
+                total_cases: 1,
+            },
+        ));
+        let failed_problem = app.current_problem().unwrap();
+        assert!(run_summary(failed_problem).contains("Stress unverified"));
+        assert_eq!(summary_style(Some(failed_problem)).fg, Some(Color::Red));
+        assert_eq!(problem_symbol(failed_problem), "✗");
+        assert_eq!(problem_style(failed_problem).fg, Some(Color::Red));
     }
 
     #[test]

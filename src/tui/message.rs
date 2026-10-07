@@ -205,6 +205,9 @@ pub enum UserInputRunEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestEvent {
     NoSamples,
+    SavedStressCaseSkipped {
+        reason: String,
+    },
 
     CompileFailed {
         stderr: String,

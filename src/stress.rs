@@ -21,7 +21,8 @@ use crate::safe_file;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 
-const FAILURE_FORMAT_VERSION: u32 = 1;
+const FAILURE_FORMAT_VERSION: u32 = 2;
+const LEGACY_FAILURE_FORMAT_VERSION: u32 = 1;
 const FAILURE_GENERATION_FILES: [&str; 5] = [
     "failed.in",
     "actual.out",
@@ -30,6 +31,27 @@ const FAILURE_GENERATION_FILES: [&str; 5] = [
     "meta.toml",
 ];
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct UnscopedStagingError(String);
+
+impl fmt::Display for UnscopedStagingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for UnscopedStagingError {}
+
+pub(crate) fn is_unscoped_load_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<UnscopedStagingError>())
+}
+
+fn unscoped_staging_error(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, UnscopedStagingError(message))
+}
 
 pub(crate) fn automatic_seed() -> io::Result<u64> {
     let elapsed = SystemTime::now()
@@ -745,6 +767,24 @@ fn persist_failure_with_hooks(
     before_install: impl FnOnce(),
     before_recovery_cleanup: impl FnOnce(),
 ) -> io::Result<PersistenceOutcome> {
+    persist_failure_with_cleanup_hook(
+        request,
+        failure,
+        is_cancelled,
+        before_install,
+        before_recovery_cleanup,
+        || {},
+    )
+}
+
+fn persist_failure_with_cleanup_hook(
+    request: &StressRequest,
+    failure: &StressFailure,
+    is_cancelled: &dyn Fn() -> bool,
+    before_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+    before_staging_cleanup: impl FnOnce(),
+) -> io::Result<PersistenceOutcome> {
     workspace::validate_problem_index(&request.problem_index)?;
     workspace::validate_workspace_marker(&request.destination)?;
 
@@ -756,22 +796,49 @@ fn persist_failure_with_hooks(
             format!("stress directory disappeared: {}", stress_root.display()),
         )
     })?;
-    let generation_lock = open_stress_lock(&stress_directory, &request.problem_index, true)?
-        .expect("create was requested for the stress generation lock");
-
-    let target = stress_root.join(&request.problem_index);
-    let target_exists = existing_real_directory(&target, "stress failure directory")?;
-    if target_exists {
-        validate_failure_generation(&target, request)?;
-    }
+    let generation_lock = open_stress_lock(&stress_directory, &request.problem_index)?;
 
     if is_cancelled() {
         return Ok(PersistenceOutcome::Cancelled);
     }
 
-    let staging = tempfile::Builder::new()
-        .prefix(".stress-staging-")
-        .tempdir_in(&stress_root)?;
+    loop {
+        if is_cancelled() {
+            return Ok(PersistenceOutcome::Cancelled);
+        }
+
+        match generation_lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    ensure_no_interrupted_generation(
+        &stress_directory,
+        &request.contest_id,
+        &request.problem_index,
+    )?;
+    let target = stress_root.join(&request.problem_index);
+    let target_exists = existing_real_directory(&target, "stress failure directory")?;
+    let previous_snapshot = if target_exists {
+        validate_failure_generation(&target, request)?;
+        Some(safe_file::read_tree_snapshot(&target)?)
+    } else {
+        None
+    };
+
+    let staging_prefix = format!(
+        ".stress-staging-{}-{}-",
+        request.problem_index.len(),
+        request.problem_index
+    );
+    let staging = safe_file::PreservedTempDir::new(
+        tempfile::Builder::new()
+            .prefix(&staging_prefix)
+            .tempdir_in(&stress_root)?,
+    );
     let new_generation = staging.path().join("new");
     let previous_generation = staging.path().join("previous");
     fs::create_dir(&new_generation)?;
@@ -798,45 +865,48 @@ fn persist_failure_with_hooks(
     write_new_file(&new_generation.join("meta.toml"), &metadata)?;
     sync_directory(&new_generation)?;
 
-    // Staging is harmless to discard. Once the old generation is moved, cancellation can no
-    // longer win without either hiding a committed failure or requiring a destructive rollback.
+    let recovery_identity = safe_file::RecoveryIdentity::new(
+        "stress",
+        &request.contest_id,
+        Some(&request.problem_index),
+    );
+    safe_file::write_recovery_intent(staging.path(), &recovery_identity)?;
+
+    // Once the old generation is moved, cancellation can no longer win without either hiding a
+    // committed failure or requiring a destructive rollback.
     if is_cancelled() {
+        complete_stress_recovery(staging, &recovery_identity, "aborted")?;
         return Ok(PersistenceOutcome::Cancelled);
-    }
-
-    loop {
-        if is_cancelled() {
-            return Ok(PersistenceOutcome::Cancelled);
-        }
-
-        match generation_lock.try_lock() {
-            Ok(()) => break,
-            Err(fs::TryLockError::WouldBlock) => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(fs::TryLockError::Error(error)) => return Err(error),
-        }
     }
 
     // destructive swap直前に再検査する。symlinkやfileへ差し替わっていたら止める。
     let target_still_exists = existing_real_directory(&target, "stress failure directory")?;
     if target_still_exists != target_exists {
-        return Err(io::Error::new(
+        let error = io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "stress failure destination changed while preparing update: {}",
                 target.display()
             ),
-        ));
+        );
+        return Err(abort_stress_recovery(staging, &recovery_identity, error));
     }
 
     if target_exists {
         safe_file::rename_noclobber(&target, &previous_generation)?;
-        if let Err(error) = validate_failure_generation(&previous_generation, request) {
+        if let Err(error) =
+            validate_failure_generation(&previous_generation, request).and_then(|()| {
+                validate_previous_failure_snapshot(
+                    &previous_generation,
+                    previous_snapshot.as_ref().unwrap(),
+                )
+            })
+        {
             return Err(rollback_previous_generation(
                 staging,
                 &target,
                 &previous_generation,
+                &recovery_identity,
                 error,
             ));
         }
@@ -850,15 +920,23 @@ fn persist_failure_with_hooks(
                 staging,
                 &target,
                 &previous_generation,
+                &recovery_identity,
                 error,
             ));
         }
 
-        return Err(error);
+        return Err(abort_stress_recovery(staging, &recovery_identity, error));
     }
 
     before_recovery_cleanup();
-    if target_exists && let Err(error) = validate_failure_generation(&previous_generation, request)
+    if target_exists
+        && let Err(error) =
+            validate_failure_generation(&previous_generation, request).and_then(|()| {
+                validate_previous_failure_snapshot(
+                    &previous_generation,
+                    previous_snapshot.as_ref().unwrap(),
+                )
+            })
     {
         let kind = error.kind();
         let recovery_path = staging.keep();
@@ -872,7 +950,117 @@ fn persist_failure_with_hooks(
         ));
     }
 
+    before_staging_cleanup();
+    let staging_path = staging.path().to_path_buf();
+    if let Err(error) = complete_stress_staging(staging, request, target_exists, &recovery_identity)
+    {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "stress failure installed at {}, but recovery completion failed at {}: {error}; recovery check required before another save",
+                target.display(),
+                staging_path.display()
+            ),
+        ));
+    }
+
     Ok(PersistenceOutcome::Saved(target))
+}
+
+fn validate_previous_failure_snapshot(
+    path: &Path,
+    expected: &safe_file::TreeSnapshot,
+) -> io::Result<()> {
+    if &safe_file::read_tree_snapshot(path)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "previous stress generation changed during update: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn complete_stress_staging(
+    staging: safe_file::PreservedTempDir,
+    request: &StressRequest,
+    had_previous: bool,
+    recovery_identity: &safe_file::RecoveryIdentity,
+) -> io::Result<()> {
+    let root = staging.path();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry.file_name() != safe_file::RECOVERY_INTENT
+            && (entry.file_name() != "previous" || !had_previous)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stress staging contains an unowned entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    if had_previous {
+        let previous = root.join("previous");
+        if !existing_real_directory(&previous, "previous stress generation")? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "previous stress generation is missing: {}",
+                    previous.display()
+                ),
+            ));
+        }
+        validate_failure_generation(&previous, request)?;
+    }
+    complete_stress_recovery(staging, recovery_identity, "recovery").map(|_| ())
+}
+
+fn complete_stress_recovery(
+    staging: safe_file::PreservedTempDir,
+    identity: &safe_file::RecoveryIdentity,
+    state: &str,
+) -> io::Result<PathBuf> {
+    let root = staging.path();
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stress staging name is not Unicode",
+            )
+        })?;
+    let suffix = name.strip_prefix(".stress-staging-").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "unexpected stress staging name")
+    })?;
+    let completed = root.with_file_name(format!(".stress-{state}-{suffix}"));
+    safe_file::complete_recovery(staging, &completed, identity)
+}
+
+fn abort_stress_recovery(
+    staging: safe_file::PreservedTempDir,
+    identity: &safe_file::RecoveryIdentity,
+    original: io::Error,
+) -> io::Error {
+    let kind = original.kind();
+    match complete_stress_recovery(staging, identity, "aborted") {
+        Ok(path) => io::Error::new(
+            kind,
+            format!(
+                "{original}; attempted generation kept at {}",
+                path.display()
+            ),
+        ),
+        Err(error) => io::Error::new(
+            kind,
+            format!("{original}; recovery completion also failed: {error}"),
+        ),
+    }
 }
 
 fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Result<()> {
@@ -927,8 +1115,10 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
             )
         })?;
 
-    if metadata.version != FAILURE_FORMAT_VERSION
-        || metadata.contest != request.contest_id
+    if !matches!(
+        metadata.version,
+        LEGACY_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
+    ) || metadata.contest != request.contest_id
         || metadata.problem != request.problem_index
         || metadata.case == 0
     {
@@ -967,8 +1157,19 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
                 ));
             }
         }
-        // Historical v1 RE/TLE generations did not include expected.out.
-        "runtime-error" | "timed-out" => {}
+        // Historical v1 RE/TLE generations did not include expected.out. New generations do.
+        "runtime-error" | "timed-out" if metadata.version == LEGACY_FAILURE_FORMAT_VERSION => {}
+        "runtime-error" | "timed-out" => {
+            if !existing_regular_file(&path.join("expected.out"), "stress expected output")? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "stress generation is missing expected.out: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -976,6 +1177,12 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
             ));
         }
     }
+
+    // Use the same snapshot and content checks as ordinary tests before moving the old
+    // generation. A legacy RE/TLE without expected.out remains valid but cannot be replayed.
+    let generation = CapDir::open_ambient_dir(path, ambient_authority())?;
+    let snapshot = open_saved_case_snapshot(&generation)?;
+    read_saved_case_snapshot(snapshot, &request.contest_id, &request.problem_index)?;
 
     Ok(())
 }
@@ -985,8 +1192,10 @@ fn valid_failure_metadata(
     contest_id: &str,
     problem_index: &str,
 ) -> bool {
-    metadata.version == FAILURE_FORMAT_VERSION
-        && metadata.contest == contest_id
+    matches!(
+        metadata.version,
+        LEGACY_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
+    ) && metadata.contest == contest_id
         && metadata.problem == problem_index
         && metadata.case != 0
         && metadata
@@ -1001,9 +1210,10 @@ fn valid_failure_metadata(
 }
 
 fn rollback_previous_generation(
-    staging: tempfile::TempDir,
+    staging: safe_file::PreservedTempDir,
     target: &Path,
     previous_generation: &Path,
+    identity: &safe_file::RecoveryIdentity,
     original: io::Error,
 ) -> io::Error {
     if let Err(rollback_error) = safe_file::rename_noclobber(previous_generation, target) {
@@ -1019,7 +1229,7 @@ fn rollback_previous_generation(
         );
     }
 
-    original
+    abort_stress_recovery(staging, identity, original)
 }
 
 pub(crate) fn load_saved_case(
@@ -1030,31 +1240,60 @@ pub(crate) fn load_saved_case(
     load_saved_case_with_hook(destination, contest_id, problem_index, || {})
 }
 
+pub(crate) enum SavedCaseLoad {
+    Absent,
+    Replay(Sample),
+    AmbiguousV1WithoutExpected { kind: &'static str },
+}
+
+pub(crate) fn load_saved_case_status(
+    destination: &Path,
+    contest_id: &str,
+    problem_index: &str,
+) -> io::Result<SavedCaseLoad> {
+    load_saved_case_status_with_hook(destination, contest_id, problem_index, || {})
+}
+
 fn load_saved_case_with_hook(
     destination: &Path,
     contest_id: &str,
     problem_index: &str,
     before_shared_lock: impl FnOnce(),
 ) -> io::Result<Option<Sample>> {
+    match load_saved_case_status_with_hook(
+        destination,
+        contest_id,
+        problem_index,
+        before_shared_lock,
+    )? {
+        SavedCaseLoad::Replay(sample) => Ok(Some(sample)),
+        SavedCaseLoad::Absent | SavedCaseLoad::AmbiguousV1WithoutExpected { .. } => Ok(None),
+    }
+}
+
+fn load_saved_case_status_with_hook(
+    destination: &Path,
+    contest_id: &str,
+    problem_index: &str,
+    before_shared_lock: impl FnOnce(),
+) -> io::Result<SavedCaseLoad> {
     workspace::validate_problem_index(problem_index)?;
 
     let Some(stress_directory) = open_stress_directory(destination)? else {
-        return Ok(None);
+        return Ok(SavedCaseLoad::Absent);
     };
 
-    let generation_lock = open_stress_lock(&stress_directory, problem_index, false)?;
+    let generation_lock = open_stress_lock(&stress_directory, problem_index)?;
     before_shared_lock();
-    if let Some(lock) = generation_lock.as_ref() {
-        lock.lock_shared()?;
-    }
+    generation_lock.lock_shared()?;
+
+    ensure_no_interrupted_generation(&stress_directory, contest_id, problem_index)?;
 
     let Some(generation) = open_optional_directory(&stress_directory, problem_index)? else {
-        return Ok(None);
+        return Ok(SavedCaseLoad::Absent);
     };
 
-    let Some(snapshot) = open_saved_case_snapshot(&generation)? else {
-        return Ok(None);
-    };
+    let snapshot = open_saved_case_snapshot(&generation)?;
 
     // Keep the shared lock through the reads. On Windows, no-follow file handles intentionally
     // block a directory rename, so releasing the lock before closing them would make the writer's
@@ -1065,91 +1304,342 @@ fn load_saved_case_with_hook(
     result
 }
 
-struct SavedCaseSnapshot {
-    metadata: fs::File,
-    _actual: fs::File,
-    input: fs::File,
-    expected: fs::File,
+fn ensure_no_interrupted_generation(
+    stress_directory: &CapDir,
+    contest_id: &str,
+    problem_index: &str,
+) -> io::Result<()> {
+    let owned_recovery_prefix = format!(
+        ".stress-recovery-{}-{}-",
+        problem_index.len(),
+        problem_index
+    );
+    let owned_aborted_prefix =
+        format!(".stress-aborted-{}-{}-", problem_index.len(), problem_index);
+    for entry in stress_directory.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            if name.to_string_lossy().starts_with(".stress-staging-") {
+                return Err(unscoped_staging_error(
+                    "stress staging has a non-Unicode name; recovery check required".to_string(),
+                ));
+            }
+            continue;
+        };
+        if name.starts_with(&owned_recovery_prefix) || name.starts_with(&owned_aborted_prefix) {
+            let expected =
+                safe_file::RecoveryIdentity::new("stress", contest_id, Some(problem_index));
+            let archive = stress_directory.open_dir_nofollow(name)?;
+            let mut intent =
+                open_regular_file(&archive, safe_file::RECOVERY_INTENT)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stress recovery intent is missing",
+                    )
+                })?;
+            let mut complete = open_regular_file(&archive, safe_file::RECOVERY_COMPLETE)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stress recovery completion is missing",
+                    )
+                })?;
+            let mut intent_bytes = Vec::new();
+            let mut complete_bytes = Vec::new();
+            intent.read_to_end(&mut intent_bytes)?;
+            complete.read_to_end(&mut complete_bytes)?;
+            if safe_file::parse_completed_recovery(&intent_bytes, &complete_bytes)? != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stress recovery area requires review: .atc/stress/{name}"),
+                ));
+            }
+            continue;
+        }
+        if !name.starts_with(".stress-staging-") {
+            continue;
+        }
+        let (requires_review, unscoped) = match current_staging_problem(name) {
+            Ok(Some(owner)) if owner == problem_index => (true, false),
+            Ok(Some(owner)) => {
+                // A writer of another problem can still be creating meta.toml. Do not inspect
+                // that partial file without its lock; an idle stage must match its name.
+                let lock = open_stress_lock(stress_directory, owner)?;
+                match lock.try_lock_shared() {
+                    Ok(()) => (
+                        current_staging_metadata_conflicts(
+                            stress_directory,
+                            name,
+                            contest_id,
+                            owner,
+                        ),
+                        true,
+                    ),
+                    Err(fs::TryLockError::WouldBlock) => (false, false),
+                    Err(fs::TryLockError::Error(error)) => return Err(error),
+                }
+            }
+            Ok(None) => (
+                legacy_staging_requires_review(stress_directory, name, contest_id, problem_index),
+                true,
+            ),
+            Err(()) => (true, true),
+        };
+        if requires_review {
+            let message = format!(
+                "saved stress case for problem {problem_index} requires recovery check: .atc/stress/{name}"
+            );
+            return Err(if unscoped {
+                unscoped_staging_error(message)
+            } else {
+                io::Error::new(io::ErrorKind::InvalidData, message)
+            });
+        }
+    }
+    Ok(())
 }
 
-fn open_saved_case_snapshot(generation: &CapDir) -> io::Result<Option<SavedCaseSnapshot>> {
-    if !saved_generation_entries_are_owned(generation)? {
+fn current_staging_problem(name: &str) -> Result<Option<&str>, ()> {
+    let suffix = name.strip_prefix(".stress-staging-").ok_or(())?;
+    if !suffix.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return Ok(None);
     }
-
-    let Some(metadata) = open_regular_file(generation, "meta.toml")? else {
-        return Ok(None);
-    };
-    let Some(actual) = open_regular_file(generation, "actual.out")? else {
-        return Ok(None);
-    };
-    let Some(input) = open_regular_file(generation, "failed.in")? else {
-        return Ok(None);
-    };
-    let Some(expected) = open_regular_file(generation, "expected.out")? else {
-        // Historical v1 RE/TLE generations did not have expected.out and cannot be promoted.
-        return Ok(None);
-    };
-
-    Ok(Some(SavedCaseSnapshot {
-        metadata,
-        _actual: actual,
-        input,
-        expected,
-    }))
+    let (length_text, remainder) = suffix.split_once('-').ok_or(())?;
+    let length = length_text.parse::<usize>().map_err(|_| ())?;
+    if length == 0 || length.to_string() != length_text {
+        return Err(());
+    }
+    let problem = remainder.get(..length).ok_or(())?;
+    let random = remainder
+        .get(length..)
+        .and_then(|tail| tail.strip_prefix('-'))
+        .ok_or(())?;
+    if random.is_empty()
+        || !random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || workspace::validate_problem_index(problem).is_err()
+    {
+        return Err(());
+    }
+    Ok(Some(problem))
 }
 
-fn saved_generation_entries_are_owned(generation: &CapDir) -> io::Result<bool> {
+fn current_staging_metadata_conflicts(
+    stress_directory: &CapDir,
+    name: &str,
+    contest_id: &str,
+    named_problem: &str,
+) -> bool {
+    let Ok(staging) = stress_directory.open_dir_nofollow(name) else {
+        return true;
+    };
+    for generation_name in ["previous", "new"] {
+        let generation = match open_optional_directory(&staging, generation_name) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => continue,
+            Err(_) => return true,
+        };
+        let mut metadata_file = match open_regular_file(&generation, "meta.toml") {
+            Ok(Some(file)) => file,
+            Ok(None) => continue,
+            Err(_) => return true,
+        };
+        let mut metadata_text = String::new();
+        if metadata_file.read_to_string(&mut metadata_text).is_err() {
+            continue;
+        }
+        let Ok(metadata) = toml::from_str::<toml::Value>(&metadata_text) else {
+            continue;
+        };
+        if metadata
+            .get("contest")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|id| id != contest_id)
+            || metadata
+                .get("problem")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|index| index != named_problem)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn legacy_staging_requires_review(
+    stress_directory: &CapDir,
+    name: &str,
+    contest_id: &str,
+    problem_index: &str,
+) -> bool {
+    let Ok(staging) = stress_directory.open_dir_nofollow(name) else {
+        return true;
+    };
+    let mut known_owner: Option<(String, String)> = None;
+    for generation_name in ["previous", "new"] {
+        let generation = match open_optional_directory(&staging, generation_name) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => continue,
+            Err(_) => return true,
+        };
+        let Ok(Some(mut metadata_file)) = open_regular_file(&generation, "meta.toml") else {
+            return true;
+        };
+        let mut metadata_text = String::new();
+        if metadata_file.read_to_string(&mut metadata_text).is_err() {
+            return true;
+        }
+        let Ok(metadata) = toml::from_str::<StoredFailureMetadata>(&metadata_text) else {
+            return true;
+        };
+        if !valid_failure_metadata(&metadata, &metadata.contest, &metadata.problem)
+            || workspace::validate_problem_index(&metadata.problem).is_err()
+        {
+            return true;
+        }
+        let owner = (metadata.contest, metadata.problem);
+        if known_owner.as_ref().is_some_and(|known| known != &owner) {
+            return true;
+        }
+        known_owner = Some(owner);
+    }
+    match known_owner {
+        Some((owner_contest, owner_problem)) => {
+            owner_contest == contest_id && owner_problem == problem_index
+        }
+        None => true,
+    }
+}
+
+struct SavedCaseSnapshot {
+    metadata: fs::File,
+    actual: fs::File,
+    input: fs::File,
+    expected: Option<fs::File>,
+    stderr: Option<fs::File>,
+}
+
+fn open_saved_case_snapshot(generation: &CapDir) -> io::Result<SavedCaseSnapshot> {
+    validate_saved_generation_entries(generation)?;
+
+    let metadata = require_saved_case_file(generation, "meta.toml")?;
+    let actual = require_saved_case_file(generation, "actual.out")?;
+    let input = require_saved_case_file(generation, "failed.in")?;
+    // Historical v1 RE/TLE generations did not have expected.out. They remain valid
+    // stored failures, but cannot be replayed as ordinary test cases.
+    let expected = open_regular_file(generation, "expected.out")?;
+    let stderr = open_regular_file(generation, "stderr.txt").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot open saved stress stderr.txt: {error}"),
+        )
+    })?;
+
+    Ok(SavedCaseSnapshot {
+        metadata,
+        actual,
+        input,
+        expected,
+        stderr,
+    })
+}
+
+fn require_saved_case_file(generation: &CapDir, name: &str) -> io::Result<fs::File> {
+    open_regular_file(generation, name)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("saved stress case is missing {name}"),
+        )
+    })
+}
+
+fn validate_saved_generation_entries(generation: &CapDir) -> io::Result<()> {
     for entry in generation.entries()? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            return Ok(false);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved stress case contains a non-Unicode entry",
+            ));
         };
 
         if !FAILURE_GENERATION_FILES.contains(&name) || !entry.file_type()?.is_file() {
-            return Ok(false);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("saved stress case contains an unowned entry: {name}"),
+            ));
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 fn read_saved_case_snapshot(
     mut snapshot: SavedCaseSnapshot,
     contest_id: &str,
     problem_index: &str,
-) -> io::Result<Option<Sample>> {
-    let Some(metadata_text) = read_utf8_or_ignore(&mut snapshot.metadata)? else {
-        return Ok(None);
-    };
-    let Ok(metadata) = toml::from_str::<StoredFailureMetadata>(&metadata_text) else {
-        return Ok(None);
-    };
+) -> io::Result<SavedCaseLoad> {
+    let metadata_text = read_saved_case_utf8(&mut snapshot.metadata, "meta.toml")?;
+    let metadata = toml::from_str::<StoredFailureMetadata>(&metadata_text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid saved stress metadata: {error}"),
+        )
+    })?;
     if !valid_failure_metadata(&metadata, contest_id, problem_index) {
-        return Ok(None);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "saved stress metadata does not match the current contest and problem",
+        ));
     }
 
-    let Some(input) = read_utf8_or_ignore(&mut snapshot.input)? else {
-        return Ok(None);
-    };
-    let Some(expected) = read_utf8_or_ignore(&mut snapshot.expected)? else {
-        return Ok(None);
-    };
+    let input = read_saved_case_utf8(&mut snapshot.input, "failed.in")?;
+    read_saved_case_bytes(&mut snapshot.actual, "actual.out")?;
+    if let Some(stderr) = snapshot.stderr.as_mut() {
+        read_saved_case_bytes(stderr, "stderr.txt")?;
+    }
 
-    Ok(Some(Sample {
+    let Some(expected_file) = snapshot.expected.as_mut() else {
+        let kind = match (metadata.version, metadata.kind.as_str()) {
+            (LEGACY_FAILURE_FORMAT_VERSION, "runtime-error") => "runtime-error",
+            (LEGACY_FAILURE_FORMAT_VERSION, "timed-out") => "timed-out",
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "saved stress case is missing expected.out",
+                ));
+            }
+        };
+        return Ok(SavedCaseLoad::AmbiguousV1WithoutExpected { kind });
+    };
+    let expected = read_saved_case_utf8(expected_file, "expected.out")?;
+
+    Ok(SavedCaseLoad::Replay(Sample {
         input,
         output: expected,
     }))
 }
 
-fn read_utf8_or_ignore(file: &mut fs::File) -> io::Result<Option<String>> {
+fn read_saved_case_bytes(file: &mut fs::File, name: &str) -> io::Result<()> {
+    io::copy(file, &mut io::sink()).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read saved stress {name}: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn read_saved_case_utf8(file: &mut fs::File, name: &str) -> io::Result<String> {
     let mut content = String::new();
-    match file.read_to_string(&mut content) {
-        Ok(_) => Ok(Some(content)),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
-        Err(error) => Err(error),
-    }
+    file.read_to_string(&mut content).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read saved stress {name}: {error}"),
+        )
+    })?;
+    Ok(content)
 }
 
 fn open_stress_directory(destination: &Path) -> io::Result<Option<CapDir>> {
@@ -1188,23 +1678,20 @@ fn open_regular_file(directory: &CapDir, name: &str) -> io::Result<Option<fs::Fi
     Ok(Some(file.into_std()))
 }
 
-fn open_stress_lock(
-    stress_directory: &CapDir,
-    problem_index: &str,
-    create: bool,
-) -> io::Result<Option<fs::File>> {
+fn open_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Result<fs::File> {
     let name = format!(".{problem_index}.lock");
     let mut options = CapOpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    if create {
-        options.write(true).create(true).truncate(false);
-    }
+    // Readers and writers must both open the same persistent lock file. Never remove it:
+    // recreating the name could leave concurrent processes locking different file objects.
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .follow(FollowSymlinks::No)
+        .nonblock(true);
 
-    let file = match stress_directory.open_with(&name, &options) {
-        Ok(file) => file,
-        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let file = stress_directory.open_with(&name, &options)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1212,7 +1699,7 @@ fn open_stress_lock(
         ));
     }
 
-    Ok(Some(file.into_std()))
+    Ok(file.into_std())
 }
 
 fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
@@ -1403,6 +1890,43 @@ mod tests {
     }
 
     #[test]
+    fn save_refuses_unreadable_previous_case_before_moving_it() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("answer\n"),
+        );
+        let original = vec![0xff, 0xfe, b'\n'];
+        fs::write(target.join("failed.in"), &original).unwrap();
+        assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
+
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "new answer\n".to_string(),
+            actual: "actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let error = persist_failure(&request(temp.path(), 10), &failure, &|| false).unwrap_err();
+        assert!(error.to_string().contains("failed.in"));
+        assert_eq!(fs::read(target.join("failed.in")).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(target.join("expected.out")).unwrap(),
+            "answer\n"
+        );
+    }
+
+    #[test]
     fn replacing_failure_generation_does_not_leave_stale_optional_files() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join(".atc")).unwrap();
@@ -1452,8 +1976,354 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("failed.in")).unwrap(), "4\n");
 
         let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+        assert!(metadata.contains("version = 2"));
         assert!(metadata.contains("kind = \"runtime-error\""));
         assert!(metadata.contains("seed = 11"));
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            Some(Sample {
+                input: "4\n".to_string(),
+                output: "5\n".to_string(),
+            })
+        );
+        assert!(
+            fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stress-staging-"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_diagnostic_file_refuses_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("answer\n"),
+        );
+        let diagnostic = target.join("stderr.txt");
+        fs::write(&diagnostic, [0xff, 0x00, 0xfe]).unwrap();
+        // Permit rename, but deny another reader while this handle is alive.
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x2 | 0x4)
+            .open(&diagnostic)
+            .unwrap();
+
+        let request = request(temp.path(), 10);
+        let validation_error = validate_failure_generation(&target, &request).unwrap_err();
+        assert!(
+            validation_error.to_string().contains("stderr.txt"),
+            "{validation_error}"
+        );
+
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "new answer\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let error = persist_failure(&request, &failure, &|| false).unwrap_err();
+        assert!(error.to_string().contains("stderr.txt"), "{error}");
+        drop(blocker);
+        assert_eq!(fs::read(&diagnostic).unwrap(), [0xff, 0x00, 0xfe]);
+        assert_eq!(
+            fs::read_to_string(target.join("failed.in")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn binary_diagnostics_remain_valid_and_are_kept_in_previous_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("answer\n"),
+        );
+        fs::write(target.join("actual.out"), [0xff, 0x00]).unwrap();
+        fs::write(target.join("stderr.txt"), [0xfe, 0x00]).unwrap();
+        let request = request(temp.path(), 10);
+        validate_failure_generation(&target, &request).unwrap();
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "new answer\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        persisted_path(persist_failure(&request, &failure, &|| false));
+        let recovery = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-recovery-")
+                    && path.join("previous/failed.in").exists()
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(recovery.join("previous/actual.out")).unwrap(),
+            [0xff, 0x00]
+        );
+        assert_eq!(
+            fs::read(recovery.join("previous/stderr.txt")).unwrap(),
+            [0xfe, 0x00]
+        );
+        assert!(
+            load_saved_case(temp.path(), "abc123", "A")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn valid_external_edit_of_previous_generation_aborts_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("answer\n"),
+        );
+        let request = request(temp.path(), 10);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "new answer\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let stress_root = target.parent().unwrap();
+        let changed = std::cell::RefCell::new(None);
+        let result = persist_failure_with_hooks(
+            &request,
+            &failure,
+            &|| false,
+            || {},
+            || {
+                let staging = fs::read_dir(stress_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-")
+                    })
+                    .unwrap();
+                let input = staging.join("previous/failed.in");
+                fs::write(&input, "externally edited\n").unwrap();
+                *changed.borrow_mut() = Some(input);
+            },
+        );
+        assert!(result.is_err(), "external edit must stop completion");
+        assert_eq!(
+            fs::read_to_string(changed.into_inner().unwrap()).unwrap(),
+            "externally edited\n"
+        );
+    }
+
+    #[test]
+    fn same_name_replacement_of_previous_file_is_detected_by_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("answer\n"),
+        );
+        let moved_original = temp.path().join("original-failed.in");
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "new answer\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let stress_root = target.parent().unwrap();
+        let result = persist_failure_with_hooks(
+            &request(temp.path(), 10),
+            &failure,
+            &|| false,
+            || {},
+            || {
+                let staging = fs::read_dir(stress_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-")
+                    })
+                    .unwrap();
+                let input = staging.join("previous/failed.in");
+                fs::rename(&input, &moved_original).unwrap();
+                fs::write(&input, "old\n").unwrap();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&moved_original).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn completed_stress_update_retains_previous_generation_without_blocking_load() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let first = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old input\n".to_string(),
+            expected: "old expected\n".to_string(),
+            actual: "old actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        persisted_path(persist_failure(&request, &first, &|| false));
+        let second = StressFailure {
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "new actual\n".to_string(),
+            ..first
+        };
+        persisted_path(persist_failure(&request, &second, &|| false));
+
+        let stress_root = temp.path().join(".atc/stress");
+        let recovery = fs::read_dir(&stress_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-recovery-1-A-")
+                    && path.join("previous/failed.in").is_file()
+            })
+            .expect("completed update must retain its previous generation");
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous/failed.in")).unwrap(),
+            "old input\n"
+        );
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A")
+                .unwrap()
+                .unwrap()
+                .input,
+            "new input\n"
+        );
+    }
+
+    #[test]
+    fn failed_stress_completion_record_keeps_both_generations_for_review() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let first = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old\n".to_string(),
+            expected: "old expected\n".to_string(),
+            actual: "old actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        persisted_path(persist_failure(&request, &first, &|| false));
+        let second = StressFailure {
+            input: "new\n".to_string(),
+            ..first
+        };
+        let root = temp.path().join(".atc/stress");
+        let error = persist_failure_with_cleanup_hook(
+            &request,
+            &second,
+            &|| false,
+            || {},
+            || {},
+            || {
+                let staging = fs::read_dir(&root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-1-A-")
+                    })
+                    .unwrap();
+                fs::write(staging.join("recovery-complete.toml"), "partial\n").unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("recovery completion failed"));
+        let staging = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-staging-1-A-")
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(staging.join("previous/failed.in")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("A/failed.in")).unwrap(),
+            "new\n"
+        );
+        assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
     }
 
     #[test]
@@ -1734,6 +2604,130 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn installed_failure_with_blocked_staging_cleanup_is_not_reported_as_saved() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let stress_root = temp.path().join(".atc/stress");
+        let blocked_file = std::cell::RefCell::new(None);
+        let result = persist_failure_with_hooks(
+            &request,
+            &failure,
+            &|| false,
+            || {},
+            || {
+                let staging = fs::read_dir(&stress_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-")
+                    })
+                    .unwrap();
+                let blocker = staging.join("cleanup-blocker");
+                fs::write(&blocker, "keep until return\n").unwrap();
+                *blocked_file.borrow_mut() = Some(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(&blocker)
+                        .unwrap(),
+                );
+            },
+        );
+        let error = result.expect_err("installed case with failed cleanup needs recovery review");
+        assert!(error.to_string().contains("cleanup"));
+        assert!(error.to_string().contains("installed"));
+        assert!(error.to_string().contains(".stress-staging-"));
+        assert_eq!(
+            fs::read_to_string(stress_root.join("A/failed.in")).unwrap(),
+            "new input\n"
+        );
+        assert!(fs::read_dir(&stress_root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stress-staging-")
+        }));
+        assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
+        assert!(persist_failure(&request, &failure, &|| false).is_err());
+        assert_eq!(
+            fs::read_to_string(stress_root.join("A/failed.in")).unwrap(),
+            "new input\n"
+        );
+        drop(blocked_file.take());
+    }
+
+    #[test]
+    fn staging_cleanup_preserves_a_late_unowned_file() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let request = request(temp.path(), 10);
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new input\n".to_string(),
+            expected: "new expected\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let stress_root = temp.path().join(".atc/stress");
+        let inserted = std::cell::RefCell::new(None);
+        let result = persist_failure_with_cleanup_hook(
+            &request,
+            &failure,
+            &|| false,
+            || {},
+            || {},
+            || {
+                let staging = fs::read_dir(&stress_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".stress-staging-")
+                    })
+                    .unwrap();
+                let path = staging.join("user-note.txt");
+                fs::write(&path, "keep me\n").unwrap();
+                *inserted.borrow_mut() = Some(path);
+            },
+        );
+        assert!(
+            result.is_err(),
+            "unknown staging content must prevent success"
+        );
+        let path = inserted.into_inner().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep me\n");
+        assert_eq!(
+            fs::read_to_string(stress_root.join("A/failed.in")).unwrap(),
+            "new input\n"
+        );
+    }
+
     #[test]
     fn loader_and_writer_both_reject_a_generation_with_unowned_entries() {
         let temp = tempfile::tempdir().unwrap();
@@ -1748,7 +2742,9 @@ mod tests {
         );
         fs::write(target.join("important.txt"), "user data\n").unwrap();
 
-        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unowned entry"));
 
         let request = request(temp.path(), 10);
         let replacement = StressFailure {
@@ -1769,6 +2765,328 @@ mod tests {
             fs::read_to_string(target.join("important.txt")).unwrap(),
             "user data\n"
         );
+    }
+
+    #[test]
+    fn unusable_saved_generations_return_errors_without_modifying_files() {
+        for damaged in ["input", "actual", "expected", "metadata", "unowned"] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(
+                &target,
+                "abc123",
+                "A",
+                "wrong-answer",
+                "input\n",
+                Some("expected\n"),
+            );
+            match damaged {
+                "input" => fs::remove_file(target.join("failed.in")).unwrap(),
+                "actual" => fs::remove_file(target.join("actual.out")).unwrap(),
+                "expected" => fs::remove_file(target.join("expected.out")).unwrap(),
+                "metadata" => fs::write(target.join("meta.toml"), "invalid TOML = [").unwrap(),
+                "unowned" => fs::write(target.join("important.txt"), "user data\n").unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::read_dir(&target)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+
+            let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{damaged}: {error}"
+            );
+            let after = fs::read_dir(&target)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(after, before, "{damaged}");
+        }
+    }
+
+    #[test]
+    fn absent_saved_case_is_distinct_from_a_valid_case_and_unknown_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "input\n",
+            Some("expected\n"),
+        );
+        fs::write(target.join("stderr.txt"), "diagnostic\n").unwrap();
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A").unwrap(),
+            Some(Sample {
+                input: "input\n".to_string(),
+                output: "expected\n".to_string()
+            })
+        );
+        let unknown = target.parent().unwrap().join(".stress-staging-old");
+        fs::create_dir(&unknown).unwrap();
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert!(error.to_string().contains("recovery"));
+        assert!(unknown.is_dir());
+    }
+
+    #[test]
+    fn interrupted_replacement_with_previous_generation_is_not_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let stress_root = temp.path().join(".atc/stress");
+        let target = stress_root.join("A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old input\n",
+            Some("old expected\n"),
+        );
+        let staging = stress_root.join(".stress-staging-interrupted");
+        fs::create_dir(&staging).unwrap();
+        fs::rename(&target, staging.join("previous")).unwrap();
+        write_v1_generation(
+            &stress_root.join("B"),
+            "abc123",
+            "B",
+            "wrong-answer",
+            "B input\n",
+            Some("B expected\n"),
+        );
+
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("recovery"));
+        assert_eq!(
+            fs::read_to_string(staging.join("previous/failed.in")).unwrap(),
+            "old input\n"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "B").unwrap(),
+            Some(Sample {
+                input: "B input\n".to_string(),
+                output: "B expected\n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn unfinished_current_staging_only_blocks_its_named_problem() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join(".atc/stress/.stress-staging-1-B-empty");
+        fs::create_dir_all(&staging).unwrap();
+
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "B").unwrap_err();
+        assert!(error.to_string().contains("recovery"));
+        assert!(staging.is_dir());
+    }
+
+    #[test]
+    fn malformed_current_staging_names_and_metadata_mismatch_fail_closed() {
+        for name in [
+            ".stress-staging-01-B-random",
+            ".stress-staging-1-B-",
+            ".stress-staging-1-BC-random",
+            ".stress-staging-2-B-random",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temp.path().join(".atc/stress").join(name)).unwrap();
+            assert!(
+                load_saved_case(temp.path(), "abc123", "A").is_err(),
+                "{name}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join(".atc/stress/.stress-staging-1-B-mismatch");
+        write_v1_generation(
+            &staging.join("new"),
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("expected\n"),
+        );
+        assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
+        assert!(load_saved_case(temp.path(), "abc123", "B").is_err());
+        assert!(staging.join("new/failed.in").is_file());
+
+        for metadata in ["problem = \"A\"\n", "contest = \"other\"\n"] {
+            let temp = tempfile::tempdir().unwrap();
+            let staging = temp.path().join(".atc/stress/.stress-staging-1-B-partial");
+            fs::create_dir_all(staging.join("new")).unwrap();
+            fs::write(staging.join("new/meta.toml"), metadata).unwrap();
+            assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
+            assert_eq!(
+                fs::read_to_string(staging.join("new/meta.toml")).unwrap(),
+                metadata
+            );
+        }
+    }
+
+    #[test]
+    fn current_staging_owner_uses_exact_length_and_separator() {
+        assert_eq!(
+            current_staging_problem(".stress-staging-1-A-random"),
+            Ok(Some("A"))
+        );
+        assert_eq!(
+            current_staging_problem(".stress-staging-2-AA-random"),
+            Ok(Some("AA"))
+        );
+        assert_eq!(
+            current_staging_problem(".stress-staging-3-A-B-random"),
+            Ok(Some("A-B"))
+        );
+        assert_eq!(
+            current_staging_problem(".stress-staging-2-Å-random"),
+            Ok(Some("Å"))
+        );
+        assert_eq!(
+            current_staging_problem(".stress-staging-1-AA-random"),
+            Err(())
+        );
+        assert_eq!(
+            current_staging_problem(".stress-staging-2-A-random"),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn reading_a_does_not_wait_for_an_active_b_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let stress_root = temp.path().join(".atc/stress");
+        fs::create_dir_all(&stress_root).unwrap();
+        let stress_directory = open_stress_directory(temp.path()).unwrap().unwrap();
+        let writer_lock = open_stress_lock(&stress_directory, "B").unwrap();
+        writer_lock.lock().unwrap();
+        let staging = stress_root.join(".stress-staging-1-B-active");
+        fs::create_dir(&staging).unwrap();
+        // This can be a partially written metadata file while B owns the lock.
+        fs::create_dir(staging.join("new")).unwrap();
+        fs::write(staging.join("new/meta.toml"), "version =").unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(writer_lock);
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "B").unwrap_err();
+        assert!(error.to_string().contains("recovery"));
+        assert_eq!(
+            fs::read_to_string(staging.join("new/meta.toml")).unwrap(),
+            "version ="
+        );
+    }
+
+    #[test]
+    fn interrupted_first_install_and_post_install_cleanup_require_review() {
+        for installed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let stress_root = temp.path().join(".atc/stress");
+            fs::create_dir_all(&stress_root).unwrap();
+            let staging = stress_root.join(if installed {
+                ".stress-staging-legacy-interrupted"
+            } else {
+                ".stress-staging-1-A-interrupted"
+            });
+            fs::create_dir(&staging).unwrap();
+            if installed {
+                write_v1_generation(
+                    &staging.join("previous"),
+                    "abc123",
+                    "A",
+                    "wrong-answer",
+                    "old\n",
+                    Some("old expected\n"),
+                );
+                write_v1_generation(
+                    &stress_root.join("A"),
+                    "abc123",
+                    "A",
+                    "wrong-answer",
+                    "new\n",
+                    Some("new expected\n"),
+                );
+            } else {
+                write_v1_generation(
+                    &staging.join("new"),
+                    "abc123",
+                    "A",
+                    "wrong-answer",
+                    "new\n",
+                    Some("new expected\n"),
+                );
+            }
+
+            let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("recovery"));
+            assert_eq!(load_saved_case(temp.path(), "abc123", "B").unwrap(), None);
+            let preserved = if installed {
+                staging.join("previous/failed.in")
+            } else {
+                staging.join("new/failed.in")
+            };
+            assert_eq!(
+                fs::read_to_string(preserved).unwrap(),
+                if installed { "old\n" } else { "new\n" }
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_replacement_blocks_a_new_stress_save_without_touching_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let stress_root = temp.path().join(".atc/stress");
+        let target = stress_root.join("A");
+        write_v1_generation(
+            &target,
+            "abc123",
+            "A",
+            "wrong-answer",
+            "old\n",
+            Some("old expected\n"),
+        );
+        let staging = stress_root.join(".stress-staging-interrupted");
+        fs::create_dir(&staging).unwrap();
+        fs::rename(&target, staging.join("previous")).unwrap();
+        let replacement = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "replacement\n".to_string(),
+            expected: "replacement expected\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        let error =
+            persist_failure(&request(temp.path(), 10), &replacement, &|| false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("recovery"));
+        assert_eq!(
+            fs::read_to_string(staging.join("previous/failed.in")).unwrap(),
+            "old\n"
+        );
+        assert!(!target.exists());
     }
 
     #[test]
@@ -1804,7 +3122,9 @@ mod tests {
         fs::write(target.join("failed.in"), "1 2\n").unwrap();
         fs::write(target.join("expected.out"), "3\n").unwrap();
 
-        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("missing meta.toml"));
     }
 
     #[test]
@@ -1837,6 +3157,154 @@ mod tests {
     }
 
     #[test]
+    fn only_legacy_v1_runtime_failures_may_omit_expected_output() {
+        for kind in ["runtime-error", "timed-out"] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(&target, "abc123", "A", kind, "input\n", None);
+            assert!(matches!(
+                load_saved_case_status(temp.path(), "abc123", "A").unwrap(),
+                SavedCaseLoad::AmbiguousV1WithoutExpected { kind: loaded_kind } if loaded_kind == kind
+            ));
+            assert!(!target.join("expected.out").exists());
+        }
+
+        for (version, kind) in [
+            (1, "wrong-answer"),
+            (2, "wrong-answer"),
+            (2, "runtime-error"),
+            (2, "timed-out"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(&target, "abc123", "A", kind, "input\n", None);
+            if version == 2 {
+                let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+                fs::write(
+                    target.join("meta.toml"),
+                    metadata.replace("version = 1", "version = 2"),
+                )
+                .unwrap();
+            }
+            let before = fs::read(target.join("meta.toml")).unwrap();
+            let error = load_saved_case_status(temp.path(), "abc123", "A")
+                .err()
+                .expect("missing expected output must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("expected.out"));
+            assert_eq!(fs::read(target.join("meta.toml")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn v1_wrong_answer_and_all_v2_failure_kinds_replay_with_expected_output() {
+        for (version, kind) in [
+            (1, "wrong-answer"),
+            (2, "wrong-answer"),
+            (2, "runtime-error"),
+            (2, "timed-out"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(&target, "abc123", "A", kind, "input\n", Some("expected\n"));
+            if version == 2 {
+                let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+                fs::write(
+                    target.join("meta.toml"),
+                    metadata.replace("version = 1", "version = 2"),
+                )
+                .unwrap();
+            }
+            assert!(matches!(
+                load_saved_case_status(temp.path(), "abc123", "A").unwrap(),
+                SavedCaseLoad::Replay(Sample { input, output })
+                    if input == "input\n" && output == "expected\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_metadata_cannot_be_treated_as_legacy_runtime_failure() {
+        for replacement in ["version = 9", "version = 0", "version = \"1\""] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(&target, "abc123", "A", "runtime-error", "input\n", None);
+            let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+            fs::write(
+                target.join("meta.toml"),
+                metadata.replace("version = 1", replacement),
+            )
+            .unwrap();
+            assert!(load_saved_case_status(temp.path(), "abc123", "A").is_err());
+        }
+
+        for version in [1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join(".atc/stress/A");
+            write_v1_generation(&target, "abc123", "A", "runtime-error", "input\n", None);
+            let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
+            let metadata = metadata
+                .replace("version = 1", &format!("version = {version}"))
+                .replace("\nseed = 10", "\nseed = 11");
+            fs::write(target.join("meta.toml"), &metadata).unwrap();
+            let error = load_saved_case_status(temp.path(), "abc123", "A")
+                .err()
+                .expect("inconsistent metadata must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!target.join("expected.out").exists());
+            assert_eq!(
+                fs::read_to_string(target.join("meta.toml")).unwrap(),
+                metadata
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_legacy_v1_runtime_failure_keeps_its_unreplayable_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        write_v1_generation(&target, "abc123", "A", "runtime-error", "old\n", None);
+        let old_metadata = fs::read(target.join("meta.toml")).unwrap();
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "new\n".to_string(),
+            expected: "answer\n".to_string(),
+            actual: "wrong\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        persisted_path(persist_failure(
+            &request(temp.path(), 10),
+            &failure,
+            &|| false,
+        ));
+        let recovery = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-recovery-")
+                    && path.join("previous/meta.toml").exists()
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(recovery.join("previous/meta.toml")).unwrap(),
+            old_metadata
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous/failed.in")).unwrap(),
+            "old\n"
+        );
+        assert!(!recovery.join("previous/expected.out").exists());
+    }
+
+    #[test]
     fn saved_case_metadata_must_match_the_current_contest_and_problem() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join(".atc").join("stress").join("A");
@@ -1849,14 +3317,18 @@ mod tests {
             Some("2\n"),
         );
 
-        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"));
 
         fs::write(
             target.join("meta.toml"),
             "version = 1\ncontest = \"abc123\"\nproblem = \"B\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 10\nseed = 10\n",
         )
         .unwrap();
-        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
@@ -1874,9 +3346,7 @@ mod tests {
         );
 
         let stress_directory = open_stress_directory(temp.path()).unwrap().unwrap();
-        let writer_lock = open_stress_lock(&stress_directory, "A", true)
-            .unwrap()
-            .unwrap();
+        let writer_lock = open_stress_lock(&stress_directory, "A").unwrap();
         writer_lock.lock().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -1909,5 +3379,151 @@ mod tests {
                 })
             );
         });
+    }
+
+    #[test]
+    fn first_save_lock_creation_cannot_expose_active_staging_to_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().to_path_buf();
+        let stress_root = destination.join(".atc/stress");
+        fs::create_dir_all(&stress_root).unwrap();
+        assert!(!stress_root.join(".A.lock").exists());
+        let writer = std::cell::RefCell::new(None);
+
+        let loaded = load_saved_case_with_hook(&destination, "abc123", "A", || {
+            let writer_destination = destination.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let stress_root = writer_destination.join(".atc/stress");
+                let stress_directory = open_stress_directory(&writer_destination).unwrap().unwrap();
+                let lock = open_stress_lock(&stress_directory, "A").unwrap();
+                lock.lock().unwrap();
+                let staging = stress_root.join(".stress-staging-1-A-active");
+                fs::create_dir(&staging).unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+                write_v1_generation(
+                    &stress_root.join("A"),
+                    "abc123",
+                    "A",
+                    "wrong-answer",
+                    "new input\n",
+                    Some("new expected\n"),
+                );
+                fs::remove_dir(&staging).unwrap();
+                drop(lock);
+            });
+            ready_rx.recv().unwrap();
+            *writer.borrow_mut() = Some(handle);
+        });
+        writer.into_inner().unwrap().join().unwrap();
+        assert_eq!(
+            loaded.unwrap(),
+            Some(Sample {
+                input: "new input\n".to_string(),
+                output: "new expected\n".to_string(),
+            })
+        );
+        assert!(stress_root.join(".A.lock").exists());
+    }
+
+    #[test]
+    fn lock_open_failure_never_falls_back_to_unlocked_read_or_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let stress_root = temp.path().join(".atc/stress");
+        fs::create_dir_all(stress_root.join(".A.lock")).unwrap();
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "input\n".to_string(),
+            expected: "expected\n".to_string(),
+            actual: "actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+
+        assert!(load_saved_case(temp.path(), "abc123", "A").is_err());
+        assert!(persist_failure(&request(temp.path(), 10), &failure, &|| false).is_err());
+        assert!(!stress_root.join("A").exists());
+        assert_eq!(load_saved_case(temp.path(), "abc123", "B").unwrap(), None);
+        assert!(stress_root.join(".A.lock").is_dir());
+    }
+
+    #[test]
+    fn same_problem_saves_serialize_while_another_problem_can_save() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".atc")).unwrap();
+        let first_request = request(temp.path(), 10);
+        let second_request = first_request.clone();
+        let mut other_request = first_request.clone();
+        other_request.problem_index = "B".to_string();
+        let failure = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "first\n".to_string(),
+            expected: "expected\n".to_string(),
+            actual: "actual\n".to_string(),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        let mut second_failure = failure.clone();
+        second_failure.input = "second\n".to_string();
+        let mut other_failure = failure.clone();
+        other_failure.input = "other\n".to_string();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                persist_failure_with_hooks(
+                    &first_request,
+                    &failure,
+                    &|| false,
+                    || {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                    || {},
+                )
+                .unwrap()
+            });
+            ready_rx.recv().unwrap();
+            let second = scope.spawn(move || {
+                persist_failure(&second_request, &second_failure, &|| false).unwrap()
+            });
+            let other = persisted_path(persist_failure(&other_request, &other_failure, &|| false));
+            assert_eq!(
+                fs::read_to_string(other.join("failed.in")).unwrap(),
+                "other\n"
+            );
+            release_tx.send(()).unwrap();
+            assert!(matches!(
+                first.join().unwrap(),
+                PersistenceOutcome::Saved(_)
+            ));
+            assert!(matches!(
+                second.join().unwrap(),
+                PersistenceOutcome::Saved(_)
+            ));
+        });
+
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "A")
+                .unwrap()
+                .unwrap()
+                .input,
+            "second\n"
+        );
+        assert_eq!(
+            load_saved_case(temp.path(), "abc123", "B")
+                .unwrap()
+                .unwrap()
+                .input,
+            "other\n"
+        );
     }
 }

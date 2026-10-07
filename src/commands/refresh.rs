@@ -2,6 +2,7 @@ use super::{FetchedContestData, fetch_contest_data};
 use crate::atcoder;
 use crate::auth::SessionAuth;
 use crate::error::AppError;
+use crate::safe_file::{self, FileSnapshot};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::validate_refresh_destination;
@@ -14,8 +15,8 @@ pub(crate) struct PreparedRefresh {
     destination_identity: RefreshDestinationIdentity,
     contest_id: String,
     force: bool,
-    metadata_snapshot: Option<Vec<u8>>,
-    staging: tempfile::TempDir,
+    metadata_snapshot: Option<FileSnapshot>,
+    staging: crate::safe_file::PreservedTempDir,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub(super) fn resolve_refresh_contest_id(
         };
 
         validate_refresh_destination(destination, &contest_id, true)?;
+        workspace::validate_existing_contest_identity(destination, &contest_id)?;
         return Ok(contest_id);
     }
 
@@ -112,24 +114,7 @@ pub(super) fn resolve_refresh_contest_id(
         Some(contest_id) => {
             validate_refresh_destination(destination, contest_id, false)?;
 
-            match workspace::inspect_contest_metadata(destination)? {
-                workspace::ContestMetadataHealth::Healthy(contest) => {
-                    workspace::validate_contest_identity(&contest, contest_id)?;
-                }
-                workspace::ContestMetadataHealth::UnsupportedVersion(version) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsupported contest metadata version: {version}"),
-                    )
-                    .into());
-                }
-                workspace::ContestMetadataHealth::Missing
-                | workspace::ContestMetadataHealth::Invalid => {
-                    // An explicit contest ID is the existing recovery mechanism for
-                    // missing or malformed metadata. Healthy metadata, however, must
-                    // agree with the requested target before it may be replaced.
-                }
-            }
+            workspace::validate_existing_contest_identity(destination, contest_id)?;
 
             Ok(contest_id.to_string())
         }
@@ -166,7 +151,7 @@ pub(crate) fn prepare_refresh(
         &destination_identity,
         contest_id,
         force,
-        metadata_snapshot.as_deref(),
+        metadata_snapshot.as_ref(),
     )?;
 
     let FetchedContestData {
@@ -183,12 +168,14 @@ pub(crate) fn prepare_refresh(
         &destination_identity,
         contest_id,
         force,
-        metadata_snapshot.as_deref(),
+        metadata_snapshot.as_ref(),
     )?;
 
-    let staging = tempfile::Builder::new()
-        .prefix(".atc-refresh-")
-        .tempdir_in(destination)?;
+    let staging = crate::safe_file::PreservedTempDir::new(
+        tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(destination)?,
+    );
 
     // Creating the staging directory is path-based. Recheck immediately so a
     // replaced destination cannot cause staging to be built in another contest.
@@ -197,7 +184,7 @@ pub(crate) fn prepare_refresh(
         &destination_identity,
         contest_id,
         force,
-        metadata_snapshot.as_deref(),
+        metadata_snapshot.as_ref(),
     )?;
 
     for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
@@ -210,7 +197,7 @@ pub(crate) fn prepare_refresh(
         &destination_identity,
         contest_id,
         force,
-        metadata_snapshot.as_deref(),
+        metadata_snapshot.as_ref(),
     )?;
 
     Ok(PreparedRefresh {
@@ -241,9 +228,14 @@ pub(crate) fn apply_refresh(
         &destination_identity,
         &contest_id,
         force,
-        metadata_snapshot.as_deref(),
+        metadata_snapshot.as_ref(),
     )?;
-    workspace::replace_refresh_data(&destination, staging, force)?;
+    workspace::replace_refresh_data_with_snapshot(
+        &destination,
+        staging.into_temp_dir(),
+        force,
+        metadata_snapshot,
+    )?;
     reporter.report(Event::WorkspaceRefreshed {
         destination: &destination,
     });
@@ -251,12 +243,8 @@ pub(crate) fn apply_refresh(
     Ok(())
 }
 
-fn refresh_metadata_snapshot(destination: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(destination.join(".atc").join("contest.toml")) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
+fn refresh_metadata_snapshot(destination: &Path) -> io::Result<Option<FileSnapshot>> {
+    safe_file::read_optional_regular_file_snapshot(&destination.join(".atc").join("contest.toml"))
 }
 
 #[cfg(unix)]
@@ -343,20 +331,21 @@ fn revalidate_prepared_destination(
     expected_identity: &RefreshDestinationIdentity,
     contest_id: &str,
     force: bool,
-    expected_metadata: Option<&[u8]>,
+    expected_metadata: Option<&FileSnapshot>,
 ) -> Result<(), AppError> {
     if refresh_destination_identity(destination)? != *expected_identity {
         return Err(changed_refresh_destination_error());
     }
     validate_refresh_destination(destination, contest_id, force)?;
     let current_metadata = refresh_metadata_snapshot(destination)?;
-    if current_metadata.as_deref() != expected_metadata {
+    if current_metadata.as_ref() != expected_metadata {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "contest metadata changed while refresh was being prepared; retry refresh",
         )
         .into());
     }
+    workspace::validate_existing_contest_identity(destination, contest_id)?;
     if refresh_destination_identity(destination)? != *expected_identity {
         return Err(changed_refresh_destination_error());
     }

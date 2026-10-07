@@ -334,8 +334,26 @@ fn test_problem_with_debug_header_and_cancel(
         .into());
     }
 
-    let samples = workspace::load_samples(destination, &problem.index)?;
-    let stress_case = crate::stress::load_saved_case(destination, contest_id, &problem.index)?;
+    let samples = workspace::load_verified_samples(destination, problem)?;
+    let stress_case = match crate::stress::load_saved_case_status(
+        destination,
+        contest_id,
+        &problem.index,
+    )? {
+        crate::stress::SavedCaseLoad::Absent => None,
+        crate::stress::SavedCaseLoad::Replay(sample) => Some(sample),
+        crate::stress::SavedCaseLoad::AmbiguousV1WithoutExpected { kind } => {
+            let reason = format!(
+                "v1 {kind} has no expected.out; the saved case is unverified (historical or damaged). Review .atc/stress/{} and its recovery areas",
+                problem.index
+            );
+            reporter.report(Event::SavedStressCaseSkipped {
+                problem_index: &problem.index,
+                reason: &reason,
+            });
+            None
+        }
+    };
 
     if samples.is_empty() && stress_case.is_none() {
         reporter.report(Event::NoSamples {

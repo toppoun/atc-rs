@@ -1355,6 +1355,7 @@ struct PreparedWatchInput {
     contest: Contest,
     sample_counts: Vec<usize>,
     stress_cases: Vec<Option<crate::model::Sample>>,
+    stress_load_errors: Vec<Option<String>>,
     user_inputs: Vec<UserInputState>,
 }
 
@@ -1372,13 +1373,14 @@ struct SwitchPreparationError {
 
 impl PreparedWatchInput {
     fn load(destination: &Path, expected_contest_id: Option<&str>) -> Result<Self, AppError> {
-        let (contest, sample_counts, stress_cases, user_inputs) =
+        let (contest, sample_counts, stress_cases, stress_load_errors, user_inputs) =
             load_watch_input(destination, expected_contest_id)?;
         Ok(Self {
             destination: destination.to_path_buf(),
             contest,
             sample_counts,
             stress_cases,
+            stress_load_errors,
             user_inputs,
         })
     }
@@ -1451,7 +1453,7 @@ impl PreparedWatchInput {
             }
         }
 
-        let (contest, sample_counts, stress_cases, user_inputs) =
+        let (contest, sample_counts, stress_cases, stress_load_errors, user_inputs) =
             load_watch_input(&destination, Some(contest_id)).map_err(|error| {
                 SwitchPreparationError {
                     destination: Some(destination.clone()),
@@ -1464,6 +1466,7 @@ impl PreparedWatchInput {
             contest,
             sample_counts,
             stress_cases,
+            stress_load_errors,
             user_inputs,
         }))
     }
@@ -2012,6 +2015,7 @@ impl ContestSession {
     {
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
+        let stress_load_errors = std::mem::take(&mut self.input.stress_load_errors);
         let user_inputs = std::mem::take(&mut self.input.user_inputs);
         let channels = self.channels();
         let runtime = crate::tui::SessionRuntime::new(
@@ -2021,6 +2025,7 @@ impl ContestSession {
             &self.input.contest,
             sample_counts,
             stress_cases,
+            stress_load_errors,
             user_inputs,
             crate::tui::SessionExecution::new(channels, submissions),
         );
@@ -2087,11 +2092,13 @@ type LoadedWatchInput = (
     Contest,
     Vec<usize>,
     Vec<Option<crate::model::Sample>>,
+    Vec<Option<String>>,
     Vec<UserInputState>,
 );
 type LoadedWatchData = (
     Vec<usize>,
     Vec<Option<crate::model::Sample>>,
+    Vec<Option<String>>,
     Vec<UserInputState>,
 );
 
@@ -2107,9 +2114,16 @@ fn load_watch_input(
         workspace::validate_contest_identity(&contest, contest_id)?;
     }
 
-    let (sample_counts, stress_cases, user_inputs) = load_watch_data(destination, &contest)?;
+    let (sample_counts, stress_cases, stress_load_errors, user_inputs) =
+        load_watch_data(destination, &contest)?;
 
-    Ok((contest, sample_counts, stress_cases, user_inputs))
+    Ok((
+        contest,
+        sample_counts,
+        stress_cases,
+        stress_load_errors,
+        user_inputs,
+    ))
 }
 
 fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWatchData> {
@@ -2117,26 +2131,27 @@ fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWa
         .problems
         .iter()
         .map(|problem| {
-            let sample_count = workspace::load_samples(destination, &problem.index)?.len();
-            if sample_count != problem.sample_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "problem {} has {sample_count} local samples, but contest metadata requires {}",
-                        problem.index, problem.sample_count
-                    ),
-                ));
+            workspace::load_verified_samples(destination, problem).map(|samples| samples.len())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut stress_cases = Vec::with_capacity(contest.problems.len());
+    let mut stress_load_errors = Vec::with_capacity(contest.problems.len());
+    for problem in &contest.problems {
+        match crate::stress::load_saved_case(destination, &contest.contest_id, &problem.index) {
+            Ok(case) => {
+                stress_cases.push(case);
+                stress_load_errors.push(None);
             }
-            Ok(sample_count)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let stress_cases = contest
-        .problems
-        .iter()
-        .map(|problem| {
-            crate::stress::load_saved_case(destination, &contest.contest_id, &problem.index)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            Err(error) if crate::stress::is_unscoped_load_error(&error) => return Err(error),
+            Err(error) => {
+                stress_cases.push(None);
+                stress_load_errors.push(Some(format!(
+                    "Saved Stress case for problem {} needs recovery check at .atc/stress/{}: {error}",
+                    problem.index, problem.index
+                )));
+            }
+        }
+    }
     let user_inputs = contest
         .problems
         .iter()
@@ -2159,7 +2174,7 @@ fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWa
         )
         .collect();
 
-    Ok((sample_counts, stress_cases, user_inputs))
+    Ok((sample_counts, stress_cases, stress_load_errors, user_inputs))
 }
 
 #[cfg(test)]
@@ -4762,7 +4777,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded_contest, sample_counts, stress_cases, user_inputs) =
+        let (loaded_contest, sample_counts, stress_cases, stress_load_errors, user_inputs) =
             load_watch_input(temp.path(), None).unwrap();
 
         assert_eq!(loaded_contest.contest_id, "contest");
@@ -4786,11 +4801,262 @@ mod tests {
                 None,
             ]
         );
+        assert_eq!(stress_load_errors, [None, None, None]);
         assert!(user_inputs.iter().all(|state| {
             state
                 .ready()
                 .is_some_and(|ready| ready.persisted().is_empty())
         }));
+    }
+
+    #[test]
+    fn loading_tui_contest_rejects_missing_official_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![Problem {
+                sample_count: 1,
+                ..problem("A")
+            }],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+        let error = load_watch_input(temp.path(), None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("local samples"));
+        assert_eq!(workspace::load_metadata(temp.path()).unwrap(), contest);
+    }
+
+    #[test]
+    fn loading_tui_contest_rejects_duplicate_task_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        workspace::save_metadata(
+            temp.path(),
+            &Contest {
+                contest_id: "contest".to_string(),
+                problems: vec![problem("A"), problem("B")],
+            },
+        )
+        .unwrap();
+        let path = temp.path().join(".atc/contest.toml");
+        let metadata = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("contest_b", "contest_a");
+        std::fs::write(&path, &metadata).unwrap();
+
+        let error = load_watch_input(temp.path(), None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate task ID"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), metadata);
+    }
+
+    #[test]
+    fn loading_tui_contest_reports_unusable_saved_stress_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A")],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("meta.toml"), "broken = [").unwrap();
+
+        let prepared = PreparedWatchInput::load(temp.path(), None).unwrap();
+        assert_eq!(prepared.stress_cases, [None]);
+        assert!(
+            prepared.stress_load_errors[0]
+                .as_ref()
+                .unwrap()
+                .contains(".atc/stress/A")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("meta.toml")).unwrap(),
+            "broken = ["
+        );
+    }
+
+    #[test]
+    fn loading_tui_contest_keeps_another_problems_staging_error_local() {
+        for partial_metadata in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let contest = Contest {
+                contest_id: "contest".to_string(),
+                problems: vec![problem("A"), problem("B")],
+            };
+            workspace::save_metadata(temp.path(), &contest).unwrap();
+            let staging = temp
+                .path()
+                .join(".atc/stress/.stress-staging-1-B-interrupted");
+            std::fs::create_dir_all(&staging).unwrap();
+            if partial_metadata {
+                std::fs::create_dir(staging.join("new")).unwrap();
+                std::fs::write(staging.join("new/meta.toml"), "version =").unwrap();
+            }
+
+            let prepared = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap();
+            let session = ContestSession::start(
+                PreparedWatchInput::load(temp.path(), Some("contest")).unwrap(),
+                &RunnerConfig::default(),
+            )
+            .unwrap();
+            drop(session);
+            assert_eq!(prepared.sample_counts, [0, 0]);
+            assert_eq!(prepared.stress_cases, [None, None]);
+            assert_eq!(prepared.stress_load_errors[0], None);
+            let error = prepared.stress_load_errors[1].as_ref().unwrap();
+            assert!(error.contains("recovery check"), "{error}");
+            assert!(error.contains(".stress-staging-1-B-interrupted"), "{error}");
+            let mut app = crate::tui::app::WatchApp::new_with_session_data(
+                &prepared.contest,
+                prepared.sample_counts,
+                prepared.stress_cases,
+                prepared.user_inputs,
+            )
+            .unwrap();
+            for (problem, error) in prepared.stress_load_errors.into_iter().enumerate() {
+                if let Some(error) = error {
+                    app.set_saved_stress_load_error(problem, error);
+                }
+            }
+            assert_eq!(app.problems()[0].run.phase, crate::tui::app::RunPhase::Idle);
+            assert_eq!(
+                app.problems()[1].run.phase,
+                crate::tui::app::RunPhase::Failed
+            );
+            assert!(app.select_problem(1));
+            assert!(
+                app.current_problem()
+                    .unwrap()
+                    .run
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("recovery")
+            );
+            assert!(app.select_problem(0));
+            std::fs::write(temp.path().join("A.cpp"), "not valid C++").unwrap();
+            std::fs::write(temp.path().join("B.cpp"), "not valid C++").unwrap();
+            let runner = RunnerConfig {
+                cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+                ..RunnerConfig::default()
+            };
+            assert!(
+                crate::commands::test::test_problem(
+                    temp.path(),
+                    "contest",
+                    &contest.problems[0],
+                    Language::Cpp,
+                    &runner,
+                    false,
+                    &mut crate::ui::NullReporter,
+                )
+                .is_ok()
+            );
+            let blocked = crate::commands::test::test_problem(
+                temp.path(),
+                "contest",
+                &contest.problems[1],
+                Language::Cpp,
+                &runner,
+                false,
+                &mut crate::ui::NullReporter,
+            )
+            .unwrap_err();
+            assert!(blocked.to_string().contains("recovery"));
+            assert!(staging.is_dir());
+            if partial_metadata {
+                std::fs::remove_file(staging.join("new/meta.toml")).unwrap();
+                std::fs::remove_dir(staging.join("new")).unwrap();
+            }
+            std::fs::remove_dir(&staging).unwrap();
+            let reloaded = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap();
+            assert_eq!(reloaded.stress_load_errors, [None, None]);
+            assert!(app.source_changed(1, temp.path().join("B.cpp"), Language::Cpp));
+            let rerun = app.queue_run(1).unwrap();
+            assert!(app.run_started(1, rerun.run_id));
+            assert!(
+                crate::commands::test::test_problem(
+                    temp.path(),
+                    "contest",
+                    &contest.problems[1],
+                    Language::Cpp,
+                    &runner,
+                    false,
+                    &mut crate::ui::NullReporter,
+                )
+                .is_ok()
+            );
+            assert!(app.run_event(1, rerun.run_id, TestEvent::NoSamples));
+            assert_eq!(
+                app.problems()[1].run.phase,
+                crate::tui::app::RunPhase::NoSamples
+            );
+            assert!(app.problems()[1].run.error.is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_legacy_staging_owner_still_blocks_tui_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        workspace::save_metadata(
+            temp.path(),
+            &Contest {
+                contest_id: "contest".to_string(),
+                problems: vec![problem("A"), problem("B")],
+            },
+        )
+        .unwrap();
+        let staging = temp
+            .path()
+            .join(".atc/stress/.stress-staging-legacy-unknown");
+        std::fs::create_dir_all(&staging).unwrap();
+        let error = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap_err();
+        assert!(error.to_string().contains("recovery"));
+        assert!(staging.is_dir());
+    }
+
+    #[test]
+    fn tui_sample_run_displays_saved_stress_read_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let contest = Contest {
+            contest_id: "contest".to_string(),
+            problems: vec![problem("A")],
+        };
+        workspace::save_metadata(temp.path(), &contest).unwrap();
+        let source = temp.path().join("A.cpp");
+        std::fs::write(&source, "not valid C++").unwrap();
+        let prepared = PreparedWatchInput::load(temp.path(), None).unwrap();
+        let mut app = crate::tui::app::WatchApp::new_with_session_data(
+            &prepared.contest,
+            prepared.sample_counts,
+            prepared.stress_cases,
+            prepared.user_inputs,
+        )
+        .unwrap();
+        let target = temp.path().join(".atc/stress/A");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("meta.toml"), "broken = [").unwrap();
+
+        app.source_changed(0, source, Language::Cpp);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        let error = crate::commands::test::test_problem(
+            temp.path(),
+            "contest",
+            &contest.problems[0],
+            Language::Cpp,
+            &RunnerConfig {
+                cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+                ..RunnerConfig::default()
+            },
+            false,
+            &mut crate::ui::NullReporter,
+        )
+        .unwrap_err();
+        assert!(app.run_failed(0, request.run_id, error.to_string()));
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!(run.phase, crate::tui::app::RunPhase::Failed);
+        assert!(run.error.as_ref().unwrap().contains("saved stress case"));
     }
 
     #[test]
@@ -5254,7 +5520,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("contest data requires repair"));
+        assert!(error.to_string().contains("ownership"));
         assert_eq!(
             workspace::load_metadata(&active).unwrap().contest_id,
             "abc123"
@@ -5292,7 +5558,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_metadata_is_repair_required_without_mutation_or_touching_active_contest() {
+    fn unknown_metadata_owner_is_rejected_without_mutation_or_touching_active_contest() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".atc-workspace.toml"),
@@ -5314,13 +5580,11 @@ mod tests {
                 if destination == missing_metadata
         ));
 
-        let target = PreparedWatchInput::resolve_for_switch(root.path(), "abc467").unwrap();
-
-        assert!(matches!(
-            target,
-            SwitchTargetPreparation::RepairRequired { destination }
-                if destination == invalid
-        ));
+        let error = match PreparedWatchInput::resolve_for_switch(root.path(), "abc467") {
+            Ok(_) => panic!("metadata with unknown owner cannot offer automatic repair"),
+            Err(error) => error,
+        };
+        assert!(error.error.to_string().contains("ownership"));
         assert_eq!(
             std::fs::read(invalid.join(".atc/contest.toml")).unwrap(),
             invalid_before
@@ -5421,7 +5685,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_completion_requires_fresh_healthy_metadata_and_loadable_session_data() {
+    fn repair_completion_requires_healthy_metadata_and_keeps_stress_errors_local() {
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let mut reporter = crate::ui::NullReporter;
@@ -5492,7 +5756,7 @@ mod tests {
 
         let invalid_stress = root.path().join("abc472");
         std::fs::create_dir(&invalid_stress).unwrap();
-        let error = repair_and_prepare_contest_switch_with(
+        let prepared = repair_and_prepare_contest_switch_with(
             root.path(),
             &repair_request("abc472", invalid_stress.clone()),
             &mut reporter,
@@ -5508,8 +5772,13 @@ mod tests {
                 Ok(())
             },
         )
-        .unwrap_err();
-        assert!(!error.to_string().is_empty());
+        .unwrap();
+        assert_eq!(prepared.stress_cases, [None]);
+        assert!(
+            prepared.stress_load_errors[0]
+                .as_ref()
+                .is_some_and(|error| error.contains("recovery check"))
+        );
         assert!(invalid_stress.join(".atc/stress").is_file());
     }
 

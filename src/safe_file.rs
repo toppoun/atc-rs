@@ -1,6 +1,337 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+/// A staging directory whose implicit drop preserves its contents. Callers remove only
+/// verified owned entries explicitly; error paths keep possible recovery files intact.
+pub(crate) struct PreservedTempDir {
+    directory: Option<tempfile::TempDir>,
+}
+
+impl PreservedTempDir {
+    pub(crate) fn new(directory: tempfile::TempDir) -> Self {
+        Self {
+            directory: Some(directory),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.directory
+            .as_ref()
+            .expect("staging directory is present")
+            .path()
+    }
+
+    pub(crate) fn keep(mut self) -> PathBuf {
+        self.directory
+            .take()
+            .expect("staging directory is present")
+            .keep()
+    }
+
+    pub(crate) fn into_temp_dir(mut self) -> tempfile::TempDir {
+        self.directory.take().expect("staging directory is present")
+    }
+}
+
+impl Drop for PreservedTempDir {
+    fn drop(&mut self) {
+        if let Some(directory) = self.directory.take() {
+            let _ = directory.keep();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryIdentity {
+    version: u32,
+    kind: String,
+    contest_id: String,
+    problem_index: Option<String>,
+}
+
+impl RecoveryIdentity {
+    pub(crate) fn new(kind: &str, contest_id: &str, problem_index: Option<&str>) -> Self {
+        Self {
+            version: 1,
+            kind: kind.to_owned(),
+            contest_id: contest_id.to_owned(),
+            problem_index: problem_index.map(str::to_owned),
+        }
+    }
+
+    pub(crate) fn is_contest(&self) -> bool {
+        self.kind == "contest" && self.problem_index.is_none()
+    }
+}
+
+pub(crate) const RECOVERY_INTENT: &str = "recovery-intent.toml";
+pub(crate) const RECOVERY_COMPLETE: &str = "recovery-complete.toml";
+
+pub(crate) fn write_recovery_intent(root: &Path, identity: &RecoveryIdentity) -> io::Result<()> {
+    write_recovery_record(&root.join(RECOVERY_INTENT), identity)
+}
+
+/// The staging name remains an interruption signal until the same-volume no-clobber rename.
+/// A completed name is never installed unless the completion record has been flushed.
+pub(crate) fn complete_recovery(
+    staging: PreservedTempDir,
+    completed_path: &Path,
+    identity: &RecoveryIdentity,
+) -> io::Result<PathBuf> {
+    let root = staging.keep();
+    let result = write_recovery_record(&root.join(RECOVERY_COMPLETE), identity)
+        .and_then(|()| rename_noclobber(&root, completed_path));
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to complete recovery area: {error}; data kept at {}",
+                root.display()
+            ),
+        )
+    })?;
+    Ok(completed_path.to_path_buf())
+}
+
+pub(crate) fn read_completed_recovery(path: &Path) -> io::Result<RecoveryIdentity> {
+    let intent = read_regular_file_snapshot(&path.join(RECOVERY_INTENT))?.bytes;
+    let complete = read_regular_file_snapshot(&path.join(RECOVERY_COMPLETE))?.bytes;
+    parse_completed_recovery(&intent, &complete)
+}
+
+pub(crate) fn parse_completed_recovery(
+    intent_bytes: &[u8],
+    complete_bytes: &[u8],
+) -> io::Result<RecoveryIdentity> {
+    let intent = parse_recovery_record(intent_bytes)?;
+    let complete = parse_recovery_record(complete_bytes)?;
+    if intent != complete {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recovery records disagree",
+        ));
+    }
+    Ok(complete)
+}
+
+fn parse_recovery_record(bytes: &[u8]) -> io::Result<RecoveryIdentity> {
+    let content = std::str::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid recovery record encoding",
+        )
+    })?;
+    let identity: RecoveryIdentity = toml::from_str(content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if identity.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported recovery record version",
+        ));
+    }
+    Ok(identity)
+}
+
+pub(crate) fn recovery_intent_exists(path: &Path) -> io::Result<bool> {
+    Ok(read_optional_regular_file_snapshot(&path.join(RECOVERY_INTENT))?.is_some())
+}
+
+fn write_recovery_record(path: &Path, identity: &RecoveryIdentity) -> io::Result<()> {
+    let content = toml::to_string(identity).map_err(io::Error::other)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileSnapshot {
+    pub(crate) bytes: Vec<u8>,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TreeSnapshot {
+    directories: std::collections::BTreeMap<PathBuf, FileIdentity>,
+    files: std::collections::BTreeMap<PathBuf, FileSnapshot>,
+}
+
+/// Records the exact files and directory identities in a generation. Callers validate their
+/// ownership rules first; this snapshot only detects changes across the generation move.
+pub(crate) fn read_tree_snapshot(root: &Path) -> io::Result<TreeSnapshot> {
+    let mut snapshot = TreeSnapshot {
+        directories: std::collections::BTreeMap::new(),
+        files: std::collections::BTreeMap::new(),
+    };
+    read_tree_entry(root, Path::new(""), &mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn read_tree_entry(path: &Path, relative: &Path, snapshot: &mut TreeSnapshot) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reparse point in generation: {}", path.display()),
+            ));
+        }
+    }
+    if metadata.file_type().is_dir() {
+        snapshot
+            .directories
+            .insert(relative.to_path_buf(), directory_identity(path)?);
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            read_tree_entry(&entry.path(), &relative.join(entry.file_name()), snapshot)?;
+        }
+    } else if metadata.file_type().is_file() {
+        snapshot
+            .files
+            .insert(relative.to_path_buf(), read_regular_file_snapshot(path)?);
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-regular entry in generation: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("generation directory changed: {}", path.display()),
+        ));
+    }
+    file_identity(&file, path)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u32,
+    index: u64,
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    canonical_path: PathBuf,
+}
+
+pub(crate) fn read_regular_file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file is a reparse point: {}", path.display()),
+            ));
+        }
+    }
+    let identity = file_identity(&file, path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(FileSnapshot { bytes, identity })
+}
+
+pub(crate) fn read_optional_regular_file_snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {
+    match read_regular_file_snapshot(path) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(file: &fs::File, _path: &Path) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(file: &fs::File, _path: &Path) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::from_mut(&mut information))
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &fs::File, path: &Path) -> io::Result<FileIdentity> {
+    Ok(FileIdentity {
+        canonical_path: fs::canonicalize(path)?,
+    })
+}
 
 #[derive(Debug)]
 struct InstallContext {

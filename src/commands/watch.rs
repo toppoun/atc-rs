@@ -149,6 +149,12 @@ mod tests {
                 Event::NoSamples { problem_index } => {
                     self.events.push(format!("no-samples:{problem_index}"));
                 }
+                Event::SavedStressCaseSkipped {
+                    problem_index,
+                    reason,
+                } => self
+                    .events
+                    .push(format!("stress-skipped:{problem_index}:{reason}")),
                 Event::TestCaseLayout { .. } => {}
                 Event::TestRunStarted {
                     problem_index,
@@ -208,6 +214,68 @@ mod tests {
                 "no-samples:A".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn changed_source_reports_missing_official_samples_before_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.cpp");
+        std::fs::write(&source, "not valid C++").unwrap();
+        let mut problem = problem("A");
+        problem.sample_count = 3;
+        let contest = contest(vec![problem]);
+        let mut reporter = RecordingReporter::default();
+
+        let error = process_changed_paths(
+            temp.path(),
+            &contest,
+            &RunnerConfig {
+                cpp_compiler: "definitely-not-a-real-compiler".to_string(),
+                ..RunnerConfig::default()
+            },
+            vec![source.clone()],
+            &mut reporter,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("local samples"));
+        assert_eq!(reporter.events, [format!("changed:{}", source.display())]);
+    }
+
+    #[test]
+    fn changed_source_reports_unreplayable_legacy_stress_case_without_counting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("A.py");
+        std::fs::write(&source, "print(input())\n").unwrap();
+        let saved = temp.path().join(".atc/stress/A");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join("failed.in"), "42\n").unwrap();
+        std::fs::write(saved.join("actual.out"), "runtime error\n").unwrap();
+        std::fs::write(
+            saved.join("meta.toml"),
+            concat!(
+                "version = 1\ncontest = \"contest\"\nproblem = \"A\"\n",
+                "kind = \"runtime-error\"\ncase = 1\nbase_seed = 10\nseed = 10\n"
+            ),
+        )
+        .unwrap();
+        let contest = contest(vec![problem("A")]);
+        let mut reporter = RecordingReporter::default();
+
+        process_changed_paths(
+            temp.path(),
+            &contest,
+            &RunnerConfig::default(),
+            vec![source.clone()],
+            &mut reporter,
+        )
+        .unwrap();
+        assert_eq!(reporter.events.len(), 3);
+        assert_eq!(reporter.events[0], format!("changed:{}", source.display()));
+        assert!(reporter.events[1].contains("stress-skipped:A:v1 runtime-error"));
+        assert!(reporter.events[1].contains("unverified"));
+        assert_eq!(reporter.events[2], "no-samples:A");
+        assert!(!saved.join("expected.out").exists());
     }
 
     #[test]

@@ -54,6 +54,7 @@ fn run_verdict_command(
             self.failed |= matches!(
                 event,
                 Event::CompileFailed { .. }
+                    | Event::SavedStressCaseSkipped { .. }
                     | Event::CompileTimedOut { .. }
                     | Event::TestCaseWrongAnswer { .. }
                     | Event::TestCaseRuntimeError { .. }

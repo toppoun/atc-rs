@@ -46,6 +46,10 @@ pub enum Event<'a> {
     NoSamples {
         problem_index: &'a str,
     },
+    SavedStressCaseSkipped {
+        problem_index: &'a str,
+        reason: &'a str,
+    },
 
     CompileFailed {
         stderr: &'a str,
@@ -246,6 +250,7 @@ pub struct TerminalReporter {
     current_test: Option<TestDisplayState>,
     pending_test_layout: Option<(String, usize)>,
     stress_progress_visible: bool,
+    unverified_stress: bool,
 }
 
 impl Reporter for TerminalReporter {
@@ -301,7 +306,19 @@ impl Reporter for TerminalReporter {
             }
             Event::NoSamples { problem_index } => {
                 self.current_test = None;
-                println!("No samples for {problem_index}");
+                if self.unverified_stress {
+                    println!("No samples for {problem_index} (saved Stress case unverified)");
+                } else {
+                    println!("No samples for {problem_index}");
+                }
+                self.unverified_stress = false;
+            }
+            Event::SavedStressCaseSkipped {
+                problem_index,
+                reason,
+            } => {
+                self.unverified_stress = true;
+                eprintln!("Saved Stress case skipped for {problem_index}: {reason}");
             }
 
             Event::CompileFailed { stderr } => {
@@ -413,6 +430,7 @@ impl Reporter for TerminalReporter {
 
             Event::WatchSourceChanged { source } => {
                 self.current_test = None;
+                self.unverified_stress = false;
                 println!();
                 println!(
                     "Changed {}",
@@ -457,6 +475,7 @@ impl Reporter for TerminalReporter {
                 {
                     print!("{output}");
                 }
+                self.unverified_stress = false;
             }
 
             Event::StressStarted {
@@ -675,8 +694,16 @@ impl TerminalReporter {
         }
 
         writeln!(output).expect("writing to String cannot fail");
-        writeln!(output, "Result: {accepted}/{total_cases} AC")
+        if self.unverified_stress {
+            writeln!(
+                output,
+                "Result: {accepted}/{total_cases} AC (saved Stress case unverified)"
+            )
             .expect("writing to String cannot fail");
+        } else {
+            writeln!(output, "Result: {accepted}/{total_cases} AC")
+                .expect("writing to String cannot fail");
+        }
 
         for case in &test.cases {
             let has_stderr = case

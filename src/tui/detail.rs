@@ -275,6 +275,9 @@ impl<'a> DetailDocument<'a> {
 
             RunPhase::NoSamples => {
                 self.push_static("No samples");
+                if let Some(warning) = run.warning.as_ref() {
+                    self.push_shared_section("notice", warning);
+                }
             }
 
             RunPhase::Failed => {
@@ -442,6 +445,11 @@ impl<'a> DetailDocument<'a> {
     fn push_sample_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
         let run = &problem.run;
         let total = problem.total_cases;
+
+        if let Some(warning) = run.warning.as_ref() {
+            self.push_shared_section("notice", warning);
+            self.push_static("\n\n");
+        }
 
         if total == 0 {
             self.push_static("Running samples...");
@@ -1081,6 +1089,89 @@ mod tests {
 
         assert_eq!(shared.as_ptr(), state.as_ptr());
         assert_eq!(Arc::strong_count(state), owners + 1);
+    }
+
+    #[test]
+    fn skipped_legacy_stress_case_is_visible_without_counting_it_as_ac() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.py"), Language::Python);
+        let request = app.queue_run(0).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::SavedStressCaseSkipped {
+                reason: "legacy v1 runtime-error has no expected.out".to_string(),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunStarted { total_cases: 1 },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestCaseAccepted {
+                number: 1,
+                elapsed: Duration::from_millis(1),
+            },
+        ));
+        assert!(app.run_event(
+            0,
+            request.run_id,
+            TestEvent::TestRunFinished {
+                accepted: 1,
+                total_cases: 1,
+            },
+        ));
+        let run = &app.current_problem().unwrap().run;
+        assert_eq!((run.accepted, run.total_cases), (1, 1));
+        let detail = document_text(&DetailDocument::from_app(&app));
+        assert!(detail.contains("Saved Stress case skipped"), "{detail}");
+        assert!(detail.contains("expected.out"), "{detail}");
+
+        let next = app.queue_run(0).unwrap();
+        assert!(app.current_problem().unwrap().run.warning.is_none());
+        assert!(app.run_started(0, next.run_id));
+        assert!(app.run_event(
+            0,
+            next.run_id,
+            TestEvent::SavedStressCaseSkipped {
+                reason: "legacy v1 timed-out has no expected.out".to_string(),
+            },
+        ));
+        assert!(app.run_event(0, next.run_id, TestEvent::NoSamples));
+        let detail = document_text(&DetailDocument::from_app(&app));
+        assert!(detail.contains("No samples"), "{detail}");
+        assert!(detail.contains("timed-out"), "{detail}");
+    }
+
+    #[test]
+    fn startup_stress_error_is_visible_only_on_its_problem() {
+        let mut contest = contest();
+        contest.problems.push(Problem {
+            index: "B".to_string(),
+            title: "Problem B".to_string(),
+            task_id: "abc123_b".to_string(),
+            url: "https://example.invalid/b".to_string(),
+            sample_count: 0,
+        });
+        let mut app = WatchApp::new(&contest, vec![0, 0]).unwrap();
+        app.set_saved_stress_load_error(
+            1,
+            "recovery check required at .atc/stress/.stress-staging-1-B-interrupted".to_string(),
+        );
+        assert!(!document_text(&DetailDocument::from_app(&app)).contains("recovery check"));
+        assert!(app.select_problem(1));
+        let detail = document_text(&DetailDocument::from_app(&app));
+        assert!(detail.contains("Run Failed"), "{detail}");
+        assert!(
+            detail.contains(".stress-staging-1-B-interrupted"),
+            "{detail}"
+        );
+        assert!(app.select_problem(0));
+        assert!(!document_text(&DetailDocument::from_app(&app)).contains("recovery check"));
     }
 
     #[test]

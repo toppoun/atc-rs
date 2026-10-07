@@ -66,6 +66,11 @@ impl Reporter for ChannelReporter {
             Event::NoSamples { .. } => {
                 self.send(TestEvent::NoSamples);
             }
+            Event::SavedStressCaseSkipped { reason, .. } => {
+                self.send(TestEvent::SavedStressCaseSkipped {
+                    reason: reason.to_owned(),
+                });
+            }
 
             Event::CompileFailed { stderr } => {
                 self.send(TestEvent::CompileFailed {
@@ -228,6 +233,24 @@ mod tests {
     use crate::error::AppError;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn forwards_skipped_legacy_case_as_a_distinct_test_notice() {
+        let (tx, rx) = mpsc::channel();
+        let mut reporter = ChannelReporter::new(7, 2, tx);
+        reporter.report(Event::SavedStressCaseSkipped {
+            problem_index: "A",
+            reason: "legacy v1 timed-out has no expected.out",
+        });
+        match rx.recv().unwrap() {
+            Message::RunEvent {
+                run_id: 7,
+                problem: 2,
+                event: TestEvent::SavedStressCaseSkipped { reason },
+            } => assert!(reason.contains("expected.out")),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 
     #[test]
     fn converts_accepted_event_to_owned_run_message() {

@@ -623,6 +623,8 @@ impl SubmissionHub {
         if let Some(message) = auth.submission_unavailable_message() {
             return Err(message.to_string());
         }
+        plan.verify_metadata_identity()
+            .map_err(|error| error.to_string())?;
         let atcoder = Arc::new(
             AtCoderClient::from_session_auth(Arc::clone(auth))
                 .map_err(AppError::from)
@@ -1219,6 +1221,10 @@ fn run_worker_inner(
         let _ = send(WorkerEventKind::CancelledBeforeSubmit);
         return;
     }
+    if let Err(error) = prepared.verify_metadata_identity() {
+        let _ = send(WorkerEventKind::Failed(error.to_string()));
+        return;
+    }
     let result = executor.execute(
         atcoder,
         prepared,
@@ -1421,6 +1427,62 @@ mod tests {
             started_at,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn queued_submission_rechecks_metadata_before_mock_executor() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::workspace::save_metadata(
+            temp.path(),
+            &crate::model::Contest {
+                contest_id: "adt_easy_20260826_1".to_string(),
+                problems: vec![crate::model::Problem {
+                    index: "A".to_string(),
+                    title: "A".to_string(),
+                    task_id: "abc430_a".to_string(),
+                    url: "https://atcoder.jp/contests/adt_easy_20260826_1/tasks/abc430_a"
+                        .to_string(),
+                    sample_count: 0,
+                }],
+            },
+        )
+        .unwrap();
+        let source = temp.path().join("A.cpp");
+        std::fs::write(&source, "int main() {}\n").unwrap();
+        let key = key();
+        let plan = SubmitPlan::for_selected_source(
+            key.contest_id.clone(),
+            key.task_id.clone(),
+            "A".to_string(),
+            source,
+            Language::Cpp,
+            PythonRuntime::CPython,
+        )
+        .with_metadata_destination(temp.path().to_path_buf());
+        let prepared = prepare_submit(plan).unwrap();
+        assert!(prepared.verify_metadata_identity().is_ok());
+        std::fs::remove_file(temp.path().join(".atc/contest.toml")).unwrap();
+        let executor = TestExecutor::for_key(
+            key.clone(),
+            vec![Box::new(|_, _, _| panic!("mock send must not be reached"))],
+        );
+        let atcoder = AtCoderClient::from_session_auth(configured_auth()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        run_worker_inner(
+            &key,
+            1,
+            &atcoder,
+            prepared,
+            Arc::clone(&executor) as Arc<dyn SubmissionExecutor>,
+            &SubmissionCancellation::default(),
+            &WorkerProgress::default(),
+            &tx,
+        );
+        assert_eq!(executor.calls.load(Ordering::Acquire), 0);
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event.kind, WorkerEventKind::Failed(_)));
+        assert!(rx.try_recv().is_err());
+        assert!(!temp.path().join(".atc/contest.toml").exists());
     }
 
     fn wait_for_hub(
