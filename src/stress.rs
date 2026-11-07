@@ -1309,6 +1309,15 @@ fn ensure_no_interrupted_generation(
     contest_id: &str,
     problem_index: &str,
 ) -> io::Result<()> {
+    ensure_no_interrupted_generation_with_hook(stress_directory, contest_id, problem_index, |_| {})
+}
+
+fn ensure_no_interrupted_generation_with_hook(
+    stress_directory: &CapDir,
+    contest_id: &str,
+    problem_index: &str,
+    mut after_staging_listed: impl FnMut(&str),
+) -> io::Result<()> {
     let owned_recovery_prefix = format!(
         ".stress-recovery-{}-{}-",
         problem_index.len(),
@@ -1316,6 +1325,8 @@ fn ensure_no_interrupted_generation(
     );
     let owned_aborted_prefix =
         format!(".stress-aborted-{}-{}-", problem_index.len(), problem_index);
+    // A problem-local error must not hide a later entry with unknown ownership.
+    let mut problem_error = None;
     for entry in stress_directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1328,74 +1339,118 @@ fn ensure_no_interrupted_generation(
             continue;
         };
         if name.starts_with(&owned_recovery_prefix) || name.starts_with(&owned_aborted_prefix) {
-            let expected =
-                safe_file::RecoveryIdentity::new("stress", contest_id, Some(problem_index));
-            let archive = stress_directory.open_dir_nofollow(name)?;
-            let mut intent =
-                open_regular_file(&archive, safe_file::RECOVERY_INTENT)?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "stress recovery intent is missing",
-                    )
-                })?;
-            let mut complete = open_regular_file(&archive, safe_file::RECOVERY_COMPLETE)?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "stress recovery completion is missing",
-                    )
-                })?;
-            let mut intent_bytes = Vec::new();
-            let mut complete_bytes = Vec::new();
-            intent.read_to_end(&mut intent_bytes)?;
-            complete.read_to_end(&mut complete_bytes)?;
-            if safe_file::parse_completed_recovery(&intent_bytes, &complete_bytes)? != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("stress recovery area requires review: .atc/stress/{name}"),
-                ));
+            if problem_error.is_none() {
+                problem_error = validate_stress_recovery_archive(
+                    stress_directory,
+                    name,
+                    contest_id,
+                    problem_index,
+                )
+                .err();
             }
             continue;
         }
         if !name.starts_with(".stress-staging-") {
             continue;
         }
+        after_staging_listed(name);
         let (requires_review, unscoped) = match current_staging_problem(name) {
-            Ok(Some(owner)) if owner == problem_index => (true, false),
             Ok(Some(owner)) => {
-                // A writer of another problem can still be creating meta.toml. Do not inspect
-                // that partial file without its lock; an idle stage must match its name.
-                let lock = open_stress_lock(stress_directory, owner)?;
-                match lock.try_lock_shared() {
-                    Ok(()) => (
-                        current_staging_metadata_conflicts(
-                            stress_directory,
-                            name,
-                            contest_id,
-                            owner,
-                        ),
-                        true,
-                    ),
-                    Err(fs::TryLockError::WouldBlock) => (false, false),
-                    Err(fs::TryLockError::Error(error)) => return Err(error),
+                let own_stage = owner == problem_index;
+                // Inspect only while holding the named problem's lock. Our caller already holds
+                // its own lock, and another writer may be midway through its update.
+                let _other_lock = if own_stage {
+                    None
+                } else {
+                    let lock = open_stress_lock(stress_directory, owner).map_err(|error| {
+                        unscoped_staging_error(format!(
+                            "{}: {error}",
+                            staging_review_message(problem_index, name)
+                        ))
+                    })?;
+                    match lock.try_lock_shared() {
+                        Ok(()) => Some(lock),
+                        Err(fs::TryLockError::WouldBlock) => continue,
+                        Err(fs::TryLockError::Error(error)) => {
+                            return Err(unscoped_staging_error(format!(
+                                "{}: {error}",
+                                staging_review_message(problem_index, name)
+                            )));
+                        }
+                    }
+                };
+                match open_optional_directory(stress_directory, name) {
+                    Ok(Some(staging)) => {
+                        let conflicts =
+                            current_staging_metadata_conflicts(&staging, contest_id, owner)
+                                .unwrap_or(true);
+                        (own_stage || conflicts, conflicts)
+                    }
+                    // The other writer may have finished after enumeration and released its lock.
+                    Ok(None) => (own_stage, false),
+                    Err(_) => (true, true),
                 }
             }
-            Ok(None) => (
-                legacy_staging_requires_review(stress_directory, name, contest_id, problem_index),
-                true,
-            ),
+            Ok(None) => match legacy_staging_owner(stress_directory, name) {
+                Some((contest, owner)) if contest == contest_id => (owner == problem_index, false),
+                _ => (true, true),
+            },
             Err(()) => (true, true),
         };
         if requires_review {
-            let message = format!(
-                "saved stress case for problem {problem_index} requires recovery check: .atc/stress/{name}"
-            );
-            return Err(if unscoped {
-                unscoped_staging_error(message)
-            } else {
-                io::Error::new(io::ErrorKind::InvalidData, message)
+            if unscoped {
+                return Err(unscoped_staging_error(staging_review_message(
+                    problem_index,
+                    name,
+                )));
+            }
+            problem_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    staging_review_message(problem_index, name),
+                )
             });
         }
+    }
+    problem_error.map_or(Ok(()), Err)
+}
+
+fn staging_review_message(problem_index: &str, name: &str) -> String {
+    format!(
+        "saved stress case for problem {problem_index} requires recovery check: .atc/stress/{name}"
+    )
+}
+
+fn validate_stress_recovery_archive(
+    stress_directory: &CapDir,
+    name: &str,
+    contest_id: &str,
+    problem_index: &str,
+) -> io::Result<()> {
+    let expected = safe_file::RecoveryIdentity::new("stress", contest_id, Some(problem_index));
+    let archive = stress_directory.open_dir_nofollow(name)?;
+    let mut intent = open_regular_file(&archive, safe_file::RECOVERY_INTENT)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stress recovery intent is missing",
+        )
+    })?;
+    let mut complete =
+        open_regular_file(&archive, safe_file::RECOVERY_COMPLETE)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stress recovery completion is missing",
+            )
+        })?;
+    let mut intent_bytes = Vec::new();
+    let mut complete_bytes = Vec::new();
+    intent.read_to_end(&mut intent_bytes)?;
+    complete.read_to_end(&mut complete_bytes)?;
+    if safe_file::parse_completed_recovery(&intent_bytes, &complete_bytes)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("stress recovery area requires review: .atc/stress/{name}"),
+        ));
     }
     Ok(())
 }
@@ -1405,7 +1460,10 @@ fn current_staging_problem(name: &str) -> Result<Option<&str>, ()> {
     if !suffix.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return Ok(None);
     }
-    let (length_text, remainder) = suffix.split_once('-').ok_or(())?;
+    // The old tempfile suffix was alphanumeric and could start with a digit.
+    let Some((length_text, remainder)) = suffix.split_once('-') else {
+        return Ok(None);
+    };
     let length = length_text.parse::<usize>().map_err(|_| ())?;
     if length == 0 || length.to_string() != length_text {
         return Err(());
@@ -1425,90 +1483,81 @@ fn current_staging_problem(name: &str) -> Result<Option<&str>, ()> {
 }
 
 fn current_staging_metadata_conflicts(
-    stress_directory: &CapDir,
-    name: &str,
+    staging: &CapDir,
     contest_id: &str,
     named_problem: &str,
-) -> bool {
-    let Ok(staging) = stress_directory.open_dir_nofollow(name) else {
-        return true;
-    };
-    for generation_name in ["previous", "new"] {
-        let generation = match open_optional_directory(&staging, generation_name) {
-            Ok(Some(generation)) => generation,
-            Ok(None) => continue,
-            Err(_) => return true,
-        };
-        let mut metadata_file = match open_regular_file(&generation, "meta.toml") {
-            Ok(Some(file)) => file,
-            Ok(None) => continue,
-            Err(_) => return true,
-        };
-        let mut metadata_text = String::new();
-        if metadata_file.read_to_string(&mut metadata_text).is_err() {
-            continue;
-        }
-        let Ok(metadata) = toml::from_str::<toml::Value>(&metadata_text) else {
-            continue;
-        };
-        if metadata
-            .get("contest")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|id| id != contest_id)
-            || metadata
-                .get("problem")
-                .and_then(toml::Value::as_str)
-                .is_some_and(|index| index != named_problem)
-        {
-            return true;
+) -> io::Result<bool> {
+    let recovery_owner = [
+        ("kind", "stress"),
+        ("contest_id", contest_id),
+        ("problem_index", named_problem),
+    ];
+    for record in [safe_file::RECOVERY_INTENT, safe_file::RECOVERY_COMPLETE] {
+        if staging_metadata_conflicts(staging, record, &recovery_owner)? {
+            return Ok(true);
         }
     }
-    false
+
+    let generation_owner = [("contest", contest_id), ("problem", named_problem)];
+    for generation_name in ["previous", "new"] {
+        let Some(generation) = open_optional_directory(staging, generation_name)? else {
+            continue;
+        };
+        if staging_metadata_conflicts(&generation, "meta.toml", &generation_owner)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn legacy_staging_requires_review(
-    stress_directory: &CapDir,
+fn staging_metadata_conflicts(
+    directory: &CapDir,
     name: &str,
-    contest_id: &str,
-    problem_index: &str,
-) -> bool {
-    let Ok(staging) = stress_directory.open_dir_nofollow(name) else {
-        return true;
+    owner_fields: &[(&str, &str)],
+) -> io::Result<bool> {
+    let Some(mut file) = open_regular_file(directory, name)? else {
+        return Ok(false);
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    // A write can be interrupted before the file is valid TOML. The directory name still
+    // blocks its own problem. Only evidence of conflicting ownership widens that scope.
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(false);
+    };
+    let Ok(metadata) = toml::from_str::<toml::Table>(text) else {
+        return Ok(false);
+    };
+    Ok(owner_fields.iter().any(|&(key, expected)| {
+        metadata
+            .get(key)
+            .is_some_and(|value| value.as_str() != Some(expected))
+    }))
+}
+
+fn legacy_staging_owner(stress_directory: &CapDir, name: &str) -> Option<(String, String)> {
+    let staging = stress_directory.open_dir_nofollow(name).ok()?;
     let mut known_owner: Option<(String, String)> = None;
     for generation_name in ["previous", "new"] {
-        let generation = match open_optional_directory(&staging, generation_name) {
-            Ok(Some(generation)) => generation,
-            Ok(None) => continue,
-            Err(_) => return true,
+        let Some(generation) = open_optional_directory(&staging, generation_name).ok()? else {
+            continue;
         };
-        let Ok(Some(mut metadata_file)) = open_regular_file(&generation, "meta.toml") else {
-            return true;
-        };
+        let mut metadata_file = open_regular_file(&generation, "meta.toml").ok()??;
         let mut metadata_text = String::new();
-        if metadata_file.read_to_string(&mut metadata_text).is_err() {
-            return true;
-        }
-        let Ok(metadata) = toml::from_str::<StoredFailureMetadata>(&metadata_text) else {
-            return true;
-        };
+        metadata_file.read_to_string(&mut metadata_text).ok()?;
+        let metadata = toml::from_str::<StoredFailureMetadata>(&metadata_text).ok()?;
         if !valid_failure_metadata(&metadata, &metadata.contest, &metadata.problem)
             || workspace::validate_problem_index(&metadata.problem).is_err()
         {
-            return true;
+            return None;
         }
         let owner = (metadata.contest, metadata.problem);
         if known_owner.as_ref().is_some_and(|known| known != &owner) {
-            return true;
+            return None;
         }
         known_owner = Some(owner);
     }
-    match known_owner {
-        Some((owner_contest, owner_problem)) => {
-            owner_contest == contest_id && owner_problem == problem_index
-        }
-        None => true,
-    }
+    known_owner
 }
 
 struct SavedCaseSnapshot {
@@ -2991,6 +3040,72 @@ mod tests {
         assert_eq!(
             fs::read_to_string(staging.join("new/meta.toml")).unwrap(),
             "version ="
+        );
+    }
+
+    #[test]
+    fn another_problems_staging_can_finish_after_it_is_listed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".atc/stress");
+        fs::create_dir_all(&root).unwrap();
+        let directory = open_stress_directory(temp.path()).unwrap().unwrap();
+        let a_lock = open_stress_lock(&directory, "A").unwrap();
+        a_lock.lock_shared().unwrap();
+        let b_lock = open_stress_lock(&directory, "B").unwrap();
+        b_lock.lock().unwrap();
+        let staging = safe_file::PreservedTempDir::new(
+            tempfile::Builder::new()
+                .prefix(".stress-staging-1-B-")
+                .tempdir_in(&root)
+                .unwrap(),
+        );
+        let identity = safe_file::RecoveryIdentity::new("stress", "abc123", Some("B"));
+        safe_file::write_recovery_intent(staging.path(), &identity).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let mut writer = Some((staging, b_lock));
+        let mut archive = None;
+        ensure_no_interrupted_generation_with_hook(&directory, "abc123", "A", |name| {
+            if staging_path.file_name().unwrap() == name {
+                let (staging, lock) = writer.take().unwrap();
+                archive = Some(complete_stress_recovery(staging, &identity, "recovery").unwrap());
+                drop(lock);
+            }
+        })
+        .unwrap();
+
+        assert!(!staging_path.exists());
+        assert_eq!(
+            safe_file::read_completed_recovery(&archive.unwrap()).unwrap(),
+            identity
+        );
+        assert_eq!(load_saved_case(temp.path(), "abc123", "B").unwrap(), None);
+
+        // A path that still exists with the wrong file type is a recovery error.
+        fs::write(&staging_path, "unowned data").unwrap();
+        let error = load_saved_case(temp.path(), "abc123", "A").unwrap_err();
+        assert!(is_unscoped_load_error(&error));
+        assert_eq!(fs::read_to_string(&staging_path).unwrap(), "unowned data");
+    }
+
+    #[test]
+    fn digit_prefixed_legacy_staging_uses_its_metadata_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join(".atc/stress/.stress-staging-2b123X");
+        write_v1_generation(
+            &staging.join("previous"),
+            "abc123",
+            "B",
+            "wrong-answer",
+            "old\n",
+            Some("expected\n"),
+        );
+        assert_eq!(load_saved_case(temp.path(), "abc123", "A").unwrap(), None);
+        let error = load_saved_case(temp.path(), "abc123", "B").unwrap_err();
+        assert!(error.to_string().contains(".stress-staging-2b123X"));
+        assert!(!is_unscoped_load_error(&error));
+        assert_eq!(
+            fs::read_to_string(staging.join("previous/failed.in")).unwrap(),
+            "old\n"
         );
     }
 

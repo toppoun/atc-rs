@@ -391,6 +391,41 @@ fn incomplete_legacy_staging_without_metadata_fails_cli_test() {
 }
 
 #[test]
+fn staging_recovery_record_with_conflicting_owner_blocks_cli_test() {
+    let fixture = Fixture::new("open('ran.txt', 'w').write('ran')\nprint(input())\n");
+    let staging = fixture
+        .contest
+        .join(".atc/stress/.stress-staging-1-B-mismatch");
+    fs::create_dir_all(&staging).unwrap();
+    let mismatched =
+        "version = 1\nkind = \"stress\"\ncontest_id = \"abc123\"\nproblem_index = \"A\"\n";
+
+    // After the first install, the intent can be the only remaining owner record.
+    let intent = staging.join("recovery-intent.toml");
+    fs::write(&intent, mismatched).unwrap();
+    let output = fixture.test();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires recovery check"));
+    assert!(!fixture.contest.join("ran.txt").exists());
+    assert_eq!(fs::read_to_string(&intent).unwrap(), mismatched);
+
+    let matching = mismatched.replace("problem_index = \"A\"", "problem_index = \"B\"");
+    fs::write(&intent, &matching).unwrap();
+    assert_verdict(fixture.test(), true, "Result: 1/1 AC");
+
+    // Before the archive rename, a completion record must agree with the intent and name.
+    let complete = staging.join("recovery-complete.toml");
+    fs::write(&complete, "version =").unwrap();
+    assert_verdict(fixture.test(), true, "Result: 1/1 AC");
+    fs::write(&complete, mismatched).unwrap();
+    let output = fixture.test();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires recovery check"));
+    assert_eq!(fs::read_to_string(&intent).unwrap(), matching);
+    assert_eq!(fs::read_to_string(&complete).unwrap(), mismatched);
+}
+
+#[test]
 fn another_problems_unfinished_current_staging_does_not_fail_cli_test() {
     let fixture = Fixture::new("print(input())\n");
     let staging = fixture

@@ -5016,6 +5016,33 @@ mod tests {
     }
 
     #[test]
+    fn problem_local_staging_cannot_hide_unknown_owner_at_tui_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        workspace::save_metadata(
+            temp.path(),
+            &Contest {
+                contest_id: "contest".to_string(),
+                problems: vec![problem("A"), problem("B")],
+            },
+        )
+        .unwrap();
+        let root = temp.path().join(".atc/stress");
+        let a = root.join(".stress-staging-1-A-local");
+        let b = root.join(".stress-staging-1-B-local");
+        let unknown = root.join(".stress-staging-zunknown");
+        for path in [&a, &b, &unknown] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        let error = PreparedWatchInput::load(temp.path(), Some("contest")).unwrap_err();
+        assert!(
+            matches!(&error, AppError::Io(error) if crate::stress::is_unscoped_load_error(error))
+        );
+        assert!(error.to_string().contains(".stress-staging-zunknown"));
+        assert!(a.is_dir() && b.is_dir() && unknown.is_dir());
+    }
+
+    #[test]
     fn tui_sample_run_displays_saved_stress_read_error() {
         let temp = tempfile::tempdir().unwrap();
         let contest = Contest {

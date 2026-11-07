@@ -3756,6 +3756,10 @@ mod tests {
         assert_eq!(summary_style(Some(failed_problem)).fg, Some(Color::Red));
         assert_eq!(problem_symbol(failed_problem), "✗");
         assert_eq!(problem_style(failed_problem).fg, Some(Color::Red));
+        let compact = rendered_buffer_text(&app, 65, 12);
+        assert!(compact.contains("WA"), "{compact}");
+        let expanded = rendered_buffer_text(&app, 115, 32);
+        assert!(expanded.contains("Saved Stress case skipped"), "{expanded}");
     }
 
     #[test]

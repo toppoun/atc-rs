@@ -446,11 +446,6 @@ impl<'a> DetailDocument<'a> {
         let run = &problem.run;
         let total = problem.total_cases;
 
-        if let Some(warning) = run.warning.as_ref() {
-            self.push_shared_section("notice", warning);
-            self.push_static("\n\n");
-        }
-
         if total == 0 {
             self.push_static("Running samples...");
             return;
@@ -504,6 +499,10 @@ impl<'a> DetailDocument<'a> {
             CaseVerdict::TimedOut => {
                 self.push_static("\n\nTime Limit Exceeded");
             }
+        }
+
+        if let Some(warning) = run.warning.as_ref() {
+            self.push_shared_section("notice", warning);
         }
 
         if run.debug {
