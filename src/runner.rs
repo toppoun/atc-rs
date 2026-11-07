@@ -124,6 +124,7 @@ fn cpp_arguments(
     // debug用フラグ
     if let Some(include_dir) = &options.debug_include_dir {
         args.push("-DLOCAL".into());
+        args.push("-D_GLIBCXX_ASSERTIONS".into());
         args.push("-I".into());
         args.push(include_dir.as_os_str().to_os_string());
     }
@@ -724,10 +725,16 @@ mod tests {
                 debug_include_dir: Some(include_dir.clone()),
             },
         );
-        assert_eq!(&debug[..5], &normal);
-        assert_eq!(debug[5], OsString::from("-DLOCAL"));
-        assert_eq!(debug[6], OsString::from("-I"));
-        assert_eq!(debug[7], include_dir.as_os_str());
+        assert_eq!(&debug[..normal.len()], &normal);
+        assert_eq!(
+            &debug[normal.len()..],
+            [
+                OsString::from("-DLOCAL"),
+                OsString::from("-D_GLIBCXX_ASSERTIONS"),
+                OsString::from("-I"),
+                include_dir.into_os_string(),
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -747,7 +754,7 @@ mod tests {
         );
 
         assert_eq!(args[0], source.as_os_str());
-        assert_eq!(args[5], include.as_os_str());
+        assert_eq!(args.last().unwrap(), include.as_os_str());
     }
 
     #[cfg(windows)]
@@ -767,7 +774,7 @@ mod tests {
         );
 
         assert_eq!(args[0], source.as_os_str());
-        assert_eq!(args[5], include.as_os_str());
+        assert_eq!(args.last().unwrap(), include.as_os_str());
     }
 
     #[test]

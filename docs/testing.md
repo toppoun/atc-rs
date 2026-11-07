@@ -51,7 +51,11 @@ C++ では `--debug` を利用できます。
 atc test A --debug
 ```
 
-Debug ビルドでは、通常の `cpp_flags` に `-DLOCAL` と組み込み `debug.hpp` の include path を追加します。ヘッダーはユーザーの cache ディレクトリへ展開されます。
+TUI では `d` で Debug を切り替えます。コマンドから実行する Stress Test でも `--debug` を指定できます。
+
+Debug ビルドでは、通常の `cpp_flags` に `-DLOCAL`、`-D_GLIBCXX_ASSERTIONS`、組み込み `debug.hpp` の include path を追加します。ヘッダーはユーザーの cache ディレクトリへ展開されます。
+
+GNU libstdc++ では `std::vector::operator[]` などの範囲外アクセスを検出できます。アサーションで異常終了したケースは `RE` になり、標準エラー出力は CLI の `stderr` 欄や TUI のケース詳細に表示されます。macOS 標準の libc++ では、範囲チェックは使用中のツールチェーンの設定に従います。
 
 Python では `--debug` は使用できません。
 

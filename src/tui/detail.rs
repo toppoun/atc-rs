@@ -1561,6 +1561,49 @@ mod tests {
     }
 
     #[test]
+    fn debug_assertion_failure_shows_re_and_stderr_in_sample_detail() {
+        use crate::tui::{message::Message, reporter::ChannelReporter};
+        use crate::ui::{Event, Reporter};
+
+        let (mut app, run_id) = running_cpp_app(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut reporter = ChannelReporter::new(run_id, 0, tx);
+        let stderr = "index = 42\nAssertion '__n < this->size()' failed.\n";
+        reporter.report(Event::TestCaseRuntimeError {
+            number: 1,
+            elapsed: Duration::from_millis(2),
+        });
+        reporter.report(Event::TestCaseComparison {
+            number: 1,
+            input: "42\n",
+            expected: "42\n",
+            actual: "",
+        });
+        reporter.report(Event::TestCaseStderr { number: 1, stderr });
+
+        for message in rx.try_iter() {
+            let Message::RunEvent {
+                problem,
+                run_id,
+                event,
+            } = message
+            else {
+                panic!("expected a test case event");
+            };
+            assert!(app.run_event(problem, run_id, event));
+        }
+
+        let document = DetailDocument::from_app(&app);
+        let text = document_text(&document);
+        assert!(text.contains("sample 1 / 1   RE"), "{text}");
+        assert!(text.contains("Runtime Error"), "{text}");
+        assert_eq!(
+            document.section_body(DetailSectionKind::Stderr),
+            Some(stderr)
+        );
+    }
+
+    #[test]
     fn fatal_run_error_remains_a_borrowed_error_section() {
         let (mut app, run_id) = running_app();
         assert!(app.run_failed(0, run_id, "fatal runner error\n".to_string()));

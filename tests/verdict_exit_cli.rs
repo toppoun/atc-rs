@@ -70,6 +70,8 @@ impl Fixture {
             .current_dir(&self.contest)
             .env("APPDATA", &self.config)
             .env("XDG_CONFIG_HOME", &self.config)
+            .env("LOCALAPPDATA", self._temp.path().join("cache"))
+            .env("XDG_CACHE_HOME", self._temp.path().join("cache"))
             .env("NO_COLOR", "1")
             .output()
             .unwrap()
@@ -509,6 +511,87 @@ fn runtime_error_exits_nonzero() {
         false,
         "RE",
     );
+}
+
+#[test]
+fn cpp_debug_assertion_is_reported_as_re_with_stderr_in_test_and_stress() {
+    let fixture = Fixture::new("unused");
+    let compiler = executable(&["g++", "clang++"]);
+    fixture.configure(&format!(
+        "runner.cpp_compiler = {}\nrunner.cpp_flags = [\"-std=c++23\", \"-O2\"]\n\
+         runner.timeout_seconds = 15.0\nrunner.compile_timeout_seconds = 60.0\n",
+        quoted(&compiler),
+    ));
+    fs::write(
+        fixture.contest.join("A.cpp"),
+        r#"
+#ifdef LOCAL
+#ifndef _GLIBCXX_ASSERTIONS
+#error Debug must define _GLIBCXX_ASSERTIONS
+#endif
+#include <atc/debug.hpp>
+#elif defined(_GLIBCXX_ASSERTIONS)
+#error Normal builds must not define _GLIBCXX_ASSERTIONS
+#endif
+
+#include <cassert>
+#include <iostream>
+#include <vector>
+
+int main() {
+    std::size_t index = 0;
+    std::cin >> index;
+#ifdef LOCAL
+    debug(index);
+#ifdef __GLIBCXX__
+    std::cout << std::vector<int>(1)[index] << '\n';
+#else
+    // libc++ does not use _GLIBCXX_ASSERTIONS. Exercise stderr with a C++ assertion.
+    assert(index == 0);
+#endif
+#else
+    std::cout << index << '\n';
+#endif
+}
+"#,
+    )
+    .unwrap();
+
+    let test = ["test", "A", "--language", "cpp"];
+    assert_verdict(fixture.run(&test), true, "Result: 1/1 AC");
+
+    fs::write(fixture.contest.join("A_gen.py"), "print(42)\n").unwrap();
+    fs::write(fixture.contest.join("A_brute.py"), "print(42)\n").unwrap();
+    for (args, verdict) in [
+        (
+            &["test", "A", "--language", "cpp", "--debug"][..],
+            "=== sample-1 RE ===",
+        ),
+        (
+            &[
+                "stress",
+                "A",
+                "--language",
+                "cpp",
+                "--debug",
+                "--count",
+                "1",
+                "--seed",
+                "1",
+            ][..],
+            "RE at case 1",
+        ),
+    ] {
+        let output = fixture.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (_, stderr_section) = stdout.split_once("stderr:").unwrap_or_else(|| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("missing stderr section for {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        });
+        assert!(stderr_section.contains("index = 42"), "{stdout}");
+        assert!(stderr_section.contains("Assertion"), "{stdout}");
+        assert_verdict(output, false, verdict);
+    }
 }
 
 #[test]

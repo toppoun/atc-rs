@@ -1,0 +1,223 @@
+diff --git a/docs/testing.md b/docs/testing.md
+index 6a35f46..1caa6b8 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -51,7 +51,11 @@ C++ では `--debug` を利用できます。
+ atc test A --debug
+ ```
+ 
+-Debug ビルドでは、通常の `cpp_flags` に `-DLOCAL` と組み込み `debug.hpp` の include path を追加します。ヘッダーはユーザーの cache ディレクトリへ展開されます。
++TUI では `d` で Debug を切り替えます。コマンドから実行する Stress Test でも `--debug` を指定できます。
++
++Debug ビルドでは、通常の `cpp_flags` に `-DLOCAL`、`-D_GLIBCXX_ASSERTIONS`、組み込み `debug.hpp` の include path を追加します。ヘッダーはユーザーの cache ディレクトリへ展開されます。
++
++GNU libstdc++ では `std::vector::operator[]` などの範囲外アクセスを検出できます。アサーションで異常終了したケースは `RE` になり、標準エラー出力は CLI の `stderr` 欄や TUI のケース詳細に表示されます。macOS 標準の libc++ では、範囲チェックは使用中のツールチェーンの設定に従います。
+ 
+ Python では `--debug` は使用できません。
+ 
+diff --git a/src/runner.rs b/src/runner.rs
+index b682310..0be143c 100644
+--- a/src/runner.rs
++++ b/src/runner.rs
+@@ -124,6 +124,7 @@ fn cpp_arguments(
+     // debug用フラグ
+     if let Some(include_dir) = &options.debug_include_dir {
+         args.push("-DLOCAL".into());
++        args.push("-D_GLIBCXX_ASSERTIONS".into());
+         args.push("-I".into());
+         args.push(include_dir.as_os_str().to_os_string());
+     }
+@@ -724,10 +725,16 @@ mod tests {
+                 debug_include_dir: Some(include_dir.clone()),
+             },
+         );
+-        assert_eq!(&debug[..5], &normal);
+-        assert_eq!(debug[5], OsString::from("-DLOCAL"));
+-        assert_eq!(debug[6], OsString::from("-I"));
+-        assert_eq!(debug[7], include_dir.as_os_str());
++        assert_eq!(&debug[..normal.len()], &normal);
++        assert_eq!(
++            &debug[normal.len()..],
++            [
++                OsString::from("-DLOCAL"),
++                OsString::from("-D_GLIBCXX_ASSERTIONS"),
++                OsString::from("-I"),
++                include_dir.into_os_string(),
++            ]
++        );
+     }
+ 
+     #[cfg(unix)]
+@@ -747,7 +754,7 @@ mod tests {
+         );
+ 
+         assert_eq!(args[0], source.as_os_str());
+-        assert_eq!(args[5], include.as_os_str());
++        assert_eq!(args.last().unwrap(), include.as_os_str());
+     }
+ 
+     #[cfg(windows)]
+@@ -767,7 +774,7 @@ mod tests {
+         );
+ 
+         assert_eq!(args[0], source.as_os_str());
+-        assert_eq!(args[5], include.as_os_str());
++        assert_eq!(args.last().unwrap(), include.as_os_str());
+     }
+ 
+     #[test]
+diff --git a/src/tui/detail.rs b/src/tui/detail.rs
+index af5e8dd..5ed357e 100644
+--- a/src/tui/detail.rs
++++ b/src/tui/detail.rs
+@@ -1560,6 +1560,49 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn debug_assertion_failure_shows_re_and_stderr_in_sample_detail() {
++        use crate::tui::{message::Message, reporter::ChannelReporter};
++        use crate::ui::{Event, Reporter};
++
++        let (mut app, run_id) = running_cpp_app(true);
++        let (tx, rx) = std::sync::mpsc::channel();
++        let mut reporter = ChannelReporter::new(run_id, 0, tx);
++        let stderr = "index = 42\nAssertion '__n < this->size()' failed.\n";
++        reporter.report(Event::TestCaseRuntimeError {
++            number: 1,
++            elapsed: Duration::from_millis(2),
++        });
++        reporter.report(Event::TestCaseComparison {
++            number: 1,
++            input: "42\n",
++            expected: "42\n",
++            actual: "",
++        });
++        reporter.report(Event::TestCaseStderr { number: 1, stderr });
++
++        for message in rx.try_iter() {
++            let Message::RunEvent {
++                problem,
++                run_id,
++                event,
++            } = message
++            else {
++                panic!("expected a test case event");
++            };
++            assert!(app.run_event(problem, run_id, event));
++        }
++
++        let document = DetailDocument::from_app(&app);
++        let text = document_text(&document);
++        assert!(text.contains("sample 1 / 1   RE"), "{text}");
++        assert!(text.contains("Runtime Error"), "{text}");
++        assert_eq!(
++            document.section_body(DetailSectionKind::Stderr),
++            Some(stderr)
++        );
++    }
++
+     #[test]
+     fn fatal_run_error_remains_a_borrowed_error_section() {
+         let (mut app, run_id) = running_app();
+diff --git a/tests/verdict_exit_cli.rs b/tests/verdict_exit_cli.rs
+index b42e5f8..d8747de 100644
+--- a/tests/verdict_exit_cli.rs
++++ b/tests/verdict_exit_cli.rs
+@@ -70,6 +70,8 @@ impl Fixture {
+             .current_dir(&self.contest)
+             .env("APPDATA", &self.config)
+             .env("XDG_CONFIG_HOME", &self.config)
++            .env("LOCALAPPDATA", self._temp.path().join("cache"))
++            .env("XDG_CACHE_HOME", self._temp.path().join("cache"))
+             .env("NO_COLOR", "1")
+             .output()
+             .unwrap()
+@@ -511,6 +513,87 @@ fn runtime_error_exits_nonzero() {
+     );
+ }
+ 
++#[test]
++fn cpp_debug_assertion_is_reported_as_re_with_stderr_in_test_and_stress() {
++    let fixture = Fixture::new("unused");
++    let compiler = executable(&["g++", "clang++"]);
++    fixture.configure(&format!(
++        "runner.cpp_compiler = {}\nrunner.cpp_flags = [\"-std=c++23\", \"-O2\"]\n\
++         runner.timeout_seconds = 15.0\nrunner.compile_timeout_seconds = 60.0\n",
++        quoted(&compiler),
++    ));
++    fs::write(
++        fixture.contest.join("A.cpp"),
++        r#"
++#ifdef LOCAL
++#ifndef _GLIBCXX_ASSERTIONS
++#error Debug must define _GLIBCXX_ASSERTIONS
++#endif
++#include <atc/debug.hpp>
++#elif defined(_GLIBCXX_ASSERTIONS)
++#error Normal builds must not define _GLIBCXX_ASSERTIONS
++#endif
++
++#include <cassert>
++#include <iostream>
++#include <vector>
++
++int main() {
++    std::size_t index = 0;
++    std::cin >> index;
++#ifdef LOCAL
++    debug(index);
++#ifdef __GLIBCXX__
++    std::cout << std::vector<int>(1)[index] << '\n';
++#else
++    // libc++ does not use _GLIBCXX_ASSERTIONS. Exercise stderr with a C++ assertion.
++    assert(index == 0);
++#endif
++#else
++    std::cout << index << '\n';
++#endif
++}
++"#,
++    )
++    .unwrap();
++
++    let test = ["test", "A", "--language", "cpp"];
++    assert_verdict(fixture.run(&test), true, "Result: 1/1 AC");
++
++    fs::write(fixture.contest.join("A_gen.py"), "print(42)\n").unwrap();
++    fs::write(fixture.contest.join("A_brute.py"), "print(42)\n").unwrap();
++    for (args, verdict) in [
++        (
++            &["test", "A", "--language", "cpp", "--debug"][..],
++            "=== sample-1 RE ===",
++        ),
++        (
++            &[
++                "stress",
++                "A",
++                "--language",
++                "cpp",
++                "--debug",
++                "--count",
++                "1",
++                "--seed",
++                "1",
++            ][..],
++            "RE at case 1",
++        ),
++    ] {
++        let output = fixture.run(args);
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        let (_, stderr_section) = stdout.split_once("stderr:").unwrap_or_else(|| {
++            let stderr = String::from_utf8_lossy(&output.stderr);
++            panic!("missing stderr section for {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
++        });
++        assert!(stderr_section.contains("index = 42"), "{stdout}");
++        assert!(stderr_section.contains("Assertion"), "{stdout}");
++        assert_verdict(output, false, verdict);
++    }
++}
++
+ #[test]
+ fn runtime_timeout_exits_nonzero() {
+     let fixture = Fixture::new("import time; time.sleep(5)\n");
