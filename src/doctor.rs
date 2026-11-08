@@ -663,14 +663,13 @@ fn diagnose_contest(report: &mut DoctorReport, cwd: &Path) {
                 "Contest metadata not found in the current directory",
             ),
         ),
-        Ok(ContestMetadataHealth::Invalid | ContestMetadataHealth::DuplicateTaskIds(_)) => report
-            .push(
-                "Contest",
-                diagnostic(
-                    DiagnosticLevel::Error,
-                    format!("Contest metadata is invalid in {}", cwd.display()),
-                ),
+        Ok(ContestMetadataHealth::Invalid | ContestMetadataHealth::Repairable(_)) => report.push(
+            "Contest",
+            diagnostic(
+                DiagnosticLevel::Error,
+                format!("Contest metadata is invalid in {}", cwd.display()),
             ),
+        ),
         Ok(ContestMetadataHealth::UnsupportedVersion(version)) => report.push(
             "Contest",
             diagnostic(

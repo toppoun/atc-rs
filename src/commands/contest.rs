@@ -8,7 +8,9 @@ use crate::model::{Contest, Sample};
 use crate::safe_file::{self, FileSnapshot};
 use crate::template::resolve_source_template;
 use crate::ui::{Event, Reporter};
-use crate::workspace::{self, ContestDataReplacement, ContestMetadataHealth, TestsHealth};
+use crate::workspace::{
+    self, ContestDataReplacement, ContestMetadataHealth, RepairableContestMetadata, TestsHealth,
+};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,8 +47,8 @@ pub(super) fn inspect_contest_target(
                 TestsHealth::Broken => Ok(ContestTargetHealth::RepairRequired),
             }
         }
-        ContestMetadataHealth::DuplicateTaskIds(contest) => {
-            workspace::validate_contest_identity(&contest, contest_id)?;
+        ContestMetadataHealth::Repairable(manifest) => {
+            workspace::validate_contest_identity(&manifest.contest, contest_id)?;
             Ok(ContestTargetHealth::RepairRequired)
         }
         ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
@@ -366,7 +368,7 @@ struct RepairPlan {
     metadata: RepairComponent,
     tests: RepairComponent,
     basis: RepairBasis,
-    duplicate_manifest: Option<Contest>,
+    previous_manifest: Option<RepairableContestMetadata>,
     metadata_snapshot: Option<FileSnapshot>,
 }
 
@@ -447,11 +449,11 @@ fn repair_at_with_before_install_and_validation(
             true,
             plan.metadata_snapshot,
             || {
-                if let Some(previous) = &plan.duplicate_manifest
+                if let Some(previous) = &plan.previous_manifest
                     && repair_tests_health(
                         destination,
                         &plan.contest,
-                        Some(previous),
+                        Some(&previous.contest),
                         &plan.samples_by_problem,
                     )? != TestsHealth::Healthy
                 {
@@ -518,20 +520,19 @@ fn plan_repair(
                 metadata: RepairComponent::Keep,
                 tests: RepairComponent::Restore,
                 basis: RepairBasis::HealthyManifest,
-                duplicate_manifest: None,
+                previous_manifest: None,
                 metadata_snapshot,
             })
         }
         health @ (ContestMetadataHealth::Missing
         | ContestMetadataHealth::Invalid
-        | ContestMetadataHealth::DuplicateTaskIds(_)) => {
-            let duplicate_manifest =
-                if let ContestMetadataHealth::DuplicateTaskIds(contest) = health {
-                    workspace::validate_contest_identity(&contest, contest_id)?;
-                    Some(contest)
-                } else {
-                    None
-                };
+        | ContestMetadataHealth::Repairable(_)) => {
+            let previous_manifest = if let ContestMetadataHealth::Repairable(manifest) = health {
+                workspace::validate_contest_identity(&manifest.contest, contest_id)?;
+                Some(manifest)
+            } else {
+                None
+            };
             let FetchedContestData {
                 contest,
                 samples_by_problem,
@@ -542,7 +543,7 @@ fn plan_repair(
             let tests = match repair_tests_health(
                 destination,
                 &contest,
-                duplicate_manifest.as_ref(),
+                previous_manifest.as_ref().map(|manifest| &manifest.contest),
                 &samples_by_problem,
             )? {
                 TestsHealth::Healthy => RepairComponent::Keep,
@@ -557,7 +558,7 @@ fn plan_repair(
                 metadata: RepairComponent::Restore,
                 tests,
                 basis: RepairBasis::MissingOrInvalidManifest,
-                duplicate_manifest,
+                previous_manifest,
                 metadata_snapshot,
             })
         }
@@ -593,18 +594,18 @@ fn revalidate_repair_plan(
         (
             RepairBasis::MissingOrInvalidManifest,
             ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid,
-        ) if plan.duplicate_manifest.is_none() => {}
-        (
-            RepairBasis::MissingOrInvalidManifest,
-            ContestMetadataHealth::DuplicateTaskIds(current),
-        ) if plan.duplicate_manifest.as_ref() == Some(&current) => {}
+        ) if plan.previous_manifest.is_none() => {}
+        (RepairBasis::MissingOrInvalidManifest, ContestMetadataHealth::Repairable(current))
+            if plan.previous_manifest.as_ref() == Some(&current) => {}
         _ => return Err(repair_plan_changed_error().into()),
     }
 
     let current_tests = repair_tests_health(
         destination,
         &plan.contest,
-        plan.duplicate_manifest.as_ref(),
+        plan.previous_manifest
+            .as_ref()
+            .map(|manifest| &manifest.contest),
         &plan.samples_by_problem,
     )?;
     let expected_tests = match plan.tests {
@@ -624,11 +625,11 @@ fn revalidate_repair_plan(
 fn repair_tests_health(
     destination: &Path,
     contest: &Contest,
-    duplicate_manifest: Option<&Contest>,
+    previous_manifest: Option<&Contest>,
     official_samples: &[Vec<Sample>],
 ) -> io::Result<TestsHealth> {
     let health = workspace::inspect_tests_health(destination, contest)?;
-    let Some(previous) = duplicate_manifest.filter(|_| health == TestsHealth::Healthy) else {
+    let Some(previous) = previous_manifest.filter(|_| health == TestsHealth::Healthy) else {
         return Ok(health);
     };
     for (problem, official) in contest.problems.iter().zip(official_samples) {
@@ -1009,6 +1010,84 @@ mod tests {
             workspace::load_samples(&destination, "E").unwrap(),
             fetched.samples_by_problem[e]
         );
+    }
+
+    fn assert_foreign_url_tests_are_preserved(
+        foreign_index: &str,
+        update: impl FnOnce(&Path, &atcoder::AtCoderClient) -> Result<(), AppError>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let metadata = destination.join(".atc/contest.toml");
+        let foreign_tests = destination.join("tests").join(foreign_index);
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&foreign_tests).unwrap();
+        let original = format!(
+            concat!(
+                "version = 1\ncontest_id = \"abc466\"\n",
+                "[[problems]]\nindex = \"A\"\ntitle = \"A\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_a\"\n",
+                "sample_count = 3\n",
+                "[[problems]]\nindex = \"B\"\ntitle = \"B\"\n",
+                "task_id = \"abc466_a\"\n",
+                "url = \"https://atcoder.jp/contests/abc466/tasks/abc466_b\"\n",
+                "sample_count = 2\n",
+                "[[problems]]\nindex = \"{}\"\ntitle = \"Foreign\"\n",
+                "task_id = \"abc999_z\"\n",
+                "url = \"https://atcoder.jp/contests/abc999/tasks/abc999_z\"\n",
+                "sample_count = 1\n",
+            ),
+            foreign_index
+        );
+        std::fs::write(&metadata, &original).unwrap();
+        std::fs::write(foreign_tests.join("sample-1.in"), "keep input\n").unwrap();
+        std::fs::write(foreign_tests.join("sample-1.out"), "keep output\n").unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+
+        let error = update(&destination, &client)
+            .expect_err("unrelated duplicate task IDs cannot authorize moving foreign tests")
+            .to_string();
+
+        assert!(error.contains("unowned entry"), "{error}");
+        assert!(
+            error.contains(foreign_tests.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&metadata).unwrap(), original.as_bytes());
+        assert_eq!(
+            std::fs::read(foreign_tests.join("sample-1.in")).unwrap(),
+            b"keep input\n"
+        );
+        assert_eq!(
+            std::fs::read(foreign_tests.join("sample-1.out")).unwrap(),
+            b"keep output\n"
+        );
+    }
+
+    #[test]
+    fn contest_repair_preserves_foreign_url_tests_with_unrelated_duplicate_tasks() {
+        for index in ["Z", "E"] {
+            assert_foreign_url_tests_are_preserved(index, |destination, client| {
+                repair_at(destination, "abc466", client, &mut NullReporter)
+            });
+        }
+    }
+
+    #[test]
+    fn forced_refresh_preserves_foreign_url_tests_with_unrelated_duplicate_tasks() {
+        for index in ["Z", "E"] {
+            assert_foreign_url_tests_are_preserved(index, |destination, client| {
+                super::super::refresh::refresh_at(
+                    destination,
+                    "abc466",
+                    true,
+                    client,
+                    &mut NullReporter,
+                )
+            });
+        }
     }
 
     #[test]

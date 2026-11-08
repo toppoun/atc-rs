@@ -64,10 +64,17 @@ struct ContestMetadataHeader {
 
 pub enum ContestMetadataHealth {
     Healthy(Contest),
-    DuplicateTaskIds(Contest),
+    Repairable(RepairableContestMetadata),
     Missing,
     Invalid,
     UnsupportedVersion(u32),
+}
+
+#[derive(PartialEq, Eq)]
+pub struct RepairableContestMetadata {
+    pub(crate) contest: Contest,
+    duplicate_task_ids: bool,
+    url_mismatches: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -902,15 +909,18 @@ fn inspect_contest_metadata_unchecked(destination: &Path) -> io::Result<ContestM
         problems: metadata.problems,
     };
     validate_contest_index_components(&contest)?;
-    let semantics = inspect_contest_manifest_semantics(&contest)?;
-    if duplicate_task_id(&contest).is_some() {
-        return Ok(ContestMetadataHealth::DuplicateTaskIds(contest));
-    }
-    if semantics == ContestManifestSemantics::RepairableInvalid {
+    if contest.problems.is_empty() {
         return Ok(ContestMetadataHealth::Invalid);
     }
-
-    Ok(ContestMetadataHealth::Healthy(contest))
+    let manifest = RepairableContestMetadata {
+        duplicate_task_ids: duplicate_task_id(&contest).is_some(),
+        url_mismatches: problem_url_mismatches(&contest)?,
+        contest,
+    };
+    if manifest.duplicate_task_ids || !manifest.url_mismatches.is_empty() {
+        return Ok(ContestMetadataHealth::Repairable(manifest));
+    }
+    Ok(ContestMetadataHealth::Healthy(manifest.contest))
 }
 
 pub(crate) fn validate_existing_contest_identity(
@@ -920,7 +930,7 @@ pub(crate) fn validate_existing_contest_identity(
     match inspect_contest_metadata(destination)? {
         ContestMetadataHealth::Missing => Ok(()),
         ContestMetadataHealth::Healthy(contest)
-        | ContestMetadataHealth::DuplicateTaskIds(contest) => {
+        | ContestMetadataHealth::Repairable(RepairableContestMetadata { contest, .. }) => {
             validate_contest_identity(&contest, expected_contest_id)
         }
         ContestMetadataHealth::Invalid => {
@@ -1484,14 +1494,8 @@ fn is_safe_portable_path_component(value: &str) -> bool {
     validate_workspace_path_component(value).is_ok()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContestManifestSemantics {
-    Valid,
-    RepairableInvalid,
-}
-
-fn inspect_contest_manifest_semantics(contest: &Contest) -> io::Result<ContestManifestSemantics> {
-    let mut repairable_invalid = contest.problems.is_empty();
+fn problem_url_mismatches(contest: &Contest) -> io::Result<HashSet<String>> {
+    let mut mismatches = HashSet::new();
 
     for problem in &contest.problems {
         if !is_safe_task_id(&problem.task_id) {
@@ -1535,15 +1539,11 @@ fn inspect_contest_manifest_semantics(contest: &Contest) -> io::Result<ContestMa
             contest.contest_id, problem.task_id
         );
         if problem.url != expected_url {
-            repairable_invalid = true;
+            mismatches.insert(problem.index.clone());
         }
     }
 
-    Ok(if repairable_invalid {
-        ContestManifestSemantics::RepairableInvalid
-    } else {
-        ContestManifestSemantics::Valid
-    })
+    Ok(mismatches)
 }
 
 pub(crate) fn is_safe_task_id(task_id: &str) -> bool {
@@ -1593,7 +1593,7 @@ fn validate_contest_path_components(contest: &Contest) -> io::Result<()> {
 
 pub fn validate_contest_paths(contest: &Contest) -> io::Result<()> {
     validate_contest_path_components(contest)?;
-    if inspect_contest_manifest_semantics(contest)? == ContestManifestSemantics::RepairableInvalid {
+    if contest.problems.is_empty() || !problem_url_mismatches(contest)?.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "contest metadata is not an authoritative non-empty AtCoder task manifest",
@@ -1916,14 +1916,7 @@ pub(crate) fn preflight_tests_replacement(destination: &Path, contest: &Contest)
         return Ok(());
     }
 
-    let mut indices = contest
-        .problems
-        .iter()
-        .map(|problem| problem.index.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let previous_indices =
-        existing_owned_problem_indices(destination, &contest.contest_id, &indices)?;
-    indices.extend(previous_indices);
+    let indices = existing_owned_problem_indices(destination, contest)?;
     validate_refresh_owned_tests(&tests, &indices)
 }
 
@@ -2907,55 +2900,64 @@ fn refresh_owned_problem_indices(
     staging_root: &Path,
 ) -> io::Result<HashSet<String>> {
     let staged_contest = load_metadata(staging_root)?;
-    validate_contest_paths(&staged_contest)?;
-
-    let mut indices = staged_contest
-        .problems
-        .iter()
-        .map(|problem| problem.index.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-
-    let previous_indices =
-        existing_owned_problem_indices(destination, &staged_contest.contest_id, &indices)?;
-    indices.extend(previous_indices);
-
-    Ok(indices)
+    existing_owned_problem_indices(destination, &staged_contest)
 }
 
 fn existing_owned_problem_indices(
     destination: &Path,
-    expected_contest_id: &str,
-    replacement_indices: &HashSet<String>,
+    replacement: &Contest,
 ) -> io::Result<HashSet<String>> {
-    let inspection = inspect_contest_metadata(destination);
-    let previous = match inspection {
-        Ok(
-            ContestMetadataHealth::Healthy(contest)
-            | ContestMetadataHealth::DuplicateTaskIds(contest),
-        ) => {
-            if let Err(error) = validate_contest_identity(&contest, expected_contest_id) {
-                validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
-                return Err(error);
-            }
-            contest
+    let mut replacement_indices = replacement
+        .problems
+        .iter()
+        .map(|problem| problem.index.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let (previous, url_mismatches) = match inspect_contest_metadata(destination) {
+        Ok(ContestMetadataHealth::Healthy(contest)) => (contest, None),
+        Ok(ContestMetadataHealth::Repairable(manifest)) => {
+            (manifest.contest, Some(manifest.url_mismatches))
         }
         Ok(_) => {
-            validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
+            validate_refresh_owned_tests(&destination.join("tests"), &replacement_indices)?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "cannot confirm ownership of existing tests from contest metadata; move tests to a safe location and restore metadata manually before retrying",
             ));
         }
         Err(error) => {
-            validate_refresh_owned_tests(&destination.join("tests"), replacement_indices)?;
+            validate_refresh_owned_tests(&destination.join("tests"), &replacement_indices)?;
             return Err(error);
         }
     };
-    Ok(previous
-        .problems
-        .iter()
-        .map(|problem| problem.index.to_ascii_lowercase())
-        .collect())
+    if let Err(error) = validate_contest_identity(&previous, &replacement.contest_id) {
+        validate_refresh_owned_tests(&destination.join("tests"), &replacement_indices)?;
+        return Err(error);
+    }
+
+    if let Some(url_mismatches) = url_mismatches {
+        // A consistent old task/URL pair can be corroborated even if its label disappeared.
+        // A conflicting pair needs the official URL for the same label to establish ownership.
+        return Ok(previous
+            .problems
+            .iter()
+            .filter(|old| {
+                replacement.problems.iter().any(|official| {
+                    official.url == old.url
+                        && (!url_mismatches.contains(&old.index)
+                            || official.index.eq_ignore_ascii_case(&old.index))
+                })
+            })
+            .map(|problem| problem.index.to_ascii_lowercase())
+            .collect());
+    }
+
+    replacement_indices.extend(
+        previous
+            .problems
+            .iter()
+            .map(|problem| problem.index.to_ascii_lowercase()),
+    );
+    Ok(replacement_indices)
 }
 
 fn validate_refresh_owned_tests(
@@ -3826,7 +3828,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_health_classifies_safe_task_url_mismatch_as_invalid_but_unsafe_url_as_hard_error() {
+    fn metadata_health_distinguishes_repairable_task_url_mismatch_from_unsafe_url() {
         let temp = tempfile::tempdir().unwrap();
         write_metadata_text(
             temp.path(),
@@ -3849,7 +3851,8 @@ mod tests {
         );
         assert!(matches!(
             inspect_contest_metadata(temp.path()).unwrap(),
-            ContestMetadataHealth::Invalid
+            ContestMetadataHealth::Repairable(manifest)
+                if !manifest.duplicate_task_ids && manifest.url_mismatches == HashSet::from(["A".into()])
         ));
 
         write_metadata_text(
