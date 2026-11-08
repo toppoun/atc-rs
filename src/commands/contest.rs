@@ -632,10 +632,9 @@ fn repair_tests_health(
         return Ok(health);
     };
     for (problem, official) in contest.problems.iter().zip(official_samples) {
-        let same_task = previous
-            .problems
-            .iter()
-            .any(|old| old.index == problem.index && old.task_id == problem.task_id);
+        let same_task = previous.problems.iter().any(|old| {
+            old.index == problem.index && old.task_id == problem.task_id && old.url == problem.url
+        });
         if !same_task && workspace::load_verified_samples(destination, problem)? != *official {
             return Ok(TestsHealth::Broken);
         }
@@ -970,6 +969,45 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(destination.join("Z.cpp")).unwrap(),
             "user source\n"
+        );
+    }
+
+    #[test]
+    fn rc13_repair_checks_samples_when_duplicate_task_has_mismatched_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir(&destination).unwrap();
+        let fetched = abc466_snapshot();
+        let [a, e] = [0, 4];
+        assert_eq!(fetched.contest.problems[e].index, "E");
+        assert_eq!(
+            fetched.samples_by_problem[a].len(),
+            fetched.samples_by_problem[e].len()
+        );
+        assert_ne!(fetched.samples_by_problem[a], fetched.samples_by_problem[e]);
+        save_snapshot_tests(&destination, &fetched);
+        workspace::save_samples(
+            &destination,
+            &fetched.contest.problems[e],
+            &fetched.samples_by_problem[a],
+        )
+        .unwrap();
+        workspace::save_metadata(&destination, &fetched.contest).unwrap();
+        let manifest = destination.join(".atc/contest.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace("task_id = \"abc466_e\"", "task_id = \"abc466_a\""),
+        )
+        .unwrap();
+
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+        repair_at(&destination, "abc466", &client, &mut NullReporter).unwrap();
+
+        assert_eq!(
+            workspace::load_samples(&destination, "E").unwrap(),
+            fetched.samples_by_problem[e]
         );
     }
 

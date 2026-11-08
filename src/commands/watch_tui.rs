@@ -2137,7 +2137,8 @@ fn load_watch_data(destination: &Path, contest: &Contest) -> io::Result<LoadedWa
     let mut stress_cases = Vec::with_capacity(contest.problems.len());
     let mut stress_load_errors = Vec::with_capacity(contest.problems.len());
     for problem in &contest.problems {
-        match crate::stress::load_saved_case(destination, &contest.contest_id, &problem.index) {
+        match crate::stress::load_saved_case_for_problem(destination, &contest.contest_id, problem)
+        {
             Ok(case) => {
                 stress_cases.push(case);
                 stress_load_errors.push(None);

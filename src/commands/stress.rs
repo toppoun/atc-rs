@@ -260,6 +260,7 @@ pub(super) fn build_request(
         destination: destination.to_path_buf(),
         contest_id: contest_id.to_string(),
         problem_index: problem.index.clone(),
+        task_id: problem.task_id.clone(),
         candidate_source,
         candidate_language: language,
         generator_source,

@@ -18,7 +18,7 @@ pub(crate) fn watch(
 
     workspace::validate_workspace_marker(&destination)?;
 
-    let contest = workspace::load_metadata(&destination)?;
+    let mut contest = workspace::load_metadata(&destination)?;
     workspace::validate_contest_paths(&contest)?;
     if let Some(contest_id) = cli_contest {
         workspace::validate_contest_identity(&contest, contest_id)?;
@@ -35,6 +35,13 @@ pub(crate) fn watch(
     loop {
         let paths = file_watcher.next_batch()?;
 
+        // Retain the last known sources during an update so saving one still reports why
+        // the test was blocked. The test loader revalidates their bindings before execution.
+        if let Ok(current) = workspace::load_metadata(&destination)
+            && current.contest_id == contest.contest_id
+        {
+            contest = current;
+        }
         process_changed_paths(&destination, &contest, &config.runner, paths, reporter)?;
     }
 }
@@ -104,10 +111,6 @@ fn process_changed_paths_with(
             false,
             reporter,
         ) {
-            if !matches!(&error, AppError::Io(error) if crate::stress::is_problem_load_error(error))
-            {
-                return Err(error);
-            }
             reporter.report(Event::WatchTestFailed {
                 problem_index: &problem.index,
                 error: &error.to_string(),
@@ -252,7 +255,7 @@ mod tests {
         workspace::save_metadata(temp.path(), &contest).unwrap();
         let mut reporter = RecordingReporter::default();
 
-        let error = process_changed_paths(
+        process_changed_paths(
             temp.path(),
             &contest,
             &RunnerConfig {
@@ -262,10 +265,12 @@ mod tests {
             vec![source.clone()],
             &mut reporter,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("local samples"));
-        assert_eq!(reporter.events, [format!("changed:{}", source.display())]);
+        assert_eq!(reporter.events.len(), 2);
+        assert_eq!(reporter.events[0], format!("changed:{}", source.display()));
+        assert!(reporter.events[1].starts_with("failed:A:"));
+        assert!(reporter.events[1].contains("local samples"));
     }
 
     #[test]
@@ -285,17 +290,73 @@ mod tests {
         .unwrap();
         let mut reporter = RecordingReporter::default();
 
-        let error = process_changed_paths(
+        process_changed_paths(
             destination,
             &contest,
             &RunnerConfig::default(),
             vec![source.clone()],
             &mut reporter,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("requires recovery check"));
-        assert_eq!(reporter.events, [format!("changed:{}", source.display())]);
+        assert_eq!(reporter.events.len(), 2);
+        assert_eq!(reporter.events[0], format!("changed:{}", source.display()));
+        assert!(reporter.events[1].starts_with("failed:A:"));
+        assert!(reporter.events[1].contains("requires recovery check"));
+    }
+
+    #[test]
+    fn rc13_watch_processes_the_next_save_after_contest_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let source = destination.join("A.py");
+        std::fs::write(&source, "pass\n").unwrap();
+        let contest = contest(vec![problem("A")]);
+        workspace::save_metadata(destination, &contest).unwrap();
+        let staging = destination.join(".atc-refresh-interrupted");
+        std::fs::create_dir(&staging).unwrap();
+        crate::safe_file::write_recovery_intent(
+            &staging,
+            &crate::safe_file::RecoveryIdentity::new("contest", "contest", None),
+        )
+        .unwrap();
+
+        let mut reporter = RecordingReporter::default();
+        let pending = process_changed_paths(
+            destination,
+            &contest,
+            &RunnerConfig::default(),
+            vec![source.clone()],
+            &mut reporter,
+        );
+        assert!(
+            pending.is_ok(),
+            "watch must keep processing events: {pending:?}"
+        );
+        assert!(
+            reporter
+                .events
+                .iter()
+                .any(|event| event.contains("recovery"))
+        );
+        assert!(
+            !reporter
+                .events
+                .iter()
+                .any(|event| event.starts_with("no-samples:"))
+        );
+        std::fs::remove_file(staging.join(crate::safe_file::RECOVERY_INTENT)).unwrap();
+        std::fs::remove_dir(staging).unwrap();
+
+        process_changed_paths(
+            destination,
+            &contest,
+            &RunnerConfig::default(),
+            vec![source],
+            &mut reporter,
+        )
+        .unwrap();
+        assert_eq!(reporter.events.last().unwrap(), "no-samples:A");
     }
 
     #[test]

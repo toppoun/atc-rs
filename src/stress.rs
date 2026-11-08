@@ -21,7 +21,8 @@ use crate::safe_file;
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 
-const FAILURE_FORMAT_VERSION: u32 = 2;
+const FAILURE_FORMAT_VERSION: u32 = 3;
+const UNBOUND_FAILURE_FORMAT_VERSION: u32 = 2;
 const LEGACY_FAILURE_FORMAT_VERSION: u32 = 1;
 const FAILURE_GENERATION_FILES: [&str; 5] = [
     "failed.in",
@@ -85,12 +86,6 @@ fn problem_saved_case_error(problem_index: &str, source: io::Error) -> io::Error
     )
 }
 
-pub(crate) fn is_problem_load_error(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .is_some_and(|source| source.is::<ProblemSavedCaseError>())
-}
-
 pub(crate) fn automatic_seed() -> io::Result<u64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -109,6 +104,7 @@ pub(crate) struct StressRequest {
     pub(crate) destination: PathBuf,
     pub(crate) contest_id: String,
     pub(crate) problem_index: String,
+    pub(crate) task_id: String,
     pub(crate) candidate_source: PathBuf,
     pub(crate) candidate_language: Language,
     pub(crate) generator_source: PathBuf,
@@ -285,6 +281,19 @@ pub(crate) fn run(
         return Ok(outcome);
     }
 
+    let contest = workspace::ContestTaskSnapshot::capture(
+        &request.destination,
+        &request.contest_id,
+        &request.problem_index,
+        &request.task_id,
+    )?;
+    load_bound_saved_case(
+        &request.destination,
+        &request.contest_id,
+        &request.problem_index,
+        &request.task_id,
+        &contest,
+    )?;
     let prepared = match PreparedCandidate::prepare(request, reporter, is_cancelled)? {
         PrepareOutcome::Ready(candidate) => candidate,
         PrepareOutcome::Cancelled => {
@@ -312,6 +321,7 @@ pub(crate) fn run(
         if let Some(limit) = request.count
             && passed >= limit.get()
         {
+            contest.revalidate(&request.destination)?;
             let outcome = StressOutcome::Completed {
                 cases: passed,
                 elapsed: loop_started.elapsed(),
@@ -392,6 +402,7 @@ pub(crate) fn run(
 
             return finish_failure(
                 request,
+                &contest,
                 failure,
                 passed,
                 loop_started,
@@ -424,6 +435,7 @@ pub(crate) fn run(
         if let Some(limit) = request.count
             && passed >= limit.get()
         {
+            contest.revalidate(&request.destination)?;
             let outcome = StressOutcome::Completed {
                 cases: passed,
                 elapsed: loop_started.elapsed(),
@@ -443,6 +455,7 @@ pub(crate) fn run(
 
 fn finish_failure(
     request: &StressRequest,
+    contest: &workspace::ContestTaskSnapshot,
     failure: StressFailure,
     passed: u64,
     loop_started: Instant,
@@ -458,7 +471,7 @@ fn finish_failure(
         return Ok(outcome);
     }
 
-    let saved_to = match persist_failure(request, &failure, is_cancelled)? {
+    let saved_to = match persist_failure_for_task(request, contest, &failure, is_cancelled)? {
         PersistenceOutcome::Saved(path) => path,
         PersistenceOutcome::Cancelled => {
             let outcome = StressOutcome::Cancelled {
@@ -774,6 +787,7 @@ struct FailureMetadata<'a> {
     version: u32,
     contest: &'a str,
     problem: &'a str,
+    task_id: &'a str,
     kind: &'a str,
     case: u64,
     base_seed: u64,
@@ -786,6 +800,7 @@ struct StoredFailureMetadata {
     version: u32,
     contest: String,
     problem: String,
+    task_id: Option<String>,
     kind: String,
     case: u64,
     base_seed: u64,
@@ -798,6 +813,24 @@ enum PersistenceOutcome {
     Cancelled,
 }
 
+fn persist_failure_for_task(
+    request: &StressRequest,
+    contest: &workspace::ContestTaskSnapshot,
+    failure: &StressFailure,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<PersistenceOutcome> {
+    persist_failure_inner(
+        request,
+        failure,
+        is_cancelled,
+        Some(contest),
+        || {},
+        || {},
+        || {},
+    )
+}
+
+#[cfg(test)]
 fn persist_failure(
     request: &StressRequest,
     failure: &StressFailure,
@@ -806,6 +839,7 @@ fn persist_failure(
     persist_failure_with_hooks(request, failure, is_cancelled, || {}, || {})
 }
 
+#[cfg(test)]
 fn persist_failure_with_hooks(
     request: &StressRequest,
     failure: &StressFailure,
@@ -823,6 +857,7 @@ fn persist_failure_with_hooks(
     )
 }
 
+#[cfg(test)]
 fn persist_failure_with_cleanup_hook(
     request: &StressRequest,
     failure: &StressFailure,
@@ -831,8 +866,31 @@ fn persist_failure_with_cleanup_hook(
     before_recovery_cleanup: impl FnOnce(),
     before_staging_cleanup: impl FnOnce(),
 ) -> io::Result<PersistenceOutcome> {
+    persist_failure_inner(
+        request,
+        failure,
+        is_cancelled,
+        None,
+        before_install,
+        before_recovery_cleanup,
+        before_staging_cleanup,
+    )
+}
+
+fn persist_failure_inner(
+    request: &StressRequest,
+    failure: &StressFailure,
+    is_cancelled: &dyn Fn() -> bool,
+    contest: Option<&workspace::ContestTaskSnapshot>,
+    before_install: impl FnOnce(),
+    before_recovery_cleanup: impl FnOnce(),
+    before_staging_cleanup: impl FnOnce(),
+) -> io::Result<PersistenceOutcome> {
     workspace::validate_problem_index(&request.problem_index)?;
     workspace::validate_workspace_marker(&request.destination)?;
+    let revalidate_contest =
+        || contest.map_or(Ok(()), |contest| contest.revalidate(&request.destination));
+    revalidate_contest()?;
 
     let stress_root = request.destination.join(".atc").join("stress");
     ensure_real_directory(&stress_root, "stress directory")?;
@@ -861,12 +919,20 @@ fn persist_failure_with_cleanup_hook(
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
+    let _contest_lock = contest
+        .map(|_| workspace::lock_contest_update(&request.destination, true))
+        .transpose()?;
+    revalidate_contest()?;
     ensure_no_interrupted_generation(
         &stress_directory,
         &request.contest_id,
         &request.problem_index,
+        &generation_lock,
     )?;
-    let target = stress_root.join(&request.problem_index);
+    let target = stress_root.join(saved_generation_name(
+        &stress_directory,
+        &request.problem_index,
+    )?);
     let target_exists = existing_real_directory(&target, "stress failure directory")?;
     let previous_snapshot = if target_exists {
         validate_failure_generation(&target, request)?;
@@ -902,6 +968,7 @@ fn persist_failure_with_cleanup_hook(
         version: FAILURE_FORMAT_VERSION,
         contest: &request.contest_id,
         problem: &request.problem_index,
+        task_id: &request.task_id,
         kind: failure.kind.metadata_name(),
         case: failure.case_number,
         base_seed: failure.base_seed,
@@ -939,7 +1006,21 @@ fn persist_failure_with_cleanup_hook(
     }
 
     if target_exists {
-        safe_file::rename_noclobber(&target, &previous_generation)?;
+        let staged_snapshot = safe_file::read_tree_snapshot(&new_generation)?;
+        if let Err(error) = safe_file::rename_noclobber(&target, &previous_generation) {
+            let unchanged = revalidate_contest()
+                .and_then(|()| {
+                    validate_previous_failure_snapshot(&target, previous_snapshot.as_ref().unwrap())
+                })
+                .and_then(|()| {
+                    validate_previous_failure_snapshot(&new_generation, &staged_snapshot)
+                })
+                .and_then(|()| safe_file::require_absent(&previous_generation));
+            return Err(match unchanged {
+                Ok(()) => abort_stress_recovery(staging, &recovery_identity, error),
+                Err(check) => incomplete_stress_recovery(staging, error, check),
+            });
+        }
         if let Err(error) =
             validate_failure_generation(&previous_generation, request).and_then(|()| {
                 validate_previous_failure_snapshot(
@@ -960,7 +1041,9 @@ fn persist_failure_with_cleanup_hook(
 
     before_install();
 
-    if let Err(error) = safe_file::rename_noclobber(&new_generation, &target) {
+    if let Err(error) =
+        revalidate_contest().and_then(|()| safe_file::rename_noclobber(&new_generation, &target))
+    {
         if target_exists {
             return Err(rollback_previous_generation(
                 staging,
@@ -997,6 +1080,13 @@ fn persist_failure_with_cleanup_hook(
     }
 
     before_staging_cleanup();
+    if let Err(error) = revalidate_contest() {
+        return Err(incomplete_stress_recovery(
+            staging,
+            io::Error::other("new stress failure installed before the contest changed"),
+            error,
+        ));
+    }
     let staging_path = staging.path().to_path_buf();
     if let Err(error) = complete_stress_staging(staging, request, target_exists, &recovery_identity)
     {
@@ -1109,6 +1199,20 @@ fn abort_stress_recovery(
     }
 }
 
+fn incomplete_stress_recovery(
+    staging: safe_file::PreservedTempDir,
+    original: io::Error,
+    verification: io::Error,
+) -> io::Error {
+    io::Error::new(
+        original.kind(),
+        format!(
+            "{original}; could not verify a safe final state: {verification}; recovery data kept at {}",
+            staging.keep().display()
+        ),
+    )
+}
+
 fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -1163,9 +1267,11 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
 
     if !matches!(
         metadata.version,
-        LEGACY_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
+        LEGACY_FAILURE_FORMAT_VERSION | UNBOUND_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
     ) || metadata.contest != request.contest_id
-        || metadata.problem != request.problem_index
+        || !metadata
+            .problem
+            .eq_ignore_ascii_case(&request.problem_index)
         || metadata.case == 0
     {
         return Err(io::Error::new(
@@ -1228,7 +1334,12 @@ fn validate_failure_generation(path: &Path, request: &StressRequest) -> io::Resu
     // generation. A legacy RE/TLE without expected.out remains valid but cannot be replayed.
     let generation = CapDir::open_ambient_dir(path, ambient_authority())?;
     let snapshot = open_saved_case_snapshot(&generation)?;
-    read_saved_case_snapshot(snapshot, &request.contest_id, &request.problem_index)?;
+    read_saved_case_snapshot(
+        snapshot,
+        &request.contest_id,
+        &request.problem_index,
+        Some(&request.task_id),
+    )?;
 
     Ok(())
 }
@@ -1240,9 +1351,16 @@ fn valid_failure_metadata(
 ) -> bool {
     matches!(
         metadata.version,
-        LEGACY_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
+        LEGACY_FAILURE_FORMAT_VERSION | UNBOUND_FAILURE_FORMAT_VERSION | FAILURE_FORMAT_VERSION
     ) && metadata.contest == contest_id
-        && metadata.problem == problem_index
+        && metadata.problem.eq_ignore_ascii_case(problem_index)
+        && match metadata.version {
+            FAILURE_FORMAT_VERSION => metadata
+                .task_id
+                .as_deref()
+                .is_some_and(workspace::is_safe_task_id),
+            _ => metadata.task_id.is_none(),
+        }
         && metadata.case != 0
         && metadata
             .case
@@ -1278,7 +1396,61 @@ fn rollback_previous_generation(
     abort_stress_recovery(staging, identity, original)
 }
 
-pub(crate) fn load_saved_case(
+pub(crate) fn load_saved_case_for_problem(
+    destination: &Path,
+    contest_id: &str,
+    problem: &crate::model::Problem,
+) -> io::Result<Option<Sample>> {
+    let snapshot = workspace::ContestTaskSnapshot::capture(
+        destination,
+        contest_id,
+        &problem.index,
+        &problem.task_id,
+    )
+    .map_err(|error| unscoped_staging_error(error.to_string()))?;
+    match load_saved_case_for_task(destination, contest_id, problem, &snapshot)? {
+        SavedCaseLoad::Replay(sample) => Ok(Some(sample)),
+        SavedCaseLoad::Absent | SavedCaseLoad::AmbiguousV1WithoutExpected { .. } => Ok(None),
+    }
+}
+
+pub(crate) fn load_saved_case_for_task(
+    destination: &Path,
+    contest_id: &str,
+    problem: &crate::model::Problem,
+    contest: &workspace::ContestTaskSnapshot,
+) -> io::Result<SavedCaseLoad> {
+    load_bound_saved_case(
+        destination,
+        contest_id,
+        &problem.index,
+        &problem.task_id,
+        contest,
+    )
+}
+
+fn load_bound_saved_case(
+    destination: &Path,
+    contest_id: &str,
+    problem_index: &str,
+    task_id: &str,
+    contest: &workspace::ContestTaskSnapshot,
+) -> io::Result<SavedCaseLoad> {
+    let result = load_saved_case_status_with_hook(
+        destination,
+        contest_id,
+        problem_index,
+        Some(task_id),
+        || {},
+    );
+    contest
+        .revalidate(destination)
+        .map_err(|error| unscoped_staging_error(error.to_string()))?;
+    result
+}
+
+#[cfg(test)]
+fn load_saved_case(
     destination: &Path,
     contest_id: &str,
     problem_index: &str,
@@ -1292,14 +1464,16 @@ pub(crate) enum SavedCaseLoad {
     AmbiguousV1WithoutExpected { kind: &'static str },
 }
 
-pub(crate) fn load_saved_case_status(
+#[cfg(test)]
+fn load_saved_case_status(
     destination: &Path,
     contest_id: &str,
     problem_index: &str,
 ) -> io::Result<SavedCaseLoad> {
-    load_saved_case_status_with_hook(destination, contest_id, problem_index, || {})
+    load_saved_case_status_with_hook(destination, contest_id, problem_index, None, || {})
 }
 
+#[cfg(test)]
 fn load_saved_case_with_hook(
     destination: &Path,
     contest_id: &str,
@@ -1310,6 +1484,7 @@ fn load_saved_case_with_hook(
         destination,
         contest_id,
         problem_index,
+        None,
         before_shared_lock,
     )? {
         SavedCaseLoad::Replay(sample) => Ok(Some(sample)),
@@ -1321,6 +1496,7 @@ fn load_saved_case_status_with_hook(
     destination: &Path,
     contest_id: &str,
     problem_index: &str,
+    task_id: Option<&str>,
     before_shared_lock: impl FnOnce(),
 ) -> io::Result<SavedCaseLoad> {
     workspace::validate_problem_index(problem_index)?;
@@ -1335,10 +1511,16 @@ fn load_saved_case_status_with_hook(
     before_shared_lock();
     generation_lock.lock_shared().map_err(problem_error)?;
 
-    ensure_no_interrupted_generation(&stress_directory, contest_id, problem_index)?;
+    ensure_no_interrupted_generation(
+        &stress_directory,
+        contest_id,
+        problem_index,
+        &generation_lock,
+    )?;
 
+    let name = saved_generation_name(&stress_directory, problem_index).map_err(problem_error)?;
     let Some(generation) =
-        open_optional_directory(&stress_directory, problem_index).map_err(problem_error)?
+        open_optional_directory(&stress_directory, &name).map_err(problem_error)?
     else {
         return Ok(SavedCaseLoad::Absent);
     };
@@ -1349,32 +1531,59 @@ fn load_saved_case_status_with_hook(
     // block a directory rename, so releasing the lock before closing them would make the writer's
     // generation swap fail instead of merely waiting for this coherent read to finish.
     drop(generation);
-    let result = read_saved_case_snapshot(snapshot, contest_id, problem_index);
+    let result = read_saved_case_snapshot(snapshot, contest_id, problem_index, task_id);
     drop(generation_lock);
     result.map_err(problem_error)
+}
+
+fn saved_generation_name(directory: &CapDir, problem_index: &str) -> io::Result<String> {
+    let mut names = directory.entries()?.filter_map(|entry| match entry {
+        Ok(entry) => entry
+            .file_name()
+            .into_string()
+            .ok()
+            .filter(|name| name.eq_ignore_ascii_case(problem_index))
+            .map(Ok),
+        Err(error) => Some(Err(error)),
+    });
+    let name = names
+        .next()
+        .transpose()?
+        .unwrap_or_else(|| problem_index.to_owned());
+    if names.next().transpose()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "multiple saved stress paths for problem {problem_index}; recovery check required"
+            ),
+        ));
+    }
+    Ok(name)
 }
 
 fn ensure_no_interrupted_generation(
     stress_directory: &CapDir,
     contest_id: &str,
     problem_index: &str,
+    generation_lock: &fs::File,
 ) -> io::Result<()> {
-    ensure_no_interrupted_generation_with_hook(stress_directory, contest_id, problem_index, |_| {})
+    ensure_no_interrupted_generation_with_hook(
+        stress_directory,
+        contest_id,
+        problem_index,
+        generation_lock,
+        |_| {},
+    )
 }
 
 fn ensure_no_interrupted_generation_with_hook(
     stress_directory: &CapDir,
     contest_id: &str,
     problem_index: &str,
+    generation_lock: &fs::File,
     mut after_staging_listed: impl FnMut(&str),
 ) -> io::Result<()> {
-    let owned_recovery_prefix = format!(
-        ".stress-recovery-{}-{}-",
-        problem_index.len(),
-        problem_index
-    );
-    let owned_aborted_prefix =
-        format!(".stress-aborted-{}-{}-", problem_index.len(), problem_index);
+    let owned_prefix = format!("{}-{}-", problem_index.len(), problem_index);
     // A problem-local error must not hide a later entry with unknown ownership.
     let mut problem_error = None;
     for entry in stress_directory.entries()? {
@@ -1388,15 +1597,35 @@ fn ensure_no_interrupted_generation_with_hook(
             }
             continue;
         };
-        if name.starts_with(&owned_recovery_prefix) || name.starts_with(&owned_aborted_prefix) {
+        let aliases_held_lock = |owner: &str| {
+            if owner.eq_ignore_ascii_case(problem_index) {
+                return Ok(true);
+            }
+            open_regular_file(stress_directory, &stress_lock_name(owner))?
+                .map_or(Ok(false), |lock| {
+                    safe_file::same_open_file(&lock, generation_lock)
+                })
+        };
+        if let Some(suffix) = name
+            .strip_prefix(".stress-recovery-")
+            .or_else(|| name.strip_prefix(".stress-aborted-"))
+        {
             if problem_error.is_none() {
-                problem_error = validate_stress_recovery_archive(
-                    stress_directory,
-                    name,
-                    contest_id,
-                    problem_index,
-                )
-                .err();
+                let owner = if suffix
+                    .get(..owned_prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(&owned_prefix))
+                {
+                    Some(problem_index)
+                } else {
+                    staging_problem_suffix(suffix).ok().flatten()
+                };
+                if let Some(owner) = owner
+                    && aliases_held_lock(owner)?
+                {
+                    problem_error =
+                        validate_stress_recovery_archive(stress_directory, name, contest_id, owner)
+                            .err();
+                }
             }
             continue;
         }
@@ -1406,27 +1635,33 @@ fn ensure_no_interrupted_generation_with_hook(
         after_staging_listed(name);
         let (requires_review, unscoped) = match current_staging_problem(name) {
             Ok(Some(owner)) => {
-                let own_stage = owner == problem_index;
+                let recovery_error = |error| {
+                    unscoped_staging_error(format!(
+                        "{}: {error}",
+                        staging_review_message(problem_index, name)
+                    ))
+                };
+                let mut own_stage = owner.eq_ignore_ascii_case(problem_index);
                 // Inspect only while holding the named problem's lock. Our caller already holds
                 // its own lock, and another writer may be midway through its update.
                 let _other_lock = if own_stage {
                     None
                 } else {
                     let lock =
-                        open_shared_stress_lock(stress_directory, owner).map_err(|error| {
-                            unscoped_staging_error(format!(
-                                "{}: {error}",
-                                staging_review_message(problem_index, name)
-                            ))
-                        })?;
-                    match lock.try_lock_shared() {
-                        Ok(()) => Some(lock),
-                        Err(fs::TryLockError::WouldBlock) => continue,
-                        Err(fs::TryLockError::Error(error)) => {
-                            return Err(unscoped_staging_error(format!(
-                                "{}: {error}",
-                                staging_review_message(problem_index, name)
-                            )));
+                        open_shared_stress_lock(stress_directory, owner).map_err(recovery_error)?;
+                    // A native alias can open the same lock file under another spelling.
+                    // Detect it before trying to take a shared lock against our own writer.
+                    own_stage = safe_file::same_open_file(&lock, generation_lock)
+                        .map_err(recovery_error)?;
+                    if own_stage {
+                        None
+                    } else {
+                        match lock.try_lock_shared() {
+                            Ok(()) => Some(lock),
+                            Err(fs::TryLockError::WouldBlock) => continue,
+                            Err(fs::TryLockError::Error(error)) => {
+                                return Err(recovery_error(error));
+                            }
                         }
                     }
                 };
@@ -1443,7 +1678,9 @@ fn ensure_no_interrupted_generation_with_hook(
                 }
             }
             Ok(None) => match legacy_staging_owner(stress_directory, name) {
-                Some((contest, owner)) if contest == contest_id => (owner == problem_index, false),
+                Some((contest, owner)) if contest == contest_id => {
+                    (aliases_held_lock(&owner).unwrap_or(true), false)
+                }
                 _ => (true, true),
             },
             Err(()) => (true, true),
@@ -1480,7 +1717,6 @@ fn validate_stress_recovery_archive(
     contest_id: &str,
     problem_index: &str,
 ) -> io::Result<()> {
-    let expected = safe_file::RecoveryIdentity::new("stress", contest_id, Some(problem_index));
     let archive = stress_directory.open_dir_nofollow(name)?;
     let mut intent = open_regular_file(&archive, safe_file::RECOVERY_INTENT)?.ok_or_else(|| {
         io::Error::new(
@@ -1499,7 +1735,9 @@ fn validate_stress_recovery_archive(
     let mut complete_bytes = Vec::new();
     intent.read_to_end(&mut intent_bytes)?;
     complete.read_to_end(&mut complete_bytes)?;
-    if safe_file::parse_completed_recovery(&intent_bytes, &complete_bytes)? != expected {
+    if !safe_file::parse_completed_recovery(&intent_bytes, &complete_bytes)?
+        .is_stress_for(contest_id, problem_index)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("stress recovery area requires review: .atc/stress/{name}"),
@@ -1509,7 +1747,10 @@ fn validate_stress_recovery_archive(
 }
 
 fn current_staging_problem(name: &str) -> Result<Option<&str>, ()> {
-    let suffix = name.strip_prefix(".stress-staging-").ok_or(())?;
+    staging_problem_suffix(name.strip_prefix(".stress-staging-").ok_or(())?)
+}
+
+fn staging_problem_suffix(suffix: &str) -> Result<Option<&str>, ()> {
     if !suffix.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return Ok(None);
     }
@@ -1582,9 +1823,15 @@ fn staging_metadata_conflicts(
         return Ok(false);
     };
     Ok(owner_fields.iter().any(|&(key, expected)| {
-        metadata
-            .get(key)
-            .is_some_and(|value| value.as_str() != Some(expected))
+        metadata.get(key).is_some_and(|value| {
+            if matches!(key, "problem" | "problem_index") {
+                !value
+                    .as_str()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(expected))
+            } else {
+                value.as_str() != Some(expected)
+            }
+        })
     }))
 }
 
@@ -1605,7 +1852,10 @@ fn legacy_staging_owner(stress_directory: &CapDir, name: &str) -> Option<(String
             return None;
         }
         let owner = (metadata.contest, metadata.problem);
-        if known_owner.as_ref().is_some_and(|known| known != &owner) {
+        if known_owner
+            .as_ref()
+            .is_some_and(|known| known.0 != owner.0 || !known.1.eq_ignore_ascii_case(&owner.1))
+        {
             return None;
         }
         known_owner = Some(owner);
@@ -1681,6 +1931,7 @@ fn read_saved_case_snapshot(
     mut snapshot: SavedCaseSnapshot,
     contest_id: &str,
     problem_index: &str,
+    task_id: Option<&str>,
 ) -> io::Result<SavedCaseLoad> {
     let metadata_text = read_saved_case_utf8(&mut snapshot.metadata, "meta.toml")?;
     let metadata = toml::from_str::<StoredFailureMetadata>(&metadata_text).map_err(|error| {
@@ -1693,6 +1944,14 @@ fn read_saved_case_snapshot(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "saved stress metadata does not match the current contest and problem",
+        ));
+    }
+    if let (Some(saved), Some(current)) = (metadata.task_id.as_deref(), task_id)
+        && saved != current
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "saved stress case belongs to a different task ID; back it up before retrying",
         ));
     }
 
@@ -1755,7 +2014,16 @@ fn open_stress_directory(destination: &Path) -> io::Result<Option<CapDir>> {
 
 fn open_optional_directory(parent: &CapDir, name: &str) -> io::Result<Option<CapDir>> {
     match parent.open_dir_nofollow(name) {
-        Ok(directory) => Ok(Some(directory)),
+        Ok(directory) => {
+            let metadata = directory.try_clone()?.into_std_file().metadata()?;
+            if !metadata.is_dir() || stress_metadata_is_reparse(&metadata) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stress entry is not a real directory: {name}"),
+                ));
+            }
+            Ok(Some(directory))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -1766,27 +2034,28 @@ fn open_regular_file(directory: &CapDir, name: &str) -> io::Result<Option<fs::Fi
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
 
     let file = match directory.open_with(name, &options) {
-        Ok(file) => file,
+        Ok(file) => file.into_std(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || stress_metadata_is_reparse(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("stress generation entry is not a regular file: {name}"),
         ));
     }
 
-    Ok(Some(file.into_std()))
+    Ok(Some(file))
 }
 
 fn open_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Result<fs::File> {
-    let name = format!(".{problem_index}.lock");
+    let name = stress_lock_name(problem_index);
     open_writable_stress_lock(stress_directory, &name, false)
 }
 
 fn open_shared_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Result<fs::File> {
-    let name = format!(".{problem_index}.lock");
+    let name = stress_lock_name(problem_index);
     if let Some(lock) = open_regular_file(stress_directory, &name)? {
         return Ok(lock);
     }
@@ -1801,6 +2070,11 @@ fn open_shared_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io
         }
         result => result,
     }
+}
+
+fn stress_lock_name(problem_index: &str) -> String {
+    // The contest manifest already treats ASCII case variants as the same index.
+    format!(".{}.lock", problem_index.to_ascii_uppercase())
 }
 
 fn open_writable_stress_lock(
@@ -1820,15 +2094,16 @@ fn open_writable_stress_lock(
         .follow(FollowSymlinks::No)
         .nonblock(true);
 
-    let file = stress_directory.open_with(name, &options)?;
-    if !file.metadata()?.file_type().is_file() {
+    let file = stress_directory.open_with(name, &options)?.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || stress_metadata_is_reparse(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("stress generation lock is not a regular file: {name}"),
         ));
     }
 
-    Ok(file.into_std())
+    Ok(file)
 }
 
 fn ensure_real_directory(path: &Path, kind: &str) -> io::Result<()> {
@@ -1935,6 +2210,7 @@ mod tests {
             destination: destination.to_path_buf(),
             contest_id: "abc123".to_string(),
             problem_index: "A".to_string(),
+            task_id: "abc123_a".to_string(),
             candidate_source: destination.join("A.cpp"),
             candidate_language: Language::Cpp,
             generator_source: destination.join("A_gen.py"),
@@ -1950,6 +2226,84 @@ mod tests {
             count: NonZeroU64::new(100),
             debug: false,
         }
+    }
+
+    fn save_request_manifest(request: &StressRequest, task_id: &str) {
+        workspace::save_metadata(
+            &request.destination,
+            &crate::model::Contest {
+                contest_id: request.contest_id.clone(),
+                problems: vec![crate::model::Problem {
+                    index: request.problem_index.clone(),
+                    title: "A".into(),
+                    task_id: task_id.into(),
+                    url: format!(
+                        "https://atcoder.jp/contests/{}/tasks/{task_id}",
+                        request.contest_id
+                    ),
+                    sample_count: 0,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rc13_stress_revalidates_after_backup_and_excludes_managed_contest_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(temp.path(), 10);
+        save_request_manifest(&request, &request.task_id);
+        let contest = workspace::ContestTaskSnapshot::capture(
+            &request.destination,
+            &request.contest_id,
+            &request.problem_index,
+            &request.task_id,
+        )
+        .unwrap();
+        let previous = StressFailure {
+            kind: CandidateFailureKind::WrongAnswer,
+            case_number: 1,
+            base_seed: 10,
+            seed: 10,
+            input: "old\n".into(),
+            expected: "1\n".into(),
+            actual: "2\n".into(),
+            stderr: String::new(),
+            elapsed: Duration::ZERO,
+        };
+        let target = persisted_path(persist_failure_for_task(
+            &request,
+            &contest,
+            &previous,
+            &|| false,
+        ));
+        let replacement = StressFailure {
+            input: "new\n".into(),
+            ..previous
+        };
+        let error = persist_failure_inner(
+            &request,
+            &replacement,
+            &|| false,
+            Some(&contest),
+            || {
+                assert_eq!(
+                    workspace::lock_contest_update(&request.destination, false)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                save_request_manifest(&request, "abc123_changed");
+            },
+            || {},
+            || {},
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("task changed"));
+        assert_eq!(
+            fs::read_to_string(target.join("failed.in")).unwrap(),
+            "old\n"
+        );
     }
 
     fn persisted_path(result: io::Result<PersistenceOutcome>) -> PathBuf {
@@ -2105,7 +2459,8 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("failed.in")).unwrap(), "4\n");
 
         let metadata = fs::read_to_string(target.join("meta.toml")).unwrap();
-        assert!(metadata.contains("version = 2"));
+        assert!(metadata.contains("version = 3"));
+        assert!(metadata.contains("task_id = \"abc123_a\""));
         assert!(metadata.contains("kind = \"runtime-error\""));
         assert!(metadata.contains("seed = 11"));
         assert_eq!(
@@ -2492,9 +2847,18 @@ mod tests {
             check >= 2
         };
         let mut reporter = TerminalReporter::default();
+        save_request_manifest(&request, &request.task_id);
+        let contest = workspace::ContestTaskSnapshot::capture(
+            temp.path(),
+            &request.contest_id,
+            &request.problem_index,
+            &request.task_id,
+        )
+        .unwrap();
 
         let outcome = finish_failure(
             &request,
+            &contest,
             replacement,
             1,
             Instant::now(),
@@ -3144,7 +3508,7 @@ mod tests {
         let staging_path = staging.path().to_path_buf();
         let mut writer = Some((staging, b_lock));
         let mut archive = None;
-        ensure_no_interrupted_generation_with_hook(&directory, "abc123", "A", |name| {
+        ensure_no_interrupted_generation_with_hook(&directory, "abc123", "A", &a_lock, |name| {
             if staging_path.file_name().unwrap() == name {
                 let (staging, lock) = writer.take().unwrap();
                 archive = Some(complete_stress_recovery(staging, &identity, "recovery").unwrap());

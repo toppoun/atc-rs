@@ -68,6 +68,15 @@ impl RecoveryIdentity {
     pub(crate) fn is_contest(&self) -> bool {
         self.kind == "contest" && self.problem_index.is_none()
     }
+
+    pub(crate) fn is_stress_for(&self, contest_id: &str, problem_index: &str) -> bool {
+        self.kind == "stress"
+            && self.contest_id == contest_id
+            && self
+                .problem_index
+                .as_ref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(problem_index))
+    }
 }
 
 pub(crate) const RECOVERY_INTENT: &str = "recovery-intent.toml";
@@ -85,7 +94,17 @@ pub(crate) fn complete_recovery(
     identity: &RecoveryIdentity,
 ) -> io::Result<PathBuf> {
     let root = staging.keep();
-    let result = write_recovery_record(&root.join(RECOVERY_COMPLETE), identity)
+    let result = read_regular_file_snapshot(&root.join(RECOVERY_INTENT))
+        .and_then(|record| parse_recovery_record(&record.bytes))
+        .and_then(|intent| {
+            if intent != *identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recovery intent changed",
+                ));
+            }
+            write_recovery_record(&root.join(RECOVERY_COMPLETE), identity)
+        })
         .and_then(|()| rename_noclobber(&root, completed_path));
     result.map_err(|error| {
         io::Error::new(
@@ -307,6 +326,32 @@ pub(crate) fn read_optional_regular_file_snapshot(path: &Path) -> io::Result<Opt
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn require_absent(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("unexpected entry at {}", path.display()),
+        )),
+    }
+}
+
+pub(crate) fn same_open_file(left: &fs::File, right: &fs::File) -> io::Result<bool> {
+    #[cfg(any(unix, windows))]
+    {
+        Ok(file_identity(left, Path::new(""))? == file_identity(right, Path::new(""))?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is unavailable",
+        ))
     }
 }
 

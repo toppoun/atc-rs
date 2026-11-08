@@ -343,11 +343,12 @@ fn test_problem_with_debug_header_and_cancel(
         .into());
     }
 
-    let samples = workspace::load_test_samples(destination, contest_id, problem)?;
-    let stress_case = match crate::stress::load_saved_case_status(
+    let (samples, snapshot) = workspace::load_test_samples(destination, contest_id, problem)?;
+    let stress_case = match crate::stress::load_saved_case_for_task(
         destination,
         contest_id,
-        &problem.index,
+        problem,
+        &snapshot,
     )? {
         crate::stress::SavedCaseLoad::Absent => None,
         crate::stress::SavedCaseLoad::Replay(sample) => Some(sample),

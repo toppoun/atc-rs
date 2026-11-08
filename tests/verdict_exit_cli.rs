@@ -84,6 +84,10 @@ impl Fixture {
     fn stress(&self) -> Output {
         fs::write(self.contest.join("A_gen.py"), "print(42)\n").unwrap();
         fs::write(self.contest.join("A_brute.py"), "print(42)\n").unwrap();
+        self.run_stress()
+    }
+
+    fn run_stress(&self) -> Output {
         self.run(&[
             "stress",
             "A",
@@ -94,6 +98,167 @@ impl Fixture {
             "--seed",
             "1",
         ])
+    }
+}
+
+#[test]
+fn rc13_stress_rejects_task_change_during_run() {
+    let fixture = Fixture::new("print(0)\n");
+    fs::write(
+        fixture.contest.join("A_gen.py"),
+        concat!(
+            "from pathlib import Path\n",
+            "manifest = Path('.atc/contest.toml')\n",
+            "manifest.write_text(manifest.read_text().replace('abc123_a', 'abc123_changed'))\n",
+            "print(42)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(fixture.contest.join("A_brute.py"), "print(42)\n").unwrap();
+
+    let output = fixture.run_stress();
+    assert!(!output.status.success());
+    assert!(!fixture.contest.join(".atc/stress/A").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("task"));
+}
+
+#[test]
+fn rc13_stress_rejects_contest_recovery_started_during_run() {
+    let fixture = Fixture::new("print(0)\n");
+    fs::write(
+        fixture.contest.join("A_gen.py"),
+        concat!(
+            "from pathlib import Path\n",
+            "stage = Path('.atc-refresh-interrupted')\n",
+            "stage.mkdir()\n",
+            "(stage / 'recovery-intent.toml').write_text(",
+            "'version = 1\\nkind = \"contest\"\\ncontest_id = \"abc123\"\\n')\n",
+            "print(42)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(fixture.contest.join("A_brute.py"), "print(42)\n").unwrap();
+
+    let output = fixture.run_stress();
+    assert!(!output.status.success());
+    assert!(!fixture.contest.join(".atc/stress/A").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recovery"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rc13_stress_recovery_uses_the_same_problem_as_the_windows_lock() {
+    let fixture = Fixture::new("print(input())\n");
+    let root = fixture.contest.join(".atc/stress");
+    let stage = root.join(".stress-staging-1-a-interrupted");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(root.join(".a.lock"), []).unwrap();
+    assert!(root.join(".A.lock").is_file());
+    fs::write(
+        stage.join("recovery-intent.toml"),
+        "version = 1\nkind = \"stress\"\ncontest_id = \"abc123\"\nproblem_index = \"a\"\n",
+    )
+    .unwrap();
+
+    let test = fixture.test();
+    fs::write(fixture.contest.join("A.py"), "print(0)\n").unwrap();
+    let stress = fixture.stress();
+    assert!(!test.status.success());
+    for output in [test, stress] {
+        assert!(String::from_utf8_lossy(&output.stderr).contains("recovery"));
+    }
+    assert!(!root.join("A").exists());
+    assert!(stage.is_dir());
+}
+
+#[cfg(windows)]
+#[test]
+fn rc13_stress_retries_after_first_move_sharing_violation() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let fixture = Fixture::new("print(0)\n");
+    let root = fixture.contest.join(".atc/stress");
+    let target = root.join("A");
+    assert_verdict(fixture.stress(), false, "Saved to");
+    let before = fs::read(target.join("meta.toml")).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&target)
+        .unwrap();
+    let blocked = fixture.stress();
+    drop(held);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("os error 32"));
+    assert_eq!(fs::read(target.join("meta.toml")).unwrap(), before);
+
+    fs::write(fixture.contest.join("A.py"), "print(input())\n").unwrap();
+    assert_verdict(fixture.test(), true, "Result: 2/2 AC");
+    fs::write(fixture.contest.join("A.py"), "print(0)\n").unwrap();
+    assert_verdict(fixture.stress(), false, "Saved to");
+    assert!(fs::read_dir(root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".stress-aborted-")
+    }));
+}
+
+#[test]
+fn rc13_legacy_stress_cases_replay_and_v3_checks_the_task() {
+    for version in [1, 2] {
+        let fixture = Fixture::new("print(input())\n");
+        let target = fixture.contest.join(".atc/stress/A");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("failed.in"), "7\n").unwrap();
+        fs::write(target.join("expected.out"), "7\n").unwrap();
+        fs::write(target.join("actual.out"), "0\n").unwrap();
+        let legacy = format!(
+            "version = {version}\ncontest = \"abc123\"\nproblem = \"A\"\nkind = \"wrong-answer\"\ncase = 1\nbase_seed = 1\nseed = 1\n"
+        );
+        fs::write(target.join("meta.toml"), &legacy).unwrap();
+        assert_verdict(fixture.test(), true, "Result: 2/2 AC");
+
+        fs::write(fixture.contest.join("A.py"), "print(0)\n").unwrap();
+        assert_verdict(fixture.stress(), false, "Saved to");
+        let current = fs::read_to_string(target.join("meta.toml")).unwrap();
+        assert!(current.contains("version = 3"));
+        assert!(current.contains("task_id = \"abc123_a\""));
+        let archive = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stress-recovery-")
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(archive.join("previous/meta.toml")).unwrap(),
+            legacy
+        );
+
+        fs::write(fixture.contest.join("A.py"), "print(input())\n").unwrap();
+        assert_verdict(fixture.test(), true, "Result: 2/2 AC");
+        let manifest = fixture.contest.join(".atc/contest.toml");
+        let changed = fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("abc123_a", "abc123_new");
+        fs::write(manifest, changed).unwrap();
+        for output in [fixture.test(), fixture.stress()] {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("different task ID"));
+        }
+        assert_eq!(
+            fs::read_to_string(target.join("meta.toml")).unwrap(),
+            current
+        );
     }
 }
 
