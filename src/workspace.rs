@@ -1907,7 +1907,11 @@ pub(crate) enum ContestDataReplacement {
     MetadataAndTests,
 }
 
-pub(crate) fn preflight_tests_replacement(destination: &Path, contest: &Contest) -> io::Result<()> {
+pub(crate) fn preflight_tests_update(
+    destination: &Path,
+    contest: &Contest,
+    retain_tests: bool,
+) -> io::Result<()> {
     validate_contest_directory(destination)?;
     validate_contest_paths(contest)?;
 
@@ -1916,8 +1920,11 @@ pub(crate) fn preflight_tests_replacement(destination: &Path, contest: &Contest)
         return Ok(());
     }
 
-    let indices = existing_owned_problem_indices(destination, contest)?;
-    validate_refresh_owned_tests(&tests, &indices)
+    validate_existing_owned_tests(destination, contest)?;
+    if retain_tests {
+        validate_refresh_owned_tests(&tests, &problem_indices(contest))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2103,6 +2110,8 @@ pub(crate) fn replace_metadata_only(
         return Err(changed_contest_metadata_error());
     }
     let staged_contest = load_metadata(staging_root)?;
+    preflight_tests_update(destination, &staged_contest, true)
+        .map_err(|error| preserved_staging_error(staging_root, error))?;
     let staged_snapshot = safe_file::read_regular_file_snapshot(&staged_metadata)?;
     let recovery_identity =
         safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
@@ -2246,9 +2255,7 @@ fn replace_tests_only_with_hooks(
     let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")?;
     let has_staged_tests = existing_real_directory(&staged_tests, "staged tests path")?;
     let owned_problem_indices = if had_destination_tests {
-        let indices = refresh_owned_problem_indices(destination, &staging_root)?;
-        validate_refresh_owned_tests(&destination_tests, &indices)?;
-        indices
+        validate_existing_owned_tests(destination, &staged_contest)?
     } else {
         HashSet::new()
     };
@@ -2556,7 +2563,8 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
         ));
     }
 
-    let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")?;
+    let had_destination_tests = existing_real_directory(&destination_tests, "existing tests path")
+        .map_err(|error| preserved_staging_error(&staging_root, error))?;
     let has_staged_tests = existing_real_directory(&staged_tests, "staged tests path")?;
     let had_destination_metadata = had_destination_marker
         && existing_regular_file(&destination_metadata, "existing metadata path")?;
@@ -2570,10 +2578,10 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
     if safe_file::read_optional_regular_file_snapshot(&destination_metadata)? != expected_metadata {
         return Err(changed_contest_metadata_error());
     }
+    let staged_contest = load_metadata(&staging_root)?;
     let owned_problem_indices = if had_destination_tests {
-        let indices = refresh_owned_problem_indices(destination, &staging_root)?;
-        validate_refresh_owned_tests(&destination_tests, &indices)?;
-        indices
+        validate_existing_owned_tests(destination, &staged_contest)
+            .map_err(|error| preserved_staging_error(&staging_root, error))?
     } else {
         HashSet::new()
     };
@@ -2583,7 +2591,6 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
         None
     };
 
-    let staged_contest = load_metadata(&staging_root)?;
     let staged_metadata_snapshot = safe_file::read_regular_file_snapshot(&staged_metadata)?;
     let staged_tests_snapshot = has_staged_tests
         .then(|| safe_file::read_tree_snapshot(&staged_tests))
@@ -2895,23 +2902,28 @@ fn contest_staging_archive(root: &Path, prefix: &str) -> io::Result<PathBuf> {
     Ok(root.with_file_name(format!("{prefix}{suffix}")))
 }
 
-fn refresh_owned_problem_indices(
+fn validate_existing_owned_tests(
     destination: &Path,
-    staging_root: &Path,
+    replacement: &Contest,
 ) -> io::Result<HashSet<String>> {
-    let staged_contest = load_metadata(staging_root)?;
-    existing_owned_problem_indices(destination, &staged_contest)
+    let indices = existing_owned_problem_indices(destination, replacement)?;
+    validate_refresh_owned_tests(&destination.join("tests"), &indices)?;
+    Ok(indices)
+}
+
+fn problem_indices(contest: &Contest) -> HashSet<String> {
+    contest
+        .problems
+        .iter()
+        .map(|problem| problem.index.clone())
+        .collect()
 }
 
 fn existing_owned_problem_indices(
     destination: &Path,
     replacement: &Contest,
 ) -> io::Result<HashSet<String>> {
-    let mut replacement_indices = replacement
-        .problems
-        .iter()
-        .map(|problem| problem.index.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
+    let mut replacement_indices = problem_indices(replacement);
     let (previous, url_mismatches) = match inspect_contest_metadata(destination) {
         Ok(ContestMetadataHealth::Healthy(contest)) => (contest, None),
         Ok(ContestMetadataHealth::Repairable(manifest)) => {
@@ -2947,16 +2959,16 @@ fn existing_owned_problem_indices(
                             || official.index.eq_ignore_ascii_case(&old.index))
                 })
             })
-            .map(|problem| problem.index.to_ascii_lowercase())
+            .map(|problem| problem.index.clone())
             .collect());
     }
 
-    replacement_indices.extend(
-        previous
-            .problems
-            .iter()
-            .map(|problem| problem.index.to_ascii_lowercase()),
-    );
+    // Use the existing spelling when both manifests describe the same logical label.
+    // The replacement spelling may address a different directory on this volume.
+    for problem in previous.problems {
+        replacement_indices.retain(|index| !index.eq_ignore_ascii_case(&problem.index));
+        replacement_indices.insert(problem.index);
+    }
     Ok(replacement_indices)
 }
 
@@ -2964,15 +2976,23 @@ fn validate_refresh_owned_tests(
     tests_directory: &Path,
     owned_problem_indices: &HashSet<String>,
 ) -> io::Result<()> {
-    for problem_entry in fs::read_dir(tests_directory)? {
+    let tests = open_contest_destination_nofollow(tests_directory)?;
+    for problem_entry in tests.entries()? {
         let problem_entry = problem_entry?;
-        let problem_path = problem_entry.path();
-        let Some(problem_index) = problem_entry.file_name().to_str().map(str::to_owned) else {
+        let problem_name = problem_entry.file_name();
+        let problem_path = tests_directory.join(&problem_name);
+        let Some(problem_index) = problem_name.to_str() else {
             return Err(unowned_refresh_test_error(&problem_path));
         };
         if refresh_entry_is_reparse(&problem_path)?
             || !problem_entry.file_type()?.is_dir()
-            || !owned_problem_indices.contains(&problem_index.to_ascii_lowercase())
+            || (!owned_problem_indices.contains(problem_index)
+                && !matches_owned_problem_alias(
+                    &tests,
+                    tests_directory,
+                    problem_index,
+                    owned_problem_indices,
+                )?)
         {
             return Err(unowned_refresh_test_error(&problem_path));
         }
@@ -2993,6 +3013,37 @@ fn validate_refresh_owned_tests(
     }
 
     Ok(())
+}
+
+fn matches_owned_problem_alias(
+    tests: &CapDir,
+    tests_directory: &Path,
+    actual_index: &str,
+    owned_problem_indices: &HashSet<String>,
+) -> io::Result<bool> {
+    for index in owned_problem_indices
+        .iter()
+        .filter(|index| index.eq_ignore_ascii_case(actual_index))
+    {
+        let expected_path = tests_directory.join(index);
+        let actual_path = tests_directory.join(actual_index);
+        let Some(expected) =
+            open_managed_directory(tests, index, &expected_path, "problem tests directory")?
+        else {
+            continue;
+        };
+        let Some(actual) =
+            open_managed_directory(tests, actual_index, &actual_path, "problem tests directory")?
+        else {
+            return Err(unowned_refresh_test_error(&actual_path));
+        };
+        if opened_directory_identity(&expected, &expected_path)?
+            == opened_directory_identity(&actual, &actual_path)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_previous_tests_snapshot(
@@ -3113,13 +3164,7 @@ fn refresh_update_error(
     let kind = original.kind();
     let recovery_path = staging.keep();
     if rollback_errors.is_empty() {
-        return io::Error::new(
-            kind,
-            format!(
-                "contest data update failed: {original}; staging data kept at {}",
-                recovery_path.display()
-            ),
-        );
+        return preserved_staging_error(&recovery_path, original);
     }
     io::Error::new(
         kind,
@@ -3127,6 +3172,16 @@ fn refresh_update_error(
             "contest data update failed: {original}; rollback also failed: {}; recovery data kept at {}",
             rollback_errors.join("; "),
             recovery_path.display()
+        ),
+    )
+}
+
+fn preserved_staging_error(path: &Path, original: io::Error) -> io::Error {
+    io::Error::new(
+        original.kind(),
+        format!(
+            "contest data update failed: {original}; staging data kept at {}",
+            path.display()
         ),
     )
 }
@@ -4960,7 +5015,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_replacement_never_inspects_or_changes_tests() {
+    fn metadata_only_replacement_rejects_unmanaged_tests_without_changing_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
         fs::create_dir(&destination).unwrap();
@@ -4982,15 +5037,16 @@ mod tests {
         };
         save_metadata(staging.path(), &new_contest).unwrap();
 
-        replace_contest_data(
+        let error = replace_contest_data(
             &destination,
             staging,
             false,
             ContestDataReplacement::MetadataOnly,
         )
-        .unwrap();
+        .expect_err("metadata-only repair must verify retained tests before installing metadata");
 
-        assert_eq!(load_metadata(&destination).unwrap(), new_contest);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(load_metadata(&destination).unwrap(), old_contest);
         assert_eq!(fs::read(destination.join("tests")).unwrap(), tests_before);
     }
 
@@ -5433,7 +5489,7 @@ mod tests {
             inspect_tests_health(temp.path(), &contest).unwrap(),
             TestsHealth::Broken
         );
-        let error = preflight_tests_replacement(temp.path(), &contest)
+        let error = preflight_tests_update(temp.path(), &contest, false)
             .expect_err("unmanaged content must block whole-tests replacement");
         assert!(error.to_string().contains("memo.txt"));
         assert_eq!(
@@ -5561,8 +5617,62 @@ mod tests {
         )
         .unwrap();
 
-        let indices = refresh_owned_problem_indices(destination.path(), staging.path()).unwrap();
-        assert_eq!(indices, HashSet::from(["a".to_string(), "z".to_string()]));
+        let replacement = load_metadata(staging.path()).unwrap();
+        let indices = existing_owned_problem_indices(destination.path(), &replacement).unwrap();
+        assert_eq!(indices, HashSet::from(["A".to_string(), "Z".to_string()]));
+    }
+
+    #[test]
+    fn refresh_ownership_distinguishes_case_aliases_from_distinct_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        fs::create_dir(&destination).unwrap();
+        let contest = Contest {
+            contest_id: "abc466".to_string(),
+            problems: vec![problem("Z")],
+        };
+        save_metadata(&destination, &contest).unwrap();
+        let metadata = destination.join(".atc/contest.toml");
+        let original = fs::read(&metadata).unwrap();
+        write_sample_pair(&destination, "z", 1, "lowercase\n");
+        let uppercase = destination.join("tests/Z");
+        let is_alias = uppercase.try_exists().unwrap();
+        if !is_alias {
+            write_sample_pair(&destination, "Z", 1, "uppercase\n");
+        }
+
+        let staging = tempfile::Builder::new()
+            .prefix(".atc-refresh-")
+            .tempdir_in(&destination)
+            .unwrap();
+        save_metadata(staging.path(), &contest).unwrap();
+        write_sample_pair(staging.path(), "Z", 1, "official\n");
+        let result = replace_refresh_data(&destination, staging, false);
+
+        if is_alias {
+            result.expect("the alternate spelling refers to the managed directory");
+            assert_eq!(
+                fs::read(uppercase.join("sample-1.in")).unwrap(),
+                b"official\n"
+            );
+        } else {
+            let error = result.expect_err("the lowercase directory is a different object");
+            assert!(error.to_string().contains("unowned entry"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(destination.join("tests/z").to_str().unwrap())
+            );
+            assert_eq!(fs::read(&metadata).unwrap(), original);
+            assert_eq!(
+                fs::read(uppercase.join("sample-1.in")).unwrap(),
+                b"uppercase\n"
+            );
+            assert_eq!(
+                fs::read(destination.join("tests/z/sample-1.in")).unwrap(),
+                b"lowercase\n"
+            );
+        }
     }
 
     #[test]

@@ -512,7 +512,7 @@ fn plan_repair(
                 return Err(io::Error::other("contest no longer requires repair").into());
             }
 
-            workspace::preflight_tests_replacement(destination, &contest)?;
+            workspace::preflight_tests_update(destination, &contest, false)?;
             let samples_by_problem = fetch_samples_for_manifest(&contest, atcoder, reporter)?;
             Ok(RepairPlan {
                 contest,
@@ -547,11 +547,13 @@ fn plan_repair(
                 &samples_by_problem,
             )? {
                 TestsHealth::Healthy => RepairComponent::Keep,
-                TestsHealth::Broken => {
-                    workspace::preflight_tests_replacement(destination, &contest)?;
-                    RepairComponent::Restore
-                }
+                TestsHealth::Broken => RepairComponent::Restore,
             };
+            workspace::preflight_tests_update(
+                destination,
+                &contest,
+                tests == RepairComponent::Keep,
+            )?;
             Ok(RepairPlan {
                 contest,
                 samples_by_problem,
@@ -615,9 +617,11 @@ fn revalidate_repair_plan(
     if current_tests != expected_tests {
         return Err(repair_plan_changed_error().into());
     }
-    if plan.tests == RepairComponent::Restore {
-        workspace::preflight_tests_replacement(destination, &plan.contest)?;
-    }
+    workspace::preflight_tests_update(
+        destination,
+        &plan.contest,
+        plan.tests == RepairComponent::Keep,
+    )?;
 
     Ok(())
 }
@@ -1091,6 +1095,85 @@ mod tests {
     }
 
     #[test]
+    fn matching_official_samples_do_not_establish_ownership_for_either_update() {
+        let fetched = abc466_snapshot();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+        for force_refresh in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("abc466");
+            save_snapshot_tests(&destination, &fetched);
+            workspace::save_metadata(&destination, &fetched.contest).unwrap();
+            let metadata = destination.join(".atc/contest.toml");
+            let original = std::fs::read_to_string(&metadata)
+                .unwrap()
+                .replace("task_id = \"abc466_b\"", "task_id = \"abc466_a\"")
+                .replace("task_id = \"abc466_e\"", "task_id = \"abc999_z\"")
+                .replace("/abc466/tasks/abc466_e", "/abc999/tasks/abc999_z");
+            std::fs::write(&metadata, &original).unwrap();
+            let tests = destination.join("tests");
+            let before = safe_file::read_tree_snapshot(&tests).unwrap();
+
+            let result = if force_refresh {
+                super::super::refresh::refresh_at(
+                    &destination,
+                    "abc466",
+                    true,
+                    &client,
+                    &mut NullReporter,
+                )
+            } else {
+                repair_at(&destination, "abc466", &client, &mut NullReporter)
+            };
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("unowned entry"), "{error}");
+            assert!(error.contains(tests.join("E").to_str().unwrap()), "{error}");
+            assert_eq!(std::fs::read_to_string(metadata).unwrap(), original);
+            assert_eq!(safe_file::read_tree_snapshot(&tests).unwrap(), before);
+
+            if force_refresh {
+                let staging = std::fs::read_dir(&destination)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(".atc-refresh-")
+                    })
+                    .expect("refused refresh keeps its staging directory");
+                assert!(error.contains(staging.to_str().unwrap()), "{error}");
+                assert_eq!(workspace::load_metadata(&staging).unwrap(), fetched.contest);
+                assert!(staging.join("tests/E/sample-1.in").is_file());
+                assert!(!staging.join(safe_file::RECOVERY_INTENT).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_task_repair_retains_proven_owned_samples_when_binding_is_corrected() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let fetched = abc466_snapshot();
+        save_snapshot_tests(&destination, &fetched);
+        save_duplicate_task_metadata(&destination, &fetched);
+        let tests = destination.join("tests");
+        std::fs::write(tests.join("A/sample-1.in"), "local sample edit\n").unwrap();
+        let before = safe_file::read_tree_snapshot(&tests).unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixtures);
+
+        repair_at(&destination, "abc466", &client, &mut NullReporter).unwrap();
+
+        assert_eq!(
+            workspace::load_metadata(&destination).unwrap(),
+            fetched.contest
+        );
+        assert_eq!(safe_file::read_tree_snapshot(&tests).unwrap(), before);
+    }
+
+    #[test]
     fn duplicate_task_repair_restores_official_samples_even_when_counts_match() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
@@ -1487,39 +1570,27 @@ mod tests {
     }
 
     #[test]
-    fn repair_with_broken_metadata_and_healthy_tests_restores_only_metadata() {
+    fn repair_refuses_healthy_tests_when_broken_metadata_cannot_establish_ownership() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("abc466");
         std::fs::create_dir(&destination).unwrap();
         let fetched = abc466_snapshot();
         save_snapshot_tests(&destination, &fetched);
-        let edited_sample = destination.join("tests/A/sample-1.in");
-        std::fs::write(&edited_sample, "local structural edit\n").unwrap();
-        std::fs::write(destination.join("tests/memo.txt"), "unrelated").unwrap();
+        let tests = destination.join("tests");
+        let before = safe_file::read_tree_snapshot(&tests).unwrap();
         std::fs::create_dir(destination.join(".atc")).unwrap();
-        std::fs::write(
-            destination.join(".atc/contest.toml"),
-            "version = 1\ncontest_id = \"abc466\"\nproblems = []\n",
-        )
-        .unwrap();
+        let metadata = destination.join(".atc/contest.toml");
+        let original = "version = 1\ncontest_id = \"abc466\"\nproblems = []\n";
+        std::fs::write(&metadata, original).unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let client = atcoder::AtCoderClient::fixture(fixtures);
         let mut reporter = NullReporter;
 
-        repair_at(&destination, "abc466", &client, &mut reporter).unwrap();
+        let error = repair_at(&destination, "abc466", &client, &mut reporter).unwrap_err();
 
-        assert_eq!(
-            std::fs::read_to_string(edited_sample).unwrap(),
-            "local structural edit\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.join("tests/memo.txt")).unwrap(),
-            "unrelated"
-        );
-        assert_eq!(
-            workspace::load_metadata(&destination).unwrap(),
-            fetched.contest
-        );
+        assert!(error.to_string().contains("cannot confirm ownership"));
+        assert_eq!(std::fs::read_to_string(metadata).unwrap(), original);
+        assert_eq!(safe_file::read_tree_snapshot(&tests).unwrap(), before);
     }
 
     #[test]
@@ -1638,10 +1709,8 @@ mod tests {
         let metadata_only = metadata_only_root.path().join("abc466");
         std::fs::create_dir(&metadata_only).unwrap();
         save_snapshot_tests(&metadata_only, &fetched);
-        std::fs::create_dir(metadata_only.join(".atc")).unwrap();
         let invalid_metadata = metadata_only.join(".atc/contest.toml");
-        let original = "version = 1\ncontest_id = \"abc466\"\nproblems = []\n";
-        std::fs::write(&invalid_metadata, original).unwrap();
+        let original = save_duplicate_task_metadata(&metadata_only, &fetched);
         let removed_sample = metadata_only.join("tests/A/sample-1.in");
         let client = atcoder::AtCoderClient::fixture(fixtures);
         let error =
