@@ -73,10 +73,21 @@ fn test_problem_model() -> crate::model::Problem {
     crate::model::Problem {
         index: "A".to_string(),
         title: "Problem A".to_string(),
-        task_id: "abc466_a".to_string(),
-        url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".to_string(),
+        task_id: "abc123_a".to_string(),
+        url: "https://atcoder.jp/contests/abc123/tasks/abc123_a".to_string(),
         sample_count: 0,
     }
+}
+
+fn save_test_problem(destination: &Path, problem: &crate::model::Problem) {
+    workspace::save_metadata(
+        destination,
+        &crate::model::Contest {
+            contest_id: "abc123".into(),
+            problems: vec![problem.clone()],
+        },
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -221,6 +232,12 @@ impl Reporter for RecordingReporter {
 
             Event::WatchSourceChanged { source } => {
                 format!("watch-source-changed:{}", source.display())
+            }
+            Event::WatchTestFailed {
+                problem_index,
+                error,
+            } => {
+                format!("watch-test-failed:{problem_index}:{error}")
             }
             Event::TestCaseLayout { .. } => return,
             Event::TestRunStarted {
@@ -556,6 +573,7 @@ fn python_debug_is_rejected_by_commands_policy() {
 fn no_samples_is_reported_without_starting_a_runner() {
     let temp = tempfile::tempdir().unwrap();
     let problem = test_problem_model();
+    save_test_problem(temp.path(), &problem);
     std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
     let runner_config = RunnerConfig {
         cpp_compiler: "definitely-not-a-real-compiler".to_string(),
@@ -581,6 +599,7 @@ fn no_samples_is_reported_without_starting_a_runner() {
 fn no_samples_in_debug_mode_does_not_materialize_header_or_start_compiler() {
     let temp = tempfile::tempdir().unwrap();
     let problem = test_problem_model();
+    save_test_problem(temp.path(), &problem);
     std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
     let runner_config = RunnerConfig {
         cpp_compiler: "definitely-not-a-real-compiler".to_string(),
@@ -611,6 +630,7 @@ fn normal_cpp_build_neither_materializes_nor_requires_debug_header() {
     let temp = tempfile::tempdir().unwrap();
     let mut problem = test_problem_model();
     problem.sample_count = 1;
+    save_test_problem(temp.path(), &problem);
     std::fs::write(
         temp.path().join("A.cpp"),
         concat!(
@@ -664,6 +684,7 @@ fn debug_cpp_build_resolves_embedded_header_and_reports_debug_stderr_after_ac() 
     let temp = tempfile::tempdir().unwrap();
     let mut problem = test_problem_model();
     problem.sample_count = 1;
+    save_test_problem(temp.path(), &problem);
     std::fs::write(
         temp.path().join("A.cpp"),
         concat!(
@@ -724,6 +745,7 @@ fn debug_header_materialization_error_is_fatal_before_compiler_start() {
     let temp = tempfile::tempdir().unwrap();
     let mut problem = test_problem_model();
     problem.sample_count = 1;
+    save_test_problem(temp.path(), &problem);
     std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
     workspace::save_samples(
         temp.path(),
@@ -763,6 +785,7 @@ fn debug_header_materialization_error_is_fatal_before_compiler_start() {
 fn resolved_language_does_not_fall_back_to_an_existing_other_source() {
     let temp = tempfile::tempdir().unwrap();
     let problem = test_problem_model();
+    save_test_problem(temp.path(), &problem);
     std::fs::write(temp.path().join("A.cpp"), "source").unwrap();
     let mut reporter = RecordingReporter::default();
 

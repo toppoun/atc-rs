@@ -440,13 +440,35 @@ fn repair_at_with_before_install_and_validation(
         }
     };
 
-    workspace::replace_contest_data_with_snapshot(
-        destination,
-        staging.into_temp_dir(),
-        true,
-        replacement,
-        plan.metadata_snapshot,
-    )?;
+    if replacement == ContestDataReplacement::MetadataOnly {
+        workspace::replace_metadata_only(
+            destination,
+            staging.into_temp_dir(),
+            true,
+            plan.metadata_snapshot,
+            || {
+                if let Some(previous) = &plan.duplicate_manifest
+                    && repair_tests_health(
+                        destination,
+                        &plan.contest,
+                        Some(previous),
+                        &plan.samples_by_problem,
+                    )? != TestsHealth::Healthy
+                {
+                    return Err(repair_plan_changed_error());
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        workspace::replace_contest_data_with_snapshot(
+            destination,
+            staging.into_temp_dir(),
+            true,
+            replacement,
+            plan.metadata_snapshot,
+        )?;
+    }
 
     match inspect_contest_target(destination, contest_id)? {
         ContestTargetHealth::Healthy => {
@@ -517,7 +539,12 @@ fn plan_repair(
             workspace::validate_contest_identity(&contest, contest_id)?;
             workspace::validate_contest_paths(&contest)?;
 
-            let tests = match workspace::inspect_tests_health(destination, &contest)? {
+            let tests = match repair_tests_health(
+                destination,
+                &contest,
+                duplicate_manifest.as_ref(),
+                &samples_by_problem,
+            )? {
                 TestsHealth::Healthy => RepairComponent::Keep,
                 TestsHealth::Broken => {
                     workspace::preflight_tests_replacement(destination, &contest)?;
@@ -574,7 +601,12 @@ fn revalidate_repair_plan(
         _ => return Err(repair_plan_changed_error().into()),
     }
 
-    let current_tests = workspace::inspect_tests_health(destination, &plan.contest)?;
+    let current_tests = repair_tests_health(
+        destination,
+        &plan.contest,
+        plan.duplicate_manifest.as_ref(),
+        &plan.samples_by_problem,
+    )?;
     let expected_tests = match plan.tests {
         RepairComponent::Keep => TestsHealth::Healthy,
         RepairComponent::Restore => TestsHealth::Broken,
@@ -587,6 +619,28 @@ fn revalidate_repair_plan(
     }
 
     Ok(())
+}
+
+fn repair_tests_health(
+    destination: &Path,
+    contest: &Contest,
+    duplicate_manifest: Option<&Contest>,
+    official_samples: &[Vec<Sample>],
+) -> io::Result<TestsHealth> {
+    let health = workspace::inspect_tests_health(destination, contest)?;
+    let Some(previous) = duplicate_manifest.filter(|_| health == TestsHealth::Healthy) else {
+        return Ok(health);
+    };
+    for (problem, official) in contest.problems.iter().zip(official_samples) {
+        let same_task = previous
+            .problems
+            .iter()
+            .any(|old| old.index == problem.index && old.task_id == problem.task_id);
+        if !same_task && workspace::load_verified_samples(destination, problem)? != *official {
+            return Ok(TestsHealth::Broken);
+        }
+    }
+    Ok(TestsHealth::Healthy)
 }
 
 fn repair_plan_changed_error() -> io::Error {
@@ -671,6 +725,16 @@ mod tests {
         {
             workspace::save_samples(destination, problem, samples).unwrap();
         }
+    }
+
+    fn save_duplicate_task_metadata(destination: &Path, fetched: &FetchedContestData) -> String {
+        workspace::save_metadata(destination, &fetched.contest).unwrap();
+        let metadata = destination.join(".atc/contest.toml");
+        let duplicate = std::fs::read_to_string(&metadata)
+            .unwrap()
+            .replace("abc466_e", "abc466_a");
+        std::fs::write(&metadata, &duplicate).unwrap();
+        duplicate
     }
 
     #[test]
@@ -907,6 +971,117 @@ mod tests {
             std::fs::read_to_string(destination.join("Z.cpp")).unwrap(),
             "user source\n"
         );
+    }
+
+    #[test]
+    fn duplicate_task_repair_restores_official_samples_even_when_counts_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir(&destination).unwrap();
+        let fetched = abc466_snapshot();
+        let a = 0;
+        let e = 4;
+        assert_eq!(fetched.contest.problems[a].index, "A");
+        assert_eq!(fetched.contest.problems[e].index, "E");
+        assert_eq!(
+            fetched.samples_by_problem[a].len(),
+            fetched.samples_by_problem[e].len()
+        );
+        assert_ne!(fetched.samples_by_problem[a], fetched.samples_by_problem[e]);
+        save_snapshot_tests(&destination, &fetched);
+        workspace::save_samples(
+            &destination,
+            &fetched.contest.problems[e],
+            &fetched.samples_by_problem[a],
+        )
+        .unwrap();
+        let duplicate = save_duplicate_task_metadata(&destination, &fetched);
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixture);
+
+        repair_at(&destination, "abc466", &client, &mut NullReporter).unwrap();
+
+        assert_eq!(
+            workspace::load_metadata(&destination).unwrap(),
+            fetched.contest
+        );
+        assert_eq!(
+            workspace::load_samples(&destination, "E").unwrap(),
+            fetched.samples_by_problem[e]
+        );
+        let recovery = std::fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-recovery-repair-")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("previous-contest.toml")).unwrap(),
+            duplicate
+        );
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("previous-tests/E/sample-1.in")).unwrap(),
+            fetched.samples_by_problem[a][0].input
+        );
+    }
+
+    #[test]
+    fn duplicate_task_repair_keeps_recovery_pending_if_retained_samples_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir(&destination).unwrap();
+        let fetched = abc466_snapshot();
+        save_snapshot_tests(&destination, &fetched);
+        let duplicate = save_duplicate_task_metadata(&destination, &fetched);
+        let edited_sample = destination.join("tests/E/sample-1.in");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let client = atcoder::AtCoderClient::fixture(fixture);
+
+        let error = repair_at_with_before_install_and_validation(
+            &destination,
+            "abc466",
+            &client,
+            &mut NullReporter,
+            || {},
+            || Ok(()),
+            || std::fs::write(&edited_sample, "late edit\n").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("retained samples could not be verified")
+        );
+        assert!(
+            workspace::load_metadata(&destination)
+                .unwrap_err()
+                .to_string()
+                .contains("requires recovery check")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&edited_sample).unwrap(),
+            "late edit\n"
+        );
+        let staging = std::fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-repair-")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staging.join("previous-contest.toml")).unwrap(),
+            duplicate
+        );
+        assert!(!staging.join(safe_file::RECOVERY_COMPLETE).exists());
     }
 
     #[test]

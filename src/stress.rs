@@ -53,6 +53,44 @@ fn unscoped_staging_error(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, UnscopedStagingError(message))
 }
 
+#[derive(Debug)]
+struct ProblemSavedCaseError {
+    problem_index: String,
+    source: io::Error,
+}
+
+impl fmt::Display for ProblemSavedCaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot load saved stress case at .atc/stress/{}: {}",
+            self.problem_index, self.source
+        )
+    }
+}
+
+impl std::error::Error for ProblemSavedCaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn problem_saved_case_error(problem_index: &str, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        ProblemSavedCaseError {
+            problem_index: problem_index.to_owned(),
+            source,
+        },
+    )
+}
+
+pub(crate) fn is_problem_load_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ProblemSavedCaseError>())
+}
+
 pub(crate) fn automatic_seed() -> io::Result<u64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1291,17 +1329,21 @@ fn load_saved_case_status_with_hook(
         return Ok(SavedCaseLoad::Absent);
     };
 
-    let generation_lock = open_stress_lock(&stress_directory, problem_index)?;
+    let problem_error = |error| problem_saved_case_error(problem_index, error);
+    let generation_lock =
+        open_shared_stress_lock(&stress_directory, problem_index).map_err(problem_error)?;
     before_shared_lock();
-    generation_lock.lock_shared()?;
+    generation_lock.lock_shared().map_err(problem_error)?;
 
     ensure_no_interrupted_generation(&stress_directory, contest_id, problem_index)?;
 
-    let Some(generation) = open_optional_directory(&stress_directory, problem_index)? else {
+    let Some(generation) =
+        open_optional_directory(&stress_directory, problem_index).map_err(problem_error)?
+    else {
         return Ok(SavedCaseLoad::Absent);
     };
 
-    let snapshot = open_saved_case_snapshot(&generation)?;
+    let snapshot = open_saved_case_snapshot(&generation).map_err(problem_error)?;
 
     // Keep the shared lock through the reads. On Windows, no-follow file handles intentionally
     // block a directory rename, so releasing the lock before closing them would make the writer's
@@ -1309,7 +1351,7 @@ fn load_saved_case_status_with_hook(
     drop(generation);
     let result = read_saved_case_snapshot(snapshot, contest_id, problem_index);
     drop(generation_lock);
-    result
+    result.map_err(problem_error)
 }
 
 fn ensure_no_interrupted_generation(
@@ -1370,12 +1412,13 @@ fn ensure_no_interrupted_generation_with_hook(
                 let _other_lock = if own_stage {
                     None
                 } else {
-                    let lock = open_stress_lock(stress_directory, owner).map_err(|error| {
-                        unscoped_staging_error(format!(
-                            "{}: {error}",
-                            staging_review_message(problem_index, name)
-                        ))
-                    })?;
+                    let lock =
+                        open_shared_stress_lock(stress_directory, owner).map_err(|error| {
+                            unscoped_staging_error(format!(
+                                "{}: {error}",
+                                staging_review_message(problem_index, name)
+                            ))
+                        })?;
                     match lock.try_lock_shared() {
                         Ok(()) => Some(lock),
                         Err(fs::TryLockError::WouldBlock) => continue,
@@ -1420,7 +1463,9 @@ fn ensure_no_interrupted_generation_with_hook(
             });
         }
     }
-    problem_error.map_or(Ok(()), Err)
+    problem_error.map_or(Ok(()), |error| {
+        Err(problem_saved_case_error(problem_index, error))
+    })
 }
 
 fn staging_review_message(problem_index: &str, name: &str) -> String {
@@ -1737,6 +1782,32 @@ fn open_regular_file(directory: &CapDir, name: &str) -> io::Result<Option<fs::Fi
 
 fn open_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Result<fs::File> {
     let name = format!(".{problem_index}.lock");
+    open_writable_stress_lock(stress_directory, &name, false)
+}
+
+fn open_shared_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Result<fs::File> {
+    let name = format!(".{problem_index}.lock");
+    if let Some(lock) = open_regular_file(stress_directory, &name)? {
+        return Ok(lock);
+    }
+    match open_writable_stress_lock(stress_directory, &name, true) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_regular_file(stress_directory, &name)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("stress generation lock disappeared: {name}"),
+                )
+            })
+        }
+        result => result,
+    }
+}
+
+fn open_writable_stress_lock(
+    stress_directory: &CapDir,
+    name: &str,
+    create_new: bool,
+) -> io::Result<fs::File> {
     let mut options = CapOpenOptions::new();
     // Readers and writers must both open the same persistent lock file. Never remove it:
     // recreating the name could leave concurrent processes locking different file objects.
@@ -1744,11 +1815,12 @@ fn open_stress_lock(stress_directory: &CapDir, problem_index: &str) -> io::Resul
         .read(true)
         .write(true)
         .create(true)
+        .create_new(create_new)
         .truncate(false)
         .follow(FollowSymlinks::No)
         .nonblock(true);
 
-    let file = stress_directory.open_with(&name, &options)?;
+    let file = stress_directory.open_with(name, &options)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

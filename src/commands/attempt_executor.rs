@@ -271,7 +271,7 @@ mod tests {
             index: "A".to_string(),
             title: "Problem A".to_string(),
             task_id: "abc123_a".to_string(),
-            url: "https://example.invalid/a".to_string(),
+            url: "https://atcoder.jp/contests/abc123/tasks/abc123_a".to_string(),
             sample_count: 0,
         }
     }
@@ -281,6 +281,14 @@ mod tests {
     ) -> (tempfile::TempDir, AttemptExecutor) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("A.py"), "pass\n").unwrap();
+        crate::workspace::save_metadata(
+            temp.path(),
+            &crate::model::Contest {
+                contest_id: "abc123".into(),
+                problems: vec![problem()],
+            },
+        )
+        .unwrap();
         let executor = AttemptExecutor::new(
             temp.path().to_path_buf(),
             "abc123".to_string(),
@@ -324,6 +332,34 @@ mod tests {
             ]
         ));
         assert!(message_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tui_sample_attempt_rechecks_contest_recovery() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (temp, executor) = executor_with_no_samples(message_tx);
+        let staging = temp.path().join(".atc-repair-interrupted");
+        std::fs::create_dir(&staging).unwrap();
+        crate::safe_file::write_recovery_intent(
+            &staging,
+            &crate::safe_file::RecoveryIdentity::new("contest", "abc123", None),
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::channel();
+
+        let outcome = executor
+            .spawn(request(), completion_tx)
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(
+            matches!(outcome, AttemptOutcome::Failed(error) if error.to_string().contains("requires recovery check"))
+        );
+        assert!(matches!(
+            message_rx.try_iter().collect::<Vec<_>>().as_slice(),
+            [Message::RunStarted { .. }]
+        ));
     }
 
     #[test]

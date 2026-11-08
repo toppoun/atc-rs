@@ -229,7 +229,8 @@ impl Reporter for ChannelReporter {
             | Event::StressFileExists { .. }
             | Event::StressFilesAlreadyInitialized { .. }
             | Event::WatchStarted { .. }
-            | Event::WatchSourceChanged { .. } => {}
+            | Event::WatchSourceChanged { .. }
+            | Event::WatchTestFailed { .. } => {}
         }
     }
 }

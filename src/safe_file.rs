@@ -1,4 +1,7 @@
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -96,6 +99,7 @@ pub(crate) fn complete_recovery(
     Ok(completed_path.to_path_buf())
 }
 
+#[cfg(test)]
 pub(crate) fn read_completed_recovery(path: &Path) -> io::Result<RecoveryIdentity> {
     let intent = read_regular_file_snapshot(&path.join(RECOVERY_INTENT))?.bytes;
     let complete = read_regular_file_snapshot(&path.join(RECOVERY_COMPLETE))?.bytes;
@@ -133,10 +137,6 @@ fn parse_recovery_record(bytes: &[u8]) -> io::Result<RecoveryIdentity> {
         ));
     }
     Ok(identity)
-}
-
-pub(crate) fn recovery_intent_exists(path: &Path) -> io::Result<bool> {
-    Ok(read_optional_regular_file_snapshot(&path.join(RECOVERY_INTENT))?.is_some())
 }
 
 fn write_recovery_record(path: &Path, identity: &RecoveryIdentity) -> io::Result<()> {
@@ -219,7 +219,7 @@ fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
     }
     let file = options.open(path)?;
     if !file.metadata()?.file_type().is_dir() {
@@ -257,7 +257,7 @@ pub(crate) fn read_regular_file_snapshot(path: &Path) -> io::Result<FileSnapshot
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -265,7 +265,20 @@ pub(crate) fn read_regular_file_snapshot(path: &Path) -> io::Result<FileSnapshot
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let mut file = options.open(path)?;
+    snapshot_regular_file(options.open(path)?, path)
+}
+
+pub(crate) fn read_regular_file_snapshot_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<FileSnapshot> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    snapshot_regular_file(directory.open_with(name, &options)?.into_std(), path)
+}
+
+fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnapshot> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -657,6 +670,44 @@ mod tests {
     use std::fs;
 
     const PREFIX: &str = ".atc-safe-create-";
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_record_fifo_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RECOVERY_INTENT);
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (done, result) = mpsc::channel();
+        let record = path.clone();
+        let reader = std::thread::spawn(move || {
+            done.send(read_regular_file_snapshot(&record)).unwrap();
+        });
+
+        let read = result.recv_timeout(Duration::from_secs(2));
+        if read.is_err() {
+            // Unblock a regressed reader so the test fails without hanging the suite.
+            if let Ok(writer) = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            {
+                reader.join().unwrap();
+                drop(writer);
+            }
+            panic!("opening the recovery record blocked without a FIFO writer");
+        }
+        reader.join().unwrap();
+        assert_eq!(
+            read.unwrap().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[cfg(unix)]
     fn create_file_symlink(target: &Path, link: &Path) -> bool {

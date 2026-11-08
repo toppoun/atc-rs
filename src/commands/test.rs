@@ -343,7 +343,7 @@ fn test_problem_with_debug_header_and_cancel(
         .into());
     }
 
-    let samples = workspace::load_verified_samples(destination, problem)?;
+    let samples = workspace::load_test_samples(destination, contest_id, problem)?;
     let stress_case = match crate::stress::load_saved_case_status(
         destination,
         contest_id,

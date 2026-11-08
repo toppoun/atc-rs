@@ -688,9 +688,11 @@ fn load_metadata_unchecked(destination: &Path) -> io::Result<Contest> {
         ));
     }
 
-    let content = fs::read_to_string(&path)?;
+    parse_contest_metadata(&fs::read_to_string(&path)?)
+}
 
-    let metadata: ContestMetadata = toml::from_str(&content)
+fn parse_contest_metadata(content: &str) -> io::Result<Contest> {
+    let metadata: ContestMetadata = toml::from_str(content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     if metadata.version != METADATA_VERSION {
@@ -751,25 +753,43 @@ pub fn ensure_contest_parent(destination: &Path) -> io::Result<()> {
 
 fn ensure_contest_recovery_state(destination: &Path) -> io::Result<()> {
     validate_contest_directory(destination)?;
-    for entry in fs::read_dir(destination)? {
+    let directory = open_contest_destination_nofollow(destination)?;
+    contest_recovery_state(destination, &directory).map(|_| ())
+}
+
+fn contest_recovery_state(destination: &Path, directory: &CapDir) -> io::Result<HashSet<String>> {
+    let mut finalized = HashSet::new();
+    for entry in directory.entries()? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         let is_staging = name.starts_with(".atc-refresh-") || name.starts_with(".atc-repair-");
-        let is_recovery = name.starts_with(".atc-recovery-");
+        let is_recovery = name.starts_with(".atc-recovery-") || name.starts_with(".atc-aborted-");
         if !is_staging && !is_recovery {
             continue;
         }
-        let path = entry.path();
-        if !existing_real_directory(&path, "contest recovery directory")? {
+        let path = destination.join(&name);
+        let Some(recovery) =
+            open_managed_directory(directory, &name, &path, "contest recovery directory")?
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("contest recovery directory disappeared: {}", path.display()),
             ));
-        }
+        };
         if is_recovery {
-            let identity = safe_file::read_completed_recovery(&path)?;
+            let read_record = |name: &str| {
+                safe_file::read_regular_file_snapshot_at(
+                    &recovery,
+                    OsStr::new(name),
+                    &path.join(name),
+                )
+            };
+            let identity = safe_file::parse_completed_recovery(
+                &read_record(safe_file::RECOVERY_INTENT)?.bytes,
+                &read_record(safe_file::RECOVERY_COMPLETE)?.bytes,
+            )?;
             if !identity.is_contest() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -779,9 +799,10 @@ fn ensure_contest_recovery_state(destination: &Path) -> io::Result<()> {
                     ),
                 ));
             }
-        } else if safe_file::recovery_intent_exists(&path)?
-            || path_entry_exists(&path.join("previous-tests"))?
-            || path_entry_exists(&path.join("previous-contest.toml"))?
+            finalized.insert(name);
+        } else if entry_exists(&recovery, safe_file::RECOVERY_INTENT)?
+            || entry_exists(&recovery, "previous-tests")?
+            || entry_exists(&recovery, "previous-contest.toml")?
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -789,11 +810,11 @@ fn ensure_contest_recovery_state(destination: &Path) -> io::Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(finalized)
 }
 
-fn path_entry_exists(path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
+fn entry_exists(directory: &CapDir, name: &str) -> io::Result<bool> {
+    match directory.symlink_metadata(name) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -929,8 +950,8 @@ enum SampleFileKind {
 
 #[derive(Debug, Default)]
 struct SampleFiles {
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
+    input: Option<std::ffi::OsString>,
+    output: Option<std::ffi::OsString>,
 }
 
 fn parse_sample_filename(name: &OsStr) -> io::Result<Option<(usize, SampleFileKind)>> {
@@ -983,31 +1004,81 @@ fn parse_sample_filename(name: &OsStr) -> io::Result<Option<(usize, SampleFileKi
 
 pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<Sample>> {
     validate_path_component(problem_index, "problem index")?;
+    let directory = match open_contest_destination_nofollow(destination) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    load_samples_in(destination, &directory, problem_index)
+}
 
-    let tests_dir = destination.join("tests");
-    if !existing_real_directory(&tests_dir, "tests directory")? {
-        return Ok(Vec::new());
+fn open_managed_directory(
+    parent: &CapDir,
+    name: &str,
+    path: &Path,
+    kind: &str,
+) -> io::Result<Option<CapDir>> {
+    let validate = |metadata: cap_std::fs::Metadata| {
+        #[cfg(windows)]
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} is a reparse point: {}", path.display()),
+            ));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{kind} is not a real directory: {}", path.display()),
+            ));
+        }
+        Ok(())
+    };
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => validate(metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
+    let directory = parent.open_dir_nofollow(name)?;
+    validate(directory.dir_metadata()?)?;
+    Ok(Some(directory))
+}
+
+fn load_samples_in(
+    destination: &Path,
+    directory: &CapDir,
+    problem_index: &str,
+) -> io::Result<Vec<Sample>> {
+    let tests_dir = destination.join("tests");
+    let Some(tests) = open_managed_directory(directory, "tests", &tests_dir, "tests directory")?
+    else {
+        return Ok(Vec::new());
+    };
 
     let test_dir = tests_dir.join(problem_index);
-    if !existing_real_directory(&test_dir, "problem tests directory")? {
+    let Some(problem_dir) =
+        open_managed_directory(&tests, problem_index, &test_dir, "problem tests directory")?
+    else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut files = BTreeMap::<usize, SampleFiles>::new();
 
-    for entry in fs::read_dir(&test_dir)? {
+    for entry in problem_dir.entries()? {
         let entry = entry?;
-        let path = entry.path();
+        let name = entry.file_name();
 
-        let Some((number, kind)) = parse_sample_filename(&entry.file_name())? else {
+        let Some((number, kind)) = parse_sample_filename(&name)? else {
             continue;
         };
 
-        if !existing_regular_file(&path, "sample file")? {
+        if !entry.file_type()?.is_file() {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sample file not found: {}", path.display()),
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "sample file is not a regular file: {}",
+                    test_dir.join(&name).display()
+                ),
             ));
         }
 
@@ -1015,7 +1086,7 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
 
         match kind {
             SampleFileKind::Input => {
-                if sample.input.replace(path).is_some() {
+                if sample.input.replace(name).is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("duplicate sample input for sample {number}"),
@@ -1024,7 +1095,7 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
             }
 
             SampleFileKind::Output => {
-                if sample.output.replace(path).is_some() {
+                if sample.output.replace(name).is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("duplicate sample output for sample {number}"),
@@ -1046,22 +1117,29 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
             ));
         }
 
-        let input_path = sample_files.input.ok_or_else(|| {
+        let input_name = sample_files.input.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("sample-{number}.in is missing"),
             )
         })?;
 
-        let output_path = sample_files.output.ok_or_else(|| {
+        let output_name = sample_files.output.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("sample-{number}.out is missing"),
             )
         })?;
 
-        let input = fs::read_to_string(&input_path)?;
-        let output = fs::read_to_string(&output_path)?;
+        let read_sample = |name: &OsStr| {
+            let bytes =
+                safe_file::read_regular_file_snapshot_at(&problem_dir, name, &test_dir.join(name))?
+                    .bytes;
+            String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        };
+        let input = read_sample(&input_name)?;
+        let output = read_sample(&output_name)?;
 
         samples.push(Sample { input, output });
     }
@@ -1070,7 +1148,10 @@ pub fn load_samples(destination: &Path, problem_index: &str) -> io::Result<Vec<S
 }
 
 pub fn load_verified_samples(destination: &Path, problem: &Problem) -> io::Result<Vec<Sample>> {
-    let samples = load_samples(destination, &problem.index)?;
+    verify_sample_count(load_samples(destination, &problem.index)?, problem)
+}
+
+fn verify_sample_count(samples: Vec<Sample>, problem: &Problem) -> io::Result<Vec<Sample>> {
     if samples.len() != problem.sample_count {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1083,6 +1164,87 @@ pub fn load_verified_samples(destination: &Path, problem: &Problem) -> io::Resul
         ));
     }
     Ok(samples)
+}
+
+pub(crate) fn load_test_samples(
+    destination: &Path,
+    contest_id: &str,
+    selected: &Problem,
+) -> io::Result<Vec<Sample>> {
+    load_test_samples_with_hook(destination, contest_id, selected, || {})
+}
+
+fn load_test_samples_with_hook(
+    destination: &Path,
+    contest_id: &str,
+    selected: &Problem,
+    after_samples: impl FnOnce(),
+) -> io::Result<Vec<Sample>> {
+    let directory = open_contest_destination_nofollow(destination)?;
+    let identity = opened_directory_identity(&directory, destination)?;
+    let recovery = contest_recovery_state(destination, &directory)?;
+    let manifest = test_manifest_snapshot(destination, &directory)?;
+    let contest = parse_contest_metadata(
+        std::str::from_utf8(&manifest.bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )?;
+    validate_contest_identity(&contest, contest_id)?;
+    let problem = contest
+        .problems
+        .iter()
+        .find(|problem| problem.index == selected.index && problem.task_id == selected.task_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "task for problem {} changed; reopen the contest and retry the test",
+                    selected.index
+                ),
+            )
+        })?;
+    let samples = verify_sample_count(
+        load_samples_in(destination, &directory, &problem.index)?,
+        problem,
+    )?;
+    after_samples();
+
+    // Managed replacements publish an intent before moving live files and keep a uniquely
+    // named archive afterwards. Comparing both scans detects even a replacement that starts
+    // and finishes during the read. Recheck the files for edits outside that protocol as well.
+    if samples != load_samples_in(destination, &directory, &problem.index)?
+        || recovery != contest_recovery_state(destination, &directory)?
+        || manifest != test_manifest_snapshot(destination, &directory)?
+        || identity
+            != opened_directory_identity(
+                &open_contest_destination_nofollow(destination)?,
+                destination,
+            )?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "contest data changed while loading test samples; retry the test",
+        ));
+    }
+    Ok(samples)
+}
+
+fn test_manifest_snapshot(
+    destination: &Path,
+    directory: &CapDir,
+) -> io::Result<safe_file::FileSnapshot> {
+    let marker_path = destination.join(".atc");
+    let marker = open_managed_directory(directory, ".atc", &marker_path, "workspace marker")?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("workspace marker not found: {}", marker_path.display()),
+            )
+        })?;
+    safe_file::read_regular_file_snapshot_at(
+        &marker,
+        OsStr::new("contest.toml"),
+        &marker_path.join("contest.toml"),
+    )
 }
 
 pub fn inspect_tests_health(destination: &Path, contest: &Contest) -> io::Result<TestsHealth> {
@@ -1807,6 +1969,7 @@ fn replace_contest_data_with_hooks_and_snapshot(
             staging,
             allow_missing_marker,
             expected_metadata,
+            || Ok(()),
         ),
         ContestDataReplacement::TestsOnly => replace_tests_only_with_hooks(
             destination,
@@ -1832,11 +1995,12 @@ fn replace_contest_data_with_hooks_and_snapshot(
     }
 }
 
-fn replace_metadata_only(
+pub(crate) fn replace_metadata_only(
     destination: &Path,
     staging: TempDir,
     allow_missing_marker: bool,
     expected_metadata: Option<safe_file::FileSnapshot>,
+    validate_retained_tests: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
@@ -1923,6 +2087,16 @@ fn replace_metadata_only(
         return Err(refresh_update_error(staging, error, rollback_errors));
     }
 
+    if let Err(error) = validate_retained_tests() {
+        let recovery_path = staging.keep();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "contest repair installed new data, but retained samples could not be verified: {error}; recovery data kept at {}",
+                recovery_path.display()
+            ),
+        ));
+    }
     let recovery_path = staging.path().to_path_buf();
     if let Err(error) = complete_contest_staging(
         staging,
@@ -1989,14 +2163,47 @@ fn replace_tests_only_with_hooks(
     } else {
         None
     };
+    let staged_tests_snapshot = if has_staged_tests {
+        Some(safe_file::read_tree_snapshot(&staged_tests)?)
+    } else {
+        None
+    };
 
     let recovery_identity =
         safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
     safe_file::write_recovery_intent(&staging_root, &recovery_identity)?;
 
+    let rollback = |staging, original, new_tests_moved, old_tests_moved| {
+        let mut errors = rollback_tests(
+            &destination_tests,
+            &staged_tests,
+            &backup_tests,
+            new_tests_moved,
+            old_tests_moved,
+        );
+        if errors.is_empty() {
+            let restored =
+                validate_restored_tests(&destination_tests, previous_tests_snapshot.as_ref())
+                    .and_then(|()| {
+                        validate_restored_tests(&staged_tests, staged_tests_snapshot.as_ref())
+                    })
+                    .and_then(|()| validate_restored_tests(&backup_tests, None))
+                    .and_then(|()| validate_restored_test_bindings(destination, &staged_contest));
+            match restored {
+                Ok(()) => {
+                    return complete_aborted_contest_update(staging, original, &recovery_identity);
+                }
+                Err(error) => errors.push(format!("could not verify the restored state: {error}")),
+            }
+        }
+        refresh_update_error(staging, original, errors)
+    };
+
     before_tests_backup();
     if had_destination_tests {
-        safe_file::rename_noclobber(&destination_tests, &backup_tests)?;
+        if let Err(error) = safe_file::rename_noclobber(&destination_tests, &backup_tests) {
+            return Err(rollback(staging, error, false, false));
+        }
         if let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
             .and_then(|()| {
                 validate_previous_tests_snapshot(
@@ -2005,14 +2212,7 @@ fn replace_tests_only_with_hooks(
                 )
             })
         {
-            let rollback_errors = rollback_tests(
-                &destination_tests,
-                &staged_tests,
-                &backup_tests,
-                false,
-                true,
-            );
-            return Err(refresh_update_error(staging, error, rollback_errors));
+            return Err(rollback(staging, error, false, true));
         }
     }
 
@@ -2021,26 +2221,12 @@ fn replace_tests_only_with_hooks(
         validate_metadata_snapshot(&destination_marker.join("contest.toml"), &expected_metadata)
             .and_then(|()| validate_live_tests_manifest(destination, &staged_contest))
     {
-        let rollback_errors = rollback_tests(
-            &destination_tests,
-            &staged_tests,
-            &backup_tests,
-            false,
-            had_destination_tests,
-        );
-        return Err(refresh_update_error(staging, error, rollback_errors));
+        return Err(rollback(staging, error, false, had_destination_tests));
     }
     if has_staged_tests
         && let Err(error) = safe_file::rename_noclobber(&staged_tests, &destination_tests)
     {
-        let rollback_errors = rollback_tests(
-            &destination_tests,
-            &staged_tests,
-            &backup_tests,
-            false,
-            had_destination_tests,
-        );
-        return Err(refresh_update_error(staging, error, rollback_errors));
+        return Err(rollback(staging, error, false, had_destination_tests));
     }
 
     before_recovery_cleanup();
@@ -2048,25 +2234,12 @@ fn replace_tests_only_with_hooks(
         validate_metadata_snapshot(&destination_marker.join("contest.toml"), &expected_metadata)
             .and_then(|()| validate_live_tests_manifest(destination, &staged_contest))
     {
-        let rollback_errors = rollback_tests(
-            &destination_tests,
-            &staged_tests,
-            &backup_tests,
+        return Err(rollback(
+            staging,
+            error,
             has_staged_tests,
             had_destination_tests,
-        );
-        if has_staged_tests && rollback_errors.is_empty() {
-            let kind = error.kind();
-            let recovery_path = staging.keep();
-            return Err(io::Error::new(
-                kind,
-                format!(
-                    "tests replacement failed after installing new data: {error}; moved-out tests recovery data kept at {}",
-                    recovery_path.display()
-                ),
-            ));
-        }
-        return Err(refresh_update_error(staging, error, rollback_errors));
+        ));
     }
     if had_destination_tests
         && let Err(error) = validate_refresh_owned_tests(&backup_tests, &owned_problem_indices)
@@ -2118,6 +2291,67 @@ fn validate_live_tests_manifest(destination: &Path, staged_contest: &Contest) ->
             "live contest metadata changed during tests replacement; retry repair",
         )),
     }
+}
+
+fn validate_restored_tests(
+    path: &Path,
+    expected: Option<&safe_file::TreeSnapshot>,
+) -> io::Result<()> {
+    if let Some(expected) = expected {
+        return validate_previous_tests_snapshot(path, expected);
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("unexpected tests at {} after rollback", path.display()),
+        )),
+    }
+}
+
+fn validate_restored_test_bindings(destination: &Path, expected: &Contest) -> io::Result<()> {
+    let live = load_metadata_unchecked(destination)?;
+    // A comment or title edit does not change which task owns a directory of tests.
+    if live.contest_id == expected.contest_id
+        && live.problems.len() == expected.problems.len()
+        && live
+            .problems
+            .iter()
+            .zip(&expected.problems)
+            .all(|(live, expected)| {
+                live.index == expected.index
+                    && live.task_id == expected.task_id
+                    && live.sample_count == expected.sample_count
+            })
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "contest task bindings changed during rollback",
+    ))
+}
+
+fn complete_aborted_contest_update(
+    staging: safe_file::PreservedTempDir,
+    original: io::Error,
+    identity: &safe_file::RecoveryIdentity,
+) -> io::Error {
+    let root = staging.path().to_path_buf();
+    let result = contest_staging_archive(&root, ".atc-aborted-")
+        .and_then(|archive| safe_file::complete_recovery(staging, &archive, identity));
+    let message = match result {
+        Ok(archive) => format!(
+            "contest data update failed and was rolled back: {original}; attempted data kept at {}",
+            archive.display()
+        ),
+        Err(error) => format!(
+            "contest data update failed and was rolled back: {original}; could not finalize recovery at {}: {error}",
+            root.display()
+        ),
+    };
+    io::Error::new(original.kind(), message)
 }
 
 fn validate_metadata_snapshot(
@@ -2488,6 +2722,11 @@ fn complete_contest_staging(
         return Err(changed_contest_metadata_error());
     }
 
+    let completed = contest_staging_archive(&root, ".atc-recovery-")?;
+    safe_file::complete_recovery(staging, &completed, identity).map(|_| ())
+}
+
+fn contest_staging_archive(root: &Path, prefix: &str) -> io::Result<PathBuf> {
     let name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -2506,8 +2745,7 @@ fn complete_contest_staging(
                 "unexpected contest staging name",
             )
         })?;
-    let completed = root.with_file_name(format!(".atc-recovery-{suffix}"));
-    safe_file::complete_recovery(staging, &completed, identity).map(|_| ())
+    Ok(root.with_file_name(format!("{prefix}{suffix}")))
 }
 
 fn refresh_owned_problem_indices(
@@ -4042,6 +4280,85 @@ mod tests {
     }
 
     #[test]
+    fn test_samples_reject_an_interrupted_or_completed_update_during_the_read() {
+        for complete in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path();
+            let contest = Contest {
+                contest_id: "abc466".into(),
+                problems: vec![problem_with_sample_count("A", 1)],
+            };
+            let problem = &contest.problems[0];
+            save_metadata(destination, &contest).unwrap();
+            write_sample_pair(destination, "A", 1, "same\n");
+            let staging = tempfile::Builder::new()
+                .prefix(".atc-repair-")
+                .tempdir_in(destination)
+                .unwrap();
+            save_metadata(staging.path(), &contest).unwrap();
+            write_sample_pair(staging.path(), "A", 1, "same\n");
+
+            let error =
+                load_test_samples_with_hook(destination, &contest.contest_id, problem, || {
+                    if complete {
+                        replace_contest_data(
+                            destination,
+                            staging,
+                            false,
+                            ContestDataReplacement::TestsOnly,
+                        )
+                        .unwrap();
+                    } else {
+                        let staging = staging.keep();
+                        safe_file::write_recovery_intent(
+                            &staging,
+                            &safe_file::RecoveryIdentity::new("contest", &contest.contest_id, None),
+                        )
+                        .unwrap();
+                    }
+                })
+                .unwrap_err();
+
+            if complete {
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert_eq!(
+                    load_test_samples(destination, &contest.contest_id, problem)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            } else {
+                assert!(error.to_string().contains("requires recovery check"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_samples_use_the_live_count_and_reject_a_changed_task_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let selected = problem_with_sample_count("A", 0);
+        let mut contest = Contest {
+            contest_id: "abc466".into(),
+            problems: vec![problem_with_sample_count("A", 1)],
+        };
+        save_metadata(destination, &contest).unwrap();
+        write_sample_pair(destination, "A", 1, "new sample\n");
+        assert_eq!(
+            load_test_samples(destination, &contest.contest_id, &selected)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        contest.problems[0].task_id = "abc466_changed".into();
+        contest.problems[0].url = "https://atcoder.jp/contests/abc466/tasks/abc466_changed".into();
+        save_metadata(destination, &contest).unwrap();
+        let error = load_test_samples(destination, &contest.contest_id, &selected).unwrap_err();
+        assert!(error.to_string().contains("task for problem A changed"));
+    }
+
+    #[test]
     fn load_samples_rejects_unsafe_problem_index_and_non_directories() {
         let temp = tempfile::tempdir().unwrap();
 
@@ -4605,11 +4922,8 @@ mod tests {
         .expect_err("metadata changing after backup must abort and restore old tests");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert!(load_metadata(&destination).is_err());
-        assert_eq!(
-            load_metadata_unchecked(&destination).unwrap(),
-            changed_contest
-        );
+        assert!(error.to_string().contains("was rolled back"));
+        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
         assert_eq!(
             fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
             "old\n"
@@ -4661,6 +4975,26 @@ mod tests {
         .expect_err("comment-only changes must abort tests replacement");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(load_metadata(&destination).unwrap(), contest);
+        let retained = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-aborted-repair-")
+            })
+            .expect("the attempted generation must be retained in a finalized abort archive");
+        assert!(
+            safe_file::read_completed_recovery(&retained)
+                .unwrap()
+                .is_contest()
+        );
+        assert_eq!(
+            fs::read_to_string(retained.join("tests/A/sample-1.in")).unwrap(),
+            "new input\n"
+        );
         assert!(
             fs::read(&metadata_path)
                 .unwrap()
@@ -4713,11 +5047,8 @@ mod tests {
         .expect_err("metadata changing after install must roll new tests back");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert!(load_metadata(&destination).is_err());
-        assert_eq!(
-            load_metadata_unchecked(&destination).unwrap(),
-            changed_contest
-        );
+        assert!(error.to_string().contains("was rolled back"));
+        assert_eq!(load_metadata(&destination).unwrap(), changed_contest);
         assert_eq!(
             fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
             "old\n"

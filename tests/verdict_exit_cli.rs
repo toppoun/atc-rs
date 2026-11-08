@@ -97,6 +97,39 @@ impl Fixture {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn test_replays_a_saved_case_with_a_readonly_windows_lock() {
+    let fixture = Fixture::new("print(input())\n");
+    let root = fixture.contest.join(".atc/stress");
+    let saved = root.join("A");
+    fs::create_dir_all(&saved).unwrap();
+    fs::write(saved.join("failed.in"), "7\n").unwrap();
+    fs::write(saved.join("expected.out"), "7\n").unwrap();
+    fs::write(saved.join("actual.out"), "0\n").unwrap();
+    fs::write(
+        saved.join("meta.toml"),
+        concat!(
+            "version = 1\ncontest = \"abc123\"\nproblem = \"A\"\n",
+            "kind = \"wrong-answer\"\ncase = 1\nbase_seed = 1\nseed = 1\n",
+        ),
+    )
+    .unwrap();
+    let lock = root.join(".A.lock");
+    fs::write(&lock, []).unwrap();
+    let original = fs::metadata(&lock).unwrap().permissions();
+    let mut readonly = original.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&lock, readonly).unwrap();
+    assert!(fs::metadata(&lock).unwrap().permissions().readonly());
+
+    let output = fixture.test();
+
+    assert!(fs::metadata(&lock).unwrap().permissions().readonly());
+    fs::set_permissions(&lock, original).unwrap();
+    assert_verdict(output, true, "Result: 2/2 AC");
+}
+
 fn assert_verdict(output: Output, success: bool, expected: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

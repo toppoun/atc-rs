@@ -96,14 +96,23 @@ fn process_changed_paths_with(
 
         reporter.report(Event::WatchSourceChanged { source: &path });
 
-        run_test(
+        if let Err(error) = run_test(
             destination,
             problem,
             source.language,
             runner_config,
             false,
             reporter,
-        )?;
+        ) {
+            if !matches!(&error, AppError::Io(error) if crate::stress::is_problem_load_error(error))
+            {
+                return Err(error);
+            }
+            reporter.report(Event::WatchTestFailed {
+                problem_index: &problem.index,
+                error: &error.to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -119,7 +128,10 @@ mod tests {
             index: index.to_string(),
             title: format!("Problem {index}"),
             task_id: format!("contest_{}", index.to_ascii_lowercase()),
-            url: format!("https://example.invalid/{index}"),
+            url: format!(
+                "https://atcoder.jp/contests/contest/tasks/contest_{}",
+                index.to_ascii_lowercase()
+            ),
             sample_count: 0,
         }
     }
@@ -145,6 +157,12 @@ mod tests {
                 }
                 Event::WatchSourceChanged { source } => {
                     self.events.push(format!("changed:{}", source.display()));
+                }
+                Event::WatchTestFailed {
+                    problem_index,
+                    error,
+                } => {
+                    self.events.push(format!("failed:{problem_index}:{error}"));
                 }
                 Event::NoSamples { problem_index } => {
                     self.events.push(format!("no-samples:{problem_index}"));
@@ -196,6 +214,7 @@ mod tests {
         std::fs::write(&cpp, "cpp source").unwrap();
         std::fs::write(&python, "python source").unwrap();
         let contest = contest(vec![problem("A")]);
+        workspace::save_metadata(&destination, &contest).unwrap();
         let mut reporter = RecordingReporter::default();
 
         reporter.report(Event::WatchStarted {
@@ -230,6 +249,7 @@ mod tests {
         let mut problem = problem("A");
         problem.sample_count = 3;
         let contest = contest(vec![problem]);
+        workspace::save_metadata(temp.path(), &contest).unwrap();
         let mut reporter = RecordingReporter::default();
 
         let error = process_changed_paths(
@@ -246,6 +266,91 @@ mod tests {
 
         assert!(error.to_string().contains("local samples"));
         assert_eq!(reporter.events, [format!("changed:{}", source.display())]);
+    }
+
+    #[test]
+    fn watch_rechecks_contest_recovery_after_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let source = destination.join("A.py");
+        std::fs::write(&source, "pass\n").unwrap();
+        workspace::save_metadata(destination, &contest(vec![problem("A")])).unwrap();
+        let contest = workspace::load_metadata(destination).unwrap();
+        let staging = destination.join(".atc-refresh-interrupted");
+        std::fs::create_dir(&staging).unwrap();
+        crate::safe_file::write_recovery_intent(
+            &staging,
+            &crate::safe_file::RecoveryIdentity::new("contest", "contest", None),
+        )
+        .unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        let error = process_changed_paths(
+            destination,
+            &contest,
+            &RunnerConfig::default(),
+            vec![source.clone()],
+            &mut reporter,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires recovery check"));
+        assert_eq!(reporter.events, [format!("changed:{}", source.display())]);
+    }
+
+    #[test]
+    fn watch_continues_to_another_problem_after_a_broken_stress_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let a = destination.join("A.py");
+        let b = destination.join("B.py");
+        std::fs::write(&a, "pass\n").unwrap();
+        std::fs::write(&b, "print(input())\n").unwrap();
+        let mut problem_b = problem("B");
+        problem_b.sample_count = 1;
+        workspace::save_samples(
+            destination,
+            &problem_b,
+            &[crate::model::Sample {
+                input: "42\n".into(),
+                output: "42\n".into(),
+            }],
+        )
+        .unwrap();
+        let contest = contest(vec![problem("A"), problem_b]);
+        workspace::save_metadata(destination, &contest).unwrap();
+        std::fs::create_dir_all(destination.join(".atc/stress/A")).unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        process_changed_paths(
+            destination,
+            &contest,
+            &RunnerConfig {
+                python: ["python3", "python"]
+                    .into_iter()
+                    .find(|python| {
+                        std::process::Command::new(python)
+                            .arg("--version")
+                            .output()
+                            .is_ok_and(|output| output.status.success())
+                    })
+                    .expect("watch test requires Python")
+                    .into(),
+                ..RunnerConfig::default()
+            },
+            vec![a.clone(), b.clone()],
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert_eq!(reporter.events[0], format!("changed:{}", a.display()));
+        assert!(reporter.events[1].contains(".atc/stress/A"));
+        assert!(reporter.events[1].contains("meta.toml"));
+        assert_eq!(reporter.events[2], format!("changed:{}", b.display()));
+        assert_eq!(
+            reporter.events[3..],
+            ["test-started:B:1", "case-accepted:1", "test-finished:B:1:1"]
+        );
     }
 
     #[test]
@@ -266,6 +371,7 @@ mod tests {
         )
         .unwrap();
         let contest = contest(vec![problem("A")]);
+        workspace::save_metadata(temp.path(), &contest).unwrap();
         let mut reporter = RecordingReporter::default();
 
         process_changed_paths(
@@ -376,6 +482,7 @@ mod tests {
         )
         .unwrap();
         let contest = contest(vec![problem]);
+        workspace::save_metadata(destination, &contest).unwrap();
         let runner = RunnerConfig {
             cpp_compiler,
             compile_timeout_seconds: 60.0,

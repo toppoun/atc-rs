@@ -142,6 +142,10 @@ pub enum Event<'a> {
     WatchSourceChanged {
         source: &'a Path,
     },
+    WatchTestFailed {
+        problem_index: &'a str,
+        error: &'a str,
+    },
 
     StressStarted {
         problem_index: &'a str,
@@ -451,6 +455,12 @@ impl Reporter for TerminalReporter {
                         .unwrap_or(source.as_os_str())
                         .to_string_lossy()
                 );
+            }
+            Event::WatchTestFailed {
+                problem_index,
+                error,
+            } => {
+                eprintln!("Test failed for {problem_index}: {error}");
             }
             Event::TestCaseLayout {
                 problem_index,
