@@ -58,7 +58,7 @@ fn create_single_problem_fixture(root: &Path, contest_id: &str) {
     .expect("problem fixture should be written");
 }
 
-fn available_cpp_compiler() -> Option<String> {
+pub(super) fn available_cpp_compiler() -> Option<String> {
     ["g++", "clang++"].into_iter().find_map(|compiler| {
         ProcessCommand::new(compiler)
             .arg("--version")
@@ -163,6 +163,11 @@ impl Reporter for RecordingReporter {
                 problem_index,
                 reason,
             } => format!("stress-skipped:{problem_index}:{reason}"),
+
+            Event::CompileDiagnostics {
+                problem_index,
+                stderr,
+            } => format!("compile-diagnostics:{problem_index}:{stderr}"),
 
             Event::CompileFailed { .. } => "compile-failed".to_string(),
 
@@ -780,14 +785,32 @@ fn resolved_language_does_not_fall_back_to_an_existing_other_source() {
 }
 
 #[test]
+fn successful_compile_reports_only_nonempty_stderr_without_rewriting_it() {
+    let mut reporter = RecordingReporter::default();
+    let stderr = "  warning: comparison [-Wsign-compare]\r\n\t ^\r\n\r\n";
+
+    for stderr in ["", stderr] {
+        assert!(report_compile_result(
+            "A",
+            &execution(ExecutionOutcome::Exited(exit_status(0)), "", stderr),
+            &mut reporter,
+        ));
+    }
+
+    assert_eq!(reporter.events, [format!("compile-diagnostics:A:{stderr}")]);
+}
+
+#[test]
 fn compile_failure_and_compile_timeout_are_distinct_recoverable_events() {
     let mut reporter = RecordingReporter::default();
 
     assert!(!report_compile_result(
+        "A",
         &execution(ExecutionOutcome::Exited(exit_status(1)), "", "error"),
         &mut reporter,
     ));
     assert!(!report_compile_result(
+        "A",
         &execution(ExecutionOutcome::TimedOut, "", ""),
         &mut reporter,
     ));

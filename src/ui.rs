@@ -51,6 +51,11 @@ pub enum Event<'a> {
         reason: &'a str,
     },
 
+    CompileDiagnostics {
+        problem_index: &'a str,
+        stderr: &'a str,
+    },
+
     CompileFailed {
         stderr: &'a str,
     },
@@ -319,6 +324,13 @@ impl Reporter for TerminalReporter {
             } => {
                 self.unverified_stress = true;
                 eprintln!("Saved Stress case skipped for {problem_index}: {reason}");
+            }
+
+            Event::CompileDiagnostics {
+                problem_index,
+                stderr,
+            } => {
+                eprint!("Compiler Diagnostics ({problem_index})\n{stderr}");
             }
 
             Event::CompileFailed { stderr } => {

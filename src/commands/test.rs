@@ -134,11 +134,20 @@ pub(super) fn run_test_cases(
 }
 
 pub(super) fn report_compile_result(
+    problem_index: &str,
     result: &runner::ExecutionResult,
     reporter: &mut dyn Reporter,
 ) -> bool {
     match &result.outcome {
-        ExecutionOutcome::Exited(status) if status.success() => true,
+        ExecutionOutcome::Exited(status) if status.success() => {
+            if !result.stderr.is_empty() {
+                reporter.report(Event::CompileDiagnostics {
+                    problem_index,
+                    stderr: &result.stderr,
+                });
+            }
+            true
+        }
 
         ExecutionOutcome::Exited(_) => {
             reporter.report(Event::CompileFailed {
@@ -440,7 +449,7 @@ fn test_problem_with_debug_header_and_cancel(
                 )?
             };
 
-            if !report_compile_result(&compile_result, reporter) {
+            if !report_compile_result(&problem.index, &compile_result, reporter) {
                 return Ok(());
             }
 

@@ -72,6 +72,14 @@ impl Reporter for ChannelReporter {
                 });
             }
 
+            Event::CompileDiagnostics { stderr, .. } => {
+                self.send_message(Message::CompileDiagnostics {
+                    run_id: self.run_id,
+                    problem: self.problem,
+                    stderr: stderr.to_owned(),
+                });
+            }
+
             Event::CompileFailed { stderr } => {
                 self.send(TestEvent::CompileFailed {
                     stderr: stderr.to_owned(),

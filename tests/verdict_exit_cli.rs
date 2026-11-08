@@ -602,16 +602,93 @@ fn runtime_timeout_exits_nonzero() {
 }
 
 #[test]
+fn cpp_compile_warnings_allow_test_and_stress_to_succeed_with_or_without_debug() {
+    let fixture = Fixture::new("unused");
+    let compiler = executable(&["g++", "clang++"]);
+    fixture.configure(&format!(
+        "runner.cpp_compiler = {}\nrunner.cpp_flags = [\"-std=c++23\", \"-Wall\", \"-Wextra\"]\n\
+         runner.timeout_seconds = 15.0\nrunner.compile_timeout_seconds = 60.0\n",
+        quoted(&compiler),
+    ));
+    let source = fixture.contest.join("A.cpp");
+    let warning_source = r#"
+#include <cstdio>
+int main() {
+    int value = 0;
+    std::scanf("%d", &value);
+    const unsigned maximum = 100;
+    if (value > maximum) return 1;
+    std::printf("%d\n", value);
+}
+"#;
+    fs::write(&source, warning_source).unwrap();
+    fs::write(fixture.contest.join("A_gen.py"), "print(42)\n").unwrap();
+    fs::write(fixture.contest.join("A_brute.py"), "print(42)\n").unwrap();
+
+    for debug in [false, true] {
+        let mut test_args = vec!["test", "A", "--language", "cpp"];
+        let mut stress_args = vec![
+            "stress",
+            "A",
+            "--language",
+            "cpp",
+            "--count",
+            "2",
+            "--seed",
+            "1",
+        ];
+        if debug {
+            test_args.push("--debug");
+            stress_args.push("--debug");
+        }
+
+        for (args, summary) in [
+            (&test_args, "Result: 1/1 AC"),
+            (&stress_args, "2 cases passed"),
+        ] {
+            let output = fixture.run(args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stderr.matches("Compiler Diagnostics (A)\n").count(),
+                1,
+                "{stderr}"
+            );
+            assert_eq!(stderr.matches("[-Wsign-compare]").count(), 1, "{stderr}");
+            assert!(!stdout.contains("-Wsign-compare"), "{stdout}");
+            assert_verdict(output, true, summary);
+        }
+    }
+
+    fs::write(
+        source,
+        warning_source.replace("value > maximum", "value > static_cast<int>(maximum)"),
+    )
+    .unwrap();
+    let output = fixture.run(&["test", "A", "--language", "cpp"]);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_verdict(output, true, "Result: 1/1 AC");
+}
+
+#[test]
 fn compile_error_exits_nonzero() {
     let fixture = Fixture::new("unused");
     let compiler = executable(&["g++", "clang++"]);
     fixture.configure(&format!("runner.cpp_compiler = {}\n", quoted(&compiler)));
-    fs::write(fixture.contest.join("A.cpp"), "not valid C++\n").unwrap();
-    assert_verdict(
-        fixture.run(&["test", "A", "--language", "cpp"]),
-        false,
-        "Compile Error",
-    );
+    fs::write(
+        fixture.contest.join("A.cpp"),
+        "#error atc_test_compile_failure\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["test", "A", "--language", "cpp"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("atc_test_compile_failure"), "{stderr}");
+    assert!(!stderr.contains("Compiler Diagnostics"), "{stderr}");
+    assert_verdict(output, false, "Compile Error");
 }
 
 #[test]

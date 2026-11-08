@@ -292,6 +292,10 @@ impl<'a> DetailDocument<'a> {
                 self.push_sample_detail(app, problem);
             }
         }
+
+        if let Some(diagnostics) = run.compile_diagnostics.as_ref() {
+            self.push_shared_section("Compiler Diagnostics", diagnostics);
+        }
     }
 
     fn push_stress_detail(&mut self, app: &'a WatchApp, problem: &'a ProblemState) {
@@ -399,6 +403,10 @@ impl<'a> DetailDocument<'a> {
                     self.push_shared_section("error", error);
                 }
             }
+        }
+
+        if let Some(diagnostics) = stress.compile_diagnostics.as_ref() {
+            self.push_shared_section("Compiler Diagnostics", diagnostics);
         }
 
         if matches!(
@@ -1144,6 +1152,39 @@ mod tests {
         let detail = document_text(&DetailDocument::from_app(&app));
         assert!(detail.contains("No samples"), "{detail}");
         assert!(detail.contains("timed-out"), "{detail}");
+    }
+
+    #[test]
+    fn stress_detail_keeps_one_compiler_diagnostics_section_through_completion() {
+        let mut app = WatchApp::new(&contest(), vec![1]).unwrap();
+        app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp);
+        let request = app.queue_stress(0, 1).unwrap();
+        assert!(app.run_started(0, request.run_id));
+        let stderr = "A.cpp:2: warning: comparison [-Wsign-compare]\n";
+        assert!(app.compile_diagnostics(0, request.run_id, stderr.to_owned()));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Started {
+                base_seed: 1,
+                case_limit: Some(2)
+            },
+        ));
+        assert!(app.stress_event(
+            0,
+            request.run_id,
+            StressEvent::Finished {
+                cases: 2,
+                elapsed: Duration::ZERO
+            },
+        ));
+        let text = document_text(&DetailDocument::from_app(&app));
+        assert!(text.contains("2 cases passed"), "{text}");
+        assert_eq!(text.matches("Compiler Diagnostics").count(), 1, "{text}");
+        assert!(text.ends_with(stderr), "{text}");
+
+        app.queue_stress(0, 1).unwrap();
+        assert!(!document_text(&DetailDocument::from_app(&app)).contains("Compiler Diagnostics"));
     }
 
     #[test]

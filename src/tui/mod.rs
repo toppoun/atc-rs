@@ -3158,6 +3158,14 @@ fn handle_messages_with_destination(
                 }
             }
 
+            Ok(Message::CompileDiagnostics {
+                run_id,
+                problem,
+                stderr,
+            }) => {
+                changed |= app.compile_diagnostics(problem, run_id, stderr);
+            }
+
             Ok(Message::RunEvent {
                 run_id,
                 problem,
@@ -11460,6 +11468,114 @@ mod tests {
             handle_key_event(&mut app, key(KeyCode::Down, KeyEventKind::Press), &run_tx,).unwrap()
         );
         assert_eq!(app.selected_case(), 1);
+    }
+
+    #[test]
+    fn compiler_diagnostics_follow_tui_test_and_watch_attempts() {
+        let mut app = app_with_problems(&[1]);
+        let source = PathBuf::from("A.cpp");
+        assert!(app.select_source(0, source.clone(), Language::Cpp));
+        let (tx, rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::channel();
+
+        assert!(queue_problem_run(&mut app, 0, &run_tx).unwrap());
+        let first = received_run(&run_rx);
+        tx.send(Message::RunStarted {
+            run_id: first.run_id,
+            problem: 0,
+        })
+        .unwrap();
+        let mut reporter = reporter::ChannelReporter::new(first.run_id, 0, tx.clone());
+        let diagnostics = "  A.cpp:2: warning: comparison [-Wsign-compare]\r\n  ^\r\n\r\n";
+        reporter.report(Event::CompileDiagnostics {
+            problem_index: "A",
+            stderr: diagnostics,
+        });
+        reporter.report(Event::TestRunStarted {
+            problem_index: "A",
+            total_cases: 1,
+        });
+        reporter.report(Event::TestCaseAccepted {
+            number: 1,
+            elapsed: Duration::ZERO,
+        });
+        reporter.report(Event::TestCaseStderr {
+            number: 1,
+            stderr: "runtime stderr\n",
+        });
+        reporter.report(Event::TestRunFinished {
+            problem_index: "A",
+            accepted: 1,
+            total_cases: 1,
+        });
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+
+        let document = detail::DetailDocument::from_app(&app);
+        let text: String = document.segments().map(|segment| segment.text()).collect();
+        assert!(text.contains("sample 1 / 1   AC"), "{text}");
+        assert!(
+            text.ends_with(&format!("\n\nCompiler Diagnostics\n{diagnostics}")),
+            "{text}"
+        );
+        assert_eq!(
+            document.section_body(detail::DetailSectionKind::Stderr),
+            Some("runtime stderr\n")
+        );
+
+        tx.send(Message::SourceChanged {
+            problem: 0,
+            path: source,
+            language: Language::Cpp,
+        })
+        .unwrap();
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+        let second = received_run(&run_rx);
+        assert!(
+            app.current_problem()
+                .unwrap()
+                .run
+                .compile_diagnostics
+                .is_none()
+        );
+
+        tx.send(Message::RunStarted {
+            run_id: second.run_id,
+            problem: 0,
+        })
+        .unwrap();
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+        reporter.report(Event::CompileDiagnostics {
+            problem_index: "A",
+            stderr: "late warning",
+        });
+        assert!(!handle_messages(&mut app, &rx, &run_tx).unwrap());
+
+        let mut reporter = reporter::ChannelReporter::new(second.run_id, 0, tx.clone());
+        reporter.report(Event::CompileDiagnostics {
+            problem_index: "A",
+            stderr: "new warning\n",
+        });
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+        let text: String = detail::DetailDocument::from_app(&app)
+            .segments()
+            .map(|segment| segment.text())
+            .collect();
+        assert!(
+            text.ends_with("\n\nCompiler Diagnostics\nnew warning\n"),
+            "{text}"
+        );
+
+        tx.send(Message::RunRequeued {
+            run_id: second.run_id,
+            problem: 0,
+        })
+        .unwrap();
+        assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
+        let text: String = detail::DetailDocument::from_app(&app)
+            .segments()
+            .map(|segment| segment.text())
+            .collect();
+        assert!(!text.contains("Compiler Diagnostics"), "{text}");
     }
 
     #[test]

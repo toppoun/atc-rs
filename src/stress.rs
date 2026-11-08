@@ -247,7 +247,7 @@ pub(crate) fn run(
         return Ok(outcome);
     }
 
-    let prepared = match PreparedCandidate::prepare(request, is_cancelled)? {
+    let prepared = match PreparedCandidate::prepare(request, reporter, is_cancelled)? {
         PrepareOutcome::Ready(candidate) => candidate,
         PrepareOutcome::Cancelled => {
             let outcome = StressOutcome::Cancelled {
@@ -519,6 +519,7 @@ enum PreparedCandidate {
 impl PreparedCandidate {
     fn prepare(
         request: &StressRequest,
+        reporter: &mut dyn Reporter,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<PrepareOutcome, AppError> {
         match request.candidate_language {
@@ -559,7 +560,14 @@ impl PreparedCandidate {
                 };
 
                 match result.outcome {
-                    ExecutionOutcome::Exited(status) if status.success() => {}
+                    ExecutionOutcome::Exited(status) if status.success() => {
+                        if !result.stderr.is_empty() {
+                            reporter.report(Event::CompileDiagnostics {
+                                problem_index: &request.problem_index,
+                                stderr: &result.stderr,
+                            });
+                        }
+                    }
                     ExecutionOutcome::Exited(_) => {
                         return Err(StressError::CandidateCompileFailed {
                             stderr: result.stderr,

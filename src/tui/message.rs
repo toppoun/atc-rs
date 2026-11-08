@@ -334,6 +334,12 @@ pub enum Message {
         problem: usize,
     },
 
+    CompileDiagnostics {
+        run_id: RunId,
+        problem: usize,
+        stderr: String,
+    },
+
     RunEvent {
         run_id: RunId,
         problem: usize,

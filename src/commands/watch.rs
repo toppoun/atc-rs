@@ -155,6 +155,12 @@ mod tests {
                 } => self
                     .events
                     .push(format!("stress-skipped:{problem_index}:{reason}")),
+                Event::CompileDiagnostics {
+                    problem_index,
+                    stderr,
+                } => self
+                    .events
+                    .push(format!("compiler:{problem_index}:{stderr}")),
                 Event::TestCaseLayout { .. } => {}
                 Event::TestRunStarted {
                     problem_index,
@@ -347,6 +353,75 @@ mod tests {
                 "case-accepted:1".to_string(),
                 "test-finished:A:1:1".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn watch_reports_diagnostics_only_for_the_recompile_that_produced_them() {
+        let Some(cpp_compiler) = crate::commands::tests::available_cpp_compiler() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        let source = destination.join("A.cpp");
+        let mut problem = problem("A");
+        problem.sample_count = 1;
+        workspace::save_samples(
+            destination,
+            &problem,
+            &[crate::model::Sample {
+                input: String::new(),
+                output: String::new(),
+            }],
+        )
+        .unwrap();
+        let contest = contest(vec![problem]);
+        let runner = RunnerConfig {
+            cpp_compiler,
+            compile_timeout_seconds: 60.0,
+            timeout_seconds: 15.0,
+            ..RunnerConfig::default()
+        };
+        let mut reporter = RecordingReporter::default();
+
+        std::fs::write(
+            &source,
+            "#pragma message(\"atc watch diagnostic\")\nint main() {}\n",
+        )
+        .unwrap();
+        process_changed_paths(
+            destination,
+            &contest,
+            &runner,
+            vec![source.clone()],
+            &mut reporter,
+        )
+        .unwrap();
+        let events = &reporter.events;
+        assert_eq!(events[0], format!("changed:{}", source.display()));
+        assert!(
+            events[1].starts_with("compiler:A:") && events[1].contains("atc watch diagnostic"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events[2..],
+            ["test-started:A:1", "case-accepted:1", "test-finished:A:1:1"]
+        );
+
+        reporter.events.clear();
+        std::fs::write(&source, "int main() {}\n").unwrap();
+        process_changed_paths(
+            destination,
+            &contest,
+            &runner,
+            vec![source.clone()],
+            &mut reporter,
+        )
+        .unwrap();
+        assert_eq!(reporter.events[0], format!("changed:{}", source.display()));
+        assert_eq!(
+            reporter.events[1..],
+            ["test-started:A:1", "case-accepted:1", "test-finished:A:1:1"]
         );
     }
 

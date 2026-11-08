@@ -811,6 +811,7 @@ pub struct StressState {
     pub cases_per_second: f64,
     pub failure: Option<StressFailureState>,
     pub error: Option<Arc<String>>,
+    pub compile_diagnostics: Option<Arc<String>>,
 }
 
 impl Default for StressState {
@@ -828,6 +829,7 @@ impl Default for StressState {
             cases_per_second: 0.0,
             failure: None,
             error: None,
+            compile_diagnostics: None,
         }
     }
 }
@@ -890,6 +892,7 @@ pub struct RunState {
     pub total_cases: usize,
     pub error: Option<Arc<String>>,
     pub warning: Option<Arc<String>>,
+    pub compile_diagnostics: Option<Arc<String>>,
     pub cases: Vec<CaseState>,
 }
 
@@ -906,6 +909,7 @@ impl Default for RunState {
             total_cases: 0,
             error: None,
             warning: None,
+            compile_diagnostics: None,
 
             cases: Vec::new(),
         }
@@ -2235,6 +2239,7 @@ impl WatchApp {
             total_cases,
             error: None,
             warning: None,
+            compile_diagnostics: None,
             cases: vec![CaseState::default(); total_cases],
         };
         if self.selected_problem == problem {
@@ -2293,6 +2298,7 @@ impl WatchApp {
             cases_per_second: 0.0,
             failure: None,
             error: None,
+            compile_diagnostics: None,
         };
         self.problems[problem].stress_setup = StressSetupState::None;
         self.reset_detail_scroll();
@@ -2342,6 +2348,33 @@ impl WatchApp {
         } else {
             None
         }
+    }
+
+    pub(super) fn compile_diagnostics(
+        &mut self,
+        problem: usize,
+        run_id: RunId,
+        stderr: String,
+    ) -> bool {
+        let Some(mode) = self.attempt_mode(problem, run_id) else {
+            return false;
+        };
+        let state = &mut self.problems[problem];
+        let diagnostics = match mode {
+            DetailMode::Samples if state.run.phase == RunPhase::Compiling => {
+                &mut state.run.compile_diagnostics
+            }
+            DetailMode::Stress if state.stress.phase == StressPhase::Compiling => {
+                &mut state.stress.compile_diagnostics
+            }
+            _ => return false,
+        };
+        *diagnostics = Some(Arc::new(stderr));
+
+        if self.displays_attempt_detail(problem, mode) {
+            self.invalidate_detail();
+        }
+        true
     }
 
     pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
@@ -2419,6 +2452,7 @@ impl WatchApp {
         run.total_cases = total_cases;
         run.error = None;
         run.warning = None;
+        run.compile_diagnostics = None;
         run.cases = vec![CaseState::default(); total_cases];
 
         if self.selected_problem == problem {
