@@ -5,7 +5,7 @@
 | 資料 | 分類・状態 | 対象時点・範囲 | 現行の確認先 |
 | --- | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Current architecture map | 作成時点のコード構造、モジュールの責務、主要な処理フロー | [エントリーポイント](../../src/main.rs)、[コマンド実装](../../src/commands/) |
-| `INVARIANTS.md` | Current behavioral contracts（作成予定） | 作成時点の動作契約と安全性 | 作業対象の本番コード、同じモジュールのテストと[統合テスト](../../tests/) |
+| [INVARIANTS.md](INVARIANTS.md) | Current behavioral contracts | 動作の保証・拒否条件・非保証範囲を引くための索引。コード構造と処理フローは ARCHITECTURE.md を参照 | 各契約に記載した本番コードと回帰テスト |
 | [SPEC.md](SPEC.md) | Historical design | 2026-08-11 の Rust 移行設計と当時の構想 | [CLI 定義](../../src/cli.rs)、[ワークスペース実装](../../src/workspace.rs) |
 | [pre-release-inventory.md](pre-release-inventory.md) | Historical audit | 2026-08-24 のリリース前監査で棚卸しした機能・操作・対応環境 | [CLI 定義](../../src/cli.rs)、[ヘルプの回帰テスト](../../tests/help_cli.rs)、[ユーザー向け README](../../README.md) |
 | [macos-settings-store-p1-validation.md](macos-settings-store-p1-validation.md) | Scope-limited validation record | 2026-09-21 の macOS arm64 / APFS における Global Settings の既存 Config 保存の検証。結果は当時の環境と対象経路に限る | [Settings Store](../../src/settings_store.rs)、[macOS 固有の実装](../../src/settings_store/macos.rs)、[macOS の回帰テスト](../../src/settings_store/tests/macos_tests.rs) |
