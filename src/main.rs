@@ -35,7 +35,7 @@ mod user_config_fs;
 mod user_input;
 mod watcher;
 mod workspace;
-// Registry persistence and frontend callers are introduced in later phases.
+// Frontend callers are introduced in later phases.
 #[allow(dead_code)]
 mod workspace_registry;
 use crate::error::AppError;

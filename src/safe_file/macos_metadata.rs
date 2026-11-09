@@ -1,4 +1,3 @@
-use super::{MetadataContract, open_nofollow};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
@@ -7,14 +6,13 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 // Resource forks and other xattrs can be arbitrarily large. Refuse structured
 // writes when their complete metadata cannot be inspected within this budget.
 const METADATA_BUDGET: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct ExtendedMetadata {
+struct ExtendedMetadata {
     acl: Vec<u8>,
     xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
 }
@@ -26,7 +24,13 @@ impl fmt::Debug for ExtendedMetadata {
     }
 }
 
-pub(super) fn metadata_contract(before: &Metadata, file: &File) -> io::Result<MetadataContract> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataContract {
+    mode: u32,
+    extended: ExtendedMetadata,
+}
+
+pub(crate) fn metadata_contract(before: &Metadata, file: &File) -> io::Result<MetadataContract> {
     let extended = read_extended(file)?;
     let confirmation = read_extended(file)?;
     let after = file.metadata()?;
@@ -188,8 +192,7 @@ fn read_acl(file: &File) -> io::Result<Vec<u8>> {
         .collect())
 }
 
-pub(super) fn preserve_metadata(source: &Path, destination: &File) -> io::Result<()> {
-    let source = open_nofollow(source)?;
+pub(crate) fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     if !source.metadata()?.is_file() {
         return Err(io::Error::other("metadata source must be a regular file"));
     }

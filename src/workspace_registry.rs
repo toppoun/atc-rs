@@ -1,6 +1,7 @@
 //! Validated snapshots and pure updates for the Workspace and Contest recency index.
 
 mod encoding;
+pub(crate) mod store;
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -75,7 +76,7 @@ pub(crate) struct VerifiedContestOpen<'a> {
     relative_path: &'a str,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum RegistryMutation<'a> {
     Register(&'a VerifiedWorkspace),
     RecordWorkspaceOpen {
@@ -181,7 +182,17 @@ impl Default for RegistrySnapshot {
 
 impl RegistrySnapshot {
     pub(crate) fn from_toml(source: &str) -> Result<Self, RegistryError> {
-        let document: RegistryDocument = toml::from_str(source).map_err(RegistryError::Decode)?;
+        let table = toml::from_str(source).map_err(RegistryError::Decode)?;
+        Self::from_toml_table(table)
+    }
+
+    fn from_toml_table(table: toml::Table) -> Result<Self, RegistryError> {
+        if let Some(version) = table.get("version").and_then(toml::Value::as_integer)
+            && version != REGISTRY_VERSION
+        {
+            return Err(RegistryError::UnsupportedVersion(version));
+        }
+        let document: RegistryDocument = table.try_into().map_err(RegistryError::Decode)?;
         document.validate()?;
         Ok(Self(document))
     }

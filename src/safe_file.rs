@@ -6,6 +6,19 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_metadata;
+
+#[cfg(windows)]
+pub(crate) fn protected_windows_attributes(metadata: &fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    };
+    metadata.file_attributes()
+        & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM)
+}
+
 /// A staging directory whose implicit drop preserves its contents. Callers remove only
 /// verified owned entries explicitly; error paths keep possible recovery files intact.
 pub(crate) struct PreservedTempDir {
@@ -557,7 +570,8 @@ fn replace_file_platform(_source: &Path, _destination: &Path) -> io::Result<()> 
 }
 
 #[cfg(windows)]
-fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
+// Registry uses the raw result to retry only a confirmed name collision.
+pub(crate) fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     let source = wide_path(&resolved_parent_path(source)?)?;

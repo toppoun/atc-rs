@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use std::fs::File;
+use std::io;
 
 /// A previously observed directory identity. Use it to compare fresh observations
 /// with a registration, never as proof that two path spellings still refer to it.
@@ -21,6 +23,66 @@ pub(crate) enum DirectoryIdentity {
         #[serde(with = "hex_file_id")]
         file_id: [u8; 16],
     },
+}
+
+impl DirectoryIdentity {
+    /// The caller retains the opened directory for as long as the observation is needed.
+    pub(crate) fn from_open_directory(directory: &File) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory is a reparse point",
+                ));
+            }
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an open directory",
+            ));
+        }
+        Self::of_handle(directory)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn of_handle(file: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        Ok(Self::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn of_handle(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: the handle remains live and info is the writable buffer for FileIdInfo.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self::Windows {
+            volume_serial_number: info.VolumeSerialNumber,
+            file_id: info.FileId.Identifier,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]

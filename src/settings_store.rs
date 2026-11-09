@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 const STAGING_PREFIX: &str = ".atc-settings-";
 
 #[cfg(target_os = "macos")]
-mod macos;
+use crate::safe_file::macos_metadata as macos;
+#[cfg(target_os = "macos")]
+use macos::MetadataContract;
 
 #[derive(Debug)]
 pub(crate) enum SettingsStoreLoadError {
@@ -149,12 +151,11 @@ enum FileIdentity {
     Unsupported,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetadataContract {
     #[cfg(unix)]
     mode: u32,
-    #[cfg(target_os = "macos")]
-    extended: macos::ExtendedMetadata,
     #[cfg(windows)]
     protected_attributes: u32,
 }
@@ -360,7 +361,8 @@ impl SettingsStore {
             .write_all(&candidate)
             .map_err(SettingsSaveError::BeforeCommit)?;
         #[cfg(target_os = "macos")]
-        macos::preserve_metadata(&self.path, staging.as_file())
+        open_nofollow(&self.path)
+            .and_then(|source| macos::preserve_metadata(&source, staging.as_file()))
             .map_err(SettingsSaveError::BeforeCommit)?;
         #[cfg(not(target_os = "macos"))]
         preserve_metadata(&self.path, staging.path(), &baseline)
@@ -755,13 +757,8 @@ fn metadata_contract(metadata: &Metadata) -> MetadataContract {
 
 #[cfg(windows)]
 fn metadata_contract(metadata: &Metadata) -> MetadataContract {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
-    };
     MetadataContract {
-        protected_attributes: metadata.file_attributes()
-            & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM),
+        protected_attributes: safe_file::protected_windows_attributes(metadata),
     }
 }
 

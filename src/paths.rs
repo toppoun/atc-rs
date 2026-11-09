@@ -1,5 +1,6 @@
 use etcetera::{BaseStrategy, choose_base_strategy};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
@@ -8,6 +9,76 @@ pub(crate) struct CookieLocation {
     pub(crate) platform_base: PathBuf,
     pub(crate) state_dir: PathBuf,
     pub(crate) file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryLocation {
+    platform_base: PathBuf,
+}
+
+impl RegistryLocation {
+    pub(crate) const FILE_NAME: &str = "workspaces.toml";
+    pub(crate) const LOCK_NAME: &str = ".workspaces.lock";
+    #[cfg(windows)]
+    pub(crate) const STATE_COMPONENTS: &[&str] = &["atc", "state"];
+    #[cfg(not(windows))]
+    pub(crate) const STATE_COMPONENTS: &[&str] = &["atc"];
+
+    pub(crate) fn from_platform_base(platform_base: PathBuf) -> io::Result<Self> {
+        if !platform_base.is_absolute()
+            || platform_base.as_os_str().as_encoded_bytes().contains(&0)
+            || platform_base
+                .components()
+                .any(|part| part == Component::ParentDir)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Workspace Registry state base",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::path::Prefix;
+            if !matches!(platform_base.components().next(), Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _)))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid Windows Registry state namespace",
+                ));
+            }
+        }
+        Ok(Self { platform_base })
+    }
+
+    pub(crate) fn platform_base(&self) -> &Path {
+        &self.platform_base
+    }
+
+    /// Display and diagnostics path. Use the store for I/O.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn file(&self) -> PathBuf {
+        let mut path = self.platform_base.clone();
+        path.extend(Self::STATE_COMPONENTS);
+        path.join(Self::FILE_NAME)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // The frontend connects in a later phase.
+pub(crate) fn registry_location() -> io::Result<RegistryLocation> {
+    #[cfg(windows)]
+    let base = choose_base_strategy()
+        .map_err(io::Error::other)?
+        .cache_dir();
+    #[cfg(not(windows))]
+    let base = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => etcetera::home_dir()
+            .map_err(io::Error::other)?
+            .join(".local")
+            .join("state"),
+    };
+    RegistryLocation::from_platform_base(base)
 }
 
 pub fn config_dir() -> Result<PathBuf, etcetera::HomeDirError> {
@@ -68,6 +139,40 @@ pub(crate) fn cookie_location() -> Result<CookieLocation, etcetera::HomeDirError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_base_rejects_ambiguous_and_invalid_locations() {
+        #[cfg(windows)]
+        let base = Path::new(r"C:\state");
+        #[cfg(not(windows))]
+        let base = Path::new("/state");
+        for path in [
+            PathBuf::new(),
+            "relative".into(),
+            base.join("../other"),
+            base.join("bad\0path"),
+        ] {
+            assert_eq!(
+                RegistryLocation::from_platform_base(path)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            RegistryLocation::from_platform_base(r"\\.\pipe\state".into())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            RegistryLocation::from_platform_base(base.to_owned())
+                .unwrap()
+                .platform_base(),
+            base
+        );
+    }
 
     #[test]
     fn config_file_is_under_atc_config_directory() {
