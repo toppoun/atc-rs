@@ -41,7 +41,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 ### Workspace 初期化
 
 - `atc init` → `commands::init` → カレントディレクトリを渡して `workspace::initialize_workspace`。既存設定の確認と既定の `.atc-workspace.toml` の作成はここで行う。
-- 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ自体にマーカーがあれば Workspace Home、なければ Global Home。Global Home から選んだディレクトリの初期化も `initialize_workspace` を呼び、初期化後に開き直す。
+- 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ直下の `.atc-workspace.toml` を検査し、通常ファイルとして開ければ Workspace Home、欠損していれば Global Home に進む。種類が不正な場合や、検査・オープンに失敗した場合はエラーになる。この分岐ではファイルの内容を解析しない。Global Home から選んだディレクトリの初期化も `initialize_workspace` を呼び、初期化後に開き直す。
 
 ### Contest 作成・切替・修復
 
@@ -74,7 +74,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 ### AtCoder への提出と結果追跡
 
 - CLI の `atc submit` は `resolve_submit_plan` で問題・ソース・ランタイムを決める。TUI は選択中のソースから計画を作り、`SubmissionHub::start` で提出時点のソースを `prepare_submit` で読み取って、提出専用ワーカーを起動する。両経路は `execute_prepared_with_client` に合流する。
-- `atcoder/submit.rs` が提出ページからフォームと言語を解決し、POST 直前のフックで `atcoder/submission_tracking.rs` が提出一覧の基準を取る。POST の受理後は新しい提出 ID の特定と状態のポーリングに進み、CLI の出力または TUI の履歴を更新する。受理と追跡の結果を分ける分岐は `execute_prepared_with_tracking_diagnostics` を読む。
+- `atcoder/submit.rs` が提出ページからフォームと言語を解決し、POST 直前のフックで `atcoder/submission_tracking.rs` が提出一覧の基準の取得を試みる。POST の受理後、基準を取得できており追跡を続ける場合は、新しい提出 ID を探索し、特定できた ID の状態をポーリングする。基準を取得できなかった場合は、受理済みとして扱い、ID 探索とポーリングを省略する。受理と追跡の結果は CLI の出力または TUI の履歴に反映する。分岐は `execute_prepared_with_tracking_diagnostics` を読む。
 
 ### 設定・認証の読み込みと保存
 
@@ -125,5 +125,5 @@ macOS / Linux の XDG ベースは、環境変数が絶対パスの場合に採�
 
 - モジュールの責務や主要なデータフローが変わったときに更新する。構造を変えないバグ修正では更新は不要。
 - 記述と実装が食い違う場合は、対象の本番コードと関連する回帰テストを確認する。
-- 安全性の保証・拒否条件・非保証範囲は、次の Phase で作成する `INVARIANTS.md` が担当する。
+- 安全性の保証・拒否条件・非保証範囲は [INVARIANTS.md](INVARIANTS.md) を参照する。
 - 変更時は、探索ガイドと索引から関係する資料を選ぶ。内部資料を一律に全文読む必要はない。
