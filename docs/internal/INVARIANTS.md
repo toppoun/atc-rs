@@ -11,6 +11,7 @@
 | 監視、実行ワーカー、Refresh | [5. Watch / TUI consistency](#5-watch--tui-consistency) |
 | 提出、認証、診断 | [7. Submission safety](#7-submission-safety)、[8. Credential secrecy](#8-credential-secrecy) |
 | OS・ファイルシステムの違い | [9. Windows / macOS filesystem differences](#9-windows--macos-filesystem-differences) |
+| Workspace・Contest の最近使用履歴 | [10. Workspace Registry](#10-workspace-registry) |
 
 ## 1. Problem identity
 
@@ -101,3 +102,11 @@
 - **関連する本番実装** — [src/safe_file.rs](../../src/safe_file.rs) の `rename_noclobber_platform`、`replace_file_platform`、[src/settings_store.rs](../../src/settings_store.rs) の `metadata_contract`、`sync_parent`、[src/settings_store/macos.rs](../../src/settings_store/macos.rs) の `metadata_contract`、`preserve_metadata`、[src/workspace.rs](../../src/workspace.rs) の `matches_owned_problem_alias`、[src/watcher.rs](../../src/watcher.rs) の `watch_directory`、`EventPathMapper::map`、[src/commands/watch_source.rs](../../src/commands/watch_source.rs) の `resolve_watched_source`。
 - **関連する回帰テスト** — [src/settings_store.rs](../../src/settings_store.rs) の `windows_protected_attributes_survive_replacement`（Hidden）、`windows_custom_dacl_survives_replacement`。[src/settings_store/tests/macos_tests.rs](../../src/settings_store/tests/macos_tests.rs) の `atomic_replacement_preserves_mode_acl_and_binary_empty_and_resource_fork_xattrs`、`mode_acl_and_xattr_mutations_after_copy_are_conflicts`。[src/safe_file.rs](../../src/safe_file.rs) の `rename_noclobber_preserves_every_existing_file_or_directory_destination`。[src/workspace.rs](../../src/workspace.rs) の `refresh_ownership_distinguishes_case_aliases_from_distinct_directories`（実ボリュームの挙動で分岐）、`rc13_refresh_retries_after_first_move_sharing_violation`（Windows）。[src/watcher.rs](../../src/watcher.rs) の `maps_observed_backend_root_back_to_reported_root`（通知の写像）。
 - **未検証事項・プラットフォーム依存事項** — Windows のすべての属性・ストリーム、各種ボリュームやネットワークファイルシステムでの置換・監視、停電時の耐久性は未確認。
+
+## 10. Workspace Registry
+
+- **対象となる操作** — Registry v1 の TOML 読込と、登録・使用記録・削除のスナップショット更新。
+- **保証する動作** — 登録 ID と使用順には共通の `next_seq` を使い、登録を削除しても採番位置を維持する。未使用の登録の `last_used_seq` は `0`。Contest の使用記録は Workspace と同じ番号を持ち、履歴は Workspace ごとに新しい順で最大 20 件を取得できる。ルートの表記は UTF-8、Unix のネイティブバイト列、Windows の UTF-16 コード単位列のいずれかで保持する。ネイティブ形式は UTF-8 で表現できないルートに使う。
+- **拒否・失敗時の動作** — 未対応バージョン、不正なパスや採番、重複した登録・履歴を読込時に拒否する。登録を対象とする更新では ID・ルート表記・保存済み実体 ID を照合する。オープン時は呼び出し側が確認した実体も照合し、別のルート表記を認めるには両方の現行ディレクトリの実体確認を要する。適用エラーは元のスナップショットに影響しない。
+- **適用範囲** — Registry は最近使用した対象の索引。Contest の相対パスは再開時の照合用で、ルーティングと所有確認は既存の処理が担う。ディレクトリの実体確認は呼び出し側の責務で、保存やプロセス間ロックは Phase 3-1b 以降で扱う。
+- **実装・テスト** — [src/workspace_registry.rs](../../src/workspace_registry.rs)、[src/workspace_registry/encoding.rs](../../src/workspace_registry/encoding.rs)、[src/workspace_registry/tests.rs](../../src/workspace_registry/tests.rs)。

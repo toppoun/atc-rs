@@ -1392,7 +1392,7 @@ pub fn create_source_files(
     Ok(())
 }
 
-fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
+pub(crate) fn validate_path_component(value: &str, kind: &str) -> io::Result<()> {
     let contains_path_separator = value.contains('/') || value.contains('\\');
 
     let mut components = Path::new(value).components();
@@ -1425,7 +1425,7 @@ fn invalid_workspace_path(value: &str, component: Option<&str>, reason: &'static
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn validate_workspace_path_component(component: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_workspace_path_component(component: &str) -> Result<(), &'static str> {
     if component.is_empty() {
         return Err("components must not be empty");
     }
