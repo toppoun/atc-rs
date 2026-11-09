@@ -625,7 +625,7 @@ mod tests {
             "# coding: latin-1\nfrom __future__ import annotations\n",
             "import sys, builtins, __main__, sibling\n",
             "__builtins__.print('normal script')\n",
-            "print(__file__, __name__, __package__, __spec__, __cached__)\n",
+            "print(__file__, __name__, __package__, __spec__, globals().get('__cached__'))\n",
             "print(type(__builtins__), __builtins__ is builtins)\n",
             "print(type(__loader__), __loader__.name, __loader__.path)\n",
             "print(sys.argv, sys.path[0], __main__.__dict__ is globals(), sibling.VALUE)\n",
