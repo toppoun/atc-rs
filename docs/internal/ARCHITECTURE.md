@@ -33,6 +33,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 | [src/stress.rs](../../src/stress.rs)、[src/user_input.rs](../../src/user_input.rs) | Stress の比較ループと反例の保存・再読込。User Input の永続化は `user_input`、実行はコマンド側 | 同ファイル、[src/commands/user_input_run.rs](../../src/commands/user_input_run.rs) |
 | [src/watcher.rs](../../src/watcher.rs)、[src/commands/watch_source.rs](../../src/commands/watch_source.rs) | ファイルイベントの集約と、変更パスから問題・言語への対応付け。Plain Watch と TUI Watch が共有 | 同ファイル、[src/commands/watch.rs](../../src/commands/watch.rs)、[src/commands/watch_tui.rs](../../src/commands/watch_tui.rs) |
 | [src/tui/](../../src/tui/)、[src/commands/watch_tui.rs](../../src/commands/watch_tui.rs) | `watch_tui` は画面間の遷移と Contest セッションの開始・終了を管理。`tui/mod.rs` は Contest のイベントループ、`app.rs` は状態遷移、`view.rs` は描画。Home と提出履歴は別モジュール | `watch_tui.rs`、`tui/mod.rs`、`tui/app.rs`、[src/tui/tests/](../../src/tui/tests/) |
+| [src/tui/folder_selection.rs](../../src/tui/folder_selection.rs)、[src/tui/terminal.rs](../../src/tui/terminal.rs) | `FolderPicker` は同期で OS ダイアログの結果を返す。`select_folder` は端末の退避・復帰を介して、候補パス、キャンセル、Explorer への遷移、ダイアログの失敗を呼び出し側へ返す。`TerminaSession` は入力リーダーと端末モードを管理する | 同ファイルの模擬アダプターと端末ライフサイクルのテスト |
 | [src/config.rs](../../src/config.rs)、[src/settings.rs](../../src/settings.rs)、[src/settings_store.rs](../../src/settings_store.rs)、[src/paths.rs](../../src/paths.rs) | 実行用設定の既定値と検証、Global Settings の TOML 編集と保存、OS 別のパス解決 | 同ファイル、[src/settings_store/tests/macos_tests.rs](../../src/settings_store/tests/macos_tests.rs)、[tests/config_init_cli.rs](../../tests/config_init_cli.rs) |
 | [src/auth.rs](../../src/auth.rs) | Cookie の読込・更新・削除、`AuthSnapshot` から作る `SessionAuth`、HTTP 応答に伴う Cookie 更新の永続化。Home の Authentication と `AtCoderClient` が利用 | 同ファイル、[src/tui/authentication_modal.rs](../../src/tui/authentication_modal.rs)、[src/atcoder.rs](../../src/atcoder.rs) |
 | [src/safe_file.rs](../../src/safe_file.rs)、[src/user_config_fs.rs](../../src/user_config_fs.rs) | 上書きしない配置、ファイル置換、スナップショット、復旧レコードの共通部品。`user_config_fs` は設定・テンプレート用のファイル調査などを担当 | 同ファイル、呼び出し元の `workspace.rs`、`stress.rs`、`settings_store.rs` |
@@ -43,6 +44,11 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 
 - `atc init` → `commands::init` → カレントディレクトリを渡して `workspace::initialize_workspace`。既存設定の確認と既定の `.atc-workspace.toml` の作成はここで行う。
 - 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ直下の `.atc-workspace.toml` を検査し、通常ファイルとして開ければ Workspace Home、欠損していれば Global Home に進む。種類が不正な場合や、検査・オープンに失敗した場合はエラーになる。この分岐ではファイルの内容を解析しない。Global Home から選んだディレクトリの初期化も `initialize_workspace` を呼び、初期化後に開き直す。
+
+### OS フォルダ選択の共通基盤
+
+- Phase 3-2a の `select_folder` は、OS ダイアログのアダプターと画面の操作を接続するための内部 API。`SystemDialog` は端末内エディタと同じ `run_suspended_with` で、退避 → アダプター実行 → 端末の再生成と残留入力の破棄を行う。呼び出し側は処理前に入力バッチを打ち切り、結果に応じた画面を描画してから入力の受付を再開する。
+- `Unavailable` と明示的な `Explorer` 要求は、既存 Explorer を開く指示になる。`Cancelled` は元の画面に戻る。`Failed` では固定の表示メッセージと内部原因を分離し、画面側で利用者に Explorer への切替を提示できる。端末エラーは TUI の終了・後片付けの経路に返す。実際のアダプターと画面からの呼び出しは後続フェーズで追加する。
 
 ### Contest 作成・切替・修復
 

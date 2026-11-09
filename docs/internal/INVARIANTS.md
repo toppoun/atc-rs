@@ -12,6 +12,7 @@
 | 提出、認証、診断 | [7. Submission safety](#7-submission-safety)、[8. Credential secrecy](#8-credential-secrecy) |
 | OS・ファイルシステムの違い | [9. Windows / macOS filesystem differences](#9-windows--macos-filesystem-differences) |
 | Workspace・Contest の最近使用履歴 | [10. Workspace Registry](#10-workspace-registry) |
+| OS フォルダ選択 | [11. Folder selection](#11-folder-selection) |
 
 ## 1. Problem identity
 
@@ -112,3 +113,12 @@
 - **拒否と復旧** — atc 所有の状態ディレクトリ、Registry、ロックのリンク・reparse point と不適切なファイル種別を拒否する。読込時に破損または未対応バージョンを検出したファイルは保全する。公開・同期・再検査でエラーが出た場合は、候補が見える、従来の状態が見える、結果不明のいずれかを返す。結果不明時は残存候補を保全し、置換用の候補が残った状態で Registry 本体が欠損していれば復旧が必要な状態として扱う。
 - **適用範囲** — Registry は最近使用した対象の索引。Contest の相対パスは再開時の照合用で、ルーティングと所有確認は既存の処理が担う。Workspace と Contest の実体確認はロックを取得する前に呼び出し側が行う。プラットフォーム基点のリダイレクトは許容する。最終照合と置換の間に協調しない外部更新が入る競合、全祖先の差し替え、Registry と残存候補を外部からすべて削除した後の採番継続、停電時の耐久性は保証範囲外。Windows には Unix 相当の親ディレクトリ同期を行わない。
 - **実装・テスト** — [モデル](../../src/workspace_registry.rs)、[ストア](../../src/workspace_registry/store.rs)、[ファイル操作](../../src/workspace_registry/store/files.rs)、[保存と排他のテスト](../../src/workspace_registry/store/tests.rs)。
+
+## 11. Folder selection
+
+- **対象となる操作** — OS フォルダ選択の共通 API と、既存 Explorer への切替判定。
+- **保証する動作** — 選択は未検証の `PathBuf` を受け取る操作。共通 API はパスの表記を保持し、Workspace マーカーや既存ファイルを変更せず、Registry にアクセスしない。Workspace 初期化・登録の可否とリンクや reparse point の検査は後続の操作が担う。OS ダイアログ内のフォルダ作成は利用者がダイアログ上で行う操作とする。
+- **入力の切替** — ダイアログ中は TUI の入力処理を止める。復帰時は OS の入力を破棄して新しい Termina リーダーを作り、再生成後に残ったキューと読み取れる入力イベントを破棄する。呼び出し側が持つ入力バッチは、呼び出し側が破棄する。
+- **検証の範囲** — 復帰中に新しい Termina リーダーが取り込んだ未完了の入力列を個別に消去する API はない。ダイアログからフォーカスが戻る前後の入力は、ネイティブ実装と実端末で検証する。
+- **拒否・失敗時の動作** — 退避失敗時はアダプターを起動せず、端末の復帰を試みる。退避・復帰・残留入力の破棄でエラーが出た場合は TUI の端末エラーとして扱い、選択や Explorer への遷移を返さない。端末の復帰が成功した場合、GUI の利用不可では Explorer へ進み、キャンセルでは元の画面へ戻る。ダイアログ失敗時は利用者が Explorer への切替を選べる。
+- **実装・テスト** — [フォルダ選択](../../src/tui/folder_selection.rs)、[端末ライフサイクル](../../src/tui/terminal.rs)。Phase 3-2a は模擬アダプターで結果と遷移を検証する。

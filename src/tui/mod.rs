@@ -7,6 +7,7 @@ pub(crate) mod detail_analysis;
 mod detail_layout;
 mod detail_scrollbar;
 pub(crate) mod explorer;
+pub(crate) mod folder_selection;
 mod global_home;
 mod home;
 pub mod message;

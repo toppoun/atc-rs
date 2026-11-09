@@ -25,6 +25,7 @@ type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
 const INITIAL_PIXEL_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
 const PIXEL_ENABLE_VERIFY_TIMEOUT: Duration = Duration::from_millis(100);
 const RESIZE_METRIC_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+const MAX_POST_DIALOG_INPUT_EVENTS: usize = 256;
 
 #[derive(Debug)]
 pub(super) enum SuspendedRunError<E> {
@@ -61,7 +62,7 @@ impl<E: std::fmt::Display> std::fmt::Display for SuspendedRunError<E> {
     }
 }
 
-fn run_suspended_with<S, T, E>(
+pub(super) fn run_suspended_with<S, T, E>(
     state: &mut S,
     suspend: impl FnOnce(&mut S) -> io::Result<()>,
     operation: impl FnOnce(&mut S) -> Result<T, E>,
@@ -94,6 +95,30 @@ fn recreate_after_input_flush<R, T, E>(
     flush_input()?;
     drop(resource.take());
     operation()
+}
+
+fn discard_resumed_dialog_input(
+    pending_events: &mut VecDeque<TerminalEvent>,
+    flush: impl FnOnce() -> io::Result<()>,
+    mut read_available: impl FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<bool> {
+    let mut resized = pending_events
+        .iter()
+        .any(|event| matches!(event, TerminalEvent::Resize(_)));
+    pending_events.clear();
+    flush()?;
+
+    // A platform flush cannot discard events already buffered by the new Termina reader.
+    // Bound the drain and fail if the input boundary cannot be reached.
+    for _ in 0..=MAX_POST_DIALOG_INPUT_EVENTS {
+        let Some(event) = read_available()? else {
+            return Ok(resized);
+        };
+        resized |= matches!(event, Event::WindowResized(_));
+    }
+    Err(io::Error::other(
+        "could not drain terminal input after the folder dialog",
+    ))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2154,6 +2179,38 @@ impl TerminaSession {
         Ok(())
     }
 
+    pub(super) fn suspend_for_folder_dialog(&mut self) -> io::Result<()> {
+        self.restore()?;
+        // There is no asynchronous reader in this session. Dropping both handles also discards
+        // the old shared parser (including partial input) and releases Termina's platform modes.
+        drop(self.resources.take());
+        self.pending_events.clear();
+        Ok(())
+    }
+
+    pub(super) fn resume_after_folder_dialog(&mut self) -> io::Result<()> {
+        self.restart()?;
+        let reader = &self
+            .resources
+            .as_ref()
+            .expect("a restarted TUI session must own terminal resources")
+            .reader;
+        let resized =
+            discard_resumed_dialog_input(&mut self.pending_events, flush_terminal_input, || {
+                if reader.poll(Some(Duration::ZERO), |_| true)? {
+                    reader.read(|_| true).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })?;
+        if resized {
+            // Retain the geometry invalidation without dispatching the discarded input.
+            self.invalidate_pixel_metrics();
+            self.note_resize_dispatched();
+        }
+        Ok(())
+    }
+
     pub(super) fn suspend_and_run<T, E>(
         &mut self,
         operation: impl FnOnce() -> Result<T, E>,
@@ -2620,6 +2677,68 @@ mod lifecycle_tests {
         assert_eq!(error, "flush failed");
         assert!(!started);
         assert_eq!(resource, Some("old-terminal"));
+    }
+
+    #[test]
+    fn dialog_resume_discards_application_os_and_reader_input() {
+        let mut pending = VecDeque::from([test_key_press('q'), test_key_enter()]);
+        let mut platform_input = VecDeque::from([Event::Paste("platform input".into())]);
+        let mut reader_input = VecDeque::from([
+            Event::Paste("reader input".into()),
+            Event::WindowResized(termina::WindowSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: None,
+                pixel_height: None,
+            }),
+        ]);
+
+        let resized = discard_resumed_dialog_input(
+            &mut pending,
+            || {
+                platform_input.clear();
+                Ok(())
+            },
+            || Ok(reader_input.pop_front()),
+        )
+        .unwrap();
+
+        assert!(resized);
+        assert!(pending.is_empty());
+        assert!(platform_input.is_empty());
+        assert!(reader_input.is_empty());
+    }
+
+    #[test]
+    fn dialog_resume_fails_when_input_cannot_be_discarded() {
+        let error = discard_resumed_dialog_input(
+            &mut VecDeque::new(),
+            || Err(io::Error::other("flush failed")),
+            || panic!("do not read terminal events after a failed flush"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "flush failed");
+
+        let error = discard_resumed_dialog_input(
+            &mut VecDeque::new(),
+            || Ok(()),
+            || Err(io::Error::other("read failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "read failed");
+
+        let mut reads = 0;
+        let error = discard_resumed_dialog_input(
+            &mut VecDeque::new(),
+            || Ok(()),
+            || {
+                reads += 1;
+                Ok(Some(Event::Paste(String::new())))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reads, MAX_POST_DIALOG_INPUT_EVENTS + 1);
+        assert!(error.to_string().contains("could not drain terminal input"));
     }
 
     #[test]
