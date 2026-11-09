@@ -1,5 +1,8 @@
 # macOS Settings Store P1 検証記録
 
+> **Scope-limited validation record · 2026-09-21**
+> 当時の macOS arm64 / APFS 環境で、Global Settings の既存 Config 保存を検証した記録です。記載した結果は当時の検証に限ります。現行の確認先は[内部資料の索引](README.md)を参照してください。
+
 2026-09-21の開発者向け検証記録。対象はGlobal Settingsの既存Config保存経路。
 
 ## 実行環境と作業状態

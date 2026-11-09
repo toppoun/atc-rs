@@ -1,5 +1,8 @@
 # atc Pre-release Inventory
 
+> **Historical audit · 2026-08-24**
+> This is a snapshot of the pre-release audit. Its descriptions apply to that audit, and the current implementation may differ. See the [internal documentation index](README.md) for current references.
+
 This inventory describes the repository state after the 2026-08-24 pre-release
 correctness and safety audit. It is source material for later documentation, not
 a README or an installation guide.
