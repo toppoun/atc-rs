@@ -159,7 +159,7 @@ atc test A -l python
 3. ブラウザから AtCoder を開けるか。接続できない場合は、network が戻ってから再試行する
 4. 既存の Contest に `Contest data requires repair.` と表示されていないか
 
-既存の Contest に修復が必要な場合は、ファイルを削除して作り直さず、TUI の `Repair & Open` または `atc contest <contest-id>` の確認画面を利用してください。自動修復を拒否するエラーが出た場合は、そのファイルとエラー内容を確認し、安易に削除しないでください。
+修復の確認が表示された場合は、TUI の `Repair & Open` または `atc contest <contest-id>` の確認画面を利用してください。エラーで止まった場合は、ファイルをそのままにして、表示された対象とエラー内容を確認してください。
 
 初回の操作は[最初の Contest を開く](installation.md#5-最初の-contest-を開く)、保存先と修復方法は[ワークスペース](workspace.md#壊れたコンテストの修復)を参照してください。
 
@@ -202,7 +202,7 @@ version = 1
 atc refresh
 ```
 
-メタデータが壊れていることが明らかな場合だけ、[ワークスペースの修復手順](workspace.md#壊れたコンテストの修復)を確認してください。
+メタデータの不整合や所有先を確認できないというエラーが出た場合は、[ワークスペースの修復条件](workspace.md#壊れたコンテストの修復)を確認してください。
 
 ## 設定ファイルを読み込めない
 
@@ -276,9 +276,7 @@ Contest の Command Palette
 
 ## 提出結果を確認できない
 
-network error などで提出結果を確定できない場合、atc-rs は同じ解答を自動再送しません。同じ起動中は、同じ Contest・問題への再提出も止めます。
-
-AtCoder の My Submissions をブラウザで確認してください。提出されていないことを確認できた場合だけ、atc-rs を再起動して再提出します。
+まずブラウザで AtCoder の `My Submissions` を確認してください。TUI に `Unknown` や `Untracked` が表示された場合は、[各表示の意味と再提出の制限](tui.md#提出結果を確認する)を確認してください。
 
 ## テンプレートを作成・編集できない
 

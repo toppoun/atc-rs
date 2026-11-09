@@ -74,7 +74,7 @@ Workspace Config は異なります。Workspace Home を開いた後に `.atc-wo
 
 元の `.atc-workspace.toml` を復元できる場合は復元してください。復元できず、初期設定の振り分けでよい場合は、TUI を終了し、正確な workspace ルートで `atc init` を実行してから `atc` を起動し直します。`atc init` は marker がない場合だけ既定ファイルを作成し、既存の不正なファイルやディレクトリを上書きしません。カスタムした振り分けは自動では戻らないため、Contest を開く前に[workspace config](workspace.md#workspace-config)を確認してください。
 
-Contest の管理ファイルやサンプルが不足している場合は、修復の確認が表示されます。ソースは上書きされません。`Esc` でキャンセルできます。
+Contest の管理ファイルやサンプルに修復の対象となる問題が見つかると、確認画面が表示されます。ソースは上書きされません。`Esc` でキャンセルできます。修復の条件は[壊れたコンテストの修復](workspace.md#壊れたコンテストの修復)を参照してください。
 
 Workspace Home から別の workspace へは切り替えられません。`q` で終了し、移動先の workspace ルートで `atc` を起動してください。
 
@@ -241,11 +241,22 @@ User Input には expected output がないため、AC / WA の比較は行い�
 2. `Enter` で提出する
 3. 提出しない場合は `Esc` で戻る
 
-提出後は画面を閉じても status の確認が続き、最新の結果が footer に表示されます。`v` で `Submissions` pane に切り替えると、現在の起動中に行った提出の履歴を確認できます。
+Python の runtime は設定の `submit.python_runtime` を使用します。TUI から一時的に変更することはできません。提出には [AtCoder 認証](authentication.md)が必要です。
 
-Python の runtime は設定の `submit.python_runtime` を使用します。TUI から一時的に変更することはできません。
+### 提出結果を確認する
 
-提出には AtCoder 認証が必要です。提出結果を確定できなかった場合は自動で再送しません。AtCoder の My Submissions で確認してから次の操作を行ってください。
+結果の追跡が始まると、提出画面を閉じた後も確認が続きます。画面下部に最新の提出の状態が表示されます。`v` で `Submissions` に切り替えると、現在の Contest について、この TUI セッション中の提出履歴を確認できます。
+
+| 表示 | 意味 | 再提出 |
+| --- | --- | --- |
+| `Unknown` | 送信（POST）の結果が不明で、AtCoder が提出を受理したか確認できなかった | 同じ Contest ID・task ID への再提出が制限される |
+| `Untracked` | AtCoder は提出を受理したが、提出 ID を特定できなかったか、結果を追跡できなかった | この状態による再提出制限はない |
+
+送信前の提出一覧を取得できなかった場合は、AtCoder に受理されても、提出 ID の探索と結果の取得を省略して `Untracked` になることがあります。
+
+`Unknown` の制限は、その TUI セッション内に限られます。同じワークスペース内で Contest を切り替えたり、Workspace Home に戻ったりしても続きます。
+
+どちらの表示でも、atc-rs は自動で再送しません。別プロセスから提出する場合や再起動後も、次に提出する前にブラウザで AtCoder の `My Submissions` を確認してください。
 
 ## マウス操作
 
