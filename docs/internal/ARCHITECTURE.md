@@ -45,10 +45,14 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `atc init` → `commands::init` → カレントディレクトリを渡して `workspace::initialize_workspace`。既存設定の確認と既定の `.atc-workspace.toml` の作成はここで行う。
 - 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ直下の `.atc-workspace.toml` を検査し、通常ファイルとして開ければ Workspace Home、欠損していれば Global Home に進む。種類が不正な場合や、検査・オープンに失敗した場合はエラーになる。この分岐ではファイルの内容を解析しない。Global Home から選んだディレクトリの初期化も `initialize_workspace` を呼び、初期化後に開き直す。
 
-### OS フォルダ選択の共通基盤
+### OS フォルダ選択
 
-- Phase 3-2a の `select_folder` は、OS ダイアログのアダプターと画面の操作を接続するための内部 API。`SystemDialog` は端末内エディタと同じ `run_suspended_with` で、退避 → アダプター実行 → 端末の再生成と残留入力の破棄を行う。呼び出し側は処理前に入力バッチを打ち切り、結果に応じた画面を描画してから入力の受付を再開する。
-- `Unavailable` と明示的な `Explorer` 要求は、既存 Explorer を開く指示になる。`Cancelled` は元の画面に戻る。`Failed` では固定の表示メッセージと内部原因を分離し、画面側で利用者に Explorer への切替を提示できる。端末エラーは TUI の終了・後片付けの経路に返す。実際のアダプターと画面からの呼び出しは後続フェーズで追加する。
+- `select_folder` の `SystemDialog` に `NativeFolderPicker` と任意の初期ディレクトリを渡す。端末内エディタと同じ `run_suspended_with` で、退避 → アダプター実行 → 端末の再生成と残留入力の破棄を行う。呼び出し側は処理前に入力バッチを打ち切り、結果に応じた画面を描画してから入力の受付を再開する。Global Home と Setup からの呼び出しは後続フェーズで追加する。
+- [Windows](../../src/tui/folder_selection/windows.rs) は可視のウィンドウステーションで `IFileOpenDialog` を実行する。呼び出し元を STA として初期化できない理由が COM モードの不一致であれば、専用 STA スレッド上で開き、終了を待つ。前面の可視コンソールだけを親とし、ConPTY では OS にウィンドウ管理を任せる。
+- [macOS](../../src/tui/folder_selection/macos.rs) はメインスレッドと Quartz GUI セッションを確認し、`NSOpenPanel` のモーダルループを実行する。必要な場合だけ一時的に AppKit のアクティベーションポリシーを変更する。通常の TUI は `main` から同期実行されるため、スレッド間ディスパッチを必要としない。
+- `Unavailable` と明示的な `Explorer` 要求は、既存 Explorer を開く指示になる。`Cancelled` は元の画面に戻る。`Failed` では固定の表示メッセージと内部原因を分離し、画面側で利用者に Explorer への切替を提示できる。端末エラーは TUI の終了・後片付けの経路に返す。
+
+実機では検証用ディレクトリからデバッグビルドを `cargo run --locked --manifest-path <リポジトリのCargo.toml> -- --tui-folder-picker-probe` で起動する。`Enter` でダイアログを開き、既存フォルダの選択、ダイアログでの新規作成と選択、キャンセルをそれぞれ試す。各回の終了後に端末の前面表示、結果の再描画、直前のキーの誤配送がないことを確認する。プローブは `q` または `Esc` で終了する。Windows Terminal、VS Code 統合端末、macOS の Terminal.app と統合端末を対象にする。
 
 ### Contest 作成・切替・修復
 

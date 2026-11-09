@@ -1,5 +1,5 @@
 //! Shared folder selection flow for future Global Home and Setup actions.
-#![allow(dead_code)] // The adapter and screen actions are wired in later phases.
+#![allow(dead_code)] // Screen actions are wired in later phases.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -7,10 +7,50 @@ use std::{fmt, io};
 
 use super::terminal::{TerminaSession, run_suspended_with};
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(debug_assertions)]
+pub(crate) mod probe;
+#[cfg(windows)]
+mod windows;
+
 pub(crate) trait FolderPicker {
     /// Runs synchronously until the dialog closes. The initial directory is an optional hint.
     /// Return the native path as selected, with no Workspace or Registry operations.
     fn pick_folder(&mut self, initial_dir: Option<&Path>) -> FolderDialogResult;
+}
+
+pub(crate) struct NativeFolderPicker;
+
+impl FolderPicker for NativeFolderPicker {
+    fn pick_folder(&mut self, initial_dir: Option<&Path>) -> FolderDialogResult {
+        #[cfg(windows)]
+        let result = windows::pick_folder(initial_dir);
+        #[cfg(target_os = "macos")]
+        let result = macos::pick_folder(initial_dir);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let result: io::Result<FolderDialogResult> = {
+            let _ = initial_dir;
+            Ok(FolderDialogResult::Unavailable)
+        };
+
+        result.unwrap_or_else(|error| FolderDialogResult::Failed(FolderDialogFailure::new(error)))
+    }
+}
+
+fn initial_directory_hint(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|path| path.is_absolute() && path.is_dir())
+}
+
+fn show_if_gui_available(
+    available: bool,
+    show: impl FnOnce() -> io::Result<FolderDialogResult>,
+) -> io::Result<FolderDialogResult> {
+    if available {
+        show()
+    } else {
+        Ok(FolderDialogResult::Unavailable)
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +162,32 @@ mod tests {
     use std::cell::RefCell;
     use std::error::Error as _;
     use std::fs;
+
+    #[test]
+    fn initial_directory_hint_keeps_valid_paths_and_ignores_unusable_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("日本語 and spaces 🦀");
+        let file = root.path().join("file.txt");
+        fs::create_dir(&folder).unwrap();
+        fs::write(&file, b"fixture").unwrap();
+
+        assert_eq!(
+            initial_directory_hint(Some(&folder)),
+            Some(folder.as_path())
+        );
+        for path in [&file, &root.path().join("missing"), Path::new("relative")] {
+            assert_eq!(initial_directory_hint(Some(path)), None);
+        }
+        assert_eq!(initial_directory_hint(None), None);
+    }
+
+    #[test]
+    fn missing_gui_skips_the_native_dialog() {
+        assert!(matches!(
+            show_if_gui_available(false, || panic!("no GUI")),
+            Ok(FolderDialogResult::Unavailable)
+        ));
+    }
 
     struct MockPicker<'a> {
         result: Option<FolderDialogResult>,

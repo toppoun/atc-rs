@@ -104,6 +104,15 @@ fn run() -> Result<ExitCode, AppError> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    #[cfg(debug_assertions)]
+    if std::env::args_os()
+        .skip(1)
+        .eq(["--tui-folder-picker-probe"])
+    {
+        tui::folder_selection::probe::run()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let cli = cli::Cli::parse();
 
     let mut reporter = TerminalReporter::default();
