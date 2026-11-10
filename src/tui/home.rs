@@ -364,6 +364,7 @@ pub(crate) fn run_with_terminal<T>(
     resolve: &mut dyn FnMut(&str) -> ContestSwitchResolution,
     task: ContestSwitchTask,
     start_contest: impl FnMut() -> Result<T, String>,
+    first_draw: impl FnOnce() -> Option<String>,
 ) -> io::Result<HomeExit<T>> {
     let paths = HomeActionPaths::current();
     run_with_terminal_and_paths(
@@ -374,6 +375,7 @@ pub(crate) fn run_with_terminal<T>(
         task,
         start_contest,
         &paths,
+        first_draw,
     )
 }
 
@@ -386,8 +388,11 @@ pub(crate) fn run_with_terminal_and_paths<T>(
     task: ContestSwitchTask,
     mut start_contest: impl FnMut() -> Result<T, String>,
     paths: &HomeActionPaths,
+    first_draw: impl FnOnce() -> Option<String>,
 ) -> io::Result<HomeExit<T>> {
     let mut state = HomeState::new(resolve, task);
+    let mut first_draw = Some(first_draw);
+    let mut history_warning = None;
     let mut settings = None;
     let mut suspended_settings = None;
     let mut reload_suspended_settings = false;
@@ -410,10 +415,28 @@ pub(crate) fn run_with_terminal_and_paths<T>(
                     settings_screen::render_page(frame, page);
                 } else {
                     render(frame, &state, workspace_root);
+                    if let Some(warning) = history_warning.as_deref() {
+                        let area = frame.area();
+                        if area.height >= 2 {
+                            let warning_area = Rect::new(area.x, area.y, area.width, 1);
+                            frame.render_widget(Clear, warning_area);
+                            frame.render_widget(
+                                Paragraph::new(warning).style(Style::default().fg(Color::Yellow)),
+                                warning_area,
+                            );
+                        }
+                    }
                 }
             })?;
             terminal.finish_home_redraw()?;
             dirty = false;
+            if let Some(record) = first_draw.take() {
+                history_warning = record();
+                if history_warning.is_some() {
+                    dirty = true;
+                    continue;
+                }
+            }
         }
 
         if !terminal.poll_home(HOME_POLL_INTERVAL)? {
@@ -905,7 +928,7 @@ fn render(frame: &mut Frame<'_>, state: &HomeState<'_>, workspace_root: &Path) {
         );
     }
     if state.shortcut_help_visible {
-        super::global_home::render_shortcuts(frame, true);
+        super::global_home::render_shortcuts(frame);
     }
 
     if let Some(modal) = state.open_contest.modal() {
@@ -1548,6 +1571,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 
@@ -1600,6 +1624,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 
@@ -1657,6 +1682,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 
@@ -1714,6 +1740,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 
@@ -1776,6 +1803,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 
@@ -1850,6 +1878,7 @@ mod tests {
             Arc::new(|_, _| Ok(())),
             || Ok::<(), String>(()),
             &paths,
+            || None,
         )
         .unwrap();
 

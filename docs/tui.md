@@ -25,30 +25,45 @@ atc contest abc466
 
 ## Global Home
 
-Global Home は、フォルダを探して workspace を開くための画面です。
+Global Home では、`Recent Workspaces` から以前使ったワークスペースを開けます。一覧には名前とパスが表示されます。最後に開いたものが先頭に並び、まだ開いたことのない登録はその後に並びます。登録がなければ `Create Workspace` が選ばれます。
 
-左側の Explorer でフォルダを選び、`o` の `Open` で開きます。通常のフォルダを開いた場合は `Initialize Workspace` が表示されるため、`Enter` の `Init Here` でその場所を workspace にできます。初期化せずに戻るには `Esc` を押します。
+- **Create Workspace** では、OS のフォルダ選択画面でフォルダを作って選ぶか、既存のフォルダを選びます。
+- **Open Existing Folder** では、OS のフォルダ選択画面で開きたいフォルダを選びます。
+- **Browse in Terminal** では、端末内の Explorer を使います。OS の選択画面を利用できない場合も Explorer が開きます。ダイアログの起動や操作に失敗した場合は、エラー画面の `b` で Explorer に切り替えられます。
 
-画面の幅が狭い場合は、`o` で Explorer の選択画面が開きます。その中でもう一度 `o` を押すと、選択中のフォルダを開きます。`Esc` で閉じます。
+有効なワークスペースを選ぶと、その設定のまま Workspace Home が開きます。フォルダに設定ファイルがない場合は `Initialize Workspace` が表示されます。`Enter` で `atc init` と同じ[初期設定](workspace.md#contest-の保存先)を作り、`Esc` で元の画面に戻ります。
+
+履歴から開こうとしてフォルダや設定ファイルが見つからない場合は、エラーが表示されます。移動先が分かっていれば `Open Existing Folder` で選び直してください。設定内容が不正な場合は、そのフォルダに移動して `atc` を起動し、Workspace Home の `w` で修正できます。
+
+`Remove from List` は登録と使用履歴を一覧から外す操作です。確認画面の `y` で実行します。フォルダと `.atc-workspace.toml` はディスクに残ります。一覧の読込や保存に問題がある場合は画面に表示されます。`r` で読み直せます。
 
 | キー | 操作 |
 | --- | --- |
-| `j` / `↓` | 次の項目へ移動 |
-| `k` / `↑` | 前の項目へ移動 |
-| `l` / `→` | フォルダを展開、または子へ移動 |
-| `h` / `←` | フォルダを閉じる、または表示中の親へ移動 |
-| `Enter` | フォルダの展開・折りたたみ |
-| `Backspace` | Explorer の起点を親フォルダへ移動 |
-| `r` | Explorer を再読み込み |
-| `o` | 選択中のフォルダを開く |
-| `g` | `Go to Path` を開く |
-| `s` | Global Settings を開く |
-| `t` | Template を開く |
-| `a` | Authentication を開く |
-| `?` | `Help` を表示 |
+| `j` / `↓`、`k` / `↑` | 項目の選択 |
+| `Enter` | 選択中の項目を開く |
+| `o` | Open Existing Folder |
+| `b` | Browse in Terminal |
+| `g` | Go to Path |
+| `d` | 選択中のワークスペースを一覧から外す確認を開く |
+| `r` | Recent Workspaces を読み直す |
+| `s` | Settings |
+| `t` | Templates |
+| `a` | Authentication |
+| `?` | Help |
 | `q` | 終了 |
 
-`Go to Path` ではフォルダの path を入力し、`Enter` で移動します。`Esc` でキャンセルします。
+`Go to Path` でフォルダのパスを入力して `Enter` を押すと、Explorer がそのフォルダを表示します。相対パスは Explorer の起点から解決します。`Esc` で入力をキャンセルできます。
+
+| Explorer 内のキー | 操作 |
+| --- | --- |
+| `j` / `↓`、`k` / `↑` | フォルダの選択 |
+| `l` / `→`、`h` / `←` | 展開・折りたたみ、または子・親に移動 |
+| `Enter` | 選択中のフォルダを展開・折りたたみ |
+| `o` | 選択中のフォルダを開く |
+| `Backspace` | Explorer の起点を親フォルダに移動 |
+| `r` | Explorer を読み直す |
+| `g` | Go to Path |
+| `Esc` | ランチャーに戻る |
 
 Global Config をエディタで開くには、`s` で Settings を開いて `e` を押します。ファイルがまだない場合は `Initialize & Open` が表示されます。`Enter` でコメントだけの設定ファイルを作成して開き、`Esc` で戻ります。既存ファイルは上書きしません。
 
@@ -76,7 +91,7 @@ Workspace Config は異なります。Workspace Home を開いた後に `.atc-wo
 
 Contest の管理ファイルやサンプルに修復の対象となる問題が見つかると、確認画面が表示されます。ソースは上書きされません。`Esc` でキャンセルできます。修復の条件は[壊れたコンテストの修復](workspace.md#壊れたコンテストの修復)を参照してください。
 
-Workspace Home から別の workspace へは切り替えられません。`q` で終了し、移動先の workspace ルートで `atc` を起動してください。
+Workspace Home の `q` は終了です。別のワークスペースを開くには、そのルートで `atc` を起動するか、Global Home の一覧から選びます。
 
 ## Global Settings
 

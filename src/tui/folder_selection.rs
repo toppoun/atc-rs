@@ -1,5 +1,4 @@
-//! Shared folder selection flow for future Global Home and Setup actions.
-#![allow(dead_code)] // Screen actions are wired in later phases.
+//! Shared folder selection flow for the Workspace launcher.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -38,10 +37,12 @@ impl FolderPicker for NativeFolderPicker {
     }
 }
 
+#[cfg(any(test, windows, target_os = "macos"))]
 fn initial_directory_hint(path: Option<&Path>) -> Option<&Path> {
     path.filter(|path| path.is_absolute() && path.is_dir())
 }
 
+#[cfg(any(test, windows, target_os = "macos"))]
 fn show_if_gui_available(
     available: bool,
     show: impl FnOnce() -> io::Result<FolderDialogResult>,
@@ -89,6 +90,7 @@ pub(crate) enum FolderSelectionRequest<'a> {
         picker: &'a mut dyn FolderPicker,
         initial_dir: Option<&'a Path>,
     },
+    #[allow(dead_code)] // Explicit launcher navigation opens the existing Explorer directly.
     Explorer,
 }
 
@@ -123,7 +125,7 @@ pub(crate) fn select_folder(
     )
 }
 
-fn select_folder_with<S>(
+pub(crate) fn select_folder_with<S>(
     terminal: &mut S,
     request: FolderSelectionRequest<'_>,
     suspend: impl FnOnce(&mut S) -> io::Result<()>,

@@ -1,6 +1,7 @@
 use crate::language::Language;
 use crate::model::{Contest, Problem, Sample};
 use crate::safe_file;
+use crate::workspace_registry::DirectoryIdentity;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::ambient_authority;
 #[cfg(windows)]
@@ -297,6 +298,53 @@ pub(crate) fn inspect_workspace_config_file(root: &Path) -> io::Result<Workspace
     Ok(WorkspaceConfigFileState::Existing)
 }
 
+/// The directory handle anchors marker inspection and the Registry identity observation.
+pub(crate) struct LauncherWorkspace {
+    _directory: CapDir,
+    pub(crate) identity: Option<DirectoryIdentity>,
+    pub(crate) initialized: bool,
+}
+
+pub(crate) fn inspect_launcher_workspace(root: &Path) -> io::Result<LauncherWorkspace> {
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Workspace path must be absolute",
+        ));
+    }
+    // A trailing separator or '/.' can make Unix follow the final symlink despite O_NOFOLLOW.
+    // Check the final named component while preserving the original spelling for the Registry.
+    let lookup = root
+        .file_name()
+        .zip(root.parent())
+        .map_or_else(|| root.to_path_buf(), |(name, parent)| parent.join(name));
+    let directory = open_contest_destination_nofollow(&lookup)
+        .map_err(|error| workspace_directory_error(root, "open Workspace directory", error))?;
+    #[cfg(any(unix, windows))]
+    let identity = Some(DirectoryIdentity::from_open_directory(
+        &directory.try_clone()?.into_std_file(),
+    )?);
+    #[cfg(not(any(unix, windows)))]
+    let identity = None;
+    let initialized = load_existing_workspace_config(root, &directory)?.is_some();
+    Ok(LauncherWorkspace {
+        _directory: directory,
+        identity,
+        initialized,
+    })
+}
+
+fn is_regular_workspace_config(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return false;
+    }
+    metadata.file_type().is_file()
+}
+
 fn load_existing_workspace_config(
     root: &Path,
     directory: &CapDir,
@@ -304,7 +352,7 @@ fn load_existing_workspace_config(
     let path = root.join(WORKSPACE_CONFIG_FILE);
 
     match directory.symlink_metadata(WORKSPACE_CONFIG_FILE) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(metadata) if is_regular_workspace_config(&metadata) => {}
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -336,7 +384,7 @@ fn load_existing_workspace_config(
     let metadata = file
         .metadata()
         .map_err(|error| workspace_config_error(&path, "inspect open", error.kind(), error))?;
-    if !metadata.file_type().is_file() {
+    if !is_regular_workspace_config(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("workspace config is not a regular file: {}", path.display()),

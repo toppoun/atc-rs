@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -14,10 +14,10 @@ use unicode_width::UnicodeWidthStr;
 
 use super::authentication_modal::{self, AuthenticationModalController};
 use super::explorer::{self, ExplorerState};
-use super::home::{
-    centered_rect, centered_row, home_footer_line, logo_size, menu_line,
-    truncate_start_with_ellipsis,
+use super::folder_selection::{
+    FolderDialogFailure, FolderSelection, FolderSelectionRequest, NativeFolderPicker, select_folder,
 };
+use super::home::{centered_rect, truncate_start_with_ellipsis};
 use super::settings_screen::{self, SettingsPage, SettingsTransition};
 use super::template_modal::{
     OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
@@ -28,30 +28,44 @@ use super::{
     HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, ShortcutHelpTransition,
     TerminaSession, is_shortcut_help_key, shortcut_help_transition,
 };
-use crate::{branding, config::Config};
+use crate::config::Config;
+use crate::workspace_registry::store::{RegistryApply, RegistryLoad, RegistryStore};
+use crate::workspace_registry::{
+    DirectoryIdentity, EntryRef, RegistryEntry, RegistryMutation, RegistryMutationResult,
+    RegistrySnapshot,
+};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-const GLOBAL_HOME_ACTIONS: [Option<(&str, &str)>; 6] = [
-    Some(("Open", "o")),
-    Some(("Go to Path", "g")),
-    None,
-    Some(("Settings", "s")),
-    Some(("Template", "t")),
-    Some(("Authentication Cookie", "a")),
+#[derive(Debug, Clone, Copy)]
+enum LauncherAction {
+    CreateWorkspace,
+    OpenExistingFolder,
+    BrowseInTerminal,
+    Settings,
+    Templates,
+    Authentication,
+}
+
+const LAUNCHER_ACTIONS: [(LauncherAction, &str, &str); 6] = [
+    (LauncherAction::CreateWorkspace, "Create Workspace", ""),
+    (
+        LauncherAction::OpenExistingFolder,
+        "Open Existing Folder",
+        "o",
+    ),
+    (LauncherAction::BrowseInTerminal, "Browse in Terminal", "b"),
+    (LauncherAction::Settings, "Settings", "s"),
+    (LauncherAction::Templates, "Templates", "t"),
+    (LauncherAction::Authentication, "Authentication", "a"),
 ];
-const MENU_WIDTH: u16 = 23;
-const MENU_HEIGHT: u16 = GLOBAL_HOME_ACTIONS.len() as u16;
-const SELECTED_PREFIX: &str = "Selected  ";
-const EXPLORER_MIN_WIDTH: u16 = 32;
-const EXPLORER_MAX_WIDTH: u16 = 48;
-const DASHBOARD_MIN_WIDTH: u16 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalHomeExit {
     Quit,
     OpenWorkspace(PathBuf),
-    InitializeWorkspace(PathBuf),
+    OpenRecentWorkspace(Box<RegistryEntry>),
+    InitializeWorkspace(PathBuf, Option<DirectoryIdentity>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +74,7 @@ enum GlobalHomeErrorKind {
     WorkspaceInitialization,
     WorkspaceInitializedOpen,
     GoToPath,
+    RegistryRemoval,
     GlobalConfig,
 }
 
@@ -72,6 +87,7 @@ struct GlobalHomeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitializeWorkspaceModal {
     target: PathBuf,
+    identity: Option<DirectoryIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +97,9 @@ struct InitializeGlobalConfigModal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalHomeFileAction {
+    PickFolder,
+    ReloadRegistry,
+    RemoveWorkspace(EntryRef),
     OpenSettings,
     OpenGlobalConfig,
     OpenTemplate,
@@ -185,7 +204,13 @@ pub(crate) struct GlobalHomeState {
     file_action: Option<GlobalHomeFileAction>,
     shortcut_help_visible: bool,
     explorer_overlay_visible: bool,
-    explorer_pane_visible: bool,
+    recent: Vec<RegistryEntry>,
+    selected: usize,
+    scroll: usize,
+    registry_warning: Option<String>,
+    registry_notice: Option<String>,
+    remove_workspace: Option<RegistryEntry>,
+    folder_dialog_failed: Option<FolderDialogFailure>,
 }
 
 impl GlobalHomeState {
@@ -201,7 +226,89 @@ impl GlobalHomeState {
             file_action: None,
             shortcut_help_visible: false,
             explorer_overlay_visible: false,
-            explorer_pane_visible: false,
+            recent: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            registry_warning: None,
+            registry_notice: None,
+            remove_workspace: None,
+            folder_dialog_failed: None,
+        }
+    }
+
+    pub(crate) fn reload_registry(&mut self, registry: Result<&RegistryStore, &str>) {
+        self.registry_notice = None;
+        let loaded = registry
+            .map_err(str::to_owned)
+            .and_then(|store| store.load().map_err(|error| error.to_string()));
+        match loaded {
+            Ok(RegistryLoad::Snapshot(snapshot)) => {
+                let was_empty = self.recent.is_empty();
+                self.set_recent(snapshot);
+                if was_empty {
+                    self.selected = 0;
+                }
+            }
+            Ok(RegistryLoad::Missing) => self.set_recent(RegistrySnapshot::default()),
+            Err(error) => {
+                self.recent.clear();
+                self.selected = 0;
+                self.scroll = 0;
+                self.registry_warning = Some(format!("Workspace Registry unavailable: {error}"));
+            }
+        }
+    }
+
+    fn set_recent(&mut self, snapshot: RegistrySnapshot) {
+        let previously_selected = self.recent.get(self.selected).map(RegistryEntry::entry_ref);
+        let action_index = self.selected.checked_sub(self.recent.len());
+        self.recent = snapshot
+            .entries_by_recent_use()
+            .into_iter()
+            .cloned()
+            .collect();
+        self.selected = match (previously_selected, action_index) {
+            (Some(entry), _) => self
+                .recent
+                .iter()
+                .position(|row| row.entry_ref() == entry)
+                .unwrap_or(self.selected.min(self.recent.len())),
+            (None, Some(action)) => self.recent.len() + action,
+            (None, None) => 0,
+        };
+        self.registry_warning = None;
+    }
+
+    fn remove_from_list(&mut self, registry: Result<&RegistryStore, &str>, entry: &EntryRef) {
+        self.registry_notice = None;
+        let result = registry.map_err(str::to_owned).and_then(|store| {
+            store
+                .apply(RegistryMutation::Remove(entry))
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(RegistryApply::Applied {
+                snapshot,
+                result: RegistryMutationResult::Removed,
+            }) => {
+                self.set_recent(snapshot);
+                self.registry_notice =
+                    Some("Removed from list. Workspace files remain on disk.".into());
+            }
+            Ok(RegistryApply::StaleEntry { .. }) => {
+                self.show_workspace_error(
+                    GlobalHomeErrorKind::RegistryRemoval,
+                    "The registration changed. Press r to reload Recent Workspaces.".into(),
+                );
+            }
+            outcome => {
+                let reason = outcome
+                    .err()
+                    .unwrap_or_else(|| "Registry did not confirm removal".into());
+                self.show_workspace_error(GlobalHomeErrorKind::RegistryRemoval, format!(
+                    "Removal from the list could not be confirmed:\n{reason}\nPress r to reload Recent Workspaces."
+                ));
+            }
         }
     }
 
@@ -226,13 +333,17 @@ impl GlobalHomeState {
         self.show_workspace_error(GlobalHomeErrorKind::WorkspaceOpen, message);
     }
 
-    pub(crate) fn show_initialize_workspace_confirmation(&mut self, target: PathBuf) {
+    pub(crate) fn show_initialize_workspace_confirmation(
+        &mut self,
+        target: PathBuf,
+        identity: Option<DirectoryIdentity>,
+    ) {
         self.path_input = None;
         self.initialize_global_config = None;
         self.template = None;
         self.file_action = None;
         self.shortcut_help_visible = false;
-        self.initialize_workspace = Some(InitializeWorkspaceModal { target });
+        self.initialize_workspace = Some(InitializeWorkspaceModal { target, identity });
     }
 
     pub(crate) fn show_workspace_initialization_error(&mut self, message: String) {
@@ -303,13 +414,27 @@ impl GlobalHomeState {
         GlobalHomeExit::OpenWorkspace(self.explorer.selected_path().to_path_buf())
     }
 
-    fn request_open(&mut self) -> Option<GlobalHomeExit> {
-        if self.explorer_pane_visible {
-            Some(self.selected_open_exit())
-        } else {
-            self.explorer_overlay_visible = true;
-            None
+    fn activate_launcher_action(&mut self, action: LauncherAction) {
+        self.file_action = match action {
+            LauncherAction::CreateWorkspace | LauncherAction::OpenExistingFolder => {
+                Some(GlobalHomeFileAction::PickFolder)
+            }
+            LauncherAction::BrowseInTerminal => {
+                self.explorer_overlay_visible = true;
+                None
+            }
+            LauncherAction::Settings => Some(GlobalHomeFileAction::OpenSettings),
+            LauncherAction::Templates => Some(GlobalHomeFileAction::OpenTemplate),
+            LauncherAction::Authentication => Some(GlobalHomeFileAction::OpenAuthentication),
+        };
+    }
+
+    fn activate_selected(&mut self) -> Option<GlobalHomeExit> {
+        if let Some(entry) = self.recent.get(self.selected) {
+            return Some(GlobalHomeExit::OpenRecentWorkspace(Box::new(entry.clone())));
         }
+        self.activate_launcher_action(LAUNCHER_ACTIONS[self.selected - self.recent.len()].0);
+        None
     }
 
     fn submit_path_input(&mut self, input: PathInputModal) {
@@ -317,6 +442,7 @@ impl GlobalHomeState {
         let mut rebased = self.explorer.clone();
         if rebased.rebase(candidate.clone()) {
             self.explorer = rebased;
+            self.explorer_overlay_visible = true;
         } else {
             self.error = Some(GlobalHomeError {
                 kind: GlobalHomeErrorKind::GoToPath,
@@ -390,6 +516,35 @@ impl GlobalHomeState {
             return None;
         }
 
+        if self.folder_dialog_failed.is_some() {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Char('b') if has_plain_modifiers(key) => {
+                        self.folder_dialog_failed = None;
+                        self.explorer_overlay_visible = true;
+                    }
+                    KeyCode::Escape | KeyCode::Enter => self.folder_dialog_failed = None,
+                    _ => {}
+                }
+            }
+            return None;
+        }
+
+        if let Some(entry) = self.remove_workspace.as_ref() {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Char('y') if has_plain_modifiers(key) => {
+                        self.file_action =
+                            Some(GlobalHomeFileAction::RemoveWorkspace(entry.entry_ref()));
+                        self.remove_workspace = None;
+                    }
+                    KeyCode::Escape => self.remove_workspace = None,
+                    _ => {}
+                }
+            }
+            return None;
+        }
+
         if self.initialize_workspace.is_some() {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Escape {
                 self.initialize_workspace = None;
@@ -400,7 +555,10 @@ impl GlobalHomeState {
                     .initialize_workspace
                     .take()
                     .expect("active initialization confirmation must remain present until Enter");
-                return Some(GlobalHomeExit::InitializeWorkspace(modal.target));
+                return Some(GlobalHomeExit::InitializeWorkspace(
+                    modal.target,
+                    modal.identity,
+                ));
             }
             return None;
         }
@@ -463,47 +621,46 @@ impl GlobalHomeState {
             ShortcutHelpTransition::PassThrough => {}
         }
 
+        if is_shortcut_help_key(key) {
+            self.shortcut_help_visible = true;
+            return None;
+        }
         if self.explorer_overlay_visible {
             return self.handle_explorer_overlay_key(key);
         }
-
-        if key.kind != KeyEventKind::Press {
-            if self.explorer_pane_visible {
-                self.handle_explorer_navigation(key);
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && has_plain_modifiers(key)
+        {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.selected =
+                        (self.selected + 1).min(self.recent.len() + LAUNCHER_ACTIONS.len() - 1);
+                    return None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selected = self.selected.saturating_sub(1);
+                    return None;
+                }
+                _ => {}
             }
+        }
+        if key.kind != KeyEventKind::Press || !has_plain_modifiers(key) {
             return None;
         }
-        if is_shortcut_help_key(key) {
-            self.shortcut_help_visible = true;
-            None
-        } else {
-            match key.code {
-                KeyCode::Char('o') if has_plain_modifiers(key) => self.request_open(),
-                KeyCode::Char('g') if has_plain_modifiers(key) => {
-                    self.open_path_input();
-                    None
-                }
-                KeyCode::Char('s') if has_plain_modifiers(key) => {
-                    self.file_action = Some(GlobalHomeFileAction::OpenSettings);
-                    None
-                }
-                KeyCode::Char('t') if has_plain_modifiers(key) => {
-                    self.file_action = Some(GlobalHomeFileAction::OpenTemplate);
-                    None
-                }
-                KeyCode::Char('a') if has_plain_modifiers(key) => {
-                    self.file_action = Some(GlobalHomeFileAction::OpenAuthentication);
-                    None
-                }
-                KeyCode::Char('q') if has_plain_modifiers(key) => Some(GlobalHomeExit::Quit),
-                _ => {
-                    if self.explorer_pane_visible {
-                        self.handle_explorer_navigation(key);
-                    }
-                    None
-                }
-            }
+        match key.code {
+            KeyCode::Enter => return self.activate_selected(),
+            KeyCode::Char('q') => return Some(GlobalHomeExit::Quit),
+            KeyCode::Char('g') => self.open_path_input(),
+            KeyCode::Char('d') => self.remove_workspace = self.recent.get(self.selected).cloned(),
+            KeyCode::Char('r') => self.file_action = Some(GlobalHomeFileAction::ReloadRegistry),
+            KeyCode::Char('o') => self.activate_launcher_action(LauncherAction::OpenExistingFolder),
+            KeyCode::Char('b') => self.activate_launcher_action(LauncherAction::BrowseInTerminal),
+            KeyCode::Char('s') => self.activate_launcher_action(LauncherAction::Settings),
+            KeyCode::Char('t') => self.activate_launcher_action(LauncherAction::Templates),
+            KeyCode::Char('a') => self.activate_launcher_action(LauncherAction::Authentication),
+            _ => {}
         }
+        None
     }
 
     fn handle_paste(&mut self, text: &str) {
@@ -549,6 +706,15 @@ pub(crate) trait GlobalHomeTerminal {
     fn note_global_home_resize(&mut self);
     fn poll_global_home(&mut self, wait: Duration) -> io::Result<bool>;
     fn read_global_home(&mut self) -> io::Result<TerminalEvent>;
+
+    fn select_global_home_folder(
+        &mut self,
+        _request: FolderSelectionRequest<'_>,
+    ) -> io::Result<FolderSelection> {
+        Err(io::Error::other(
+            "folder picker terminal adapter unavailable",
+        ))
+    }
 
     fn resolve_global_home_editor(&mut self, _config: &Config) -> Result<ResolvedEditor, String> {
         Err("editor launching is unavailable".to_string())
@@ -602,6 +768,13 @@ impl GlobalHomeTerminal for TerminaSession {
         self.read()
     }
 
+    fn select_global_home_folder(
+        &mut self,
+        request: FolderSelectionRequest<'_>,
+    ) -> io::Result<FolderSelection> {
+        select_folder(self, request)
+    }
+
     fn resolve_global_home_editor(&mut self, config: &Config) -> Result<ResolvedEditor, String> {
         super::resolve_live_home_editor(self, config)
     }
@@ -619,15 +792,17 @@ impl GlobalHomeTerminal for TerminaSession {
 pub(crate) fn run_with_terminal(
     terminal: &mut impl GlobalHomeTerminal,
     state: &mut GlobalHomeState,
+    registry: Result<&RegistryStore, &str>,
 ) -> io::Result<GlobalHomeExit> {
     let paths = HomeActionPaths::current();
-    run_with_terminal_and_paths(terminal, state, &paths)
+    run_with_terminal_and_paths(terminal, state, &paths, registry)
 }
 
 fn run_with_terminal_and_paths(
     terminal: &mut impl GlobalHomeTerminal,
     state: &mut GlobalHomeState,
     paths: &HomeActionPaths,
+    registry: Result<&RegistryStore, &str>,
 ) -> io::Result<GlobalHomeExit> {
     let mut settings = None;
     let mut suspended_settings = None;
@@ -695,19 +870,42 @@ fn run_with_terminal_and_paths(
             return Ok(exit);
         }
         if let Some(action) = state.take_file_action() {
-            if action == GlobalHomeFileAction::OpenSettings {
-                match paths.global_config() {
+            match action {
+                GlobalHomeFileAction::PickFolder => {
+                    terminal.discard_global_home_input_batch()?;
+                    let selection = terminal.select_global_home_folder(
+                        FolderSelectionRequest::SystemDialog {
+                            picker: &mut NativeFolderPicker,
+                            initial_dir: Some(state.explorer.root()),
+                        },
+                    )?;
+                    match selection {
+                        FolderSelection::Selected(path) => {
+                            return Ok(GlobalHomeExit::OpenWorkspace(path));
+                        }
+                        FolderSelection::Cancelled => {}
+                        FolderSelection::OpenExplorer(_) => state.explorer_overlay_visible = true,
+                        FolderSelection::Failed(error) => state.folder_dialog_failed = Some(error),
+                    }
+                }
+                GlobalHomeFileAction::ReloadRegistry => state.reload_registry(registry),
+                GlobalHomeFileAction::RemoveWorkspace(entry) => {
+                    terminal.discard_global_home_input_batch()?;
+                    state.remove_from_list(registry, &entry);
+                }
+                GlobalHomeFileAction::OpenSettings => match paths.global_config() {
                     Ok(path) => settings = Some(SettingsPage::load(path.to_path_buf())),
                     Err(error) => state.show_home_action_error(
                         GlobalHomeErrorKind::GlobalConfig,
                         error.to_string(),
                     ),
+                },
+                action => {
+                    let initialized_from_settings = suspended_settings.is_some()
+                        && matches!(action, GlobalHomeFileAction::InitializeGlobalConfig(_));
+                    handle_file_action(terminal, state, paths, action)?;
+                    reload_suspended_settings |= initialized_from_settings;
                 }
-            } else {
-                let initialized_from_settings = suspended_settings.is_some()
-                    && matches!(action, GlobalHomeFileAction::InitializeGlobalConfig(_));
-                handle_file_action(terminal, state, paths, action)?;
-                reload_suspended_settings |= initialized_from_settings;
             }
         }
         if suspended_settings.is_some()
@@ -781,7 +979,10 @@ fn handle_file_action(
     action: GlobalHomeFileAction,
 ) -> io::Result<()> {
     match action {
-        GlobalHomeFileAction::OpenSettings => {
+        GlobalHomeFileAction::PickFolder
+        | GlobalHomeFileAction::ReloadRegistry
+        | GlobalHomeFileAction::RemoveWorkspace(_)
+        | GlobalHomeFileAction::OpenSettings => {
             unreachable!("Settings is opened by the Global Home event loop")
         }
         GlobalHomeFileAction::OpenGlobalConfig => {
@@ -901,96 +1102,6 @@ fn handle_file_action(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GlobalHomeLayout {
-    logo: Option<Rect>,
-    menu: Rect,
-    footer: Option<Rect>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GlobalHomePanes {
-    explorer: Option<Rect>,
-    dashboard: Rect,
-}
-
-fn global_home_panes(area: Rect) -> GlobalHomePanes {
-    let proportional = area.width.saturating_mul(30) / 100;
-    let explorer_width = proportional.clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH);
-    if area.width.saturating_sub(explorer_width) < DASHBOARD_MIN_WIDTH {
-        return GlobalHomePanes {
-            explorer: None,
-            dashboard: area,
-        };
-    }
-
-    GlobalHomePanes {
-        explorer: Some(Rect::new(area.x, area.y, explorer_width, area.height)),
-        dashboard: Rect::new(
-            area.x.saturating_add(explorer_width),
-            area.y,
-            area.width.saturating_sub(explorer_width),
-            area.height,
-        ),
-    }
-}
-
-fn global_home_layout(area: Rect) -> GlobalHomeLayout {
-    if area.width == 0 || area.height == 0 {
-        return GlobalHomeLayout {
-            logo: None,
-            menu: Rect::new(area.x, area.y, 0, 0),
-            footer: None,
-        };
-    }
-
-    let (logo_width, logo_height) = logo_size();
-    let full_content_height = logo_height.saturating_add(1).saturating_add(MENU_HEIGHT);
-    let show_footer = area.height >= MENU_HEIGHT.saturating_add(1);
-    let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
-    let body_height = if show_footer {
-        footer_y.saturating_sub(area.y)
-    } else {
-        area.height
-    };
-
-    let show_logo = area.width >= logo_width && body_height >= full_content_height;
-
-    let content_height = if show_logo {
-        full_content_height
-    } else {
-        MENU_HEIGHT.min(body_height)
-    };
-    let content_y = area
-        .y
-        .saturating_add(body_height.saturating_sub(content_height) / 2);
-
-    let (logo, menu_y) = if show_logo {
-        (
-            Some(centered_row(area, content_y, logo_width, logo_height)),
-            content_y.saturating_add(logo_height).saturating_add(1),
-        )
-    } else {
-        (None, content_y)
-    };
-
-    let footer = show_footer.then(|| {
-        let margin = u16::from(area.width >= 4);
-        Rect::new(
-            area.x.saturating_add(margin),
-            footer_y,
-            area.width.saturating_sub(margin.saturating_mul(2)),
-            1,
-        )
-    });
-
-    GlobalHomeLayout {
-        logo,
-        menu: centered_row(area, menu_y, MENU_WIDTH, MENU_HEIGHT.min(body_height)),
-        footer,
-    }
-}
-
 fn prefixed_path_line(prefix: &str, path: &Path, width: usize) -> String {
     let path = path.to_string_lossy();
     let full = format!("{prefix}{path}");
@@ -1015,53 +1126,14 @@ pub(crate) fn prefixed_path_line_for_test(prefix: &str, path: &Path, width: usiz
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
-    let panes = global_home_panes(frame.area());
-    state.explorer_pane_visible = panes.explorer.is_some();
-    if state.explorer_pane_visible {
-        state.explorer_overlay_visible = false;
-    }
-
-    if let Some(area) = panes.explorer {
-        explorer::render(frame, area, &mut state.explorer);
-    }
-
-    let layout = global_home_layout(panes.dashboard);
-
-    if let Some(area) = layout.logo {
-        let lines = branding::ascii_logo_lines().map(|line| {
-            Line::styled(
-                line,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
-        frame.render_widget(Paragraph::new(Text::from_iter(lines)), area);
-    }
-    if layout.menu.width > 0 && layout.menu.height > 0 {
-        let lines = GLOBAL_HOME_ACTIONS.iter().map(|action| match action {
-            Some((label, shortcut)) => menu_line(label, shortcut, usize::from(layout.menu.width)),
-            None => Line::raw(""),
-        });
-        frame.render_widget(Paragraph::new(Text::from_iter(lines)), layout.menu);
-    }
-    if let Some(area) = layout.footer {
-        frame.render_widget(
-            Paragraph::new(home_footer_line(
-                SELECTED_PREFIX,
-                state.explorer.selected_path(),
-                usize::from(area.width),
-            )),
-            area,
-        );
-    }
-
     if state.explorer_overlay_visible {
         render_explorer_overlay(frame, &mut state.explorer);
+    } else {
+        render_launcher(frame, state);
     }
 
     if state.shortcut_help_visible {
-        render_shortcuts(frame, false);
+        render_global_shortcuts(frame, state.explorer_overlay_visible);
     }
     if let Some(input) = state.path_input.as_ref() {
         render_path_input(frame, state.explorer.root(), input);
@@ -1071,6 +1143,23 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
     if let Some(modal) = state.initialize_global_config.as_ref() {
         render_initialize_global_config(frame, modal);
+    }
+    if let Some(entry) = state.remove_workspace.as_ref() {
+        render_launcher_dialog(
+            frame,
+            " Remove from List ",
+            &format!(
+                "{}\n\nRemove this registration and its history?\nWorkspace files remain on disk.\n\ny Remove from List   Esc Cancel",
+                entry.root().display()
+            ),
+        );
+    }
+    if let Some(error) = state.folder_dialog_failed.as_ref() {
+        render_launcher_dialog(
+            frame,
+            " Folder Dialog Failed ",
+            &format!("{error}\n\nb Browse in Terminal   Esc Dismiss"),
+        );
     }
     if let Some(error) = state.error.as_ref() {
         render_error(frame, error);
@@ -1083,8 +1172,112 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
 }
 
+fn render_launcher(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
+    let area = frame.area();
+    if area.is_empty() {
+        return;
+    }
+
+    let warning = state
+        .registry_warning
+        .as_deref()
+        .or(state.registry_notice.as_deref());
+    let mut header = vec![Line::styled(
+        "Recent Workspaces",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(message) = warning {
+        header.push(Line::styled(message, Style::default().fg(Color::Yellow)));
+    } else if state.recent.is_empty() {
+        header.push(Line::raw("No registered Workspaces"));
+    }
+    let header_height = (header.len() as u16).min(area.height.saturating_sub(1));
+    let footer_height = u16::from(area.height >= 5);
+    let [heading, body, footer] = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Min(1),
+        Constraint::Length(footer_height),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(header), heading);
+    frame.render_widget(
+        Paragraph::new("Enter Select   g Go to Path   ? Help   q Quit"),
+        footer,
+    );
+
+    // Allocate two lines to each Workspace when possible, keeping the selected row visible.
+    let height = usize::from(body.height);
+    let recent_height = if height >= 2 { 2 } else { 1 };
+    let row_height = |index| {
+        if index < state.recent.len() {
+            recent_height
+        } else {
+            1
+        }
+    };
+    let mut visible_height = 0;
+    let earliest_visible = (0..=state.selected)
+        .rev()
+        .take_while(|index| {
+            visible_height += row_height(*index);
+            visible_height <= height
+        })
+        .last()
+        .unwrap_or(state.selected);
+    state.scroll = state.scroll.clamp(earliest_visible, state.selected);
+
+    let mut lines = Vec::new();
+    let width = usize::from(body.width);
+    for index in state.scroll..state.recent.len() + LAUNCHER_ACTIONS.len() {
+        if lines.len() + row_height(index) > height {
+            break;
+        }
+        let selected = index == state.selected;
+        let marker = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        if let Some(entry) = state.recent.get(index) {
+            let root = entry.root();
+            let name = root
+                .file_name()
+                .unwrap_or(root.as_os_str())
+                .to_string_lossy();
+            let name = view::clip_text_with_ellipsis(&name, width.saturating_sub(2));
+            lines.push(Line::styled(format!("{marker}{name}"), style));
+            if recent_height > 1 {
+                lines.push(Line::raw(prefixed_path_line("  ", root, width)));
+            }
+        } else {
+            let (_, label, shortcut) = LAUNCHER_ACTIONS[index - state.recent.len()];
+            let shortcut = if shortcut.is_empty() {
+                String::new()
+            } else {
+                format!("  [{shortcut}]")
+            };
+            lines.push(Line::styled(format!("{marker}{label}{shortcut}"), style));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+fn render_launcher_dialog(frame: &mut Frame<'_>, title: &str, text: &str) {
+    let area = centered_rect(frame.area(), 68, 12);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspaceModal) {
-    let area = centered_rect(frame.area(), 64, 11);
+    let area = centered_rect(frame.area(), 64, 14);
     let block = Block::default()
         .title(" Initialize Workspace ")
         .borders(Borders::ALL);
@@ -1100,7 +1293,9 @@ fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspac
         Paragraph::new(Text::from(vec![
             Line::raw("This directory is not an atc workspace."),
             Line::raw(""),
-            Line::raw("Initialize here?"),
+            Line::raw("Initialize here with the atc init defaults?"),
+            Line::raw("abc → ABC/, arc → ARC/, agc → AGC/"),
+            Line::raw("Other contests go directly in this folder."),
             Line::raw(""),
             Line::raw(target),
             Line::raw(""),
@@ -1116,9 +1311,9 @@ fn render_initialize_workspace(frame: &mut Frame<'_>, modal: &InitializeWorkspac
     );
 }
 
-pub(super) fn render_shortcuts(frame: &mut Frame<'_>, workspace_home: bool) {
-    let area = centered_rect(frame.area(), 46, 11);
-    let lines = if workspace_home {
+pub(super) fn render_shortcuts(frame: &mut Frame<'_>) {
+    render_help(
+        frame,
         vec![
             Line::raw("c Open / Create Contest"),
             Line::raw("s Settings"),
@@ -1127,18 +1322,36 @@ pub(super) fn render_shortcuts(frame: &mut Frame<'_>, workspace_home: bool) {
             Line::raw("a Authentication"),
             Line::raw(""),
             Line::raw("? keep open   Esc close"),
-        ]
-    } else {
+        ],
+    );
+}
+
+fn render_global_shortcuts(frame: &mut Frame<'_>, explorer: bool) {
+    let lines = if explorer {
         vec![
             Line::raw("Enter     Expand / Collapse"),
             Line::raw("↑↓ jk     Navigate"),
             Line::raw("←→ hl     Collapse / Expand"),
             Line::raw("Backspace Parent"),
-            Line::raw("r         Reload"),
-            Line::raw(""),
+            Line::raw("r Reload   o Open   g Go to Path"),
+            Line::raw("? keep open   Esc close"),
+        ]
+    } else {
+        vec![
+            Line::raw("↑↓ jk Navigate   Enter Select"),
+            Line::raw("o Open Existing Folder"),
+            Line::raw("b Browse in Terminal   g Go to Path"),
+            Line::raw("d Remove from List   r Reload"),
+            Line::raw("s Settings   t Templates"),
+            Line::raw("a Authentication   q Quit"),
             Line::raw("? keep open   Esc close"),
         ]
     };
+    render_help(frame, lines);
+}
+
+fn render_help(frame: &mut Frame<'_>, lines: Vec<Line<'_>>) {
+    let area = centered_rect(frame.area(), 46, 11);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1255,9 +1468,10 @@ fn prefixed_text_line(prefix: &str, value: &str, width: usize) -> String {
 fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
     let height = match error.kind {
         GlobalHomeErrorKind::WorkspaceInitialization
-        | GlobalHomeErrorKind::WorkspaceInitializedOpen => 13,
-        GlobalHomeErrorKind::WorkspaceOpen | GlobalHomeErrorKind::GoToPath => 9,
-        GlobalHomeErrorKind::GlobalConfig => 11,
+        | GlobalHomeErrorKind::WorkspaceInitializedOpen
+        | GlobalHomeErrorKind::WorkspaceOpen => 15,
+        GlobalHomeErrorKind::GoToPath => 9,
+        GlobalHomeErrorKind::RegistryRemoval | GlobalHomeErrorKind::GlobalConfig => 11,
     };
     let area = centered_rect(frame.area(), 64, height);
     let title = match error.kind {
@@ -1265,6 +1479,7 @@ fn render_error(frame: &mut Frame<'_>, error: &GlobalHomeError) {
         GlobalHomeErrorKind::WorkspaceInitialization => " Workspace Initialization Failed ",
         GlobalHomeErrorKind::WorkspaceInitializedOpen => " Workspace Initialized, Open Failed ",
         GlobalHomeErrorKind::GoToPath => " Go to Path Failed ",
+        GlobalHomeErrorKind::RegistryRemoval => " Remove from List Failed ",
         GlobalHomeErrorKind::GlobalConfig => " Global Config Failed ",
     };
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -1537,7 +1752,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(
@@ -1561,7 +1782,13 @@ mod tests {
             ],
         );
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(
@@ -1597,7 +1824,13 @@ mod tests {
         terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.editor_targets, [config]);
@@ -1634,7 +1867,13 @@ mod tests {
         terminal.editor_file_contents = Some("[defaults]\nlanguage = \"python\"\n".to_string());
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.editor_targets, [config]);
@@ -1674,7 +1913,13 @@ mod tests {
         );
         terminal.use_production_editor_resolver = true;
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.editor_targets, [config]);
@@ -1712,7 +1957,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(
@@ -1776,7 +2027,13 @@ mod tests {
             VecDeque::from([None, Some((config_path.clone(), config_b.to_string()))]);
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
 
@@ -1846,7 +2103,13 @@ mod tests {
         terminal.resolve_error = Some("No editor configured.".to_string());
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert!(!config.exists());
@@ -1881,7 +2144,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert!(terminal.editor_targets.is_empty());
@@ -1911,7 +2180,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert!(!cookie.file.exists());
@@ -1953,7 +2228,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(state.explorer.root(), root);
@@ -2072,7 +2353,13 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert!(terminal.editor_targets.is_empty());
@@ -2109,7 +2396,13 @@ mod tests {
         };
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.discarded_events, 1);
@@ -2144,7 +2437,13 @@ mod tests {
         };
 
         assert_eq!(
-            run_with_terminal_and_paths(&mut terminal, &mut state, &paths).unwrap(),
+            run_with_terminal_and_paths(
+                &mut terminal,
+                &mut state,
+                &paths,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.discarded_events, 2);
@@ -2158,29 +2457,29 @@ mod tests {
     }
 
     #[test]
-    fn production_dashboard_and_explorer_show_phase_3b_2_actions_and_selection() {
-        let mut state = GlobalHomeState::new(PathBuf::from(r"D:\current\directory"));
+    fn empty_launcher_prioritizes_workspace_actions() {
+        let mut state = GlobalHomeState::new(PathBuf::from("root"));
         let rendered = buffer_text(&draw(&mut state, 80, 24));
-
-        for expected in branding::ascii_logo_lines().chain([
-            "Explorer",
-            "Open",
-            "Go to Path",
+        for expected in [
+            "Recent Workspaces",
+            "No registered Workspaces",
+            "> Create Workspace",
+            "Open Existing Folder",
+            "Browse in Terminal",
             "Settings",
-            "Template",
-            "Authentication Cookie",
-            "[?] Help   [q] Quit",
-            "Selected  …rent\\directory",
-        ]) {
+            "Templates",
+            "Authentication",
+            "Enter Select",
+            "g Go to Path",
+            "? Help",
+            "q Quit",
+        ] {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}\n{rendered}"
             );
         }
-        assert!(!rendered.contains("AtCoder workspace launcher"));
-        assert!(!rendered.contains("Global Config"));
-        assert!(!rendered.contains("Browse Directories"));
-        assert!(!rendered.contains("Recent Workspaces"));
+        assert!(!rendered.contains("Explorer"));
     }
 
     #[test]
@@ -2284,7 +2583,7 @@ mod tests {
         let selected = selected_directory.path().to_path_buf();
         let changed_selection = changed_directory.path().to_path_buf();
         let mut state = GlobalHomeState::new(selected.clone());
-        state.show_initialize_workspace_confirmation(selected.clone());
+        state.show_initialize_workspace_confirmation(selected.clone(), None);
         assert!(state.explorer.rebase(changed_selection.clone()));
         let explorer_after_selection_change = state.explorer.clone();
 
@@ -2321,7 +2620,7 @@ mod tests {
         assert_eq!(state.explorer.selected_path(), changed_selection);
         assert_eq!(
             state.handle_key(key(KeyCode::Enter)),
-            Some(GlobalHomeExit::InitializeWorkspace(selected))
+            Some(GlobalHomeExit::InitializeWorkspace(selected, None))
         );
         assert!(state.initialize_workspace.is_none());
     }
@@ -2330,7 +2629,7 @@ mod tests {
     fn initialization_confirmation_consumes_pointer_events_in_the_production_loop() {
         let target = PathBuf::from("confirmed-target");
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.show_initialize_workspace_confirmation(target.clone());
+        state.show_initialize_workspace_confirmation(target.clone(), None);
         let pointer = TerminalEvent::Pointer(PointerEvent {
             kind: PointerKind::Move,
             position: PointerPosition::Cells { column: 3, row: 4 },
@@ -2348,40 +2647,41 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
-            GlobalHomeExit::InitializeWorkspace(target)
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
+            GlobalHomeExit::InitializeWorkspace(target, None)
         );
         assert_eq!(terminal.reads, 3);
     }
 
     #[test]
-    fn initialization_confirmation_cancel_preserves_wide_and_narrow_explorer_context() {
+    fn initialization_confirmation_cancel_preserves_explorer_at_any_width() {
         let root = tempfile::tempdir().unwrap();
         let child = root.path().join("child");
         std::fs::create_dir(&child).unwrap();
 
-        let mut wide = GlobalHomeState::new(root.path().to_path_buf());
-        let _ = draw(&mut wide, 80, 24);
-        wide.handle_key(key(KeyCode::Enter));
-        wide.handle_key(key(KeyCode::Char('j')));
-        let wide_explorer = wide.explorer.clone();
-        wide.show_initialize_workspace_confirmation(child.clone());
-        assert_eq!(wide.handle_key(key(KeyCode::Escape)), None);
-        assert_eq!(wide.explorer, wide_explorer);
-        assert!(!wide.explorer_overlay_visible);
-
-        let mut narrow = GlobalHomeState::new(root.path().to_path_buf());
-        let _ = draw(&mut narrow, 61, 24);
-        narrow.handle_key(key(KeyCode::Char('o')));
-        narrow.handle_key(key(KeyCode::Enter));
-        narrow.handle_key(key(KeyCode::Char('j')));
-        let narrow_explorer = narrow.explorer.clone();
-        narrow.show_initialize_workspace_confirmation(child);
-        assert_eq!(narrow.handle_key(key(KeyCode::Escape)), None);
-        assert_eq!(narrow.explorer, narrow_explorer);
-        assert!(narrow.explorer_overlay_visible);
-        assert_eq!(narrow.handle_key(key(KeyCode::Char('q'))), None);
-        assert!(narrow.explorer_overlay_visible);
+        for width in [61, 80] {
+            let mut state = GlobalHomeState::new(root.path().to_path_buf());
+            state.handle_key(key(KeyCode::Char('b')));
+            let _ = draw(&mut state, width, 24);
+            state.handle_key(key(KeyCode::Enter));
+            state.handle_key(key(KeyCode::Char('j')));
+            let explorer = state.explorer.clone();
+            state.show_initialize_workspace_confirmation(child.clone(), None);
+            assert_eq!(state.handle_key(key(KeyCode::Escape)), None);
+            assert_eq!(state.explorer, explorer);
+            assert_eq!(state.explorer.selected_path(), child);
+            assert!(state.explorer_overlay_visible);
+            assert_eq!(state.handle_key(key(KeyCode::Escape)), None);
+            assert_eq!(
+                state.handle_key(key(KeyCode::Char('q'))),
+                Some(GlobalHomeExit::Quit)
+            );
+        }
     }
 
     #[test]
@@ -2392,7 +2692,7 @@ mod tests {
         assert!(clipped.ends_with(r"\projects\日本語\abc"));
         assert!(!clipped.contains('\u{fffd}'));
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.show_initialize_workspace_confirmation(target);
+        state.show_initialize_workspace_confirmation(target, None);
 
         for (width, height) in [(0, 0), (0, 8), (8, 0), (1, 1), (8, 3), (24, 5)] {
             let _ = draw(&mut state, width, height);
@@ -2402,7 +2702,8 @@ mod tests {
         for expected in [
             "Initialize Workspace",
             "This directory is not an atc workspace.",
-            "Initialize here?",
+            "Initialize here with the atc init defaults?",
+            "abc → ABC/, arc → ARC/, agc → AGC/",
             "abc",
             "Enter Initialize",
             "Esc Cancel",
@@ -2423,17 +2724,18 @@ mod tests {
 
         let target = PathBuf::from(OsString::from_vec(b"workspace-\xff".to_vec()));
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        state.show_initialize_workspace_confirmation(target.clone());
+        state.show_initialize_workspace_confirmation(target.clone(), None);
 
         assert_eq!(
             state.handle_key(key(KeyCode::Enter)),
-            Some(GlobalHomeExit::InitializeWorkspace(target))
+            Some(GlobalHomeExit::InitializeWorkspace(target, None))
         );
     }
 
     #[test]
     fn explorer_shortcut_help_is_retained_and_one_shot() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
+        state.handle_key(key(KeyCode::Char('b')));
         state.handle_key(key(KeyCode::Char('?')));
         let rendered = buffer_text(&draw(&mut state, 80, 24));
         for expected in [
@@ -2442,7 +2744,7 @@ mod tests {
             "↑↓ jk     Navigate",
             "←→ hl     Collapse / Expand",
             "Backspace Parent",
-            "r         Reload",
+            "r Reload",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -2468,9 +2770,8 @@ mod tests {
             let _ = draw(&mut state, width, height);
         }
 
-        let line =
-            home_footer_line(SELECTED_PREFIX, state.explorer.selected_path(), 60).to_string();
-        assert!(UnicodeWidthStr::width(line.as_str()) <= 60);
+        let line = prefixed_path_line("Selected  ", state.explorer.selected_path(), 36);
+        assert!(UnicodeWidthStr::width(line.as_str()) <= 36);
         assert!(line.contains("Selected  …"));
         assert!(line.ends_with(r"\競プロ\atcoder"));
         assert!(!line.contains('\u{fffd}'));
@@ -2492,94 +2793,15 @@ mod tests {
     }
 
     #[test]
-    fn responsive_panes_apply_threshold_clamp_centering_separator_and_selected_footer() {
-        for (width, expected_explorer, expected_dashboard) in [
-            (61, None, 61),
-            (62, Some(32), 30),
-            (80, Some(32), 48),
-            (120, Some(36), 84),
-            (160, Some(48), 112),
-        ] {
-            let area = Rect::new(0, 0, width, 24);
-            let panes = global_home_panes(area);
-            assert_eq!(panes.explorer.map(|area| area.width), expected_explorer);
-            assert_eq!(panes.dashboard.width, expected_dashboard);
-            assert_eq!(
-                panes.dashboard.x,
-                expected_explorer.unwrap_or_default(),
-                "unexpected dashboard origin at width {width}"
-            );
-            let layout = global_home_layout(panes.dashboard);
-            assert_eq!(
-                layout.menu.x,
-                panes
-                    .dashboard
-                    .x
-                    .saturating_add(panes.dashboard.width.saturating_sub(MENU_WIDTH) / 2),
-                "menu was not centered inside the right pane at width {width}"
-            );
-
-            let mut state = GlobalHomeState::new(PathBuf::from("selected-root"));
-            let buffer = draw(&mut state, width, 24);
-            let text = buffer_text(&buffer);
-            if width == 62 {
-                assert!(!text.contains("Selected"));
-            } else {
-                assert!(text.contains("Selected  selected-root"));
-            }
-            if let Some(explorer_width) = expected_explorer {
-                assert!(state.explorer_pane_visible);
-                assert_eq!(buffer.cell((explorer_width - 1, 0)).unwrap().symbol(), "│");
-            } else {
-                assert!(!state.explorer_pane_visible);
-            }
-        }
-    }
-
-    #[test]
-    fn selected_footer_tracks_explorer_navigation() {
-        let root = tempfile::tempdir().unwrap();
-        let child = root.path().join("selected-child");
-        std::fs::create_dir(&child).unwrap();
-        let mut state = GlobalHomeState::new(root.path().to_path_buf());
-        let width = u16::try_from(120 + child.to_string_lossy().len()).unwrap();
-
-        let initial = buffer_text(&draw(&mut state, width, 24));
-        assert!(initial.contains(&format!("Selected  {}", root.path().display())));
-
-        state.handle_key(key(KeyCode::Enter));
-        state.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(state.explorer.selected_path(), child);
-        let selected = buffer_text(&draw(&mut state, width, 24));
-        assert!(selected.contains(&format!("Selected  {}", child.display())));
-        assert!(!initial.contains("selected-child"));
-    }
-
-    #[test]
-    fn logo_appears_as_soon_as_menu_and_footer_fit() {
-        let (logo_width, logo_height) = logo_size();
-        let full_height = logo_height + 1 + MENU_HEIGHT + 1;
-        let too_short = global_home_layout(Rect::new(0, 0, logo_width, full_height - 1));
-        let just_enough = global_home_layout(Rect::new(0, 0, logo_width, full_height));
-        assert!(too_short.logo.is_none());
-        assert!(just_enough.logo.is_some());
-        assert!(just_enough.footer.is_some());
-        assert_eq!(just_enough.footer.unwrap().y, full_height - 1);
-        assert!(just_enough.menu.y > just_enough.logo.unwrap().bottom());
-        assert!(just_enough.footer.unwrap().y >= just_enough.menu.bottom());
-    }
-
-    #[test]
-    fn narrow_open_uses_full_screen_overlay_and_resize_to_wide_closes_it_without_state_loss() {
+    fn explorer_overlay_survives_resize_without_state_loss() {
         let root = tempfile::tempdir().unwrap();
         let child = root.path().join("a-child");
         std::fs::create_dir(&child).unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
 
         let dashboard = buffer_text(&draw(&mut state, 61, 12));
-        assert!(!state.explorer_pane_visible);
-        assert!(dashboard.contains("[?] Help   [q] Quit"));
-        assert_eq!(state.handle_key(key(KeyCode::Char('o'))), None);
+        assert!(dashboard.contains("? Help   q Quit"));
+        assert_eq!(state.handle_key(key(KeyCode::Char('b'))), None);
         assert!(state.explorer_overlay_visible);
 
         let overlay = buffer_text(&draw(&mut state, 61, 12));
@@ -2590,7 +2812,7 @@ mod tests {
         assert_eq!(state.explorer.selected_path(), child);
 
         let _ = draw(&mut state, 80, 12);
-        assert!(!state.explorer_overlay_visible);
+        assert!(state.explorer_overlay_visible);
         assert_eq!(state.explorer.selected_path(), child);
     }
 
@@ -2614,6 +2836,7 @@ mod tests {
             100,
             24,
             [
+                vec![event(KeyCode::Char('b'))],
                 vec![event(KeyCode::Enter)],
                 vec![event(KeyCode::Char('j'))],
                 vec![event(KeyCode::Enter)],
@@ -2622,7 +2845,12 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::OpenWorkspace(workspace.clone())
         );
         assert_eq!(state.explorer.selected_path(), workspace);
@@ -2649,20 +2877,26 @@ mod tests {
                     absolute.path().to_string_lossy().into_owned(),
                 )],
                 vec![event(KeyCode::Enter)],
+                vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
-        let visible_relative = home_footer_line(SELECTED_PREFIX, &relative, 66).to_string();
+
         assert!(
             terminal
                 .frames
                 .iter()
-                .any(|frame| { frame.contains(&visible_relative) })
+                .any(|frame| { frame.contains("Explorer") && frame.contains("relative") })
         );
         assert_eq!(state.explorer.root(), absolute.path());
         assert_eq!(state.explorer.selected_path(), absolute.path());
@@ -2676,6 +2910,7 @@ mod tests {
         let file = root.path().join("file.txt");
         std::fs::write(&file, "not a directory").unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        state.handle_key(key(KeyCode::Char('b')));
         state.handle_key(key(KeyCode::Enter));
         state.handle_key(key(KeyCode::Char('j')));
         let old_explorer = state.explorer.clone();
@@ -2707,13 +2942,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let mut wide_state = GlobalHomeState::new(root.path().to_path_buf());
+        wide_state.handle_key(key(KeyCode::Char('b')));
         let mut wide_terminal = ScriptedGlobalTerminal::new(
             80,
             24,
             [vec![event(KeyCode::Char('o')), event(KeyCode::Char('q'))]],
         );
         assert_eq!(
-            run_with_terminal(&mut wide_terminal, &mut wide_state).unwrap(),
+            run_with_terminal(
+                &mut wide_terminal,
+                &mut wide_state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::OpenWorkspace(root.path().to_path_buf())
         );
         assert_eq!(wide_terminal.reads, 1);
@@ -2723,13 +2964,18 @@ mod tests {
             61,
             24,
             [
-                vec![event(KeyCode::Char('o')), event(KeyCode::Char('q'))],
+                vec![event(KeyCode::Char('b')), event(KeyCode::Char('q'))],
                 vec![event(KeyCode::Escape)],
                 vec![event(KeyCode::Char('q'))],
             ],
         );
         assert_eq!(
-            run_with_terminal(&mut narrow_terminal, &mut narrow_state).unwrap(),
+            run_with_terminal(
+                &mut narrow_terminal,
+                &mut narrow_state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(narrow_terminal.reads, 4);
@@ -2745,7 +2991,12 @@ mod tests {
             ],
         );
         assert_eq!(
-            run_with_terminal(&mut modal_terminal, &mut modal_state).unwrap(),
+            run_with_terminal(
+                &mut modal_terminal,
+                &mut modal_state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(modal_terminal.reads, 4);
@@ -2768,14 +3019,19 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(terminal.reads, 2);
     }
 
     #[test]
-    fn production_narrow_hidden_enter_keeps_the_root_collapsed_and_unloaded() {
+    fn production_narrow_launcher_navigation_keeps_the_explorer_unloaded() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
@@ -2783,11 +3039,16 @@ mod tests {
         let mut terminal = ScriptedGlobalTerminal::new(
             61,
             24,
-            [vec![event(KeyCode::Enter)], vec![event(KeyCode::Char('q'))]],
+            [vec![event(KeyCode::Down)], vec![event(KeyCode::Char('q'))]],
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(state.explorer, old_explorer);
@@ -2815,7 +3076,12 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_terminal(&mut terminal, &mut state).unwrap(),
+            run_with_terminal(
+                &mut terminal,
+                &mut state,
+                Err("Registry unavailable in this test")
+            )
+            .unwrap(),
             GlobalHomeExit::Quit
         );
         assert_eq!(state.explorer, old_explorer);

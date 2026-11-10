@@ -64,7 +64,6 @@ impl RegistryLocation {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // The frontend connects in a later phase.
 pub(crate) fn registry_location() -> io::Result<RegistryLocation> {
     #[cfg(windows)]
     let base = choose_base_strategy()

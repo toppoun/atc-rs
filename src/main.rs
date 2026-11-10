@@ -35,7 +35,7 @@ mod user_config_fs;
 mod user_input;
 mod watcher;
 mod workspace;
-// Frontend callers are introduced in later phases.
+// Contest history operations connect in a later phase.
 #[allow(dead_code)]
 mod workspace_registry;
 use crate::error::AppError;

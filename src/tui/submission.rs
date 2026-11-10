@@ -3557,6 +3557,7 @@ mod tests {
             &mut resolve,
             task,
             || -> Result<(), String> { panic!("Home quit must not start a contest session") },
+            || None,
         )
         .unwrap();
 

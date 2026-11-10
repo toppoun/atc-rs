@@ -6,6 +6,11 @@ use crate::config::RunnerConfig;
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
+use crate::workspace_registry::store::{RegistryApply, RegistryLoad, RegistryStore};
+use crate::workspace_registry::{
+    DirectoryIdentity, EntryRef, RegistryEntry, RegistryMutation, RegistryMutationResult,
+    VerifiedWorkspace,
+};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -436,9 +441,13 @@ pub(crate) fn run_application() -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
     run_application_at_with(&cwd, |mut location| {
         let mut preferences = crate::tui::FrontendPreferences::default();
+        let registry = crate::paths::registry_location()
+            .map(RegistryStore::new)
+            .map_err(|error| error.to_string());
         run_bare_application(
             &mut location,
             &mut preferences,
+            registry.as_ref().map_err(String::as_str),
             crate::tui::TerminaSession::start,
         )
     })
@@ -528,8 +537,8 @@ struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
 }
 
 enum WorkspaceOpenOutcome<S = crate::tui::SubmissionHub> {
-    Opened(WorkspaceRuntime<S>),
-    NotWorkspace,
+    Opened(WorkspaceRuntime<S>, Option<DirectoryIdentity>),
+    NotWorkspace(Option<DirectoryIdentity>),
 }
 
 impl WorkspaceRuntime {
@@ -560,23 +569,20 @@ fn open_workspace_runtime_with<S>(
     path: &Path,
     create_submissions: impl FnOnce() -> S,
 ) -> Result<WorkspaceOpenOutcome<S>, AppError> {
-    open_workspace_runtime_from_context_with(AppContext::from_launch_root(path), create_submissions)
-}
-
-fn open_workspace_runtime_from_context_with<S>(
-    app_context: io::Result<AppContext>,
-    create_submissions: impl FnOnce() -> S,
-) -> Result<WorkspaceOpenOutcome<S>, AppError> {
-    let app_context = match app_context? {
-        workspace @ AppContext::Workspace { .. } => workspace,
-        AppContext::Standalone { .. } => return Ok(WorkspaceOpenOutcome::NotWorkspace),
-    };
-
-    Ok(WorkspaceOpenOutcome::Opened(WorkspaceRuntime {
-        app_context,
-        submissions: create_submissions(),
-        location: RootLocation::WorkspaceHome,
-    }))
+    let checked = workspace::inspect_launcher_workspace(path)?;
+    if !checked.initialized {
+        return Ok(WorkspaceOpenOutcome::NotWorkspace(checked.identity));
+    }
+    Ok(WorkspaceOpenOutcome::Opened(
+        WorkspaceRuntime {
+            app_context: AppContext::Workspace {
+                root: path.to_path_buf(),
+            },
+            submissions: create_submissions(),
+            location: RootLocation::WorkspaceHome,
+        },
+        checked.identity,
+    ))
 }
 
 impl<S> WorkspaceRuntime<S> {
@@ -782,6 +788,7 @@ fn run_root_tui(app_context: AppContext, location: RootLocation) -> Result<(), A
 fn run_bare_application<T>(
     location: &mut AppLocation,
     preferences: &mut crate::tui::FrontendPreferences,
+    registry: Result<&RegistryStore, &str>,
     start_terminal: impl FnOnce() -> io::Result<T>,
 ) -> Result<(), AppError>
 where
@@ -790,6 +797,7 @@ where
     run_bare_application_with(
         location,
         preferences,
+        registry,
         start_terminal,
         WorkspaceRuntime::open,
         workspace::initialize_workspace,
@@ -799,6 +807,7 @@ where
 fn run_bare_application_with<T>(
     location: &mut AppLocation,
     preferences: &mut crate::tui::FrontendPreferences,
+    registry: Result<&RegistryStore, &str>,
     start_terminal: impl FnOnce() -> io::Result<T>,
     open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
     initialize_workspace: impl FnMut(&Path) -> io::Result<workspace::WorkspaceInitialization>,
@@ -825,6 +834,7 @@ where
         location,
         &mut terminal,
         preferences,
+        registry,
         open_workspace,
         initialize_workspace,
     );
@@ -876,95 +886,270 @@ where
     cleanup_result.map_err(AppError::from)
 }
 
+enum WorkspaceHistory {
+    Direct(Option<DirectoryIdentity>),
+    Selected {
+        identity: Option<DirectoryIdentity>,
+        entry: Option<EntryRef>,
+    },
+}
+
+fn record_workspace_home(
+    registry: Result<&RegistryStore, &str>,
+    path: &Path,
+    history: WorkspaceHistory,
+) -> Option<String> {
+    let result = (|| {
+        let expected_identity = match &history {
+            WorkspaceHistory::Direct(identity) | WorkspaceHistory::Selected { identity, .. } => {
+                *identity
+            }
+        };
+        let checked =
+            workspace::inspect_launcher_workspace(path).map_err(|error| error.to_string())?;
+        if !checked.initialized {
+            return Err("Workspace marker is missing".into());
+        }
+        if expected_identity != checked.identity {
+            return Err("Workspace folder changed before recording the open".into());
+        }
+        let opened = VerifiedWorkspace::from_verified_root(path.to_path_buf(), checked.identity)
+            .map_err(|error| error.to_string())?;
+        let store = registry.map_err(str::to_owned)?;
+        let mutation = match history {
+            WorkspaceHistory::Direct(_) => RegistryMutation::RecordDirectWorkspaceOpen(&opened),
+            WorkspaceHistory::Selected { entry, .. } => {
+                let entry = match entry {
+                    Some(entry) => entry,
+                    None => match store
+                        .apply(RegistryMutation::Register(&opened))
+                        .map_err(|error| error.to_string())?
+                    {
+                        RegistryApply::Applied {
+                            result: RegistryMutationResult::Registered(entry),
+                            ..
+                        }
+                        | RegistryApply::NoChange {
+                            result: RegistryMutationResult::AlreadyRegistered(entry),
+                            ..
+                        } => entry,
+                        _ => return Err("Workspace registration could not be confirmed".into()),
+                    },
+                };
+                return apply_workspace_open(
+                    store,
+                    RegistryMutation::RecordWorkspaceOpen {
+                        entry: &entry,
+                        opened: &opened,
+                    },
+                );
+            }
+        };
+        apply_workspace_open(store, mutation)
+    })();
+    result
+        .err()
+        .map(|error| format!("Workspace history could not be saved: {error}"))
+}
+
+fn apply_workspace_open(
+    store: &RegistryStore,
+    mutation: RegistryMutation<'_>,
+) -> Result<(), String> {
+    match store.apply(mutation).map_err(|error| error.to_string())? {
+        RegistryApply::Applied {
+            result: RegistryMutationResult::Recorded(_),
+            ..
+        } => Ok(()),
+        RegistryApply::StaleEntry { .. } => {
+            Err("The registration changed. Reload Recent Workspaces with r in Global Home.".into())
+        }
+        _ => Err("The Workspace history update could not be confirmed".into()),
+    }
+}
+
+fn validate_recent_registration(
+    registry: Result<&RegistryStore, &str>,
+    entry: &RegistryEntry,
+    identity: Option<DirectoryIdentity>,
+) -> Result<(), String> {
+    if entry.identity().is_some() && entry.identity() != identity {
+        return Err("A different folder now exists at this path. Remove the old entry and open the folder explicitly.".into());
+    }
+    let reference = entry.entry_ref();
+    let store = registry.map_err(str::to_owned)?;
+    if let RegistryLoad::Snapshot(snapshot) = store.load().map_err(|error| error.to_string())?
+        && snapshot
+            .entries_by_recent_use()
+            .iter()
+            .any(|row| row.entry_ref() == reference)
+    {
+        return Ok(());
+    }
+    Err("The registration was removed or changed.\nPress r to reload Recent Workspaces.".into())
+}
+
+fn workspace_open_error(path: &Path, error: AppError) -> String {
+    let guidance = match &error {
+        AppError::Io(error) if error.kind() == io::ErrorKind::InvalidData => {
+            "To repair the marker, run atc in this folder.\nPress w in Workspace Home.\n"
+        }
+        AppError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            "The Workspace folder is missing or has moved.\n"
+        }
+        _ => "",
+    };
+    format!(
+        "Could not open workspace {}:\n{guidance}{error}",
+        path.display()
+    )
+}
+
 fn run_application_locations_with<T>(
     location: &mut AppLocation,
     terminal: &mut T,
     preferences: &mut crate::tui::FrontendPreferences,
+    registry: Result<&RegistryStore, &str>,
     mut open_workspace: impl FnMut(&Path) -> Result<WorkspaceOpenOutcome, AppError>,
     mut initialize_workspace: impl FnMut(&Path) -> io::Result<workspace::WorkspaceInitialization>,
 ) -> io::Result<()>
 where
     T: ApplicationTerminal,
 {
+    use crate::tui::GlobalHomeExit;
+
+    let mut history = match location {
+        AppLocation::GlobalHome(state) => {
+            state.reload_registry(registry);
+            None
+        }
+        AppLocation::Workspace(runtime) => runtime
+            .app_context
+            .workspace_root()
+            .and_then(|root| workspace::inspect_launcher_workspace(root).ok())
+            .filter(|checked| checked.initialized)
+            .map(|checked| WorkspaceHistory::Direct(checked.identity)),
+    };
+
     loop {
-        let global_exit = match location {
-            AppLocation::GlobalHome(state) => {
-                Some(crate::tui::run_global_home_with_terminal(terminal, state)?)
-            }
+        let state = match location {
+            AppLocation::GlobalHome(state) => state,
             AppLocation::Workspace(runtime) => {
-                return run_workspace_runtime(runtime, terminal, preferences)
-                    .map(|WorkspaceExit::Quit| ());
+                let root = runtime.app_context.workspace_root().map(Path::to_path_buf);
+                return run_workspace_runtime(runtime, terminal, preferences, || {
+                    record_workspace_home(registry, root.as_deref()?, history?)
+                })
+                .map(|WorkspaceExit::Quit| ());
             }
         };
 
-        match global_exit.expect("Global Home is the only location that returns here") {
-            crate::tui::GlobalHomeExit::Quit => return Ok(()),
-            crate::tui::GlobalHomeExit::OpenWorkspace(path) => match open_workspace(&path) {
-                Ok(WorkspaceOpenOutcome::Opened(runtime)) => {
-                    terminal.discard_global_home_input_batch()?;
-                    *location = AppLocation::Workspace(runtime);
-                }
-                Ok(WorkspaceOpenOutcome::NotWorkspace) => {
-                    let AppLocation::GlobalHome(state) = location else {
-                        unreachable!("a non-workspace open cannot commit the workspace")
-                    };
-                    state.show_initialize_workspace_confirmation(path);
+        let (runtime, next_history) = match crate::tui::run_global_home_with_terminal(
+            terminal, state, registry,
+        )? {
+            GlobalHomeExit::Quit => return Ok(()),
+            GlobalHomeExit::OpenWorkspace(path) => match open_workspace(&path) {
+                Ok(WorkspaceOpenOutcome::Opened(runtime, identity)) => (
+                    runtime,
+                    WorkspaceHistory::Selected {
+                        identity,
+                        entry: None,
+                    },
+                ),
+                Ok(WorkspaceOpenOutcome::NotWorkspace(identity)) => {
+                    state.show_initialize_workspace_confirmation(path, identity);
+                    continue;
                 }
                 Err(error) => {
-                    let AppLocation::GlobalHome(state) = location else {
-                        unreachable!("failed workspace open cannot commit the workspace")
-                    };
-                    state.show_workspace_open_error(format!(
-                        "Could not open workspace {}:\n{error}",
-                        path.display()
-                    ));
+                    state.show_workspace_open_error(workspace_open_error(&path, error));
+                    continue;
                 }
             },
-            crate::tui::GlobalHomeExit::InitializeWorkspace(path) => {
-                match initialize_workspace(&path) {
-                    Ok(
-                        workspace::WorkspaceInitialization::Created(_)
-                        | workspace::WorkspaceInitialization::AlreadyInitialized(_),
-                    ) => match open_workspace(&path) {
-                        Ok(WorkspaceOpenOutcome::Opened(runtime)) => {
-                            terminal.discard_global_home_input_batch()?;
-                            *location = AppLocation::Workspace(runtime);
-                        }
-                        Ok(WorkspaceOpenOutcome::NotWorkspace) => {
-                            let AppLocation::GlobalHome(state) = location else {
-                                unreachable!(
-                                    "post-initialization open failure cannot commit the workspace"
-                                )
-                            };
-                            state.show_workspace_initialized_open_error(format!(
-                                "Workspace initialized, but opening failed:\nNot an atc workspace: {}",
+            GlobalHomeExit::OpenRecentWorkspace(entry) => {
+                let path = entry.root();
+                match open_workspace(path) {
+                    Ok(WorkspaceOpenOutcome::Opened(runtime, identity)) => {
+                        if let Err(error) = validate_recent_registration(registry, &entry, identity)
+                        {
+                            state.show_workspace_open_error(format!(
+                                "Could not open {}:\n{error}",
                                 path.display()
                             ));
+                            continue;
                         }
-                        Err(error) => {
-                            let AppLocation::GlobalHome(state) = location else {
-                                unreachable!(
-                                    "post-initialization open failure cannot commit the workspace"
-                                )
-                            };
-                            state.show_workspace_initialized_open_error(format!(
-                                "Workspace initialized at {}, but opening failed:\n{error}",
-                                path.display()
-                            ));
-                        }
-                    },
-                    Err(error) => {
-                        let AppLocation::GlobalHome(state) = location else {
-                            unreachable!("failed initialization cannot commit the workspace")
-                        };
-                        state.show_workspace_initialization_error(format!(
-                            "Could not initialize workspace {}:\n{error}",
+                        (
+                            runtime,
+                            WorkspaceHistory::Selected {
+                                identity,
+                                entry: Some(entry.entry_ref()),
+                            },
+                        )
+                    }
+                    Ok(WorkspaceOpenOutcome::NotWorkspace(_)) => {
+                        state.show_workspace_open_error(format!(
+                            "Workspace marker .atc-workspace.toml is missing at {}. Restore it or remove the old entry.",
                             path.display()
                         ));
+                        continue;
+                    }
+                    Err(error) => {
+                        state.show_workspace_open_error(workspace_open_error(path, error));
+                        continue;
                     }
                 }
             }
-        }
+            GlobalHomeExit::InitializeWorkspace(path, expected_identity) => {
+                let initialized =
+                    workspace::inspect_launcher_workspace(&path).and_then(|checked| {
+                        if checked.identity != expected_identity {
+                            return Err(io::Error::other(
+                                "Workspace folder changed since confirmation was shown",
+                            ));
+                        }
+                        drop(checked);
+                        initialize_workspace(&path)
+                    });
+                if let Err(error) = initialized {
+                    state.show_workspace_initialization_error(format!(
+                        "Could not initialize workspace {}:\n{error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                match open_workspace(&path) {
+                    Ok(WorkspaceOpenOutcome::Opened(runtime, identity))
+                        if identity == expected_identity =>
+                    {
+                        (
+                            runtime,
+                            WorkspaceHistory::Selected {
+                                identity,
+                                entry: None,
+                            },
+                        )
+                    }
+                    other => {
+                        let reason = match other {
+                            Ok(WorkspaceOpenOutcome::NotWorkspace(_)) => {
+                                "Not an atc workspace".into()
+                            }
+                            Ok(WorkspaceOpenOutcome::Opened(..)) => {
+                                "Workspace folder changed".into()
+                            }
+                            Err(error) => error.to_string(),
+                        };
+                        state.show_workspace_initialized_open_error(format!(
+                            "Workspace initialized, but opening failed:\n{reason}: {}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+
+        terminal.discard_global_home_input_batch()?;
+        *location = AppLocation::Workspace(runtime);
+        history = Some(next_history);
     }
 }
 
@@ -996,8 +1181,8 @@ where
         }
     };
 
-    let result =
-        run_workspace_runtime(runtime, &mut terminal, preferences).map(|WorkspaceExit::Quit| ());
+    let result = run_workspace_runtime(runtime, &mut terminal, preferences, || None)
+        .map(|WorkspaceExit::Quit| ());
 
     // sample/stress実行中だった場合、runnerまでcancelを先に伝える。
     runtime.request_stop_active_contest();
@@ -1043,6 +1228,7 @@ fn run_workspace_runtime<S, T>(
     runtime: &mut WorkspaceRuntime<S>,
     terminal: &mut T,
     preferences: &mut crate::tui::FrontendPreferences,
+    first_home_draw: impl FnOnce() -> Option<String>,
 ) -> io::Result<WorkspaceExit>
 where
     S: WorkspaceSubmissionLifetime,
@@ -1057,6 +1243,7 @@ where
     let switch_task = contest_open_task(app_context, Arc::clone(&prepared_switch));
     let home_open_task = contest_open_task(app_context, Arc::clone(&prepared_home_open));
     let mut refresh_frontend_state = None;
+    let mut first_home_draw = Some(first_home_draw);
     loop {
         if matches!(&*location, RootLocation::WorkspaceHome) {
             match prepared_home_open.lock() {
@@ -1081,6 +1268,7 @@ where
                     start_prepared_contest_entry(prepared, app_context)
                         .map_err(|error| error.to_string())
                 },
+                || first_home_draw.take().and_then(|record| record()),
             ) {
                 Err(error) => break Err(error),
                 Ok(crate::tui::HomeExit::Quit) => break Ok(WorkspaceExit::Quit),
@@ -2273,6 +2461,24 @@ mod tests {
         workspace_reads: std::rc::Rc<std::cell::Cell<usize>>,
         contest_frontend_dispatches: std::rc::Rc<std::cell::Cell<usize>>,
         rendered_global_frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        rendered_workspace_frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        folder_steps: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    use crate::tui::folder_selection::{
+        FolderDialogFailure, FolderDialogResult, FolderPicker, FolderSelection,
+        FolderSelectionRequest, select_folder_with,
+    };
+
+    struct MockFolderPicker(Option<FolderDialogResult>);
+
+    impl FolderPicker for MockFolderPicker {
+        fn pick_folder(&mut self, initial_dir: Option<&Path>) -> FolderDialogResult {
+            assert!(initial_dir.is_some_and(Path::is_absolute));
+            self.0
+                .take()
+                .expect("mock folder dialog ran more than once")
+        }
     }
 
     struct BareTerminalSpy {
@@ -2281,6 +2487,11 @@ mod tests {
         width: u16,
         height: u16,
         discard_error: bool,
+        folder_dialog: Option<FolderDialogResult>,
+        resume_error: bool,
+        workspace_draw_error: bool,
+        before_global_input: Option<Box<dyn FnOnce()>>,
+        before_workspace_draw: Option<Box<dyn FnOnce()>>,
         probe: BareApplicationProbe,
     }
 
@@ -2402,6 +2613,11 @@ mod tests {
                 width,
                 height,
                 discard_error: false,
+                folder_dialog: None,
+                resume_error: false,
+                workspace_draw_error: false,
+                before_global_input: None,
+                before_workspace_draw: None,
                 probe,
             }
         }
@@ -2499,6 +2715,11 @@ mod tests {
         fn note_global_home_resize(&mut self) {}
 
         fn poll_global_home(&mut self, wait: Duration) -> io::Result<bool> {
+            if wait != Duration::ZERO
+                && let Some(action) = self.before_global_input.take()
+            {
+                action();
+            }
             self.poll_script(wait)
         }
 
@@ -2507,6 +2728,38 @@ mod tests {
                 .global_reads
                 .set(self.probe.global_reads.get() + 1);
             self.read_script()
+        }
+
+        fn select_global_home_folder(
+            &mut self,
+            request: FolderSelectionRequest<'_>,
+        ) -> io::Result<FolderSelection> {
+            let FolderSelectionRequest::SystemDialog { initial_dir, .. } = request else {
+                panic!("expected system dialog request");
+            };
+            let mut picker = MockFolderPicker(self.folder_dialog.take());
+            select_folder_with(
+                self,
+                FolderSelectionRequest::SystemDialog {
+                    picker: &mut picker,
+                    initial_dir,
+                },
+                |terminal| {
+                    assert!(
+                        terminal.active_batch.is_empty(),
+                        "drain input before suspension"
+                    );
+                    terminal.probe.folder_steps.borrow_mut().push("suspend");
+                    Ok(())
+                },
+                |terminal| {
+                    terminal.probe.folder_steps.borrow_mut().push("resume");
+                    if terminal.resume_error {
+                        return Err(io::Error::other("scripted folder dialog resume failed"));
+                    }
+                    Ok(())
+                },
+            )
         }
 
         fn discard_global_home_input_batch(&mut self) -> io::Result<()> {
@@ -2528,7 +2781,17 @@ mod tests {
 
     impl crate::tui::HomeTerminal for BareTerminalSpy {
         fn draw_home(&mut self, render: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<()> {
-            let _ = Self::render_to_text(self.width, self.height, render)?;
+            if let Some(action) = self.before_workspace_draw.take() {
+                action();
+            }
+            if self.workspace_draw_error {
+                return Err(io::Error::other("scripted Workspace Home draw failed"));
+            }
+            let rendered = Self::render_to_text(self.width, self.height, render)?;
+            self.probe
+                .rendered_workspace_frames
+                .borrow_mut()
+                .push(rendered);
             self.probe
                 .workspace_draws
                 .set(self.probe.workspace_draws.get() + 1);
@@ -2712,6 +2975,15 @@ mod tests {
         .unwrap();
     }
 
+    fn test_registry(base: &Path) -> RegistryStore {
+        RegistryStore::new(
+            crate::paths::RegistryLocation::from_platform_base(base.to_path_buf()).unwrap(),
+        )
+    }
+
+    #[path = "launcher_tests.rs"]
+    mod launcher;
+
     fn run_scripted_bare_application(
         launch_root: &Path,
         batches: impl IntoIterator<Item = Vec<crate::tui::TerminalEvent>>,
@@ -2728,9 +3000,11 @@ mod tests {
         probe: &BareApplicationProbe,
     ) -> Result<AppLocation, AppError> {
         let terminal = BareTerminalSpy::new_at_size(width, height, batches, probe.clone());
+        let state = tempfile::tempdir().unwrap();
+        let registry = test_registry(state.path());
         run_application_at_with(launch_root, |mut location| {
             let mut preferences = crate::tui::FrontendPreferences::default();
-            run_bare_application(&mut location, &mut preferences, || {
+            run_bare_application(&mut location, &mut preferences, Ok(&registry), || {
                 probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                 Ok(terminal)
             })?;
@@ -2837,6 +3111,7 @@ mod tests {
         let location = run_scripted_bare_application(
             launch.path(),
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![crate::tui::test_key_enter()],
@@ -2883,6 +3158,7 @@ mod tests {
         let location = run_scripted_bare_application(
             launch.path(),
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -2896,7 +3172,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(location, AppLocation::Workspace(_)));
-        assert_eq!(probe.global_reads.get(), 4);
+        assert_eq!(probe.global_reads.get(), 5);
         assert_eq!(probe.workspace_reads.get(), 1);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
@@ -2948,6 +3224,7 @@ mod tests {
         let location = run_scripted_bare_application(
             launch.path(),
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -2979,7 +3256,7 @@ mod tests {
             std::fs::read_to_string(ordinary.join("keep.txt")).unwrap(),
             "untouched"
         );
-        assert_eq!(probe.global_reads.get(), 5);
+        assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.workspace_reads.get(), 1);
         assert_eq!(probe.terminal_starts.get(), 1);
         assert_eq!(probe.terminal_restores.get(), 1);
@@ -2997,6 +3274,7 @@ mod tests {
         let probe = BareApplicationProbe::default();
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3011,10 +3289,15 @@ mod tests {
 
         let location = run_application_at_with(launch.path(), |mut location| {
             let mut preferences = crate::tui::FrontendPreferences::default();
-            let error = run_bare_application(&mut location, &mut preferences, || {
-                probe.terminal_starts.set(probe.terminal_starts.get() + 1);
-                Ok(terminal)
-            })
+            let error = run_bare_application(
+                &mut location,
+                &mut preferences,
+                Err("Registry unavailable in this test"),
+                || {
+                    probe.terminal_starts.set(probe.terminal_starts.get() + 1);
+                    Ok(terminal)
+                },
+            )
             .unwrap_err();
             assert!(error.to_string().contains("scripted input discard failed"));
             Ok(location)
@@ -3040,10 +3323,12 @@ mod tests {
         let location = run_scripted_bare_application(
             launch.path(),
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
                     crate::tui::test_key_press('o'),
+                    crate::tui::test_key_escape(),
                     crate::tui::test_key_escape(),
                     crate::tui::test_key_press('q'),
                 ],
@@ -3058,7 +3343,7 @@ mod tests {
         assert_eq!(state.explorer_root(), launch.path());
         assert_eq!(state.explorer_selected_path(), ordinary);
         assert!(!ordinary.join(".atc-workspace.toml").exists());
-        assert_eq!(probe.global_reads.get(), 5);
+        assert_eq!(probe.global_reads.get(), 7);
         assert_eq!(probe.workspace_draws.get(), 0);
         assert!(
             probe
@@ -3081,7 +3366,7 @@ mod tests {
             24,
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3122,7 +3407,7 @@ mod tests {
             24,
             launch.path(),
             [
-                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3149,38 +3434,34 @@ mod tests {
     }
 
     #[test]
-    fn production_malformed_marker_opens_workspace_home_for_repair() {
+    fn malformed_marker_selected_in_launcher_guides_repair_via_direct_home() {
         let launch = tempfile::tempdir().unwrap();
         let invalid = launch.path().join("a-invalid");
         std::fs::create_dir(&invalid).unwrap();
-        std::fs::write(invalid.join(".atc-workspace.toml"), "invalid").unwrap();
+        let marker = invalid.join(".atc-workspace.toml");
+        std::fs::write(&marker, "invalid").unwrap();
         let probe = BareApplicationProbe::default();
 
         let location = run_scripted_bare_application(
             launch.path(),
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
-                vec![
-                    crate::tui::test_key_press('o'),
-                    crate::tui::test_key_press('q'),
-                ],
-                vec![crate::tui::test_key_escape()],
+                vec![crate::tui::test_key_press('o')],
+                vec![crate::tui::test_key_escape(), crate::tui::test_key_escape()],
                 vec![crate::tui::test_key_press('q')],
             ],
             &probe,
         )
         .unwrap();
 
-        let AppLocation::Workspace(runtime) = location else {
-            panic!("a structurally safe malformed marker must open Workspace Home")
-        };
-        assert_eq!(
-            runtime.app_context.workspace_root(),
-            Some(invalid.as_path())
-        );
-        assert!(probe.workspace_draws.get() >= 1);
-        assert_eq!(probe.terminal_starts.get(), 1);
+        assert!(matches!(location, AppLocation::GlobalHome(_)));
+        let rendered = probe.rendered_global_frames.borrow().join("\n");
+        assert!(rendered.contains("Workspace Open Failed"));
+        assert!(rendered.contains("Press w in Workspace Home"));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "invalid");
+        assert_eq!(probe.workspace_draws.get(), 0);
         assert_eq!(probe.terminal_restores.get(), 1);
     }
 
@@ -3193,6 +3474,7 @@ mod tests {
         let probe = BareApplicationProbe::default();
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3210,6 +3492,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3242,6 +3525,7 @@ mod tests {
         let initialization_attempts = std::cell::Cell::new(0);
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3250,7 +3534,10 @@ mod tests {
                     crate::tui::test_key_press('q'),
                 ],
                 vec![crate::tui::test_key_enter()],
-                vec![crate::tui::test_key_press('q')],
+                vec![
+                    crate::tui::test_key_escape(),
+                    crate::tui::test_key_press('q'),
+                ],
             ],
             probe.clone(),
         );
@@ -3260,6 +3547,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3267,7 +3555,7 @@ mod tests {
                 WorkspaceRuntime::open,
                 |path| {
                     initialization_attempts.set(initialization_attempts.get() + 1);
-                    std::fs::remove_dir(path).unwrap();
+                    std::fs::remove_dir(path)?;
                     workspace::initialize_workspace(path)
                 },
             )?;
@@ -3281,7 +3569,7 @@ mod tests {
         assert_eq!(state.explorer_selected_path(), ordinary);
         assert_eq!(state.initialize_workspace_target(), None);
         assert_eq!(initialization_attempts.get(), 1);
-        assert_eq!(probe.global_reads.get(), 7);
+        assert_eq!(probe.global_reads.get(), 9);
         assert_eq!(probe.workspace_draws.get(), 0);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.contains("Workspace Initialization Failed"));
@@ -3297,6 +3585,7 @@ mod tests {
         let probe = BareApplicationProbe::default();
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3315,6 +3604,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3346,6 +3636,7 @@ mod tests {
         let probe = BareApplicationProbe::default();
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3363,6 +3654,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3393,7 +3685,7 @@ mod tests {
             std::fs::read(ordinary.join(".atc-workspace.toml")).unwrap(),
             external_marker
         );
-        assert_eq!(probe.global_reads.get(), 5);
+        assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.workspace_reads.get(), 1);
     }
 
@@ -3406,6 +3698,7 @@ mod tests {
         let probe = BareApplicationProbe::default();
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3414,7 +3707,10 @@ mod tests {
                     crate::tui::test_key_press('q'),
                 ],
                 vec![crate::tui::test_key_enter()],
-                vec![crate::tui::test_key_press('q')],
+                vec![
+                    crate::tui::test_key_escape(),
+                    crate::tui::test_key_press('q'),
+                ],
             ],
             probe.clone(),
         );
@@ -3424,6 +3720,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3463,6 +3760,7 @@ mod tests {
         let marker_removed = std::cell::Cell::new(false);
         let terminal = BareTerminalSpy::new(
             [
+                vec![crate::tui::test_key_press('b')],
                 vec![crate::tui::test_key_enter()],
                 vec![crate::tui::test_key_press('j')],
                 vec![
@@ -3471,7 +3769,10 @@ mod tests {
                     crate::tui::test_key_press('q'),
                 ],
                 vec![crate::tui::test_key_enter()],
-                vec![crate::tui::test_key_press('q')],
+                vec![
+                    crate::tui::test_key_escape(),
+                    crate::tui::test_key_press('q'),
+                ],
             ],
             probe.clone(),
         );
@@ -3481,6 +3782,7 @@ mod tests {
             run_bare_application_with(
                 &mut location,
                 &mut preferences,
+                Err("Registry unavailable in this test"),
                 || {
                     probe.terminal_starts.set(probe.terminal_starts.get() + 1);
                     Ok(terminal)
@@ -3515,7 +3817,7 @@ mod tests {
         assert!(!ordinary.join(".atc-workspace.toml").exists());
         assert_eq!(probe.workspace_draws.get(), 0);
         assert_eq!(probe.workspace_reads.get(), 0);
-        assert_eq!(probe.global_reads.get(), 7);
+        assert_eq!(probe.global_reads.get(), 9);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
         assert!(rendered.contains("Workspace Initialized, Open Failed"));
         assert!(rendered.contains("Workspace initialized, but opening failed"));
@@ -3574,7 +3876,7 @@ mod tests {
             hub_creations.set(hub_creations.get() + 1)
         })
         .unwrap();
-        let WorkspaceOpenOutcome::Opened(runtime) = outcome else {
+        let WorkspaceOpenOutcome::Opened(runtime, _) = outcome else {
             panic!("a valid workspace marker must open a runtime")
         };
 
@@ -3593,44 +3895,23 @@ mod tests {
         })
         .unwrap();
 
-        assert!(matches!(outcome, WorkspaceOpenOutcome::NotWorkspace));
+        assert!(matches!(outcome, WorkspaceOpenOutcome::NotWorkspace(_)));
         assert_eq!(hub_creations.get(), 0);
     }
 
     #[test]
-    fn malformed_marker_opens_workspace_home_without_parsing() {
-        let selected = tempfile::tempdir().unwrap();
-        std::fs::write(selected.path().join(".atc-workspace.toml"), "invalid").unwrap();
-        let hub_creations = std::cell::Cell::new(0);
-
-        let outcome = open_workspace_runtime_with(selected.path(), || {
-            hub_creations.set(hub_creations.get() + 1)
-        })
-        .expect("malformed contents are repairable from Workspace Home");
-
-        assert!(matches!(outcome, WorkspaceOpenOutcome::Opened(_)));
-        assert_eq!(hub_creations.get(), 1);
-    }
-
-    #[test]
-    fn marker_io_failure_remains_an_error_before_runtime_construction() {
-        let hub_creations = std::cell::Cell::new(0);
-
-        let error = match open_workspace_runtime_from_context_with(
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "marker inspection failed",
-            )),
-            || hub_creations.set(hub_creations.get() + 1),
-        ) {
-            Ok(_) => panic!("a marker I/O failure must not become a workspace-open outcome"),
+    fn marker_type_failure_remains_an_error_before_runtime_construction() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".atc-workspace.toml")).unwrap();
+        let error = match open_workspace_runtime_with(root.path(), || {
+            panic!("invalid marker must not create a hub")
+        }) {
+            Ok(_) => panic!("an invalid marker type must fail"),
             Err(error) => error,
         };
-
         assert!(
-            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput)
         );
-        assert_eq!(hub_creations.get(), 0);
     }
 
     #[test]
@@ -3872,6 +4153,7 @@ mod tests {
                     .map_err(|error| error.to_string())
             },
             &paths,
+            || None,
         )
         .unwrap();
 

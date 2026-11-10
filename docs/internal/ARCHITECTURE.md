@@ -27,7 +27,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 | [src/main.rs](../../src/main.rs)、[src/cli.rs](../../src/cli.rs) | `clap` の引数定義、コマンドの振り分け、CLI の終了コード。引数なしの起動は TUI の Home へ進む | `cli.rs`、[tests/help_cli.rs](../../tests/help_cli.rs)、[tests/verdict_exit_cli.rs](../../tests/verdict_exit_cli.rs) |
 | [src/commands/](../../src/commands/)、[src/ui.rs](../../src/ui.rs) | 操作ごとの入力解決と処理の組み立て。`commands/mod.rs` は Contest 情報・サンプル取得を共有し、`ui.rs` は進捗イベントと端末出力を定義 | [src/commands/tests.rs](../../src/commands/tests.rs)、各コマンドの単体テスト、[tests/](../../tests/) |
 | [src/app_context.rs](../../src/app_context.rs)、[src/workspace.rs](../../src/workspace.rs) | 起動場所の Workspace 判定、Contest の配置解決、メタデータ・サンプルの読み書きと置換。CLI と TUI の両方が利用 | 同ファイル、[tests/init_cli.rs](../../tests/init_cli.rs)、[tests/contest_owner_cli.rs](../../tests/contest_owner_cli.rs) |
-| [src/workspace_registry.rs](../../src/workspace_registry.rs)、[store.rs](../../src/workspace_registry/store.rs) | Workspace と Contest の最近使用順を管理する索引。モデルは TOML の変換・検証と操作の適用を担当し、`RegistryStore` は専用ロック下で最新の Registry に操作を適用して保存する。Phase 3-1b の入口はストアの API | [モデルのテスト](../../src/workspace_registry/tests.rs)、[保存と排他のテスト](../../src/workspace_registry/store/tests.rs) |
+| [src/workspace_registry.rs](../../src/workspace_registry.rs)、[store.rs](../../src/workspace_registry/store.rs) | Workspace と Contest の最近使用順を管理する索引。モデルは TOML の変換・検証と操作の適用を担当し、`RegistryStore` は専用ロック下で最新の Registry に操作を適用して保存する | [モデルのテスト](../../src/workspace_registry/tests.rs)、[保存と排他のテスト](../../src/workspace_registry/store/tests.rs) |
 | [src/atcoder.rs](../../src/atcoder.rs)、[src/atcoder/](../../src/atcoder/) | `AtCoderClient` の HTTP・Cookie 連携と HTML 解析。Contest 情報・サンプル取得には fixture 経路もある。提出フォーム送信と結果追跡はサブモジュール | `atcoder.rs` の fixture・ローカル HTTP テスト、`atcoder/submit.rs` と `atcoder/submission_tracking.rs` の単体テスト |
 | [src/runner.rs](../../src/runner.rs)、[src/comparator.rs](../../src/comparator.rs) | Test・Stress・User Input が使う C++ コンパイル、Python・実行ファイルの起動、出力取得、タイムアウト・中断。出力比較は `comparator` が担当 | 同ファイル、[tests/verdict_exit_cli.rs](../../tests/verdict_exit_cli.rs) |
 | [src/stress.rs](../../src/stress.rs)、[src/user_input.rs](../../src/user_input.rs) | Stress の比較ループと反例の保存・再読込。User Input の永続化は `user_input`、実行はコマンド側 | 同ファイル、[src/commands/user_input_run.rs](../../src/commands/user_input_run.rs) |
@@ -43,16 +43,23 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 ### Workspace 初期化
 
 - `atc init` → `commands::init` → カレントディレクトリを渡して `workspace::initialize_workspace`。既存設定の確認と既定の `.atc-workspace.toml` の作成はここで行う。
-- 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ直下の `.atc-workspace.toml` を検査し、通常ファイルとして開ければ Workspace Home、欠損していれば Global Home に進む。種類が不正な場合や、検査・オープンに失敗した場合はエラーになる。この分岐ではファイルの内容を解析しない。Global Home から選んだディレクトリの初期化も `initialize_workspace` を呼び、初期化後に開き直す。
+- 引数なしの `atc` → `run_application` → `AppContext::from_launch_root`。起動ディレクトリ直下の `.atc-workspace.toml` を検査し、通常ファイルとして開ければ Workspace Home、欠損していれば Global Home に進む。種類が不正な場合や、検査・オープンに失敗した場合はエラーになる。この分岐ではファイルの内容を解析しない。
+
+### Workspace ランチャー
+
+- `GlobalHomeState` は `RegistryStore::load` のスナップショットを使用順で表示する。行の描画では保存済みのパスを使う。履歴を開くときは現在のフォルダとマーカーを検証し、保存済みの実体 ID と最新の登録を照合する。履歴の選択から初期化には進まない。
+- OS ダイアログと Explorer で明示選択した候補は `inspect_launcher_workspace` で検証する。マーカーがない場合は既定の配置を示して確認し、`initialize_workspace` を呼ぶ。確認時と初期化後のオープン時にフォルダの実体を再確認する。
+- `run_application_locations_with` は Global Home の入力を破棄して Workspace Home に遷移する。Workspace Home の初回描画・端末の描画後処理が成功した時点で `record_workspace_home` を呼ぶ。直接起動は `RecordDirectWorkspaceOpen`、明示選択は `Register` の結果の `EntryRef`、履歴選択は元の `EntryRef` で使用順を更新する。保存の失敗は Workspace Home に表示する。直接起動時の修復用 Home は履歴の対象外。
+- `Remove from List` は確認後に `RegistryMutation::Remove` を適用し、保存確認後に返ったスナップショットで表示を更新する。
 
 ### OS フォルダ選択
 
-- `select_folder` の `SystemDialog` に `NativeFolderPicker` と任意の初期ディレクトリを渡す。端末内エディタと同じ `run_suspended_with` で、退避 → アダプター実行 → 端末の再生成と残留入力の破棄を行う。呼び出し側は処理前に入力バッチを打ち切り、結果に応じた画面を描画してから入力の受付を再開する。Global Home と Setup からの呼び出しは後続フェーズで追加する。
+- `select_folder` の `SystemDialog` に `NativeFolderPicker` と任意の初期ディレクトリを渡す。端末内エディタと同じ `run_suspended_with` で、退避 → アダプター実行 → 端末の再生成と残留入力の破棄を行う。呼び出し側は処理前に入力バッチを打ち切り、結果に応じた画面を描画してから入力の受付を再開する。Global Home の Create Workspace と Open Existing Folder がこの経路を使う。
 - [Windows](../../src/tui/folder_selection/windows.rs) は可視のウィンドウステーションで `IFileOpenDialog` を実行する。呼び出し元を STA として初期化できない理由が COM モードの不一致であれば、専用 STA スレッド上で開き、終了を待つ。前面の可視コンソールだけを親とし、ConPTY では OS にウィンドウ管理を任せる。
 - [macOS](../../src/tui/folder_selection/macos.rs) はメインスレッドと Quartz GUI セッションを確認し、`NSOpenPanel` のモーダルループを実行する。必要な場合だけ一時的に AppKit のアクティベーションポリシーを変更する。通常の TUI は `main` から同期実行されるため、スレッド間ディスパッチを必要としない。
 - `Unavailable` と明示的な `Explorer` 要求は、既存 Explorer を開く指示になる。`Cancelled` は元の画面に戻る。`Failed` では固定の表示メッセージと内部原因を分離し、画面側で利用者に Explorer への切替を提示できる。端末エラーは TUI の終了・後片付けの経路に返す。
 
-実機では検証用ディレクトリからデバッグビルドを `cargo run --locked --manifest-path <リポジトリのCargo.toml> -- --tui-folder-picker-probe` で起動する。`Enter` でダイアログを開き、既存フォルダの選択、ダイアログでの新規作成と選択、キャンセルをそれぞれ試す。各回の終了後に端末の前面表示、結果の再描画、直前のキーの誤配送がないことを確認する。プローブは `q` または `Esc` で終了する。Windows Terminal、VS Code 統合端末、macOS の Terminal.app と統合端末を対象にする。
+実機では、専用のテスト用状態ディレクトリとワークスペースを用意し、マーカーのないディレクトリから `atc` を起動する。`o` または Create Workspace でダイアログを開き、既存フォルダの選択、ダイアログでの新規作成と選択、キャンセルをそれぞれ試す。各回の終了後に端末の前面表示、結果の再描画、直前のキーの誤配送がないことを確認する。Workspace Home と Global Home は `q` で終了する。Windows Terminal、VS Code 統合端末、macOS の Terminal.app と統合端末を対象にする。
 
 ### Contest 作成・切替・修復
 
