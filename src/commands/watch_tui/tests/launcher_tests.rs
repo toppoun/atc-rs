@@ -102,11 +102,17 @@ fn displayed_recent_order_includes_unopened_entries_without_inspecting_their_fol
         "old-workspace",
         "unused-one",
         "unused-two",
-        "Create Workspace",
+        "Open Folder",
     ];
     let positions: Vec<_> = rows.iter().map(|row| first.find(row).unwrap()).collect();
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(first.contains(&new.display().to_string()));
+    assert!(
+        first.contains(&crate::tui::global_home_prefixed_path_line_for_test(
+            "Selected  ",
+            &new,
+            100
+        ))
+    );
     assert!(frames[1].contains("> old-workspace"));
     assert_eq!(fs::read(fixture.registry_file()).unwrap(), baseline);
 }
@@ -157,7 +163,9 @@ fn cancelling_a_native_selection_keeps_the_launcher_and_does_not_register() {
         AppLocation::GlobalHome(_)
     ));
     let frames = probe.rendered_global_frames.borrow();
-    assert!(frames[1].contains("> Create Workspace"));
+    assert!(frames[1].contains("> Open Folder"));
+    assert!(frames[1].starts_with("Recent Workspaces"));
+    assert!(!frames[1].contains("> Explorer"));
     assert!(
         frames
             .iter()
@@ -179,7 +187,7 @@ fn unavailable_picker_opens_explorer_and_failed_picker_waits_for_an_explicit_swi
         let probe = BareApplicationProbe::default();
         let mut batches = vec![vec![key('o'), key('b')]];
         if !unavailable {
-            batches.push(vec![key('b')]);
+            batches.push(vec![key('e')]);
         }
         // The fallback accepts the same Explorer keys, including reload and expansion.
         batches.extend([vec![enter(), key('r')], vec![esc(), key('q')]]);
@@ -198,7 +206,13 @@ fn unavailable_picker_opens_explorer_and_failed_picker_waits_for_an_explicit_swi
         assert_eq!(state.explorer_root(), fixture.root.path());
         let frames = probe.rendered_global_frames.borrow();
         assert_eq!(frames[1].contains("Folder Dialog Failed"), !unavailable);
+        assert_eq!(frames[1].starts_with("> Explorer"), unavailable);
         assert_eq!(frames[1].contains("o Open   g Go to Path"), unavailable);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.starts_with("> Explorer") && frame.contains("Open Folder"))
+        );
         assert!(
             frames
                 .iter()

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -17,7 +17,9 @@ use super::explorer::{self, ExplorerState};
 use super::folder_selection::{
     FolderDialogFailure, FolderSelection, FolderSelectionRequest, NativeFolderPicker, select_folder,
 };
-use super::home::{centered_rect, truncate_start_with_ellipsis};
+use super::home::{
+    centered_rect, centered_row, logo_size, menu_line, truncate_start_with_ellipsis,
+};
 use super::settings_screen::{self, SettingsPage, SettingsTransition};
 use super::template_modal::{
     OpenTemplateModal, TemplateAction, TemplateModalTransition, TemplateRequest,
@@ -28,36 +30,36 @@ use super::{
     HomeActionPaths, HomeEditorOutcome, HomeEditorResult, ResolvedEditor, ShortcutHelpTransition,
     TerminaSession, is_shortcut_help_key, shortcut_help_transition,
 };
-use crate::config::Config;
 use crate::workspace_registry::store::{RegistryApply, RegistryLoad, RegistryStore};
 use crate::workspace_registry::{
     DirectoryIdentity, EntryRef, RegistryEntry, RegistryMutation, RegistryMutationResult,
     RegistrySnapshot,
 };
+use crate::{branding, config::Config};
 
 const GLOBAL_HOME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_DISCARDED_TRANSITION_EVENTS: usize = 256;
-#[derive(Debug, Clone, Copy)]
-enum LauncherAction {
-    CreateWorkspace,
-    OpenExistingFolder,
-    BrowseInTerminal,
-    Settings,
-    Templates,
-    Authentication,
+const LEFT_PANE_MIN_WIDTH: u16 = 32;
+const LEFT_PANE_MAX_WIDTH: u16 = 48;
+const DASHBOARD_MIN_WIDTH: u16 = 30;
+const COMPACT_PANE_WIDTH: u16 = 20;
+const ACTION_MENU_WIDTH: u16 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftPane {
+    Recent,
+    Explorer,
 }
 
-const LAUNCHER_ACTIONS: [(LauncherAction, &str, &str); 6] = [
-    (LauncherAction::CreateWorkspace, "Create Workspace", ""),
+const LAUNCHER_ACTIONS: [(GlobalHomeFileAction, &str, &str); 4] = [
+    (GlobalHomeFileAction::PickFolder, "Open Folder", "o"),
+    (GlobalHomeFileAction::OpenSettings, "Settings", "s"),
+    (GlobalHomeFileAction::OpenTemplate, "Templates", "t"),
     (
-        LauncherAction::OpenExistingFolder,
-        "Open Existing Folder",
-        "o",
+        GlobalHomeFileAction::OpenAuthentication,
+        "Authentication",
+        "a",
     ),
-    (LauncherAction::BrowseInTerminal, "Browse in Terminal", "b"),
-    (LauncherAction::Settings, "Settings", "s"),
-    (LauncherAction::Templates, "Templates", "t"),
-    (LauncherAction::Authentication, "Authentication", "a"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,10 +205,12 @@ pub(crate) struct GlobalHomeState {
     authentication: AuthenticationModalController,
     file_action: Option<GlobalHomeFileAction>,
     shortcut_help_visible: bool,
-    explorer_overlay_visible: bool,
+    left_pane: LeftPane,
+    left_focused: bool,
     recent: Vec<RegistryEntry>,
-    selected: usize,
-    scroll: usize,
+    recent_selected: usize,
+    recent_scroll: usize,
+    action_selected: usize,
     registry_warning: Option<String>,
     registry_notice: Option<String>,
     remove_workspace: Option<RegistryEntry>,
@@ -225,10 +229,12 @@ impl GlobalHomeState {
             authentication: AuthenticationModalController::default(),
             file_action: None,
             shortcut_help_visible: false,
-            explorer_overlay_visible: false,
+            left_pane: LeftPane::Recent,
+            left_focused: false,
             recent: Vec::new(),
-            selected: 0,
-            scroll: 0,
+            recent_selected: 0,
+            recent_scroll: 0,
+            action_selected: 0,
             registry_warning: None,
             registry_notice: None,
             remove_workspace: None,
@@ -236,46 +242,44 @@ impl GlobalHomeState {
         }
     }
 
-    pub(crate) fn reload_registry(&mut self, registry: Result<&RegistryStore, &str>) {
+    pub(crate) fn load_recent_workspaces(&mut self, registry: Result<&RegistryStore, &str>) {
+        self.reload_registry(registry);
+        self.left_focused = !self.recent.is_empty();
+    }
+
+    fn reload_registry(&mut self, registry: Result<&RegistryStore, &str>) {
         self.registry_notice = None;
         let loaded = registry
             .map_err(str::to_owned)
             .and_then(|store| store.load().map_err(|error| error.to_string()));
         match loaded {
-            Ok(RegistryLoad::Snapshot(snapshot)) => {
-                let was_empty = self.recent.is_empty();
-                self.set_recent(snapshot);
-                if was_empty {
-                    self.selected = 0;
-                }
-            }
+            Ok(RegistryLoad::Snapshot(snapshot)) => self.set_recent(snapshot),
             Ok(RegistryLoad::Missing) => self.set_recent(RegistrySnapshot::default()),
             Err(error) => {
                 self.recent.clear();
-                self.selected = 0;
-                self.scroll = 0;
+                self.recent_selected = 0;
+                self.recent_scroll = 0;
                 self.registry_warning = Some(format!("Workspace Registry unavailable: {error}"));
             }
         }
     }
 
     fn set_recent(&mut self, snapshot: RegistrySnapshot) {
-        let previously_selected = self.recent.get(self.selected).map(RegistryEntry::entry_ref);
-        let action_index = self.selected.checked_sub(self.recent.len());
+        let previously_selected = self
+            .recent
+            .get(self.recent_selected)
+            .map(RegistryEntry::entry_ref);
         self.recent = snapshot
             .entries_by_recent_use()
             .into_iter()
             .cloned()
             .collect();
-        self.selected = match (previously_selected, action_index) {
-            (Some(entry), _) => self
-                .recent
-                .iter()
-                .position(|row| row.entry_ref() == entry)
-                .unwrap_or(self.selected.min(self.recent.len())),
-            (None, Some(action)) => self.recent.len() + action,
-            (None, None) => 0,
-        };
+        self.recent_selected = previously_selected
+            .and_then(|entry| self.recent.iter().position(|row| row.entry_ref() == entry))
+            .unwrap_or_else(|| {
+                self.recent_selected
+                    .min(self.recent.len().saturating_sub(1))
+            });
         self.registry_warning = None;
     }
 
@@ -387,7 +391,6 @@ impl GlobalHomeState {
         self.path_input = None;
         self.error = None;
         self.shortcut_help_visible = false;
-        self.explorer_overlay_visible = false;
         let default_language = config.defaults.language;
         self.template = Some(ActiveTemplateModal {
             modal: OpenTemplateModal::new(templates_dir, default_language, default_language),
@@ -414,26 +417,23 @@ impl GlobalHomeState {
         GlobalHomeExit::OpenWorkspace(self.explorer.selected_path().to_path_buf())
     }
 
-    fn activate_launcher_action(&mut self, action: LauncherAction) {
-        self.file_action = match action {
-            LauncherAction::CreateWorkspace | LauncherAction::OpenExistingFolder => {
-                Some(GlobalHomeFileAction::PickFolder)
-            }
-            LauncherAction::BrowseInTerminal => {
-                self.explorer_overlay_visible = true;
-                None
-            }
-            LauncherAction::Settings => Some(GlobalHomeFileAction::OpenSettings),
-            LauncherAction::Templates => Some(GlobalHomeFileAction::OpenTemplate),
-            LauncherAction::Authentication => Some(GlobalHomeFileAction::OpenAuthentication),
-        };
+    fn explorer_focused(&self) -> bool {
+        self.left_focused && self.left_pane == LeftPane::Explorer
+    }
+
+    fn focus_explorer(&mut self) {
+        self.left_pane = LeftPane::Explorer;
+        self.left_focused = true;
     }
 
     fn activate_selected(&mut self) -> Option<GlobalHomeExit> {
-        if let Some(entry) = self.recent.get(self.selected) {
-            return Some(GlobalHomeExit::OpenRecentWorkspace(Box::new(entry.clone())));
+        if self.left_focused {
+            return self
+                .recent
+                .get(self.recent_selected)
+                .map(|entry| GlobalHomeExit::OpenRecentWorkspace(Box::new(entry.clone())));
         }
-        self.activate_launcher_action(LAUNCHER_ACTIONS[self.selected - self.recent.len()].0);
+        self.file_action = Some(LAUNCHER_ACTIONS[self.action_selected].0.clone());
         None
     }
 
@@ -442,7 +442,7 @@ impl GlobalHomeState {
         let mut rebased = self.explorer.clone();
         if rebased.rebase(candidate.clone()) {
             self.explorer = rebased;
-            self.explorer_overlay_visible = true;
+            self.focus_explorer();
         } else {
             self.error = Some(GlobalHomeError {
                 kind: GlobalHomeErrorKind::GoToPath,
@@ -480,11 +480,11 @@ impl GlobalHomeState {
         true
     }
 
-    fn handle_explorer_overlay_key(&mut self, key: KeyEvent) -> Option<GlobalHomeExit> {
+    fn handle_explorer_key(&mut self, key: KeyEvent) -> Option<GlobalHomeExit> {
         if key.kind == KeyEventKind::Press {
             match key.code {
                 KeyCode::Escape => {
-                    self.explorer_overlay_visible = false;
+                    self.left_focused = false;
                     return None;
                 }
                 KeyCode::Char('o') if has_plain_modifiers(key) => {
@@ -519,9 +519,9 @@ impl GlobalHomeState {
         if self.folder_dialog_failed.is_some() {
             if key.kind == KeyEventKind::Press {
                 match key.code {
-                    KeyCode::Char('b') if has_plain_modifiers(key) => {
+                    KeyCode::Char('e' | 'b') if has_plain_modifiers(key) => {
                         self.folder_dialog_failed = None;
-                        self.explorer_overlay_visible = true;
+                        self.focus_explorer();
                     }
                     KeyCode::Escape | KeyCode::Enter => self.folder_dialog_failed = None,
                     _ => {}
@@ -625,20 +625,44 @@ impl GlobalHomeState {
             self.shortcut_help_visible = true;
             return None;
         }
-        if self.explorer_overlay_visible {
-            return self.handle_explorer_overlay_key(key);
+        if key.kind == KeyEventKind::Press && has_plain_modifiers(key) {
+            match key.code {
+                KeyCode::Tab => {
+                    self.left_focused = !self.left_focused;
+                    return None;
+                }
+                KeyCode::Char('e') => {
+                    self.left_pane = match self.left_pane {
+                        LeftPane::Recent => LeftPane::Explorer,
+                        LeftPane::Explorer => LeftPane::Recent,
+                    };
+                    return None;
+                }
+                KeyCode::Char('b') => {
+                    self.focus_explorer();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if self.explorer_focused() {
+            return self.handle_explorer_key(key);
         }
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && has_plain_modifiers(key)
         {
+            let (selected, len) = if self.left_focused {
+                (&mut self.recent_selected, self.recent.len())
+            } else {
+                (&mut self.action_selected, LAUNCHER_ACTIONS.len())
+            };
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected =
-                        (self.selected + 1).min(self.recent.len() + LAUNCHER_ACTIONS.len() - 1);
+                    *selected = (*selected + 1).min(len.saturating_sub(1));
                     return None;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected = self.selected.saturating_sub(1);
+                    *selected = selected.saturating_sub(1);
                     return None;
                 }
                 _ => {}
@@ -651,13 +675,18 @@ impl GlobalHomeState {
             KeyCode::Enter => return self.activate_selected(),
             KeyCode::Char('q') => return Some(GlobalHomeExit::Quit),
             KeyCode::Char('g') => self.open_path_input(),
-            KeyCode::Char('d') => self.remove_workspace = self.recent.get(self.selected).cloned(),
+            KeyCode::Char('d') if self.left_focused => {
+                self.remove_workspace = self.recent.get(self.recent_selected).cloned();
+            }
             KeyCode::Char('r') => self.file_action = Some(GlobalHomeFileAction::ReloadRegistry),
-            KeyCode::Char('o') => self.activate_launcher_action(LauncherAction::OpenExistingFolder),
-            KeyCode::Char('b') => self.activate_launcher_action(LauncherAction::BrowseInTerminal),
-            KeyCode::Char('s') => self.activate_launcher_action(LauncherAction::Settings),
-            KeyCode::Char('t') => self.activate_launcher_action(LauncherAction::Templates),
-            KeyCode::Char('a') => self.activate_launcher_action(LauncherAction::Authentication),
+            KeyCode::Char(shortcut) => {
+                if let Some((action, _, _)) = LAUNCHER_ACTIONS
+                    .iter()
+                    .find(|(_, _, key)| key.starts_with(shortcut))
+                {
+                    self.file_action = Some(action.clone());
+                }
+            }
             _ => {}
         }
         None
@@ -884,7 +913,7 @@ fn run_with_terminal_and_paths(
                             return Ok(GlobalHomeExit::OpenWorkspace(path));
                         }
                         FolderSelection::Cancelled => {}
-                        FolderSelection::OpenExplorer(_) => state.explorer_overlay_visible = true,
+                        FolderSelection::OpenExplorer(_) => state.focus_explorer(),
                         FolderSelection::Failed(error) => state.folder_dialog_failed = Some(error),
                     }
                 }
@@ -1126,14 +1155,10 @@ pub(crate) fn prefixed_path_line_for_test(prefix: &str, path: &Path, width: usiz
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
-    if state.explorer_overlay_visible {
-        render_explorer_overlay(frame, &mut state.explorer);
-    } else {
-        render_launcher(frame, state);
-    }
+    render_global_home(frame, state);
 
     if state.shortcut_help_visible {
-        render_global_shortcuts(frame, state.explorer_overlay_visible);
+        render_global_shortcuts(frame, state.explorer_focused());
     }
     if let Some(input) = state.path_input.as_ref() {
         render_path_input(frame, state.explorer.root(), input);
@@ -1158,7 +1183,7 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
         render_launcher_dialog(
             frame,
             " Folder Dialog Failed ",
-            &format!("{error}\n\nb Browse in Terminal   Esc Dismiss"),
+            &format!("{error}\n\ne Explorer   Esc Dismiss"),
         );
     }
     if let Some(error) = state.error.as_ref() {
@@ -1172,97 +1197,261 @@ fn render(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     }
 }
 
-fn render_launcher(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
+/// Use the original proportions when both panes fit at their usual widths.
+fn global_home_panes(area: Rect) -> Option<(Rect, Rect)> {
+    let proportional = area.width.saturating_mul(30) / 100;
+    let regular_width = proportional.clamp(LEFT_PANE_MIN_WIDTH, LEFT_PANE_MAX_WIDTH);
+    let left_width = if area.width.saturating_sub(regular_width) >= DASHBOARD_MIN_WIDTH {
+        regular_width
+    } else if area.width >= COMPACT_PANE_WIDTH * 2 {
+        COMPACT_PANE_WIDTH
+    } else {
+        return None;
+    };
+    Some((
+        Rect::new(area.x, area.y, left_width, area.height),
+        Rect::new(
+            area.x + left_width,
+            area.y,
+            area.width - left_width,
+            area.height,
+        ),
+    ))
+}
+
+fn render_global_home(frame: &mut Frame<'_>, state: &mut GlobalHomeState) {
     let area = frame.area();
     if area.is_empty() {
         return;
     }
 
-    let warning = state
-        .registry_warning
-        .as_deref()
-        .or(state.registry_notice.as_deref());
-    let mut header = vec![Line::styled(
-        "Recent Workspaces",
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
-    if let Some(message) = warning {
-        header.push(Line::styled(message, Style::default().fg(Color::Yellow)));
-    } else if state.recent.is_empty() {
-        header.push(Line::raw("No registered Workspaces"));
-    }
-    let header_height = (header.len() as u16).min(area.height.saturating_sub(1));
-    let footer_height = u16::from(area.height >= 5);
-    let [heading, body, footer] = Layout::vertical([
-        Constraint::Length(header_height),
+    let has_registry_status = state.registry_warning.is_some() || state.registry_notice.is_some();
+    let [body, registry_status, selected_path, keys] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(footer_height),
+        Constraint::Length(u16::from(has_registry_status && area.height >= 3)),
+        Constraint::Length(u16::from(area.height >= 7)),
+        Constraint::Length(u16::from(area.height >= 2)),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(header), heading);
+
+    if let Some((left, right)) = global_home_panes(body) {
+        render_left_pane(frame, left, state);
+        render_dashboard(frame, right, state);
+    } else if state.left_focused {
+        render_left_pane(frame, body, state);
+    } else {
+        render_dashboard(frame, body, state);
+    }
+
+    if let Some(status) = state
+        .registry_warning
+        .as_deref()
+        .or(state.registry_notice.as_deref())
+    {
+        frame.render_widget(
+            Paragraph::new(view::clip_text_with_ellipsis(
+                status,
+                usize::from(registry_status.width),
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            registry_status,
+        );
+    }
+    let path = match state.left_pane {
+        LeftPane::Recent => state
+            .recent
+            .get(state.recent_selected)
+            .map(RegistryEntry::root),
+        LeftPane::Explorer => Some(state.explorer.selected_path()),
+    };
+    if let Some(path) = path {
+        frame.render_widget(
+            Paragraph::new(prefixed_path_line(
+                "Selected  ",
+                path,
+                usize::from(selected_path.width),
+            )),
+            selected_path,
+        );
+    }
+
+    let toggle = match state.left_pane {
+        LeftPane::Recent => "e Explorer",
+        LeftPane::Explorer => "e Recent",
+    };
+    let hints = match (state.explorer_focused(), keys.width) {
+        (true, 64..) => {
+            format!("{toggle}   Tab Focus   o Open   g Go to Path   Esc Actions   ? Help")
+        }
+        (true, 38..) => format!("{toggle}  Tab Focus  o Open  ? Help"),
+        (false, 62..) => format!("{toggle}   Tab Focus   g Go to Path   ? Help   q Quit"),
+        (false, 38..) => format!("{toggle}  Tab Focus  ? Help  q Quit"),
+        (_, _) => format!("{toggle}  Tab  ?"),
+    };
+    frame.render_widget(Paragraph::new(hints), keys);
+}
+
+fn render_left_pane(frame: &mut Frame<'_>, area: Rect, state: &mut GlobalHomeState) {
+    match state.left_pane {
+        LeftPane::Recent => render_recent_workspaces(frame, area, state),
+        LeftPane::Explorer => {
+            render_explorer_pane(frame, area, &mut state.explorer, state.left_focused)
+        }
+    }
+}
+
+fn render_explorer_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut ExplorerState,
+    focused: bool,
+) {
+    let [tree, root] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(area.height >= 4)),
+    ])
+    .areas(area);
+    explorer::render(frame, tree, state, focused);
+    let separator = Block::default().borders(Borders::RIGHT);
+    let root_label = separator.inner(root);
+    frame.render_widget(separator, root);
     frame.render_widget(
-        Paragraph::new("Enter Select   g Go to Path   ? Help   q Quit"),
-        footer,
+        Paragraph::new(prefixed_path_line(
+            "Root  ",
+            state.root(),
+            usize::from(root_label.width),
+        )),
+        root_label,
+    );
+}
+
+fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &GlobalHomeState) {
+    let [title, content] = Layout::vertical([
+        Constraint::Length(u16::from(area.height >= 3)),
+        Constraint::Min(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(
+            Line::styled("Global Home", Style::default().add_modifier(Modifier::BOLD)).centered(),
+        ),
+        title,
     );
 
-    // Allocate two lines to each Workspace when possible, keeping the selected row visible.
-    let height = usize::from(body.height);
-    let recent_height = if height >= 2 { 2 } else { 1 };
-    let row_height = |index| {
-        if index < state.recent.len() {
-            recent_height
-        } else {
-            1
-        }
-    };
-    let mut visible_height = 0;
-    let earliest_visible = (0..=state.selected)
-        .rev()
-        .take_while(|index| {
-            visible_height += row_height(*index);
-            visible_height <= height
-        })
-        .last()
-        .unwrap_or(state.selected);
-    state.scroll = state.scroll.clamp(earliest_visible, state.selected);
+    let (logo_width, logo_height) = logo_size();
+    let menu_height = (LAUNCHER_ACTIONS.len() as u16).min(content.height);
+    let show_logo = content.width >= logo_width && content.height >= logo_height + 1 + menu_height;
+    let logo_space = if show_logo { logo_height + 1 } else { 0 };
+    let y = content.y + (content.height - logo_space - menu_height) / 2;
+    if show_logo {
+        let lines = branding::ascii_logo_lines().map(|line| {
+            Line::styled(
+                line,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        frame.render_widget(
+            Paragraph::new(Text::from_iter(lines)),
+            centered_row(content, y, logo_width, logo_height),
+        );
+    }
 
-    let mut lines = Vec::new();
-    let width = usize::from(body.width);
-    for index in state.scroll..state.recent.len() + LAUNCHER_ACTIONS.len() {
-        if lines.len() + row_height(index) > height {
-            break;
-        }
-        let selected = index == state.selected;
-        let marker = if selected { "> " } else { "  " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+    let menu = centered_row(content, y + logo_space, ACTION_MENU_WIDTH, menu_height);
+    let first = (state.action_selected + 1).saturating_sub(usize::from(menu.height));
+    let lines = LAUNCHER_ACTIONS
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(usize::from(menu.height))
+        .map(|(index, (_, label, shortcut))| {
+            let (marker, style) = row_cursor(index == state.action_selected, !state.left_focused);
+            let mut line = menu_line(label, shortcut, usize::from(menu.width.saturating_sub(2)));
+            line.spans.insert(0, Span::raw(marker));
+            line.style(style)
+        });
+    frame.render_widget(Paragraph::new(Text::from_iter(lines)), menu);
+}
+
+fn row_cursor(selected: bool, focused: bool) -> (&'static str, Style) {
+    match (selected, focused) {
+        (true, true) => (
+            "> ",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ),
+        (true, false) => ("· ", Style::default().add_modifier(Modifier::BOLD)),
+        (false, _) => ("  ", Style::default()),
+    }
+}
+
+fn render_recent_workspaces(frame: &mut Frame<'_>, area: Rect, state: &mut GlobalHomeState) {
+    let separator = Block::default().borders(Borders::RIGHT);
+    let inner = separator.inner(area);
+    frame.render_widget(separator, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let [heading, body] = Layout::vertical([
+        Constraint::Length(u16::from(inner.height >= 2)),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    let rows = usize::from(body.height);
+    let len = state.recent.len();
+    let first = (state.recent_selected + 1).saturating_sub(rows);
+    state.recent_scroll = state
+        .recent_scroll
+        .clamp(first, state.recent_selected)
+        .min(len.saturating_sub(rows));
+
+    let marker = if state.left_focused { "> " } else { "" };
+    let mut title = format!("{marker}Recent Workspaces");
+    if len > rows && heading.width >= 30 {
+        title.push_str(&format!(
+            "  {}–{}/{len}",
+            state.recent_scroll + 1,
+            state.recent_scroll + rows
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        heading,
+    );
+    if state.recent.is_empty() {
+        let message = if state.registry_warning.is_some() {
+            "Registry unavailable"
+        } else if body.width >= 24 {
+            "No registered Workspaces"
         } else {
-            Style::default()
+            "No workspaces"
         };
-        if let Some(entry) = state.recent.get(index) {
+        frame.render_widget(Paragraph::new(message), body);
+        return;
+    }
+
+    let width = usize::from(body.width);
+    let lines = state
+        .recent
+        .iter()
+        .enumerate()
+        .skip(state.recent_scroll)
+        .take(rows)
+        .map(|(index, entry)| {
+            let (marker, style) = row_cursor(index == state.recent_selected, state.left_focused);
             let root = entry.root();
             let name = root
                 .file_name()
                 .unwrap_or(root.as_os_str())
                 .to_string_lossy();
             let name = view::clip_text_with_ellipsis(&name, width.saturating_sub(2));
-            lines.push(Line::styled(format!("{marker}{name}"), style));
-            if recent_height > 1 {
-                lines.push(Line::raw(prefixed_path_line("  ", root, width)));
-            }
-        } else {
-            let (_, label, shortcut) = LAUNCHER_ACTIONS[index - state.recent.len()];
-            let shortcut = if shortcut.is_empty() {
-                String::new()
-            } else {
-                format!("  [{shortcut}]")
-            };
-            lines.push(Line::styled(format!("{marker}{label}{shortcut}"), style));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), body);
+            Line::styled(format!("{marker}{name}"), style)
+        });
+    frame.render_widget(Paragraph::new(Text::from_iter(lines)), body);
 }
 
 fn render_launcher_dialog(frame: &mut Frame<'_>, title: &str, text: &str) {
@@ -1334,13 +1523,14 @@ fn render_global_shortcuts(frame: &mut Frame<'_>, explorer: bool) {
             Line::raw("←→ hl     Collapse / Expand"),
             Line::raw("Backspace Parent"),
             Line::raw("r Reload   o Open   g Go to Path"),
-            Line::raw("? keep open   Esc close"),
+            Line::raw("e Recent   Tab / Esc Actions"),
+            Line::raw("? keep open   Esc close Help"),
         ]
     } else {
         vec![
             Line::raw("↑↓ jk Navigate   Enter Select"),
-            Line::raw("o Open Existing Folder"),
-            Line::raw("b Browse in Terminal   g Go to Path"),
+            Line::raw("e Recent / Explorer   Tab Focus"),
+            Line::raw("o Open Folder   g Go to Path"),
             Line::raw("d Remove from List   r Reload"),
             Line::raw("s Settings   t Templates"),
             Line::raw("a Authentication   q Quit"),
@@ -1358,33 +1548,6 @@ fn render_help(frame: &mut Frame<'_>, lines: Vec<Line<'_>>) {
             .block(Block::default().title(" Help ").borders(Borders::ALL)),
         area,
     );
-}
-
-fn render_explorer_overlay(frame: &mut Frame<'_>, state: &mut ExplorerState) {
-    let area = frame.area();
-    frame.render_widget(Clear, area);
-    let help_height = u16::from(area.height >= 2);
-    let explorer_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(help_height),
-    );
-    explorer::render(frame, explorer_area, state);
-    if help_height > 0 {
-        let help_area = Rect::new(
-            area.x,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            area.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new("o Open   g Go to Path   Esc Close")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
-            help_area,
-        );
-    }
 }
 
 fn render_initialize_global_config(frame: &mut Frame<'_>, modal: &InitializeGlobalConfigModal) {
@@ -2456,30 +2619,198 @@ mod tests {
         );
     }
 
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    fn register_paths(state: &mut GlobalHomeState, roots: impl IntoIterator<Item = PathBuf>) {
+        use crate::workspace_registry::VerifiedWorkspace;
+
+        let mut snapshot = RegistrySnapshot::default();
+        for root in roots {
+            let workspace = VerifiedWorkspace::from_verified_root(root, None).unwrap();
+            (snapshot, _) = snapshot
+                .apply(RegistryMutation::Register(&workspace))
+                .unwrap();
+        }
+        state.set_recent(snapshot);
+        state.left_focused = true;
+    }
+
     #[test]
-    fn empty_launcher_prioritizes_workspace_actions() {
+    fn empty_recent_and_centered_open_folder_keep_the_old_split_and_logo() {
         let mut state = GlobalHomeState::new(PathBuf::from("root"));
-        let rendered = buffer_text(&draw(&mut state, 80, 24));
-        for expected in [
-            "Recent Workspaces",
+        let buffer = draw(&mut state, 80, 24);
+        let rendered = buffer_text(&buffer);
+        assert!(row_text(&buffer, 0).starts_with("Recent Workspaces"));
+        assert!(row_text(&buffer, 0).contains("Global Home"));
+        assert_eq!(buffer.cell((31, 0)).unwrap().symbol(), "│");
+        assert!(row_text(&buffer, 23).contains("e Explorer   Tab Focus"));
+        for expected in branding::ascii_logo_lines().chain([
             "No registered Workspaces",
-            "> Create Workspace",
-            "Open Existing Folder",
-            "Browse in Terminal",
+            "> Open Folder",
             "Settings",
             "Templates",
             "Authentication",
-            "Enter Select",
-            "g Go to Path",
             "? Help",
             "q Quit",
-        ] {
+        ]) {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}\n{rendered}"
             );
         }
-        assert!(!rendered.contains("Explorer"));
+        for removed in [
+            "Create Workspace",
+            "Browse in Terminal",
+            "Workspace Actions",
+            "Global Actions",
+        ] {
+            assert!(!rendered.contains(removed));
+        }
+        let menu_y = (0..24)
+            .find(|&y| row_text(&buffer, y).contains("Open Folder"))
+            .unwrap();
+        assert_eq!(buffer.cell((70, menu_y)).unwrap().symbol(), "o");
+        assert!(
+            buffer
+                .cell((41, menu_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        let compact = draw(&mut state, 40, 12);
+        assert!(row_text(&compact, 0).starts_with("Recent Workspaces"));
+        assert!(row_text(&compact, 0).contains("Global Home"));
+        assert_eq!(compact.cell((19, 0)).unwrap().symbol(), "│");
+        assert!(buffer_text(&compact).contains("> Open Folder"));
+        assert!(buffer_text(&compact).contains("Authentication"));
+    }
+
+    #[test]
+    fn e_and_tab_preserve_the_recent_tree_and_action_selections_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("browse");
+        let child = launch.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let first = root.path().join("recent-one");
+        let second = root.path().join("recent-two");
+        let mut state = GlobalHomeState::new(launch.clone());
+        register_paths(&mut state, [first, second.clone()]);
+
+        state.handle_key(key(KeyCode::Down));
+        let dashboard = draw(&mut state, 80, 24);
+        assert!(buffer_text(&dashboard).contains("> recent-two"));
+        assert!(row_text(&dashboard, 22).contains(&prefixed_path_line("Selected  ", &second, 80)));
+
+        state.handle_key(key(KeyCode::Char('e')));
+        assert!(state.explorer_focused());
+        state.handle_key(key(KeyCode::Enter));
+        state.handle_key(key(KeyCode::Right));
+        assert_eq!(state.explorer.selected_path(), child);
+        let wide = draw(&mut state, 80, 24);
+        assert!(row_text(&wide, 0).starts_with("> Explorer"));
+        assert!(!buffer_text(&wide).contains("Recent Workspaces"));
+        assert!(
+            wide.cell((0, 2))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(row_text(&wide, 22).contains(&prefixed_path_line("Selected  ", &child, 80)));
+
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.left_pane, LeftPane::Explorer);
+        state.handle_key(key(KeyCode::Down));
+        let compact = draw(&mut state, 40, 12);
+        assert!(row_text(&compact, 0).starts_with("Explorer"));
+        assert!(buffer_text(&compact).contains("> Settings"));
+        assert_eq!(state.explorer.selected_path(), child);
+        state.handle_key(key(KeyCode::Char('e')));
+        assert!(!state.left_focused);
+        let compact = draw(&mut state, 40, 12);
+        assert!(row_text(&compact, 0).starts_with("Recent Workspaces"));
+        assert!(buffer_text(&compact).contains("· recent-two"));
+        assert!(buffer_text(&compact).contains("> Settings"));
+        assert!(row_text(&compact, 10).contains(&prefixed_path_line("Selected  ", &second, 40)));
+
+        state.handle_key(key(KeyCode::Tab));
+        let Some(GlobalHomeExit::OpenRecentWorkspace(entry)) =
+            state.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("Enter in Recent must open the selected Workspace");
+        };
+        assert_eq!(entry.root(), second);
+        state.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(state.explorer.selected_path(), child);
+        state.handle_key(key(KeyCode::Backspace));
+        assert_eq!(state.explorer.root(), root.path());
+        state.handle_key(key(KeyCode::Escape));
+        assert_eq!(state.left_pane, LeftPane::Explorer);
+        assert!(!state.left_focused);
+    }
+
+    #[test]
+    fn recent_uses_one_line_per_name_and_scrolls_at_80_and_40_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let long = root
+            .path()
+            .join("long-parent".repeat(10))
+            .join("日本語📂-long-workspace-name");
+        let roots = std::iter::once(long.clone())
+            .chain((1..35).map(|index| root.path().join(format!("recent-{index:02}"))));
+        let mut state = GlobalHomeState::new(root.path().to_path_buf());
+        register_paths(&mut state, roots);
+
+        let wide = draw(&mut state, 80, 24);
+        let cell = wide.cell((2, 1)).unwrap();
+        assert_eq!(cell.symbol(), "日");
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+        assert!(row_text(&wide, 2).contains("recent-01"));
+        assert!(!row_text(&wide, 1).contains("long-parent"));
+        let path_row = row_text(&wide, 22);
+        assert!(path_row.contains('…'));
+        assert!(path_row.contains("long-workspace-name"));
+        assert!(!path_row.contains('�'));
+        assert!(buffer_text(&wide).contains("Recent Workspaces  1–21/35"));
+
+        for _ in 0..28 {
+            state.handle_key(key(KeyCode::Down));
+        }
+        let wide = draw(&mut state, 80, 24);
+        assert!(buffer_text(&wide).contains("Recent Workspaces  9–29/35"));
+        assert!(buffer_text(&wide).contains("> recent-28"));
+        let compact = draw(&mut state, 40, 12);
+        assert!(buffer_text(&compact).contains("> recent-28"));
+        assert!(row_text(&compact, 10).contains("recent-28"));
+        assert!(buffer_text(&compact).contains("Open Folder"));
+        assert!(buffer_text(&compact).contains("q Quit"));
+        assert_eq!(state.recent_selected, 28);
+    }
+
+    #[test]
+    fn right_actions_keep_focus_and_help_and_quit_remain_shortcuts() {
+        let mut state = GlobalHomeState::new(PathBuf::from("root"));
+        state.handle_key(key(KeyCode::Down));
+        state.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(state.left_pane, LeftPane::Explorer);
+        assert!(!state.left_focused);
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(
+            state.take_file_action(),
+            Some(GlobalHomeFileAction::OpenSettings)
+        );
+        state.handle_key(key(KeyCode::Char('?')));
+        assert!(state.shortcut_help_visible);
+        state.handle_key(key(KeyCode::Escape));
+        assert!(!state.shortcut_help_visible);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('q'))),
+            Some(GlobalHomeExit::Quit)
+        );
     }
 
     #[test]
@@ -2590,6 +2921,7 @@ mod tests {
         for code in [
             KeyCode::Char('o'),
             KeyCode::Char('g'),
+            KeyCode::Char('e'),
             KeyCode::Char(':'),
             KeyCode::Char('?'),
             KeyCode::Char('q'),
@@ -2603,6 +2935,7 @@ mod tests {
             KeyCode::Left,
             KeyCode::Right,
             KeyCode::Backspace,
+            KeyCode::Tab,
         ] {
             assert_eq!(state.handle_key(key(code)), None);
         }
@@ -2675,7 +3008,7 @@ mod tests {
             assert_eq!(state.handle_key(key(KeyCode::Escape)), None);
             assert_eq!(state.explorer, explorer);
             assert_eq!(state.explorer.selected_path(), child);
-            assert!(state.explorer_overlay_visible);
+            assert!(state.explorer_focused());
             assert_eq!(state.handle_key(key(KeyCode::Escape)), None);
             assert_eq!(
                 state.handle_key(key(KeyCode::Char('q'))),
@@ -2793,34 +3126,36 @@ mod tests {
     }
 
     #[test]
-    fn explorer_overlay_survives_resize_without_state_loss() {
+    fn explorer_focus_survives_resize_without_state_loss() {
         let root = tempfile::tempdir().unwrap();
         let child = root.path().join("a-child");
         std::fs::create_dir(&child).unwrap();
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
 
-        let dashboard = buffer_text(&draw(&mut state, 61, 12));
-        assert!(dashboard.contains("? Help   q Quit"));
+        let dashboard = buffer_text(&draw(&mut state, 39, 12));
+        assert!(dashboard.contains("Tab Focus"));
+        assert!(dashboard.contains("? Help") && dashboard.contains("q Quit"));
         assert_eq!(state.handle_key(key(KeyCode::Char('b'))), None);
-        assert!(state.explorer_overlay_visible);
+        assert!(state.explorer_focused());
 
-        let overlay = buffer_text(&draw(&mut state, 61, 12));
+        let overlay = buffer_text(&draw(&mut state, 39, 12));
         assert!(overlay.contains("Explorer"));
-        assert!(overlay.contains("o Open   g Go to Path   Esc Close"));
+        assert!(overlay.contains("e Recent"));
+        assert!(!overlay.contains("Global Home"));
         state.handle_key(key(KeyCode::Enter));
         state.handle_key(key(KeyCode::Char('j')));
         assert_eq!(state.explorer.selected_path(), child);
 
         let _ = draw(&mut state, 80, 12);
-        assert!(state.explorer_overlay_visible);
+        assert!(state.explorer_focused());
         assert_eq!(state.explorer.selected_path(), child);
     }
 
     #[test]
-    fn explorer_overlay_renderer_survives_zero_very_narrow_and_very_short_geometry() {
+    fn explorer_view_survives_zero_very_narrow_and_very_short_geometry() {
         for (width, height) in [(0, 0), (1, 1), (4, 2), (20, 3)] {
             let mut state = GlobalHomeState::new(PathBuf::from("root"));
-            state.explorer_overlay_visible = true;
+            state.focus_explorer();
             let _ = draw(&mut state, width, height);
         }
     }
@@ -3037,7 +3372,7 @@ mod tests {
         let mut state = GlobalHomeState::new(root.path().to_path_buf());
         let old_explorer = state.explorer.clone();
         let mut terminal = ScriptedGlobalTerminal::new(
-            61,
+            39,
             24,
             [vec![event(KeyCode::Down)], vec![event(KeyCode::Char('q'))]],
         );
@@ -3064,7 +3399,7 @@ mod tests {
         let old_explorer = state.explorer.clone();
         let cwd_before = std::env::current_dir().unwrap();
         let mut terminal = ScriptedGlobalTerminal::new(
-            61,
+            39,
             24,
             [
                 vec![repeat_event(KeyCode::Char('j'))],

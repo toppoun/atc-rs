@@ -4,7 +4,7 @@
 
 ## ワークスペースを作る
 
-TUI から作るには、[Global Home の Create Workspace](tui.md#global-home) を使います。以下の手順ではコマンドで作成します。
+TUI から作るには、[Global Home の Open Folder](tui.md#global-home) を使います。以下の手順ではコマンドで作成します。
 
 ワークスペースにしたいディレクトリで実行します。
 

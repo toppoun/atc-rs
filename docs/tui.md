@@ -25,26 +25,26 @@ atc contest abc466
 
 ## Global Home
 
-Global Home では、`Recent Workspaces` から以前使ったワークスペースを開けます。一覧には名前とパスが表示されます。最後に開いたものが先頭に並び、まだ開いたことのない登録はその後に並びます。登録がなければ `Create Workspace` が選ばれます。
+左ペインは `Recent Workspaces` から始まります。ワークスペースの名前が最近使った順に並び、選択した項目のパスは画面下部に表示されます。まだ開いたことのない登録は一覧の後ろに並びます。
 
-- **Create Workspace** では、OS のフォルダ選択画面でフォルダを作って選ぶか、既存のフォルダを選びます。
-- **Open Existing Folder** では、OS のフォルダ選択画面で開きたいフォルダを選びます。
-- **Browse in Terminal** では、端末内の Explorer を使います。OS の選択画面を利用できない場合も Explorer が開きます。ダイアログの起動や操作に失敗した場合は、エラー画面の `b` で Explorer に切り替えられます。
+右ペインには `Open Folder`、`Settings`、`Templates`、`Authentication` があります。履歴があれば最初は左を操作し、空なら右の `Open Folder` が選ばれます。`Tab` で操作する側を切り替え、`>` が付いた行で現在の選択を確認できます。左ペインの表示は `e` で Recent Workspaces と Explorer の間で切り替えられます。端末の幅が40列未満なら、操作中のペインが全幅で表示されます。従来の `b` でも Explorer を表示して操作できます。
+
+**Open Folder** ではOS のフォルダ選択画面が開きます。新規フォルダもこの画面で作成できます。OS の選択画面が利用できない場合は Explorer に切り替わります。ダイアログに失敗した場合はエラー画面の `e` で Explorer を開けます。
 
 有効なワークスペースを選ぶと、その設定のまま Workspace Home が開きます。フォルダに設定ファイルがない場合は `Initialize Workspace` が表示されます。`Enter` で `atc init` と同じ[初期設定](workspace.md#contest-の保存先)を作り、`Esc` で元の画面に戻ります。
 
-履歴から開こうとしてフォルダや設定ファイルが見つからない場合は、エラーが表示されます。移動先が分かっていれば `Open Existing Folder` で選び直してください。設定内容が不正な場合は、そのフォルダに移動して `atc` を起動し、Workspace Home の `w` で修正できます。
+履歴から開こうとしてフォルダや設定ファイルが見つからない場合は、エラーが表示されます。移動先が分かっていれば `Open Folder` で選び直してください。設定内容が不正な場合は、そのフォルダに移動して `atc` を起動し、Workspace Home の `w` で修正できます。
 
-`Remove from List` は登録と使用履歴を一覧から外す操作です。確認画面の `y` で実行します。フォルダと `.atc-workspace.toml` はディスクに残ります。一覧の読込や保存に問題がある場合は画面に表示されます。`r` で読み直せます。
+`Remove from List` は登録と使用履歴を一覧から外す操作です。Recent Workspaces で対象を選び、`d` を押してから `y` で確認します。フォルダと `.atc-workspace.toml` はディスクに残ります。一覧の読込や保存に問題がある場合は画面に表示されます。`r` で読み直せます。
 
 | キー | 操作 |
 | --- | --- |
-| `j` / `↓`、`k` / `↑` | 項目の選択 |
-| `Enter` | 選択中の項目を開く |
-| `o` | Open Existing Folder |
-| `b` | Browse in Terminal |
+| `Tab` | 操作するペインを切り替え |
+| `e` | 左ペインを Recent Workspaces / Explorer に切り替え |
+| `j` / `↓`、`k` / `↑` | 操作中のペインで選択 |
+| `Enter` | Recent Workspaces の項目を開く、または右ペインの項目を実行 |
+| `o` | Open Folder |
 | `g` | Go to Path |
-| `d` | 選択中のワークスペースを一覧から外す確認を開く |
 | `r` | Recent Workspaces を読み直す |
 | `s` | Settings |
 | `t` | Templates |
@@ -52,18 +52,16 @@ Global Home では、`Recent Workspaces` から以前使ったワークスペー
 | `?` | Help |
 | `q` | 終了 |
 
-`Go to Path` でフォルダのパスを入力して `Enter` を押すと、Explorer がそのフォルダを表示します。相対パスは Explorer の起点から解決します。`Esc` で入力をキャンセルできます。
+`Go to Path` でパスを入力して `Enter` を押すと、Explorer がそのフォルダを表示します。相対パスは Explorer の起点から解決します。`Esc` で入力をキャンセルできます。
 
-| Explorer 内のキー | 操作 |
+| Explorer を操作中のキー | 操作 |
 | --- | --- |
-| `j` / `↓`、`k` / `↑` | フォルダの選択 |
 | `l` / `→`、`h` / `←` | 展開・折りたたみ、または子・親に移動 |
 | `Enter` | 選択中のフォルダを展開・折りたたみ |
 | `o` | 選択中のフォルダを開く |
 | `Backspace` | Explorer の起点を親フォルダに移動 |
 | `r` | Explorer を読み直す |
-| `g` | Go to Path |
-| `Esc` | ランチャーに戻る |
+| `Tab` / `Esc` | 右ペインの操作に戻る |
 
 Global Config をエディタで開くには、`s` で Settings を開いて `e` を押します。ファイルがまだない場合は `Initialize & Open` が表示されます。`Enter` でコメントだけの設定ファイルを作成して開き、`Esc` で戻ります。既存ファイルは上書きしません。
 

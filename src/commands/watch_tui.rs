@@ -1020,7 +1020,7 @@ where
 
     let mut history = match location {
         AppLocation::GlobalHome(state) => {
-            state.reload_registry(registry);
+            state.load_recent_workspaces(registry);
             None
         }
         AppLocation::Workspace(runtime) => runtime
@@ -3391,7 +3391,8 @@ mod tests {
         assert_eq!(probe.global_reads.get(), 6);
         assert_eq!(probe.workspace_reads.get(), 1);
         let rendered = probe.rendered_global_frames.borrow().join("\n");
-        assert!(rendered.contains("o Open   g Go to Path   Esc Close"));
+        assert!(rendered.contains("> Explorer"));
+        assert!(rendered.contains("e Recent") && rendered.contains("o Open"));
         assert!(rendered.contains("Initialize Workspace"));
     }
 

@@ -439,7 +439,7 @@ impl ExplorerState {
 }
 
 /// Draws the Explorer into a standalone pane. The right separator is never part of a row style.
-pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut ExplorerState) {
+pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut ExplorerState, focused: bool) {
     if area.width == 0 || area.height == 0 {
         state.reconcile_scroll(0);
         return;
@@ -449,9 +449,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut ExplorerStat
     let usable_width = area.width.saturating_sub(1);
     let header_area = Rect::new(area.x, area.y, usable_width, area.height.min(1));
     if header_area.width > 0 && header_area.height > 0 {
+        let title = if focused {
+            format!("> {HEADER}")
+        } else {
+            HEADER.to_owned()
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                clip_text_with_ellipsis(HEADER, usize::from(usable_width)),
+                clip_text_with_ellipsis(&title, usize::from(usable_width)),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             header_area,
@@ -472,7 +477,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut ExplorerStat
             .take(usize::from(tree_height))
             .map(|row| {
                 let style = if row.path == state.selected {
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    let style = Style::default().add_modifier(Modifier::BOLD);
+                    if focused {
+                        style.add_modifier(Modifier::REVERSED)
+                    } else {
+                        style
+                    }
                 } else {
                     Style::default()
                 };
@@ -608,7 +618,7 @@ mod tests {
     fn draw(state: &mut ExplorerState, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(frame, frame.area(), state))
+            .draw(|frame| render(frame, frame.area(), state, true))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -1148,7 +1158,7 @@ mod tests {
         state.selected = root;
 
         let buffer = draw(&mut state, 24, 6);
-        assert!(row_text(&buffer, 0, 23).starts_with(HEADER));
+        assert!(row_text(&buffer, 0, 23).starts_with("> Explorer"));
         assert!(
             buffer
                 .cell((0, 0))
