@@ -133,6 +133,57 @@ mod tests {
     }
 
     #[test]
+    fn embedded_header_formats_acl_modints_in_both_include_orders() {
+        let Some(compiler) = available_cpp_compiler() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let include_dir = materialize_debug_header_in(temp.path()).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/debug_modint.cpp");
+        let executable = temp.path().join(if cfg!(windows) {
+            "debug_modint.exe"
+        } else {
+            "debug_modint"
+        });
+
+        for flags in [
+            &[][..],
+            &["-DATC_DEBUG_TEST_HEADER_FIRST"][..],
+            &["-DATC_DEBUG_TEST_MODINT_FIXTURE"][..],
+        ] {
+            let compile = Command::new(compiler)
+                .args(["-std=c++23", "-Wall", "-Wextra", "-pthread"])
+                .args(flags)
+                .arg("-I")
+                .arg(&include_dir)
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                compile.status.success(),
+                "{compiler} failed to compile the modint test with flags {flags:?}:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+
+            let run = Command::new(&executable).output().unwrap();
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(run.status.success(), "modint test {flags:?}: {stderr}");
+            assert!(run.stdout.is_empty());
+            assert_eq!(
+                stderr.lines().collect::<Vec<_>>(),
+                [
+                    "[L100] alias1, alias2, fixed, atcoder::modint(16), arbitrary_modint(20) = 2, 4, 3, 5, 7",
+                    "[L101] nested = ((5, 7), {3, 0})",
+                    "[L102] unregistered_number{}, atcoder::static_modint<19>(1) = <unprintable>, custom",
+                ],
+                "modint test with flags {flags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn embedded_header_preserves_stream_state_and_formats_new_types() {
         let Some(compiler) = available_cpp_compiler() else {
             return;

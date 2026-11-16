@@ -55,6 +55,8 @@ TUI では `d` で Debug を切り替えます。コマンドから実行する 
 
 Debug ビルドでは、通常の `cpp_flags` に `-DLOCAL`、`-D_GLIBCXX_ASSERTIONS`、組み込み `debug.hpp` の include path を追加します。ヘッダーはユーザーの cache ディレクトリへ展開されます。
 
+解答コードで AtCoder Library の `<atcoder/modint>` または `<atcoder/all>` を読み込むと、`debug(x)` で `static_modint` や `dynamic_modint` の `val()` を表示できます。例えば `atcoder::modint998244353` に `-1` を代入した変数は `998244352` と表示されます。`std::vector` などに入れた値も表示できます。
+
 GNU libstdc++ では `std::vector::operator[]` などの範囲外アクセスを検出できます。アサーションで異常終了したケースは `RE` になり、標準エラー出力は CLI の `stderr` 欄や TUI のケース詳細に表示されます。macOS 標準の libc++ では、範囲チェックは使用中のツールチェーンの設定に従います。
 
 Python では `--debug` は使用できません。

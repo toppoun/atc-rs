@@ -44,6 +44,17 @@
 #define ATC_DEBUG_HAS_SYNCSTREAM 0
 #endif
 
+namespace atcoder {
+
+// Leave the default template argument to ACL so either include order works.
+template <int Modulus, std::enable_if_t<(1 <= Modulus)>*>
+struct static_modint;
+
+template <int Id>
+struct dynamic_modint;
+
+}  // namespace atcoder
+
 namespace atc_debug {
 namespace detail {
 
@@ -146,6 +157,16 @@ concept Streamable = requires(
 ) {
     output << value;
 };
+
+template <class T>
+inline constexpr bool is_acl_modint_v = false;
+
+template <int Modulus, std::enable_if_t<(1 <= Modulus)>* Enable>
+inline constexpr bool is_acl_modint_v<atcoder::static_modint<Modulus, Enable>> =
+    true;
+
+template <int Id>
+inline constexpr bool is_acl_modint_v<atcoder::dynamic_modint<Id>> = true;
 
 inline void copy_format_state(
     std::ostream& destination,
@@ -492,6 +513,8 @@ void print_value(std::ostream& output, const T& value) {
         }
     } else if constexpr (Streamable<T>) {
         output << value;
+    } else if constexpr (is_acl_modint_v<Value>) {
+        print_value(output, value.val());
     } else {
         output << "<unprintable>";
     }
