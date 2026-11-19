@@ -18,6 +18,24 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+const CURRENT_METADATA: &str = concat!(
+    "version = 1\ncontest_id = 'abc466'\n",
+    "[[problems]]\nindex = 'A'\ntitle = 'A'\n",
+    "task_id = 'abc466_a'\nurl = 'https://atcoder.jp/contests/abc466/tasks/abc466_a'\n",
+    "sample_count = 0\n",
+);
+
+fn contest_with_custom_tests(destination: &Path) {
+    let custom = destination.join("tests/A/custom");
+    fs::create_dir_all(custom.join("empty")).unwrap();
+    fs::create_dir_all(destination.join(".atc")).unwrap();
+    fs::write(destination.join(".atc/contest.toml"), CURRENT_METADATA).unwrap();
+    fs::write(destination.join(".atc/user-data"), b"user data").unwrap();
+    fs::write(destination.join("A.cpp"), b"user source\r\n").unwrap();
+    fs::write(custom.join("case.in"), b"123\n").unwrap();
+    fs::write(custom.join("unknown.bin"), [0xff, 0, 1]).unwrap();
+}
+
 fn backup(output: &Output) -> PathBuf {
     let message = stderr(output);
     assert!(output.status.success(), "{message}");
@@ -246,6 +264,138 @@ fn migrate_uses_workspace_mapping_and_preserves_old_metadata_bytes() {
 }
 
 #[test]
+fn single_and_batch_migrate_archive_custom_subdirectories_that_refresh_refuses() {
+    for batch in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".atc-workspace.toml"), "version = 1\n").unwrap();
+        let contest = root.join("abc466");
+        contest_with_custom_tests(&contest);
+        let before = tree(root);
+        let tests_before = tree(&contest.join("tests"));
+
+        for (cwd, args) in [
+            (contest.as_path(), &["refresh"][..]),
+            (contest.as_path(), &["refresh", "--force"][..]),
+            (root, &["refresh", "--all", "--dry-run"][..]),
+        ] {
+            let output = cli(cwd).args(args).output().unwrap();
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(
+                message.contains("unowned entry in tests") && message.contains("custom"),
+                "{message}"
+            );
+            assert!(!message.contains("Fetching"), "{message}");
+            assert_eq!(tree(root), before);
+        }
+        for (cwd, args) in [
+            (contest.as_path(), &["migrate", "--dry-run"][..]),
+            (root, &["migrate", "--all", "--dry-run"][..]),
+        ] {
+            let output = cli(cwd).args(args).output().unwrap();
+            let message = stderr(&output);
+            assert!(output.status.success(), "{message}");
+            assert!(
+                message.contains("tests contain entries outside atc management"),
+                "{message}"
+            );
+            assert!(!message.contains("Fetching"), "{message}");
+            assert_eq!(tree(root), before);
+        }
+
+        let output = if batch {
+            cli(root)
+                .args(["migrate", "--all", "--yes"])
+                .output()
+                .unwrap()
+        } else {
+            cli(&contest).args(["migrate", "--yes"]).output().unwrap()
+        };
+        assert!(output.status.success(), "{}", stderr(&output));
+        let archive = fs::read_dir(&contest)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".atc-recovery-migrate-")
+            })
+            .expect("migration must keep a recovery archive");
+        assert!(archive.join("recovery-complete.toml").is_file());
+        assert_eq!(tree(&archive.join("previous-tests")), tests_before);
+        assert_eq!(
+            fs::read_to_string(archive.join("previous-contest.toml")).unwrap(),
+            CURRENT_METADATA
+        );
+        assert!(contest.join("tests/A/sample-1.in").is_file());
+        assert!(!contest.join("tests/A/custom").exists());
+        assert_eq!(fs::read(contest.join("A.cpp")).unwrap(), b"user source\r\n");
+        assert_eq!(
+            fs::read(contest.join(".atc/user-data")).unwrap(),
+            b"user data"
+        );
+        assert_eq!(
+            fs::read(root.join(".atc-workspace.toml")).unwrap(),
+            b"version = 1\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn both_migrate_modes_reject_symlinks_and_special_files_inside_custom_subdirectories() {
+    use std::ffi::CString;
+    use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
+
+    for link in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".atc-workspace.toml"), "version = 1\n").unwrap();
+        let contest = root.join("abc466");
+        contest_with_custom_tests(&contest);
+        let outside = root.join("outside");
+        fs::write(&outside, b"outside data").unwrap();
+        let entry = contest.join("tests/A/custom/unsafe-entry");
+        if link {
+            symlink(&outside, &entry).unwrap();
+        } else {
+            let path = CString::new(entry.as_os_str().as_bytes()).unwrap();
+            // SAFETY: path is a valid C string pointing to an unused path in this test's TempDir.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        for (cwd, args) in [
+            (contest.as_path(), &["migrate", "--yes"][..]),
+            (root, &["migrate", "--all", "--yes"][..]),
+        ] {
+            let output = cli(cwd).args(args).output().unwrap();
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(
+                message.contains("cannot safely back up") && message.contains("unsafe-entry"),
+                "{message}"
+            );
+            assert!(!message.contains("Fetching"), "{message}");
+            assert_eq!(fs::read(outside.as_path()).unwrap(), b"outside data");
+            assert!(fs::symlink_metadata(&entry).is_ok());
+            assert!(!contest.join(".atc-update.lock").exists());
+        }
+        fs::remove_file(entry).unwrap();
+        assert_eq!(fs::read_dir(&contest).unwrap().count(), 3);
+        assert_eq!(
+            fs::read_to_string(contest.join(".atc/contest.toml")).unwrap(),
+            CURRENT_METADATA
+        );
+        assert_eq!(
+            fs::read(contest.join("tests/A/custom/case.in")).unwrap(),
+            b"123\n"
+        );
+    }
+}
+
+#[test]
 fn migrate_refuses_mismatched_or_undeterminable_owner_and_interrupted_recovery() {
     for (metadata, interrupted, expected_error) in [
         (
@@ -330,32 +480,39 @@ fn migrate_refuses_symlinks_nested_under_unknown_tests_even_for_an_old_version()
 
 #[cfg(windows)]
 #[test]
-fn migrate_refuses_junctions_nested_under_unknown_tests() {
-    let temp = tempfile::tempdir().unwrap();
-    let destination = temp.path().join("abc466");
-    old_contest(&destination, false);
-    let target = temp.path().join("outside");
-    fs::create_dir(&target).unwrap();
-    let link = destination.join("tests/a/extra/junction");
-    let created = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&link)
-        .arg(&target)
-        .output()
-        .unwrap();
-    assert!(created.status.success(), "{}", stderr(&created));
-    let result = cli(&destination)
-        .args(["migrate", "--yes"])
-        .output()
-        .unwrap();
-    fs::remove_dir(link).unwrap();
-    assert!(!result.status.success(), "{}", stderr(&result));
-    assert!(
-        stderr(&result).contains("cannot safely back up"),
-        "{}",
-        stderr(&result)
-    );
-    assert!(!stderr(&result).contains("Fetching"));
+fn migrate_refuses_junctions_nested_under_custom_tests() {
+    for current in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let link = if current {
+            contest_with_custom_tests(&destination);
+            destination.join("tests/A/custom/junction")
+        } else {
+            old_contest(&destination, false);
+            destination.join("tests/a/extra/junction")
+        };
+        let target = temp.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        let created = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{}", stderr(&created));
+        let result = cli(&destination)
+            .args(["migrate", "--yes"])
+            .output()
+            .unwrap();
+        fs::remove_dir(link).unwrap();
+        assert!(!result.status.success(), "{}", stderr(&result));
+        assert!(
+            stderr(&result).contains("cannot safely back up"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(!stderr(&result).contains("Fetching"));
+    }
 }
 
 #[test]

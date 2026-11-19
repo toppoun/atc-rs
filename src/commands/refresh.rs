@@ -8,8 +8,10 @@ use crate::workspace;
 use crate::workspace::diagnosis::{
     BlockReason, ContestDiagnosis, MigrationReason, diagnose_contest,
 };
-use crate::workspace::validate_refresh_destination;
-use std::fs;
+use crate::workspace::{
+    PhysicalDirectoryIdentity, contest_directory_identity, validate_refresh_destination,
+};
+use std::borrow::Borrow;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -22,26 +24,14 @@ pub(crate) struct PreparedRefresh {
 }
 
 pub(super) struct RefreshBaseline {
-    destination_identity: RefreshDestinationIdentity,
+    destination_identity: PhysicalDirectoryIdentity,
     metadata_snapshot: Option<FileSnapshot>,
     diagnosis: Option<ContestDiagnosis>,
-    batch_tests: Option<BatchTests>,
+    tests: Option<RefreshTests>,
 }
 
-struct BatchTests(Option<TreeSnapshot>);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RefreshDestinationIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial_number: u32,
-        file_index: u64,
-    },
-    #[cfg(not(any(unix, windows)))]
-    Other { canonical_path: PathBuf },
-}
+// A CLI update checks the original generation, including when `tests/` was absent.
+struct RefreshTests(Option<TreeSnapshot>);
 
 impl PreparedRefresh {
     pub(crate) fn destination(&self) -> &Path {
@@ -80,17 +70,18 @@ pub(super) fn refresh_from(
     create_client: impl FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    let destination = workspace::resolve_contest_target(cwd, specified_contest_id)?;
+    let route = specified_contest_id
+        .map(|id| workspace::ExplicitContestRoute::resolve(cwd, id))
+        .transpose()?;
+    let destination = route
+        .as_ref()
+        .map_or(cwd, |route| route.destination.as_path());
     // Capture the directory and metadata before diagnosis so the decision cannot
     // authorize an update to a different directory or manifest generation.
-    let destination_identity = refresh_destination_identity(&destination);
-    let metadata_snapshot = workspace::read_contest_metadata_snapshot(&destination);
-    let contest_id = resolve_refresh_contest_id(
-        &destination,
-        specified_contest_id,
-        force,
-        &metadata_snapshot,
-    )?;
+    let destination_identity = contest_directory_identity(destination);
+    let metadata_snapshot = workspace::read_contest_metadata_snapshot(destination);
+    let contest_id =
+        resolve_refresh_contest_id(destination, specified_contest_id, force, &metadata_snapshot)?;
     if !workspace::is_safe_atcoder_id(&contest_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -98,12 +89,12 @@ pub(super) fn refresh_from(
         )
         .into());
     }
-    let diagnosis = diagnose_contest(&destination, &contest_id);
+    let diagnosis = diagnose_contest(destination, &contest_id);
     let healthy = match &diagnosis {
         ContestDiagnosis::Healthy { .. } => true,
         ContestDiagnosis::RepairRequired(_) => false,
         ContestDiagnosis::MissingDirectory => {
-            return Err(workspace::missing_contest_directory(&destination).into());
+            return Err(workspace::missing_contest_directory(destination).into());
         }
         ContestDiagnosis::MigrationRequired(MigrationReason::UnsupportedVersion(version)) => {
             return Err(io::Error::new(
@@ -123,27 +114,33 @@ pub(super) fn refresh_from(
         destination_identity: destination_identity?,
         metadata_snapshot: metadata_snapshot?,
         diagnosis: Some(diagnosis),
-        batch_tests: None,
+        tests: None,
     };
-    baseline.revalidate(&destination, &contest_id, force)?;
     if healthy && !force {
+        baseline.revalidate(destination, &contest_id, force)?;
         reporter.report(Event::WorkspaceRefreshSkipped {
             contest_id: &contest_id,
         });
         return Ok(());
     }
 
-    let atcoder = create_client()?;
-    let prepared = prepare_refresh_from_baseline(
-        &destination,
+    let baseline = baseline.capture_update(destination, &contest_id, force)?;
+    let validate_route = |_: &Path| match &route {
+        Some(route) => route.revalidate(cwd, &contest_id),
+        None => Ok(()),
+    };
+    execute_cli_refresh(
+        destination,
         &contest_id,
         force,
         baseline,
-        &atcoder,
+        create_client,
         reporter,
-        ContestUpdateChecks::default(),
-    )?;
-    apply_refresh(prepared, reporter)
+        ContestUpdateChecks {
+            validate_route: &validate_route,
+            ..ContestUpdateChecks::default()
+        },
+    )
 }
 
 pub(super) fn create_atcoder_client() -> Result<atcoder::AtCoderClient, AppError> {
@@ -232,13 +229,13 @@ pub(crate) fn prepare_refresh(
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<PreparedRefresh, AppError> {
-    let destination_identity = refresh_destination_identity(destination)?;
+    let destination_identity = contest_directory_identity(destination)?;
     validate_refresh_destination(destination, contest_id, force)?;
     let baseline = RefreshBaseline {
         destination_identity,
         metadata_snapshot: refresh_metadata_snapshot(destination)?,
         diagnosis: None,
-        batch_tests: None,
+        tests: None,
     };
     baseline.revalidate(destination, contest_id, force)?;
     prepare_refresh_from_baseline(
@@ -267,10 +264,7 @@ fn prepare_refresh_from_baseline(
 
     // Fetching may take long enough for the destination to change. Revalidate
     // immediately before choosing it as the staging parent.
-    (checks.validate_route)(destination)?;
-    baseline.revalidate_diagnosis(destination, contest_id)?;
-    baseline.revalidate(destination, contest_id, force)?;
-    baseline.revalidate_batch_tests(destination)?;
+    baseline.revalidate_update(destination, contest_id, force, checks)?;
     checks.cancellation.before_staging()?;
 
     let staging = crate::safe_file::PreservedTempDir::new(
@@ -330,10 +324,9 @@ fn apply_refresh_checked(
         baseline.metadata_snapshot,
         |tests| {
             (checks.validate_route)(&destination)?;
-            if let Some(expected) = &baseline.batch_tests
-                && expected.0.as_ref() != tests
-            {
-                return Err(changed_batch_tests_error());
+            validate_destination_identity(&destination, &baseline.destination_identity)?;
+            if let Some(expected) = &baseline.tests {
+                expected.validate(tests)?;
             }
             Ok(())
         },
@@ -358,145 +351,104 @@ fn apply_refresh_checked(
     Ok(())
 }
 
-pub(super) fn plan_batch_refresh(
+pub(super) fn plan_refresh_update(
     destination: &Path,
     contest_id: &str,
     force: bool,
     diagnosis: ContestDiagnosis,
 ) -> Result<RefreshBaseline, AppError> {
-    let baseline = RefreshBaseline {
-        destination_identity: refresh_destination_identity(destination)?,
+    RefreshBaseline {
+        destination_identity: contest_directory_identity(destination)?,
         metadata_snapshot: workspace::read_contest_metadata_snapshot(destination)?,
         diagnosis: Some(diagnosis),
-        batch_tests: Some(BatchTests(workspace::snapshot_contest_tests(destination)?)),
-    };
-    baseline.revalidate_diagnosis(destination, contest_id)?;
-    baseline.revalidate(destination, contest_id, force)?;
-    Ok(baseline)
+        tests: None,
+    }
+    .capture_update(destination, contest_id, force)
 }
 
-pub(super) fn execute_batch_refresh<'a>(
+pub(super) fn execute_cli_refresh<C: Borrow<atcoder::AtCoderClient>>(
     destination: &Path,
     contest_id: &str,
     force: bool,
     baseline: RefreshBaseline,
-    client: impl FnOnce() -> Result<&'a atcoder::AtCoderClient, AppError>,
+    client: impl FnOnce() -> Result<C, AppError>,
     reporter: &mut dyn Reporter,
     checks: ContestUpdateChecks<'_>,
 ) -> Result<(), AppError> {
-    (checks.validate_route)(destination)?;
-    baseline.revalidate_diagnosis(destination, contest_id)?;
-    baseline.revalidate(destination, contest_id, force)?;
-    baseline.revalidate_batch_tests(destination)?;
+    baseline.revalidate_update(destination, contest_id, force, checks)?;
     let atcoder = client()?;
     let prepared = prepare_refresh_from_baseline(
         destination,
         contest_id,
         force,
         baseline,
-        atcoder,
+        atcoder.borrow(),
         reporter,
         checks,
     )?;
     apply_refresh_checked(prepared, reporter, checks)
 }
 
-fn changed_batch_tests_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Interrupted,
-        "local tests changed after batch planning; inspect the contest before retrying",
-    )
+impl RefreshTests {
+    fn validate(&self, actual: Option<&TreeSnapshot>) -> io::Result<()> {
+        if self.0.as_ref() != actual {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "local tests changed while refresh was being prepared; inspect the contest before retrying",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn refresh_metadata_snapshot(destination: &Path) -> io::Result<Option<FileSnapshot>> {
     safe_file::read_optional_regular_file_snapshot(&destination.join(".atc").join("contest.toml"))
 }
 
-#[cfg(unix)]
-fn refresh_destination_identity(destination: &Path) -> io::Result<RefreshDestinationIdentity> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::symlink_metadata(destination)?;
-    if !metadata.file_type().is_dir() {
+fn validate_destination_identity(
+    destination: &Path,
+    expected: &PhysicalDirectoryIdentity,
+) -> io::Result<()> {
+    if &contest_directory_identity(destination)? != expected {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "contest destination is not a real directory: {}",
-                destination.display()
-            ),
+            io::ErrorKind::Interrupted,
+            "contest destination changed while refresh was being prepared; retry refresh",
         ));
     }
-
-    Ok(RefreshDestinationIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn refresh_destination_identity(destination: &Path) -> io::Result<RefreshDestinationIdentity> {
-    use std::os::windows::io::AsRawHandle as _;
-    use std::os::windows::prelude::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        GetFileInformationByHandle,
-    };
-
-    let file = fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(destination)?;
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` keeps the handle valid for the call and `information`
-    // points to writable storage of the exact structure required by Win32.
-    if unsafe {
-        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::from_mut(&mut information))
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "contest destination is not a real directory: {}",
-                destination.display()
-            ),
-        ));
-    }
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-
-    Ok(RefreshDestinationIdentity::Windows {
-        volume_serial_number: information.dwVolumeSerialNumber,
-        file_index,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn refresh_destination_identity(destination: &Path) -> io::Result<RefreshDestinationIdentity> {
-    Ok(RefreshDestinationIdentity::Other {
-        canonical_path: fs::canonicalize(destination)?,
-    })
-}
-
-fn changed_refresh_destination_error() -> AppError {
-    io::Error::new(
-        io::ErrorKind::Interrupted,
-        "contest destination changed while refresh was being prepared; retry refresh",
-    )
-    .into()
+    Ok(())
 }
 
 impl RefreshBaseline {
-    fn revalidate_batch_tests(&self, destination: &Path) -> io::Result<()> {
-        if let Some(expected) = &self.batch_tests
-            && workspace::snapshot_contest_tests(destination)? != expected.0
-        {
-            return Err(changed_batch_tests_error());
+    /// Capture the local test tree and validate the lock entry without opening or creating it.
+    /// Both single and batch CLI refresh use this only for targets that will be updated.
+    fn capture_update(
+        mut self,
+        destination: &Path,
+        contest_id: &str,
+        force: bool,
+    ) -> Result<Self, AppError> {
+        self.tests = Some(RefreshTests(workspace::snapshot_contest_tests(
+            destination,
+        )?));
+        self.revalidate_diagnosis(destination, contest_id)?;
+        self.revalidate(destination, contest_id, force)?;
+        Ok(self)
+    }
+
+    /// Recheck the route and the original local generation around the download. The final
+    /// tests comparison uses the replacement routine's snapshot taken under the update lock.
+    fn revalidate_update(
+        &self,
+        destination: &Path,
+        contest_id: &str,
+        force: bool,
+        checks: ContestUpdateChecks<'_>,
+    ) -> Result<(), AppError> {
+        (checks.validate_route)(destination)?;
+        self.revalidate_diagnosis(destination, contest_id)?;
+        self.revalidate(destination, contest_id, force)?;
+        if let Some(expected) = &self.tests {
+            expected.validate(workspace::snapshot_contest_tests(destination)?.as_ref())?;
         }
         Ok(())
     }
@@ -507,9 +459,7 @@ impl RefreshBaseline {
         contest_id: &str,
         force: bool,
     ) -> Result<(), AppError> {
-        if refresh_destination_identity(destination)? != self.destination_identity {
-            return Err(changed_refresh_destination_error());
-        }
+        validate_destination_identity(destination, &self.destination_identity)?;
         validate_refresh_destination(destination, contest_id, force)?;
         let current_metadata = if self.diagnosis.is_some() {
             workspace::read_contest_metadata_snapshot(destination)?
@@ -524,9 +474,7 @@ impl RefreshBaseline {
             .into());
         }
         workspace::validate_existing_contest_identity(destination, contest_id)?;
-        if refresh_destination_identity(destination)? != self.destination_identity {
-            return Err(changed_refresh_destination_error());
-        }
+        validate_destination_identity(destination, &self.destination_identity)?;
         Ok(())
     }
 

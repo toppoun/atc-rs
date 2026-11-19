@@ -1,6 +1,6 @@
 use super::ContestUpdateChecks;
 use super::migrate::{confirm_migration, execute_migration};
-use super::refresh::{RefreshBaseline, execute_batch_refresh, plan_batch_refresh};
+use super::refresh::{RefreshBaseline, execute_cli_refresh, plan_refresh_update};
 use crate::atcoder::{AtCoderClient, AtCoderError, BATCH_REQUEST_INTERVAL};
 use crate::error::AppError;
 use crate::ui::Reporter;
@@ -370,7 +370,7 @@ fn plan_action(
                     return Err(crate::workspace::missing_contest_directory(path).into());
                 }
             };
-            let baseline = plan_batch_refresh(path, id, force, local)?;
+            let baseline = plan_refresh_update(path, id, force, local)?;
             Update::Refresh {
                 baseline: Box::new(baseline),
                 force,
@@ -431,7 +431,7 @@ impl Update {
                 healthy,
                 ..
             } => {
-                execute_batch_refresh(path, id, force, *baseline, client, reporter, checks)?;
+                execute_cli_refresh(path, id, force, *baseline, client, reporter, checks)?;
                 Ok((
                     if healthy {
                         Status::Refreshed
@@ -887,6 +887,186 @@ mod tests {
     }
 
     #[test]
+    fn single_and_batch_refresh_reject_changes_to_the_planned_generation_during_fetch() {
+        struct OnLastSample<F>(Option<F>);
+        impl<F: FnOnce()> Reporter for OnLastSample<F> {
+            fn report(&mut self, event: Event<'_>) {
+                if matches!(event, Event::ProblemFetched { index: "G", .. }) {
+                    self.0.take().unwrap()();
+                }
+            }
+        }
+
+        let mapping = |pattern: &str, path: &str| {
+            format!("version = 1\n[[paths]]\npattern = '{pattern}'\npath = '{path}'\n")
+        };
+        let add_samples = |contest: &Path| {
+            let tests = contest.join("tests/A");
+            fs::create_dir_all(&tests).unwrap();
+            // The first missing output keeps the diagnosis identical across edits to other files.
+            fs::write(tests.join("sample-1.in"), "local input").unwrap();
+            fs::write(tests.join("sample-2.in"), "second input").unwrap();
+            fs::write(tests.join("sample-2.out"), "second output").unwrap();
+        };
+
+        for batch in [false, true] {
+            for change in [
+                "body",
+                "add",
+                "delete",
+                "replace",
+                "route",
+                "rules",
+                "directory",
+            ] {
+                let root = workspace();
+                let root = root.path();
+                let config = root.join(".atc-workspace.toml");
+                fs::write(&config, mapping("^abc466$", "old")).unwrap();
+                let contest = repairable(&root.join("old"), "abc466", 3);
+                add_samples(&contest);
+                let mut edited = None;
+                let mut reporter = OnLastSample(Some(|| {
+                    let tests = contest.join("tests/A");
+                    match change {
+                        "body" => fs::write(tests.join("sample-1.in"), b"edited input").unwrap(),
+                        "add" => {
+                            fs::write(tests.join("sample-3.in"), b"new input").unwrap();
+                            fs::write(tests.join("sample-3.out"), b"new output").unwrap();
+                        }
+                        "delete" => fs::remove_file(tests.join("sample-2.out")).unwrap(),
+                        "replace" => {
+                            fs::rename(tests.join("sample-2.in"), contest.join("saved-input"))
+                                .unwrap();
+                            fs::write(tests.join("sample-2.in"), b"second input").unwrap();
+                        }
+                        "route" => {
+                            repairable(&root.join("new"), "abc466", 3);
+                            fs::write(&config, mapping("^abc466$", "new")).unwrap();
+                        }
+                        "rules" => fs::write(&config, mapping("^abc", "old")).unwrap(),
+                        "directory" => {
+                            fs::rename(&contest, root.join("saved-contest")).unwrap();
+                            add_samples(&repairable(&root.join("old"), "abc466", 3));
+                        }
+                        _ => unreachable!(),
+                    }
+                    edited = Some(read_tree_snapshot(root).unwrap());
+                }));
+
+                let message = if batch {
+                    let plan =
+                        BatchPlan::scan(root, BatchOperation::Refresh { force: false }).unwrap();
+                    let mut output = Vec::new();
+                    let code = plan
+                        .run(
+                            true,
+                            false,
+                            UpdateCancellation::default(),
+                            || Ok(fixture_client()),
+                            &mut reporter,
+                            &mut output,
+                        )
+                        .unwrap();
+                    let output = String::from_utf8(output).unwrap();
+                    assert_eq!(code, ExitCode::FAILURE, "{change}: {output}");
+                    output
+                } else {
+                    super::super::refresh::refresh_from(
+                        root,
+                        Some("abc466"),
+                        false,
+                        || Ok(fixture_client()),
+                        &mut reporter,
+                    )
+                    .expect_err("changed data must not be replaced")
+                    .to_string()
+                };
+                let reason = match change {
+                    "route" | "rules" | "directory" if batch => {
+                        "Workspace route or contest directory changed"
+                    }
+                    "route" | "rules" => "Workspace route changed",
+                    "directory" => "contest destination changed",
+                    _ => "local tests changed",
+                };
+                assert!(
+                    message.contains(reason),
+                    "batch={batch}, {change}: {message}"
+                );
+                assert_eq!(
+                    read_tree_snapshot(root).unwrap(),
+                    edited.expect("edit must happen during fetch")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_sample_edits_at_the_locked_replacement_boundary() {
+        for after_intent in [false, true] {
+            let root = workspace();
+            let contest = repairable(root.path(), "abc466", 2);
+            let metadata = fs::read(contest.join(".atc/contest.toml")).unwrap();
+            let tests = contest.join("tests/A");
+            fs::create_dir_all(&tests).unwrap();
+            let input = tests.join("sample-1.in");
+            fs::write(&input, b"planned input").unwrap();
+            fs::write(tests.join("sample-1.out"), b"planned output").unwrap();
+            let touched_staging = Cell::new(None);
+            let checkpoint = |checkpoint: UpdateCheckpoint<'_>| match checkpoint {
+                UpdateCheckpoint::BeforeApply(staging) if !after_intent => {
+                    fs::write(&input, b"edited input").unwrap();
+                    touched_staging.set(Some(staging.to_path_buf()));
+                }
+                UpdateCheckpoint::AfterIntent(staging) if after_intent => {
+                    fs::write(&input, b"edited input").unwrap();
+                    touched_staging.set(Some(staging.to_path_buf()));
+                }
+                _ => {}
+            };
+            let interrupted = AtomicBool::new(false);
+            let mut cancellation = UpdateCancellation::for_batch(&interrupted);
+            cancellation.checkpoint = Some(&checkpoint);
+            let plan =
+                BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+            let mut output = Vec::new();
+            let code = plan
+                .run(
+                    true,
+                    false,
+                    cancellation,
+                    || Ok(fixture_client()),
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            let message = String::from_utf8(output).unwrap();
+            assert_eq!(code, ExitCode::FAILURE, "{message}");
+            let reason = if after_intent {
+                "previous tests changed during replacement"
+            } else {
+                "local tests changed"
+            };
+            assert!(message.contains(reason), "{message}");
+            let staging = touched_staging
+                .into_inner()
+                .expect("the edit must reach the update boundary");
+            assert!(contest.join(".atc-update.lock").is_file());
+            assert_eq!(
+                staging.join(safe_file::RECOVERY_INTENT).is_file(),
+                after_intent
+            );
+            assert!(!staging.join("previous-tests").exists());
+            assert_eq!(fs::read(&input).unwrap(), b"edited input");
+            assert_eq!(
+                fs::read(contest.join(".atc/contest.toml")).unwrap(),
+                metadata
+            );
+        }
+    }
+
+    #[test]
     fn refresh_revalidates_tests_changed_by_an_independent_edit_after_planning() {
         let root = workspace();
         repairable(root.path(), "abc460", 1);
@@ -918,7 +1098,7 @@ mod tests {
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(client_initializations.get(), 1);
         assert!(
-            output.contains("local tests changed after batch planning"),
+            output.contains("local tests changed while refresh was being prepared"),
             "{output}"
         );
         assert!(!root.path().join("abc461/.atc-update.lock").exists());

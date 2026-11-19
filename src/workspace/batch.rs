@@ -265,16 +265,7 @@ impl BatchWorkspace {
             return Err(changed());
         }
         let config = load_existing_workspace_config(&self.root, &root)?.ok_or_else(changed)?;
-        if !config
-            .paths
-            .iter()
-            .map(|rule| (rule.pattern.as_str(), &rule.path))
-            .eq(self
-                .config
-                .paths
-                .iter()
-                .map(|rule| (rule.pattern.as_str(), &rule.path)))
-        {
+        if config != self.config {
             return Err(changed());
         }
         let parent_path = location.parent.append_to(&self.root);

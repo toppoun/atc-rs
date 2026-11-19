@@ -25,6 +25,8 @@ fn refresh_resolves_workspace_routing_and_skips_the_repaired_contest() {
     let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("beginner/abc466");
     fs::create_dir_all(destination.join(".atc")).unwrap();
+    let lock = destination.join(".atc-update.lock");
+    fs::write(&lock, b"existing regular lock").unwrap();
     fs::write(
         temp.path().join(".atc-workspace.toml"),
         "version = 1\n[[paths]]\npattern = '^abc'\npath = 'beginner'\n",
@@ -40,6 +42,7 @@ fn refresh_resolves_workspace_routing_and_skips_the_repaired_contest() {
     assert!(destination.join(".atc/contest.toml").is_file());
     assert!(destination.join("tests/A/sample-1.in").is_file());
     assert!(!decoy.join(".atc/contest.toml").exists());
+    assert_eq!(fs::read(&lock).unwrap(), b"existing regular lock");
 
     let missing_fixtures = temp.path().join("missing-fixtures");
     for (cwd, args) in [
@@ -54,7 +57,7 @@ fn refresh_resolves_workspace_routing_and_skips_the_repaired_contest() {
 }
 
 #[test]
-fn refresh_healthy_sends_no_requests_and_force_transport_failure_keeps_data() {
+fn refresh_healthy_and_invalid_lock_send_no_requests_and_force_transport_failure_keeps_data() {
     let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("abc466");
     fs::create_dir_all(destination.join(".atc")).unwrap();
@@ -118,7 +121,20 @@ fn refresh_healthy_sends_no_requests_and_force_transport_failure_keeps_data() {
             .unwrap()
     };
 
+    let lock = destination.join(".atc-update.lock");
+    fs::create_dir(&lock).unwrap();
+    fs::write(lock.join("keep"), b"user data").unwrap();
     let healthy = run(&[]);
+    let invalid_force = run(&["--force"]);
+    let repairable = original.replace("sample_count = 0", "sample_count = 1");
+    fs::write(&metadata, &repairable).unwrap();
+    let invalid_repair = run(&[]);
+    assert_eq!(fs::read_to_string(&metadata).unwrap(), repairable);
+    assert_eq!(fs::read(lock.join("keep")).unwrap(), b"user data");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+    fs::remove_file(lock.join("keep")).unwrap();
+    fs::remove_dir(lock).unwrap();
+    fs::write(&metadata, original).unwrap();
     let forced = run(&["--force"]);
     finished.send(()).unwrap();
     let requests = proxy.join().unwrap();
@@ -129,6 +145,15 @@ fn refresh_healthy_sends_no_requests_and_force_transport_failure_keeps_data() {
         String::from_utf8_lossy(&healthy.stderr)
     );
     assert!(String::from_utf8_lossy(&healthy.stderr).contains("refresh skipped"));
+    for invalid in [invalid_force, invalid_repair] {
+        let stderr = String::from_utf8_lossy(&invalid.stderr);
+        assert_eq!(invalid.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("not a regular file") && stderr.contains(".atc-update.lock"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Fetching"), "{stderr}");
+    }
     assert!(!forced.status.success());
     let stderr = String::from_utf8_lossy(&forced.stderr);
     assert!(stderr.contains("AtCoder operation failed"), "{stderr}");

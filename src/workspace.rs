@@ -107,6 +107,7 @@ struct WorkspacePathRuleFile {
     path: String,
 }
 
+#[derive(PartialEq, Eq)]
 struct WorkspaceConfig {
     paths: Vec<WorkspacePathRule>,
 }
@@ -127,6 +128,14 @@ struct WorkspacePathRule {
     pattern: Regex,
     path: WorkspaceRelativePath,
 }
+
+impl PartialEq for WorkspacePathRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern.as_str() == other.pattern.as_str() && self.path == other.path
+    }
+}
+
+impl Eq for WorkspacePathRule {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceRelativePath {
@@ -450,6 +459,56 @@ pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf
             contest_path(&path.append_to(root), contest_id)
         }
         None => contest_path(root, contest_id),
+    }
+}
+
+/// The Workspace settings and directory identities used to resolve an explicit `-c` target.
+#[derive(PartialEq, Eq)]
+pub(crate) struct ExplicitContestRoute {
+    pub(crate) destination: PathBuf,
+    config: Option<WorkspaceConfig>,
+    root_identity: PhysicalDirectoryIdentity,
+    parent_identity: Option<PhysicalDirectoryIdentity>,
+}
+
+impl ExplicitContestRoute {
+    pub(crate) fn resolve(root: &Path, contest_id: &str) -> io::Result<Self> {
+        validate_path_component(contest_id, "contest ID")?;
+        let directory = open_workspace_root_nofollow(root)?;
+        let root_identity = opened_directory_identity(&directory, root)?;
+        let config = load_existing_workspace_config(root, &directory)?;
+        let mapping = match &config {
+            Some(config) => matching_workspace_path(config, contest_id)?,
+            None => None,
+        };
+        let (destination, parent_identity) = if let Some(mapping) = mapping {
+            let parent = mapping.append_to(root);
+            let identity = walk_workspace_mapping_in(root, directory, mapping, false)?
+                .map(|directory| opened_directory_identity(&directory, &parent))
+                .transpose()?;
+            (parent.join(contest_id), identity)
+        } else {
+            (root.join(contest_id), Some(root_identity.clone()))
+        };
+        Ok(Self {
+            destination,
+            config,
+            root_identity,
+            parent_identity,
+        })
+    }
+
+    pub(crate) fn revalidate(&self, root: &Path, contest_id: &str) -> io::Result<()> {
+        if &Self::resolve(root, contest_id)? != self {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "Workspace route changed while refresh was being prepared: {}",
+                    self.destination.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1935,7 +1994,7 @@ fn missing_workspace_marker(marker: &Path) -> io::Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PhysicalDirectoryIdentity {
+pub(crate) enum PhysicalDirectoryIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
@@ -1945,6 +2004,13 @@ enum PhysicalDirectoryIdentity {
     },
     #[cfg(not(any(unix, windows)))]
     Other { canonical_path: PathBuf },
+}
+
+pub(crate) fn contest_directory_identity(
+    destination: &Path,
+) -> io::Result<PhysicalDirectoryIdentity> {
+    let directory = open_contest_destination_nofollow(destination.components().as_path())?;
+    opened_directory_identity(&directory, destination)
 }
 
 #[cfg(unix)]
@@ -2878,9 +2944,6 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
         ));
     }
 
-    if safe_file::read_optional_regular_file_snapshot(&destination_metadata)? != expected_metadata {
-        return Err(changed_contest_metadata_error());
-    }
     let staged_contest = load_metadata(&staging_root)?;
     let owned_problem_indices = if had_destination_tests {
         validate_existing_owned_tests(destination, &staged_contest)
@@ -2888,20 +2951,25 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
     } else {
         HashSet::new()
     };
-    let previous_tests_snapshot = if had_destination_tests {
-        Some(safe_file::read_tree_snapshot(&destination_tests)?)
-    } else {
-        None
-    };
-
-    validate_update(previous_tests_snapshot.as_ref())
-        .map_err(|error| preserved_staging_error(&staging_root, error))?;
     let staged_metadata_snapshot = safe_file::read_regular_file_snapshot(&staged_metadata)?;
     let staged_tests_snapshot = has_staged_tests
         .then(|| safe_file::read_tree_snapshot(&staged_tests))
         .transpose()?;
+
+    // Take the live snapshot under lock after checking staged data. The moves below still
+    // verify the backups so an edit outside the lock cannot silently authorize a replacement.
+    validate_metadata_snapshot(&destination_metadata, &expected_metadata)?;
+    let previous_tests_snapshot = if had_destination_tests {
+        Some(safe_file::read_tree_snapshot(&destination_tests)?)
+    } else {
+        safe_file::require_absent(&destination_tests)?;
+        None
+    };
+
     let recovery_identity =
         safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
+    validate_update(previous_tests_snapshot.as_ref())
+        .map_err(|error| preserved_staging_error(&staging_root, error))?;
     cancellation.record_intent(&staging_root, || {
         safe_file::write_recovery_intent(&staging_root, &recovery_identity)
     })?;
@@ -3340,10 +3408,13 @@ fn find_unowned_test_entry(
             let sample_name = sample_entry?.file_name();
             let sample_path = problem_path.join(&sample_name);
             let metadata = problem_dir.symlink_metadata(&sample_name)?;
-            if managed_metadata_is_reparse(&metadata) || !metadata.file_type().is_file() {
+            let file_type = metadata.file_type();
+            if managed_metadata_is_reparse(&metadata)
+                || (!file_type.is_file() && !file_type.is_dir())
+            {
                 return Ok(Some(UnownedTestEntry::Unsafe(sample_path)));
             }
-            if !matches!(parse_sample_filename(&sample_name), Ok(Some(_))) {
+            if file_type.is_dir() || !matches!(parse_sample_filename(&sample_name), Ok(Some(_))) {
                 return Ok(Some(UnownedTestEntry::Unrecognized(sample_path)));
             }
         }
