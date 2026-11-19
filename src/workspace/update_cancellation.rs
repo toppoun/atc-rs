@@ -23,6 +23,10 @@ impl<'a> UpdateCancellation<'a> {
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
+    pub(crate) fn before_fetch(self) -> io::Result<()> {
+        self.check(None)
+    }
+
     pub(crate) fn before_staging(self) -> io::Result<()> {
         #[cfg(test)]
         if let Some(checkpoint) = self.checkpoint {
@@ -75,8 +79,11 @@ impl<'a> UpdateCancellation<'a> {
 
 #[cfg(test)]
 pub(crate) enum UpdateCheckpoint<'a> {
+    Discovery,
+    AfterDiagnosis,
     BeforeStaging,
     BeforeApply(&'a Path),
+    UnderLock,
     BeforeIntent(&'a Path),
     AfterIntent(&'a Path),
 }

@@ -1,8 +1,10 @@
+use super::update_cancellation::UpdateCancellation;
 use super::{
     CapDir, PhysicalDirectoryIdentity, WORKSPACE_CONFIG_FILE, WorkspaceConfig,
     WorkspaceRelativePath, is_safe_atcoder_id, load_existing_workspace_config,
     managed_metadata_is_reparse, matching_workspace_path, open_managed_directory,
-    open_workspace_root_nofollow, opened_directory_identity, validate_path_component,
+    open_workspace_root_nofollow, open_workspace_update_parent, opened_directory_identity,
+    reject_nested_workspace, validate_path_component,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -27,6 +29,8 @@ pub(crate) struct BatchWorkspace {
 pub(crate) struct Discovery {
     pub(crate) contests: Vec<(String, PathBuf, io::Result<ContestLocation>)>,
     pub(crate) errors: Vec<(PathBuf, io::Error)>,
+    pub(crate) found: usize,
+    pub(crate) complete: bool,
 }
 
 pub(crate) struct ContestLocation {
@@ -37,7 +41,10 @@ pub(crate) struct ContestLocation {
 }
 
 impl BatchWorkspace {
-    pub(crate) fn scan(root: &Path) -> io::Result<(Self, Discovery)> {
+    pub(crate) fn scan(
+        root: &Path,
+        cancellation: UpdateCancellation<'_>,
+    ) -> io::Result<(Self, Discovery)> {
         let directory = open_workspace_root_nofollow(root)?;
         let config = load_existing_workspace_config(root, &directory)?.ok_or_else(|| {
             io::Error::new(
@@ -64,13 +71,20 @@ impl BatchWorkspace {
         let mut candidates = BTreeMap::<String, Vec<Candidate>>::new();
         let mut errors = Vec::new();
         for parent in &workspace.parents {
-            if let Err(error) = workspace.scan_parent(&directory, parent, &mut candidates) {
+            if cancellation.is_requested() {
+                break;
+            }
+            if let Err(error) =
+                workspace.scan_parent(&directory, parent, &mut candidates, cancellation)
+            {
                 errors.push((parent.append_to(root), error));
             }
         }
 
+        let found = candidates.len();
         let contests = candidates
             .into_iter()
+            .take_while(|_| !cancellation.is_requested())
             .map(|(id, candidates)| {
                 let path = candidates[0].path.clone();
                 match workspace.select(&id, candidates) {
@@ -79,7 +93,16 @@ impl BatchWorkspace {
                 }
             })
             .collect();
-        Ok((workspace, Discovery { contests, errors }))
+        let complete = !cancellation.is_requested();
+        Ok((
+            workspace,
+            Discovery {
+                contests,
+                errors,
+                found,
+                complete,
+            },
+        ))
     }
 
     fn scan_parent(
@@ -87,17 +110,28 @@ impl BatchWorkspace {
         root: &CapDir,
         parent: &WorkspaceRelativePath,
         candidates: &mut BTreeMap<String, Vec<Candidate>>,
+        cancellation: UpdateCancellation<'_>,
     ) -> io::Result<()> {
         let Some(directory) = self.open_parent(root, parent)? else {
             return Ok(());
         };
         let path = parent.append_to(&self.root);
         let identity = opened_directory_identity(&directory, &path)?;
-        let names = directory
-            .entries()?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<io::Result<BTreeSet<_>>>()?;
+        let mut names = BTreeSet::new();
+        for entry in directory.entries()? {
+            #[cfg(test)]
+            if let Some(checkpoint) = cancellation.checkpoint {
+                checkpoint(super::update_cancellation::UpdateCheckpoint::Discovery);
+            }
+            if cancellation.is_requested() {
+                return Ok(());
+            }
+            names.insert(entry?.file_name());
+        }
         for name in names {
+            if cancellation.is_requested() {
+                break;
+            }
             let Some(id) = name.to_str().filter(|id| is_safe_atcoder_id(id)) else {
                 continue;
             };
@@ -235,19 +269,7 @@ impl BatchWorkspace {
         root: &CapDir,
         parent: &WorkspaceRelativePath,
     ) -> io::Result<Option<CapDir>> {
-        let mut directory = root.try_clone()?;
-        let mut path = self.root.clone();
-        for component in parent.components() {
-            path.push(component);
-            let Some(child) =
-                open_managed_directory(&directory, component, &path, "workspace scan directory")?
-            else {
-                return Ok(None);
-            };
-            reject_nested_workspace(&child, &path)?;
-            directory = child;
-        }
-        Ok(Some(directory))
+        open_workspace_update_parent(&self.root, root, parent)
     }
 
     pub(crate) fn revalidate(&self, id: &str, location: &ContestLocation) -> io::Result<()> {
@@ -338,17 +360,4 @@ fn has_legacy_data(directory: &CapDir) -> io::Result<bool> {
         }
     }
     Ok(false)
-}
-
-fn reject_nested_workspace(directory: &CapDir, path: &Path) -> io::Result<()> {
-    if super::workspace_config_entry_exists(directory)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "nested Workspace is outside this operation: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }

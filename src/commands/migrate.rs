@@ -32,8 +32,14 @@ pub(super) fn confirm_migration(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> io::Result<bool> {
-    write!(output, "Proceed with migration? [y/N] ")?;
+    write!(output, "{MIGRATION_PROMPT}")?;
     output.flush()?;
+    read_migration_confirmation(input)
+}
+
+pub(super) const MIGRATION_PROMPT: &str = "Proceed with migration? [y/N] ";
+
+pub(super) fn read_migration_confirmation(input: &mut dyn BufRead) -> io::Result<bool> {
     let mut answer = String::new();
     input.read_line(&mut answer)?;
     Ok(matches!(
@@ -51,8 +57,15 @@ fn migrate_from(
     confirm: impl FnOnce(&mut dyn Write) -> io::Result<bool>,
 ) -> Result<(), AppError> {
     let specified_id = args.contest.as_deref();
-    let destination = workspace::resolve_contest_target(cwd, specified_id)?;
-    workspace::migration::validate_target(&destination)?;
+    let route = specified_id
+        .map(|id| workspace::ExplicitContestRoute::resolve(cwd, id))
+        .transpose()?;
+    let destination = route
+        .as_ref()
+        .map_or(cwd, |route| route.destination.as_path());
+    if route.is_none() {
+        workspace::validate_workspace_update_target(destination)?;
+    }
     let contest_id = specified_id
         .or_else(|| cwd.file_name().and_then(|name| name.to_str()))
         .filter(|id| workspace::is_safe_atcoder_id(id))
@@ -63,7 +76,7 @@ fn migrate_from(
             )
         })?;
     let MigrationInspection::Ready(plan) =
-        workspace::migration::inspect(destination, contest_id.to_owned())?
+        workspace::migration::inspect(destination.to_path_buf(), contest_id.to_owned())?
     else {
         writeln!(
             output,
@@ -81,14 +94,9 @@ fn migrate_from(
         return Ok(());
     }
 
-    let revalidate_mapping = |destination: &Path| {
-        if workspace::resolve_contest_target(cwd, specified_id)? != destination {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "workspace mapping changed during migration; inspect the new target before retrying",
-            ));
-        }
-        Ok(())
+    let revalidate_mapping = |destination: &Path| match &route {
+        Some(route) => route.revalidate(cwd, contest_id),
+        None => workspace::validate_workspace_update_target(destination),
     };
 
     let backup = execute_migration(
@@ -114,6 +122,7 @@ pub(super) fn execute_migration<C: std::borrow::Borrow<AtCoderClient>>(
     let revalidate_mapping = checks.validate_route;
     revalidate_mapping(plan.destination())?;
     plan.revalidate()?;
+    checks.cancellation.before_fetch()?;
     let client = client()?;
     let data = fetch_contest_data(plan.contest_id(), client.borrow(), reporter)?;
     workspace::validate_contest_identity(&data.contest, plan.contest_id())?;
@@ -243,6 +252,54 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), edited);
             assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
         }
+    }
+
+    #[test]
+    fn explicit_migration_rejects_an_intermediate_workspace_added_during_fetch() {
+        struct AddBoundary<'a>(&'a Path);
+
+        impl Reporter for AddBoundary<'_> {
+            fn report(&mut self, event: Event<'_>) {
+                if matches!(event, Event::ContestFetched { .. }) {
+                    fs::write(self.0, b"version = 1\n").unwrap();
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join(".atc-workspace.toml"),
+            "version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'inner/series'\n",
+        )
+        .unwrap();
+        let contest = root.join("inner/series/abc466");
+        fs::create_dir_all(contest.join("tests")).unwrap();
+        fs::write(contest.join("tests/legacy"), b"preserve").unwrap();
+        let before = crate::safe_file::read_tree_snapshot(&contest).unwrap();
+        let args = MigrateArgs {
+            contest: Some("abc466".into()),
+            dry_run: false,
+            all: false,
+            yes: true,
+        };
+        let error = migrate_from(
+            root,
+            &args,
+            fixture_client,
+            &mut AddBoundary(&root.join("inner/.atc-workspace.toml")),
+            &mut Vec::new(),
+            |_| panic!("--yes suppresses confirmation"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Workspace boundary at"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::safe_file::read_tree_snapshot(&contest).unwrap(),
+            before
+        );
     }
 
     #[test]

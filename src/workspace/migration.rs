@@ -7,7 +7,7 @@ use super::{
     entry_exists, fingerprint_tests, lock_contest_update, metadata_contest_owner,
     missing_contest_directory, open_contest_destination_nofollow, open_managed_directory,
     opened_directory_identity, preserved_staging_error, read_contest_metadata_snapshot_in,
-    snapshot_tests, validate_contest_update_lock_entry, workspace_config_entry_exists,
+    reject_nested_workspace, snapshot_tests, validate_contest_update_lock_entry,
 };
 use crate::safe_file::{
     self, FileFingerprint, FileSnapshot, PreservedTempDir, TreeFingerprint, TreeSnapshot,
@@ -163,27 +163,6 @@ struct PreviousMigrationData {
     tests: Option<TreeSnapshot>,
 }
 
-pub(crate) fn validate_target(destination: &Path) -> io::Result<()> {
-    match open_contest_destination_nofollow(destination.components().as_path()) {
-        Ok(directory) => reject_workspace_target(&directory, destination),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn reject_workspace_target(directory: &CapDir, destination: &Path) -> io::Result<()> {
-    if workspace_config_entry_exists(directory)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "cannot migrate a Workspace directory at {}. Run `atc migrate -c <contest-id>` or `atc migrate --all` from its root to select Contests",
-                destination.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn inspect(destination: PathBuf, contest_id: String) -> io::Result<MigrationInspection> {
     let diagnosis = diagnose_contest(&destination, &contest_id);
     match inspect_with_diagnosis(&destination, &contest_id, diagnosis)? {
@@ -207,7 +186,7 @@ pub(crate) fn inspect_with_diagnosis(
     };
 
     let directories = LiveDirectories::open(destination)?;
-    reject_workspace_target(&directories.root, destination)?;
+    reject_nested_workspace(&directories.root, destination)?;
     let identities = directories.identities(destination)?;
     let metadata = directories.metadata(destination)?;
     if let Some(metadata) = &metadata {
@@ -302,7 +281,7 @@ impl MigrationPlan {
     }
 
     fn unchanged_metadata(&self, live: &LiveDirectories) -> io::Result<Option<FileSnapshot>> {
-        reject_workspace_target(&live.root, &self.destination)?;
+        reject_nested_workspace(&live.root, &self.destination)?;
         let metadata = live.metadata(&self.destination)?;
         if diagnose_contest(&self.destination, &self.contest_id) != self.diagnosis
             || metadata.as_ref().map(FileSnapshot::fingerprint) != self.metadata
@@ -356,6 +335,10 @@ impl MigrationPlan {
         let identity = safe_file::RecoveryIdentity::new("contest", &self.contest_id, None);
         let _lock = lock_contest_update(destination, false)
             .map_err(|error| preserved_staging_error(&staging_root, error))?;
+        #[cfg(test)]
+        if let Some(checkpoint) = cancellation.checkpoint {
+            checkpoint(super::update_cancellation::UpdateCheckpoint::UnderLock);
+        }
         validate_route(destination)
             .map_err(|error| preserved_staging_error(&staging_root, error))?;
         let live = self
@@ -444,7 +427,7 @@ impl MigrationPlan {
         }
         let previous = PreviousMigrationData { metadata, tests };
         self.open_unchanged()?;
-        reject_workspace_target(&live.root, destination)?;
+        reject_nested_workspace(&live.root, destination)?;
         cancellation.record_intent(staging_root, || {
             safe_file::write_recovery_intent_at(&staged.root, identity)
         })?;
@@ -672,9 +655,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("cannot migrate a Workspace directory"),
+            error.to_string().contains("Workspace boundary at"),
             "{error}"
         );
         assert_eq!(fs::read(&marker).unwrap(), workspace_config);

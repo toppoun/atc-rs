@@ -2,6 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(windows)]
+#[path = "batch_cli/windows_interrupt.rs"]
+mod windows_interrupt;
+
 fn workspace(config: &str) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join(".atc-workspace.toml"), config).unwrap();
@@ -89,6 +93,120 @@ fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     visit(root, root, &mut entries);
     entries.sort();
     entries
+}
+
+#[test]
+fn explicit_and_batch_updates_share_the_nested_workspace_boundary() {
+    let fixtures_root = tempfile::tempdir().unwrap();
+    fixtures(fixtures_root.path(), &["abc466"]);
+    for operation in ["refresh", "migrate"] {
+        for marker_at_target in [false, true] {
+            let root = workspace(
+                "version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'work/Vault/series'\n",
+            );
+            let inner = root.path().join("work/vault");
+            // Keep the path spelling distinct on conventional case-insensitive NTFS.
+            let inner = if cfg!(windows) {
+                inner
+            } else {
+                root.path().join("work/Vault")
+            };
+            let contest = inner.join("series/abc466");
+            if operation == "refresh" {
+                manifest(&contest, "abc466", 1);
+            } else {
+                legacy(&contest);
+            }
+            let boundary = if marker_at_target { &contest } else { &inner };
+            let marker_name = if cfg!(windows) {
+                ".ATC-WORKSPACE.TOML"
+            } else {
+                ".atc-workspace.toml"
+            };
+            fs::write(
+                boundary.join(marker_name),
+                "version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'series'\n",
+            )
+            .unwrap();
+            let before = tree(root.path());
+            let mut single = vec![operation, "-c", "abc466"];
+            let mut batch = vec![operation, "--all", "--yes"];
+            if operation == "refresh" {
+                single.push("--force");
+                batch.push("--force");
+            } else {
+                single.push("--yes");
+            }
+            for args in [&single, &batch] {
+                let result = cli(root.path(), args, fixtures_root.path());
+                let message = stderr(&result);
+                assert_eq!(result.status.code(), Some(1), "{message}");
+                assert!(message.contains("Workspace boundary at"), "{message}");
+                assert!(message.contains("from that Workspace root"), "{message}");
+                let reported_boundary = root.path().join(if marker_at_target {
+                    "work/Vault/series/abc466"
+                } else {
+                    "work/Vault"
+                });
+                let reported_boundary = reported_boundary.components().collect::<PathBuf>();
+                assert!(
+                    message.contains(&reported_boundary.display().to_string()),
+                    "{message}"
+                );
+                assert!(!message.contains("Fetching"), "{message}");
+                assert_eq!(tree(root.path()), before);
+            }
+            if !marker_at_target {
+                let result = cli(&inner, &single, fixtures_root.path());
+                assert!(result.status.success(), "{}", stderr(&result));
+                assert!(contest.join("tests/A/sample-1.in").is_file());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn update_routes_reject_junctions_at_intermediate_and_target_directories() {
+    let outside = tempfile::tempdir().unwrap();
+    let contest = outside.path().join("abc466");
+    manifest(&contest, "abc466", 1);
+    fs::create_dir_all(contest.join("tests").join("A")).unwrap();
+    fs::write(contest.join("tests").join("A").join("sample-1.in"), "keep").unwrap();
+    let before = tree(outside.path());
+    for link_at_target in [false, true] {
+        let root =
+            workspace("version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'work/series'\n");
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let series = work.join("series");
+        let (link, target) = if link_at_target {
+            fs::create_dir(&series).unwrap();
+            (series.join("abc466"), contest.as_path())
+        } else {
+            (series, outside.path())
+        };
+        let result = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", stderr(&result));
+        for args in [
+            &["refresh", "-c", "abc466", "--force"][..],
+            &["migrate", "-c", "abc466", "--yes"][..],
+            &["refresh", "--all", "--yes", "--force"][..],
+            &["migrate", "--all", "--yes"][..],
+        ] {
+            let result = cli(root.path(), args, root.path());
+            let message = stderr(&result);
+            assert_eq!(result.status.code(), Some(1), "{message}");
+            assert!(message.contains("reparse point"), "{message}");
+            assert!(!message.contains("Fetching"), "{message}");
+            assert_eq!(tree(outside.path()), before);
+        }
+    }
 }
 
 #[test]

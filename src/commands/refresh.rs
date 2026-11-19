@@ -101,6 +101,9 @@ pub(super) fn refresh_from(
     let destination = route
         .as_ref()
         .map_or(cwd, |route| route.destination.as_path());
+    if route.is_none() {
+        workspace::validate_workspace_update_target(destination)?;
+    }
     // Capture the directory and metadata before diagnosis so the decision cannot
     // authorize an update to a different directory or manifest generation.
     let destination_identity = contest_directory_identity(destination);
@@ -150,9 +153,9 @@ pub(super) fn refresh_from(
     }
 
     let baseline = baseline.capture_update(destination, &contest_id, force)?;
-    let validate_route = |_: &Path| match &route {
+    let validate_route = |destination: &Path| match &route {
         Some(route) => route.revalidate(cwd, &contest_id),
-        None => Ok(()),
+        None => workspace::validate_workspace_update_target(destination),
     };
     execute_cli_refresh(
         destination,
@@ -407,6 +410,7 @@ pub(super) fn execute_cli_refresh<C: Borrow<atcoder::AtCoderClient>>(
     checks: ContestUpdateChecks<'_>,
 ) -> Result<(), AppError> {
     baseline.revalidate_update(destination, contest_id, force, checks)?;
+    checks.cancellation.before_fetch()?;
     let atcoder = client()?;
     let prepared = prepare_refresh_from_baseline(
         destination,

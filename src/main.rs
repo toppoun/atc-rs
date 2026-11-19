@@ -148,7 +148,6 @@ fn run() -> Result<ExitCode, AppError> {
                     commands::BatchOperation::Refresh { force },
                     dry_run,
                     yes,
-                    &mut reporter,
                 );
             }
             commands::refresh(contest, force, &mut reporter)?;
@@ -160,7 +159,6 @@ fn run() -> Result<ExitCode, AppError> {
                     commands::BatchOperation::Migrate,
                     args.dry_run,
                     args.yes,
-                    &mut reporter,
                 );
             }
             commands::migrate(args, &mut reporter)?;

@@ -1,5 +1,7 @@
 use super::ContestUpdateChecks;
-use super::migrate::{confirm_migration, execute_migration};
+#[cfg(test)]
+use super::migrate::confirm_migration;
+use super::migrate::{MIGRATION_PROMPT, execute_migration};
 use super::refresh::{RefreshBaseline, execute_cli_refresh, plan_refresh_update};
 use crate::atcoder::{AtCoderClient, AtCoderError, BATCH_REQUEST_INTERVAL};
 use crate::error::AppError;
@@ -15,6 +17,9 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use terminal::{BatchOutput, wait_for_approval};
+
+mod terminal;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -28,39 +33,80 @@ pub(crate) fn run_batch(
     operation: BatchOperation,
     dry_run: bool,
     yes: bool,
-    reporter: &mut dyn Reporter,
 ) -> Result<ExitCode, AppError> {
-    let mut output = io::stderr();
+    install_interrupt_handler()?;
+    let cancellation = UpdateCancellation::for_batch(&INTERRUPTED);
+    let mut output = BatchOutput::new(cancellation)?;
+    let mut reporter = output.clone();
+    let result = run_batch_with(
+        operation,
+        dry_run,
+        yes,
+        cancellation,
+        &mut reporter,
+        &mut output,
+    );
+    if cancellation.is_requested() {
+        return Ok(ExitCode::from(130));
+    }
+    match result {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            // The same pipe may have caused the error. Avoid a second blocking write
+            // or a panic in main's normal error handler.
+            let _ = writeln!(output, "error: {error}");
+            Ok(if cancellation.is_requested() {
+                ExitCode::from(130)
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+    }
+}
+
+fn run_batch_with(
+    operation: BatchOperation,
+    dry_run: bool,
+    yes: bool,
+    cancellation: UpdateCancellation<'_>,
+    reporter: &mut dyn Reporter,
+    output: &mut dyn Write,
+) -> Result<ExitCode, AppError> {
     writeln!(output, "Scanning workspace...")?;
-    let plan = BatchPlan::scan(&std::env::current_dir()?, operation)?;
-    plan.write(&mut output)?;
+    let plan = BatchPlan::scan(&std::env::current_dir()?, operation, cancellation)?;
+    plan.write(output, cancellation)?;
 
     let mut run = false;
     let mut approval_error = None;
-    if !dry_run && plan.has_updates() {
+    if !cancellation.is_requested() && !dry_run && plan.has_updates() {
         run = if yes {
             true
-        } else if !io::stdin().is_terminal() || !output.is_terminal() {
+        } else if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             approval_error = Some("batch changes in a non-interactive environment require --yes");
             false
         } else {
             match operation {
                 BatchOperation::Refresh { .. } => true,
-                BatchOperation::Migrate => confirm_migration(&mut io::stdin().lock(), &mut output)?,
+                BatchOperation::Migrate => {
+                    write!(output, "{MIGRATION_PROMPT}")?;
+                    output.flush()?;
+                    match wait_for_approval(cancellation) {
+                        Ok(approved) => approved,
+                        Err(_) if cancellation.is_requested() => false,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
             }
         };
-        if !run && approval_error.is_none() {
+        if !run && approval_error.is_none() && !cancellation.is_requested() {
             writeln!(output, "Migration cancelled.")?;
         }
     }
 
-    if run {
-        install_interrupt_handler()?;
-    }
     let result = plan.run(
         run,
         dry_run,
-        UpdateCancellation::for_batch(&INTERRUPTED),
+        cancellation,
         || {
             Ok(AtCoderClient::for_batch(
                 BATCH_REQUEST_INTERVAL,
@@ -68,9 +114,11 @@ pub(crate) fn run_batch(
             )?)
         },
         reporter,
-        &mut output,
+        output,
     )?;
-    if let Some(message) = approval_error {
+    if let Some(message) = approval_error
+        && !cancellation.is_requested()
+    {
         writeln!(output, "{message}")?;
         return Ok(ExitCode::FAILURE);
     }
@@ -81,6 +129,8 @@ struct BatchPlan {
     workspace: BatchWorkspace,
     entries: Vec<PlanEntry>,
     discovery_errors: Vec<(PathBuf, io::Error)>,
+    found: usize,
+    discovery_complete: bool,
 }
 
 struct PlanEntry {
@@ -109,17 +159,28 @@ enum Update {
 }
 
 impl BatchPlan {
-    fn scan(cwd: &Path, operation: BatchOperation) -> io::Result<Self> {
-        let (workspace, discovery) = BatchWorkspace::scan(cwd)?;
+    fn scan(
+        cwd: &Path,
+        operation: BatchOperation,
+        cancellation: UpdateCancellation<'_>,
+    ) -> io::Result<Self> {
+        let (workspace, discovery) = BatchWorkspace::scan(cwd, cancellation)?;
         let entries = discovery
             .contests
             .into_iter()
+            .take_while(|_| !cancellation.is_requested())
             .map(|(id, path, location)| {
                 let mut diagnosis = "Blocked";
                 let planned = (|| {
                     let location = location?;
                     workspace.revalidate(&id, &location)?;
                     let local = diagnose_contest(&path, &id);
+                    #[cfg(test)]
+                    if let Some(checkpoint) = cancellation.checkpoint {
+                        checkpoint(
+                            crate::workspace::update_cancellation::UpdateCheckpoint::AfterDiagnosis,
+                        );
+                    }
                     diagnosis = diagnosis_label(&local);
                     let action = plan_action(operation, &path, &id, location, local)?;
                     if let Action::Update { location, .. } = &action {
@@ -141,6 +202,8 @@ impl BatchPlan {
             workspace,
             entries,
             discovery_errors: discovery.errors,
+            found: discovery.found,
+            discovery_complete: discovery.complete,
         })
     }
 
@@ -150,13 +213,26 @@ impl BatchPlan {
             .any(|entry| matches!(entry.action, Action::Update { .. }))
     }
 
-    fn write(&self, output: &mut dyn Write) -> io::Result<()> {
-        writeln!(output, "Found {} contests.", self.entries.len())?;
+    fn write(
+        &self,
+        output: &mut dyn Write,
+        cancellation: UpdateCancellation<'_>,
+    ) -> io::Result<()> {
+        if cancellation.is_requested() {
+            return Ok(());
+        }
+        writeln!(output, "Found {} contests.", self.found)?;
         writeln!(output, "Plan:")?;
         for (path, error) in &self.discovery_errors {
+            if cancellation.is_requested() {
+                return Ok(());
+            }
             writeln!(output, "  {}  BLOCKED  {error}", path.display())?;
         }
         for entry in &self.entries {
+            if cancellation.is_requested() {
+                return Ok(());
+            }
             write!(
                 output,
                 "  {}  {}  {}  ",
@@ -193,7 +269,7 @@ impl BatchPlan {
         reporter: &mut dyn Reporter,
         output: &mut dyn Write,
     ) -> Result<ExitCode, AppError> {
-        let total = self.entries.len();
+        let diagnosed = self.entries.len();
         let mut counts = BTreeMap::<Status, usize>::new();
         let mut failures = Vec::new();
         let mut stopped = None;
@@ -202,21 +278,21 @@ impl BatchPlan {
             let PlanEntry {
                 id, path, action, ..
             } = entry;
-            let progress = format!("[{}/{}] {id}", index + 1, total);
+            let progress = format!("[{}/{}] {id}", index + 1, self.found);
             if cancellation.is_requested() {
                 stopped = Some(StopReason::Interrupted);
             }
             let (status, reason) = match action {
                 Action::Report(status, reason) => (status, reason),
-                Action::Update { update, .. } if dry_run => {
-                    (update.planned_status(), String::new())
-                }
-                Action::Update { .. } if !run || stopped.is_some() => (
+                Action::Update { .. } if stopped.is_some() || (!run && !dry_run) => (
                     Status::NotRun,
                     stopped
                         .map_or("changes were not approved", StopReason::message)
                         .into(),
                 ),
+                Action::Update { update, .. } if dry_run => {
+                    (update.planned_status(), String::new())
+                }
                 Action::Update { location, update } => {
                     writeln!(output, "{progress}  {}", update.running_label())?;
                     let validate_route = |_: &Path| self.workspace.revalidate(&id, &location);
@@ -269,10 +345,30 @@ impl BatchPlan {
         }
 
         writeln!(output, "\nSummary:")?;
-        writeln!(output, "  {:<22} {total:>5}", "Scanned:")?;
+        if self.discovery_complete {
+            writeln!(output, "  {:<22} {:>5}", "Scanned:", self.found)?;
+        } else {
+            writeln!(
+                output,
+                "  {:<22} {:>5}",
+                "Discovered (partial):", self.found
+            )?;
+        }
+        if !self.discovery_complete || diagnosed != self.found || cancellation.is_requested() {
+            writeln!(output, "  {:<22} {diagnosed:>5}", "Diagnosed:")?;
+            writeln!(
+                output,
+                "  {:<22} {:>5}",
+                "Undiagnosed:",
+                self.found - diagnosed
+            )?;
+        }
         for (status, label) in Status::SUMMARY {
             let count = counts.get(&status).copied().unwrap_or_default();
-            if count != 0 || matches!(status, Status::Healthy | Status::Failed) {
+            if count != 0
+                || matches!(status, Status::Healthy | Status::Failed)
+                || (status == Status::NotRun && cancellation.is_requested())
+            {
                 writeln!(output, "  {label:<22} {count:>5}")?;
             }
         }
@@ -606,6 +702,17 @@ mod tests {
     }
 
     fn assert_batch_interruption(interrupt_at: InterruptionPoint) {
+        let interrupted = AtomicBool::new(false);
+        assert_batch_interruption_with_signal(interrupt_at, &interrupted, || {
+            interrupted.store(true, Ordering::SeqCst);
+        });
+    }
+
+    fn assert_batch_interruption_with_signal(
+        interrupt_at: InterruptionPoint,
+        interrupted: &AtomicBool,
+        signal: impl Fn(),
+    ) {
         for (operation, name, completed) in [
             (
                 BatchOperation::Refresh { force: false },
@@ -614,6 +721,7 @@ mod tests {
             ),
             (BatchOperation::Migrate, "migrate", "MIGRATED"),
         ] {
+            interrupted.store(false, Ordering::SeqCst);
             let root = workspace();
             let first = repairable(root.path(), "abc466", 2);
             let next = repairable(root.path(), "abc467", 2);
@@ -638,9 +746,11 @@ mod tests {
             let metadata = fs::read(first.join(".atc/contest.toml")).unwrap();
             let tests = read_tree_snapshot(&first.join("tests")).unwrap();
             let diagnosis = diagnose_contest(&first, "abc466");
-            let interrupted = AtomicBool::new(false);
             let checkpoint = |checkpoint: UpdateCheckpoint<'_>| {
                 let observed = match checkpoint {
+                    UpdateCheckpoint::Discovery
+                    | UpdateCheckpoint::AfterDiagnosis
+                    | UpdateCheckpoint::UnderLock => return,
                     UpdateCheckpoint::BeforeStaging => {
                         assert_eq!(read_tree_snapshot(&first).unwrap(), first_before);
                         InterruptionPoint::BeforeStaging
@@ -667,13 +777,13 @@ mod tests {
                     }
                 };
                 if observed == interrupt_at {
-                    interrupted.store(true, Ordering::SeqCst);
+                    signal();
                 }
             };
-            let mut cancellation = UpdateCancellation::for_batch(&interrupted);
+            let mut cancellation = UpdateCancellation::for_batch(interrupted);
             cancellation.checkpoint = Some(&checkpoint);
             let mut output = Vec::new();
-            let code = BatchPlan::scan(root.path(), operation)
+            let code = BatchPlan::scan(root.path(), operation, UpdateCancellation::default())
                 .unwrap()
                 .run(
                     true,
@@ -792,6 +902,42 @@ mod tests {
                     assert!(!staging.join("previous-contest.toml").exists());
                 }
             }
+
+            // Retry just the interrupted target through its normal update path. The
+            // staged-but-uncommitted data and completed archives must allow reopening it.
+            let single_root = first.parent().unwrap();
+            let tree_before_rerun = read_tree_snapshot(&next).unwrap();
+            if matches!(operation, BatchOperation::Migrate) {
+                let plan = migration::inspect(first.clone(), "abc466".into()).unwrap();
+                if interrupt_at == InterruptionPoint::AfterIntent {
+                    assert!(matches!(plan, MigrationInspection::Healthy));
+                } else {
+                    let MigrationInspection::Ready(plan) = plan else {
+                        panic!("interrupted migration must be eligible for retry");
+                    };
+                    execute_migration(
+                        *plan,
+                        || Ok(fixture_client()),
+                        &mut NullReporter,
+                        ContestUpdateChecks::default(),
+                    )
+                    .unwrap();
+                }
+            } else {
+                super::super::refresh::refresh_from(
+                    single_root,
+                    Some("abc466"),
+                    false,
+                    || Ok(fixture_client()),
+                    &mut NullReporter,
+                )
+                .unwrap();
+            }
+            assert!(matches!(
+                diagnose_contest(&first, "abc466"),
+                ContestDiagnosis::Healthy { .. }
+            ));
+            assert_eq!(read_tree_snapshot(&next).unwrap(), tree_before_rerun);
         }
     }
 
@@ -815,6 +961,168 @@ mod tests {
         assert_batch_interruption(InterruptionPoint::AfterIntent);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_ctrl_c_during_discovery_diagnosis_and_replacement() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        use wait_timeout::ChildExt;
+        use windows_sys::Win32::System::Console::{
+            CTRL_C_EVENT, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        const CHILD: &str = "ATC_BATCH_UNIT_CONSOLE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let mut driver = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::batch::tests::windows_console_ctrl_c_during_discovery_diagnosis_and_replacement", "--nocapture"])
+                .env(CHILD, "1")
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            if driver
+                .wait_timeout(Duration::from_secs(30))
+                .unwrap()
+                .is_none()
+            {
+                let _ = driver.kill();
+                let _ = driver.wait();
+                panic!("isolated console test did not finish");
+            }
+            let output = driver.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        install_interrupt_handler().unwrap();
+        let mut process = 0u32;
+        // SAFETY: the single process ID buffer is writable.
+        assert_eq!(unsafe { GetConsoleProcessList(&mut process, 1) }, 1);
+        assert_eq!(process, std::process::id());
+        let signal = || {
+            // SAFETY: group zero is confined to the private console created above.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !INTERRUPTED.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "Windows handler did not receive CTRL_C_EVENT"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        for discovery in [true, false] {
+            INTERRUPTED.store(false, Ordering::SeqCst);
+            let root = workspace();
+            repairable(root.path(), "abc466", 2);
+            repairable(root.path(), "abc467", 2);
+            let before = read_tree_snapshot(root.path()).unwrap();
+            let checkpoint = |point: UpdateCheckpoint<'_>| match point {
+                UpdateCheckpoint::Discovery if discovery => signal(),
+                UpdateCheckpoint::AfterDiagnosis if !discovery => signal(),
+                _ => (),
+            };
+            let mut cancellation = UpdateCancellation::for_batch(&INTERRUPTED);
+            cancellation.checkpoint = Some(&checkpoint);
+            let plan = BatchPlan::scan(
+                root.path(),
+                BatchOperation::Refresh { force: false },
+                cancellation,
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            plan.write(&mut output, cancellation).unwrap();
+            assert!(output.is_empty());
+            let code = plan
+                .run(
+                    true,
+                    false,
+                    cancellation,
+                    || panic!("interrupted planning must not initialize a client"),
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(code, ExitCode::from(130));
+            let output = String::from_utf8(output).unwrap();
+            if discovery {
+                assert!(output.contains("Discovered (partial):      0"), "{output}");
+                assert!(output.contains("Diagnosed:                 0"), "{output}");
+            } else {
+                assert!(output.contains("Scanned:                   2"), "{output}");
+                assert!(output.contains("Diagnosed:                 1"), "{output}");
+                assert!(output.contains("Undiagnosed:               1"), "{output}");
+                assert!(output.contains("Not run:                   1"), "{output}");
+            }
+            assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
+        }
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let cancellation = UpdateCancellation::for_batch(&INTERRUPTED);
+        let root = workspace();
+        repairable(root.path(), "abc466", 2);
+        repairable(root.path(), "abc467", 2);
+        let before = read_tree_snapshot(root.path()).unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Refresh { force: false },
+            cancellation,
+        )
+        .unwrap();
+
+        struct InterruptOnPlan<F>(Vec<u8>, F);
+        impl<F: Fn()> Write for InterruptOnPlan<F> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes == b"Plan:\n" {
+                    self.1();
+                }
+                self.0.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = InterruptOnPlan(Vec::new(), signal);
+        plan.write(&mut output, cancellation).unwrap();
+        let mut output = output.0;
+        assert!(output.ends_with(b"Plan:\n"));
+        assert_eq!(
+            plan.run(
+                true,
+                false,
+                cancellation,
+                || panic!("interrupted plan must not initialize a client"),
+                &mut NullReporter,
+                &mut output
+            )
+            .unwrap(),
+            ExitCode::from(130),
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Diagnosed:                 2"), "{output}");
+        assert!(output.contains("Undiagnosed:               0"), "{output}");
+        assert!(output.contains("Not run:                   2"), "{output}");
+        assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
+
+        for point in [
+            InterruptionPoint::BeforeApply,
+            InterruptionPoint::BeforeIntent,
+            InterruptionPoint::AfterIntent,
+        ] {
+            assert_batch_interruption_with_signal(point, &INTERRUPTED, signal);
+        }
+    }
+
     #[test]
     fn one_hundred_healthy_contests_never_initialize_the_http_client() {
         let root = workspace();
@@ -827,7 +1135,7 @@ mod tests {
             BatchOperation::Migrate,
         ] {
             let mut output = Vec::new();
-            let ok = BatchPlan::scan(root.path(), operation)
+            let ok = BatchPlan::scan(root.path(), operation, UpdateCancellation::default())
                 .unwrap()
                 .run(
                     true,
@@ -854,9 +1162,15 @@ mod tests {
             fs::write(tests.join("legacy"), b"old tests").unwrap();
         }
         let before = read_tree_snapshot(root.path()).unwrap();
-        let plan = BatchPlan::scan(root.path(), BatchOperation::Migrate).unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Migrate,
+            UpdateCancellation::default(),
+        )
+        .unwrap();
         let mut output = Vec::new();
-        plan.write(&mut output).unwrap();
+        plan.write(&mut output, UpdateCancellation::default())
+            .unwrap();
         let approved = confirm_migration(&mut b"n\n".as_slice(), &mut output).unwrap();
         assert!(!approved);
         let code = plan
@@ -927,12 +1241,13 @@ mod tests {
                 "route",
                 "rules",
                 "directory",
+                "boundary",
             ] {
                 let root = workspace();
                 let root = root.path();
                 let config = root.join(".atc-workspace.toml");
-                fs::write(&config, mapping("^abc466$", "old")).unwrap();
-                let contest = repairable(&root.join("old"), "abc466", 3);
+                fs::write(&config, mapping("^abc466$", "old/series")).unwrap();
+                let contest = repairable(&root.join("old/series"), "abc466", 3);
                 add_samples(&contest);
                 let mut edited = None;
                 let mut reporter = OnLastSample(Some(|| {
@@ -953,10 +1268,14 @@ mod tests {
                             repairable(&root.join("new"), "abc466", 3);
                             fs::write(&config, mapping("^abc466$", "new")).unwrap();
                         }
-                        "rules" => fs::write(&config, mapping("^abc", "old")).unwrap(),
+                        "rules" => fs::write(&config, mapping("^abc", "old/series")).unwrap(),
                         "directory" => {
                             fs::rename(&contest, root.join("saved-contest")).unwrap();
-                            add_samples(&repairable(&root.join("old"), "abc466", 3));
+                            add_samples(&repairable(&root.join("old/series"), "abc466", 3));
+                        }
+                        "boundary" => {
+                            fs::write(root.join("old/.atc-workspace.toml"), "version = 1\n")
+                                .unwrap()
                         }
                         _ => unreachable!(),
                     }
@@ -964,8 +1283,12 @@ mod tests {
                 }));
 
                 let message = if batch {
-                    let plan =
-                        BatchPlan::scan(root, BatchOperation::Refresh { force: false }).unwrap();
+                    let plan = BatchPlan::scan(
+                        root,
+                        BatchOperation::Refresh { force: false },
+                        UpdateCancellation::default(),
+                    )
+                    .unwrap();
                     let mut output = Vec::new();
                     let code = plan
                         .run(
@@ -997,6 +1320,7 @@ mod tests {
                     }
                     "route" | "rules" => "Workspace route changed",
                     "directory" => "contest destination changed",
+                    "boundary" => "Workspace boundary at",
                     _ => "local tests changed",
                 };
                 assert!(
@@ -1037,8 +1361,12 @@ mod tests {
             let interrupted = AtomicBool::new(false);
             let mut cancellation = UpdateCancellation::for_batch(&interrupted);
             cancellation.checkpoint = Some(&checkpoint);
-            let plan =
-                BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+            let plan = BatchPlan::scan(
+                root.path(),
+                BatchOperation::Refresh { force: false },
+                UpdateCancellation::default(),
+            )
+            .unwrap();
             let mut output = Vec::new();
             let code = plan
                 .run(
@@ -1076,6 +1404,72 @@ mod tests {
     }
 
     #[test]
+    fn locked_updates_reject_a_new_intermediate_workspace_without_replacing_data() {
+        for operation in [
+            BatchOperation::Refresh { force: false },
+            BatchOperation::Migrate,
+        ] {
+            let root = workspace();
+            let root = root.path();
+            fs::write(
+                root.join(".atc-workspace.toml"),
+                "version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'inner/series'\n",
+            )
+            .unwrap();
+            let contest = repairable(&root.join("inner/series"), "abc466", 2);
+            let manifest = contest.join(".atc/contest.toml");
+            if matches!(operation, BatchOperation::Migrate) {
+                fs::write(&manifest, "version = 99\ncontest_id = 'abc466'\n").unwrap();
+            }
+            let tests = contest.join("tests/A");
+            fs::create_dir_all(&tests).unwrap();
+            fs::write(tests.join("sample-1.in"), b"old input").unwrap();
+            let metadata_before = fs::read(&manifest).unwrap();
+            let tests_before = read_tree_snapshot(&tests).unwrap();
+            let checkpoint = |point: UpdateCheckpoint<'_>| {
+                if matches!(point, UpdateCheckpoint::UnderLock) {
+                    assert_eq!(
+                        lock_contest_update(&contest, false).unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    fs::write(root.join("inner/.atc-workspace.toml"), "version = 1\n").unwrap();
+                }
+            };
+            let mut cancellation = UpdateCancellation::default();
+            cancellation.checkpoint = Some(&checkpoint);
+            let plan = BatchPlan::scan(root, operation, cancellation).unwrap();
+            let mut output = Vec::new();
+            let status = plan
+                .run(
+                    true,
+                    false,
+                    cancellation,
+                    || Ok(fixture_client()),
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            let message = String::from_utf8(output).unwrap();
+            assert_eq!(status, ExitCode::FAILURE, "{message}");
+            assert!(message.contains("Workspace boundary at"), "{message}");
+            assert_eq!(fs::read(&manifest).unwrap(), metadata_before);
+            assert_eq!(read_tree_snapshot(&tests).unwrap(), tests_before);
+            let staging = fs::read_dir(&contest)
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_str().unwrap();
+                    name.starts_with(".atc-refresh-") || name.starts_with(".atc-migrate-")
+                })
+                .unwrap()
+                .path();
+            assert!(!staging.join(safe_file::RECOVERY_INTENT).exists());
+            assert!(!staging.join("previous-tests").exists());
+        }
+    }
+
+    #[test]
     fn refresh_revalidates_tests_changed_by_an_independent_edit_after_planning() {
         let root = workspace();
         repairable(root.path(), "abc460", 1);
@@ -1087,7 +1481,12 @@ mod tests {
         let mut reporter = DuringFetch(Box::new(|| {
             fs::write(changed.join("sample-1.in"), b"modified").unwrap()
         }));
-        let plan = BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Refresh { force: false },
+            UpdateCancellation::default(),
+        )
+        .unwrap();
         let mut output = Vec::new();
         let client_initializations = Cell::new(0);
         let code = plan
@@ -1127,7 +1526,12 @@ mod tests {
         let mut reporter = DuringFetch(Box::new(|| {
             fs::write(&changed_file, b"new local input").unwrap()
         }));
-        let plan = BatchPlan::scan(root.path(), BatchOperation::Migrate).unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Migrate,
+            UpdateCancellation::default(),
+        )
+        .unwrap();
         let mut output = Vec::new();
         let code = plan
             .run(
@@ -1154,7 +1558,12 @@ mod tests {
     fn a_duplicate_created_after_planning_refuses_the_update() {
         let root = workspace();
         let original = repairable(root.path(), "abc466", 1);
-        let plan = BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Refresh { force: false },
+            UpdateCancellation::default(),
+        )
+        .unwrap();
         let duplicate = repairable(&root.path().join("ABC"), "abc466", 1);
         let before = read_tree_snapshot(root.path()).unwrap();
         let mut output = Vec::new();
@@ -1199,8 +1608,12 @@ mod tests {
             repairable(root.path(), "abc460", 1);
             repairable(root.path(), "abc466", 1);
             let before = read_tree_snapshot(root.path()).unwrap();
-            let plan =
-                BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+            let plan = BatchPlan::scan(
+                root.path(),
+                BatchOperation::Refresh { force: false },
+                UpdateCancellation::default(),
+            )
+            .unwrap();
             let mut output = Vec::new();
             let error = Cell::new(Some(error));
             let code = plan
@@ -1238,7 +1651,12 @@ mod tests {
             let empty = tests.join("empty");
             fs::create_dir_all(&empty).unwrap();
             fs::write(tests.join("custom.in"), b"preserve me").unwrap();
-            let plan = BatchPlan::scan(root.path(), BatchOperation::Migrate).unwrap();
+            let plan = BatchPlan::scan(
+                root.path(),
+                BatchOperation::Migrate,
+                UpdateCancellation::default(),
+            )
+            .unwrap();
             match change {
                 "add" => fs::create_dir(tests.join("extra")).unwrap(),
                 "remove" => fs::remove_dir(&empty).unwrap(),

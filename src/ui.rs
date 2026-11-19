@@ -189,6 +189,40 @@ pub trait Reporter {
     fn report(&mut self, event: Event<'_>);
 }
 
+pub(crate) fn write_contest_update_event(
+    output: &mut dyn std::io::Write,
+    event: &Event<'_>,
+) -> Option<std::io::Result<()>> {
+    Some(match event {
+        Event::ContestFetching { contest_id } => {
+            writeln!(output, "Fetching contest {contest_id}...")
+        }
+        Event::ContestFetched {
+            contest_id,
+            problems,
+        } => {
+            writeln!(output, "Found {problems} problems in {contest_id}")
+        }
+        Event::ProblemFetching {
+            index,
+            current,
+            total,
+        } => {
+            writeln!(output, "[{current}/{total}] Fetching {index}...")
+        }
+        Event::ProblemFetched { index, samples } => {
+            writeln!(output, "  {index}: {samples} samples")
+        }
+        Event::ProblemFetchFailed { index, error } => {
+            writeln!(output, "  failed to fetch {index}: {error}")
+        }
+        Event::WorkspaceRefreshed { destination } => {
+            writeln!(output, "Refreshed {}", destination.display())
+        }
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DisplayVerdict {
     Ac,
@@ -273,40 +307,21 @@ impl Reporter for TerminalReporter {
                     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
                 print!("{}", render_doctor_report(report, color));
             }
-            Event::ContestFetching { contest_id } => {
-                eprintln!("Fetching contest {contest_id}...");
-            }
-
-            Event::ContestFetched {
-                contest_id,
-                problems,
-            } => {
-                eprintln!("Found {problems} problems in {contest_id}");
-            }
-
-            Event::ProblemFetching {
-                index,
-                current,
-                total,
-            } => {
-                eprintln!("[{current}/{total}] Fetching {index}...");
-            }
-
-            Event::ProblemFetched { index, samples } => {
-                eprintln!("  {index}: {samples} samples");
-            }
-
-            Event::ProblemFetchFailed { index, error } => {
-                eprintln!("  failed to fetch {index}: {error}");
+            Event::ContestFetching { .. }
+            | Event::ContestFetched { .. }
+            | Event::ProblemFetching { .. }
+            | Event::ProblemFetched { .. }
+            | Event::ProblemFetchFailed { .. }
+            | Event::WorkspaceRefreshed { .. } => {
+                if let Some(result) = write_contest_update_event(&mut std::io::stderr(), &event) {
+                    result.expect("failed printing to stderr");
+                }
             }
 
             Event::WorkspaceCreated { destination } => {
                 eprintln!("Created {}", destination.display());
             }
 
-            Event::WorkspaceRefreshed { destination } => {
-                eprintln!("Refreshed {}", destination.display());
-            }
             Event::WorkspaceRefreshSkipped { contest_id } => {
                 eprintln!("{contest_id}: local data healthy; refresh skipped");
             }

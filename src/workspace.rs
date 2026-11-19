@@ -468,7 +468,8 @@ pub(crate) struct ExplicitContestRoute {
     pub(crate) destination: PathBuf,
     config: Option<WorkspaceConfig>,
     root_identity: PhysicalDirectoryIdentity,
-    parent_identity: Option<PhysicalDirectoryIdentity>,
+    parent_identity: PhysicalDirectoryIdentity,
+    destination_identity: PhysicalDirectoryIdentity,
 }
 
 impl ExplicitContestRoute {
@@ -481,29 +482,42 @@ impl ExplicitContestRoute {
             Some(config) => matching_workspace_path(config, contest_id)?,
             None => None,
         };
-        let (destination, parent_identity) = if let Some(mapping) = mapping {
-            let parent = mapping.append_to(root);
-            let identity = walk_workspace_mapping_in(root, directory, mapping, false)?
-                .map(|directory| opened_directory_identity(&directory, &parent))
-                .transpose()?;
-            (parent.join(contest_id), identity)
-        } else {
-            (root.join(contest_id), Some(root_identity.clone()))
+        let parent_path = mapping.map_or_else(|| root.to_path_buf(), |path| path.append_to(root));
+        let destination = parent_path.join(contest_id);
+        let parent = match mapping {
+            Some(mapping) => open_workspace_update_parent(root, &directory, mapping)?
+                .ok_or_else(|| missing_contest_directory(&destination))?,
+            None => directory,
         };
+        let parent_identity = opened_directory_identity(&parent, &parent_path)?;
+        let target =
+            open_managed_directory(&parent, contest_id, &destination, "contest directory")?
+                .ok_or_else(|| missing_contest_directory(&destination))?;
+        reject_nested_workspace(&target, &destination)?;
+        let destination_identity = opened_directory_identity(&target, &destination)?;
         Ok(Self {
             destination,
             config,
             root_identity,
             parent_identity,
+            destination_identity,
         })
     }
 
     pub(crate) fn revalidate(&self, root: &Path, contest_id: &str) -> io::Result<()> {
-        if &Self::resolve(root, contest_id)? != self {
+        let current = Self::resolve(root, contest_id)?;
+        if current != *self {
+            let changed = if current.destination == self.destination
+                && current.destination_identity != self.destination_identity
+            {
+                "contest destination changed"
+            } else {
+                "Workspace route changed"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!(
-                    "Workspace route changed while refresh was being prepared: {}",
+                    "{changed} while preparing the update: {}",
                     self.destination.display()
                 ),
             ));
@@ -1091,8 +1105,45 @@ fn entry_exists(directory: &CapDir, name: &str) -> io::Result<bool> {
     }
 }
 
-fn workspace_config_entry_exists(directory: &CapDir) -> io::Result<bool> {
-    entry_exists(directory, WORKSPACE_CONFIG_FILE)
+fn reject_nested_workspace(directory: &CapDir, path: &Path) -> io::Result<()> {
+    if entry_exists(directory, WORKSPACE_CONFIG_FILE)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Workspace boundary at {}: run this command from that Workspace root with `-c <contest-id>` or `--all`",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn open_workspace_update_parent(
+    root: &Path,
+    directory: &CapDir,
+    parent: &WorkspaceRelativePath,
+) -> io::Result<Option<CapDir>> {
+    let mut directory = directory.try_clone()?;
+    let mut path = root.to_path_buf();
+    for component in parent.components() {
+        path.push(component);
+        let Some(child) =
+            open_managed_directory(&directory, component, &path, "workspace mapping directory")?
+        else {
+            return Ok(None);
+        };
+        reject_nested_workspace(&child, &path)?;
+        directory = child;
+    }
+    Ok(Some(directory))
+}
+
+pub(crate) fn validate_workspace_update_target(destination: &Path) -> io::Result<()> {
+    match open_contest_destination_nofollow(destination.components().as_path()) {
+        Ok(directory) => reject_nested_workspace(&directory, destination),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
@@ -3001,6 +3052,10 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
 
     let recovery_identity =
         safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
+    #[cfg(test)]
+    if let Some(checkpoint) = cancellation.checkpoint {
+        checkpoint(update_cancellation::UpdateCheckpoint::UnderLock);
+    }
     validate_update(previous_tests_snapshot.as_ref())
         .map_err(|error| preserved_staging_error(&staging_root, error))?;
     cancellation.record_intent(&staging_root, || {

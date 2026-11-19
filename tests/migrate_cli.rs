@@ -99,12 +99,12 @@ fn migrate_refuses_a_workspace_root_before_planning_or_writing() {
             let output = cli(&root).args(["migrate", flag]).output().unwrap();
             let message = stderr(&output);
             assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(message.contains("Workspace boundary at"), "{message}");
+            assert!(message.contains("from that Workspace root"), "{message}");
             assert!(
-                message.contains("cannot migrate a Workspace directory"),
+                message.contains("`-c <contest-id>` or `--all`"),
                 "{message}"
             );
-            assert!(message.contains("atc migrate -c <contest-id>"), "{message}");
-            assert!(message.contains("atc migrate --all"), "{message}");
             assert!(!message.contains("Migrate abc466"), "{message}");
             assert!(!message.contains("Fetching"), "{message}");
             assert_eq!(tree(&root), before);
@@ -133,10 +133,7 @@ fn migrate_refuses_an_explicit_target_that_resolves_to_a_workspace() {
         .unwrap();
     let message = stderr(&output);
     assert_eq!(output.status.code(), Some(1), "{message}");
-    assert!(
-        message.contains("cannot migrate a Workspace directory"),
-        "{message}"
-    );
+    assert!(message.contains("Workspace boundary at"), "{message}");
     assert!(!message.contains("Fetching"), "{message}");
     assert_eq!(tree(root), before);
 
