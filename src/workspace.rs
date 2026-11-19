@@ -17,6 +17,10 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
+// The diagnostic entry point will be called by later refresh and migration phases.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod diagnosis;
+
 const METADATA_VERSION: u32 = 1;
 const MAX_CONTEST_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const WORKSPACE_CONFIG_FILE: &str = ".atc-workspace.toml";
@@ -930,9 +934,23 @@ pub(crate) fn lock_contest_update(destination: &Path, shared: bool) -> io::Resul
 }
 
 fn contest_recovery_state(destination: &Path, directory: &CapDir) -> io::Result<HashSet<String>> {
+    inspect_contest_recovery_state(destination, directory).map_err(|error| match error {
+        ContestRecoveryError::Scan(source) | ContestRecoveryError::Area { source, .. } => source,
+    })
+}
+
+enum ContestRecoveryError {
+    Scan(io::Error),
+    Area { path: PathBuf, source: io::Error },
+}
+
+fn inspect_contest_recovery_state(
+    destination: &Path,
+    directory: &CapDir,
+) -> Result<HashSet<String>, ContestRecoveryError> {
     let mut finalized = HashSet::new();
-    for entry in directory.entries()? {
-        let entry = entry?;
+    for entry in directory.entries().map_err(ContestRecoveryError::Scan)? {
+        let entry = entry.map_err(ContestRecoveryError::Scan)?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -942,47 +960,56 @@ fn contest_recovery_state(destination: &Path, directory: &CapDir) -> io::Result<
             continue;
         }
         let path = destination.join(&name);
-        let Some(recovery) =
-            open_managed_directory(directory, &name, &path, "contest recovery directory")?
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("contest recovery directory disappeared: {}", path.display()),
-            ));
-        };
+        if let Err(source) = inspect_contest_recovery_area(directory, &name, &path, is_recovery) {
+            return Err(ContestRecoveryError::Area { path, source });
+        }
         if is_recovery {
-            let read_record = |name: &str| {
-                safe_file::read_regular_file_snapshot_at(
-                    &recovery,
-                    OsStr::new(name),
-                    &path.join(name),
-                )
-            };
-            let identity = safe_file::parse_completed_recovery(
-                &read_record(safe_file::RECOVERY_INTENT)?.bytes,
-                &read_record(safe_file::RECOVERY_COMPLETE)?.bytes,
-            )?;
-            if !identity.is_contest() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "contest recovery area has invalid ownership: {}",
-                        path.display()
-                    ),
-                ));
-            }
             finalized.insert(name);
-        } else if entry_exists(&recovery, safe_file::RECOVERY_INTENT)?
-            || entry_exists(&recovery, "previous-tests")?
-            || entry_exists(&recovery, "previous-contest.toml")?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("contest update requires recovery check: {}", path.display()),
-            ));
         }
     }
     Ok(finalized)
+}
+
+fn inspect_contest_recovery_area(
+    directory: &CapDir,
+    name: &str,
+    path: &Path,
+    is_recovery: bool,
+) -> io::Result<()> {
+    let recovery = open_managed_directory(directory, name, path, "contest recovery directory")?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("contest recovery directory disappeared: {}", path.display()),
+            )
+        })?;
+    if is_recovery {
+        let read_record = |name: &str| {
+            safe_file::read_regular_file_snapshot_at(&recovery, OsStr::new(name), &path.join(name))
+        };
+        let identity = safe_file::parse_completed_recovery(
+            &read_record(safe_file::RECOVERY_INTENT)?.bytes,
+            &read_record(safe_file::RECOVERY_COMPLETE)?.bytes,
+        )?;
+        if !identity.is_contest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contest recovery area has invalid ownership: {}",
+                    path.display()
+                ),
+            ));
+        }
+    } else if entry_exists(&recovery, safe_file::RECOVERY_INTENT)?
+        || entry_exists(&recovery, "previous-tests")?
+        || entry_exists(&recovery, "previous-contest.toml")?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("contest update requires recovery check: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn entry_exists(directory: &CapDir, name: &str) -> io::Result<bool> {
@@ -1012,9 +1039,11 @@ fn inspect_contest_metadata_unchecked(destination: &Path) -> io::Result<ContestM
         return Ok(ContestMetadataHealth::Missing);
     }
 
-    let content = fs::read_to_string(&path)?;
+    inspect_contest_metadata_text(&fs::read_to_string(&path)?)
+}
 
-    let header: ContestMetadataHeader = match toml::from_str(&content) {
+fn inspect_contest_metadata_text(content: &str) -> io::Result<ContestMetadataHealth> {
+    let header: ContestMetadataHeader = match toml::from_str(content) {
         Ok(header) => header,
         Err(_) => {
             return Ok(ContestMetadataHealth::Invalid);
@@ -1025,7 +1054,7 @@ fn inspect_contest_metadata_unchecked(destination: &Path) -> io::Result<ContestM
         return Ok(ContestMetadataHealth::UnsupportedVersion(header.version));
     }
 
-    let metadata: ContestMetadata = match toml::from_str(&content) {
+    let metadata: ContestMetadata = match toml::from_str(content) {
         Ok(metadata) => metadata,
         Err(_) => {
             return Ok(ContestMetadataHealth::Invalid);
@@ -1065,24 +1094,18 @@ pub(crate) fn validate_existing_contest_identity(
             let path = destination.join(".atc/contest.toml");
             let bytes = safe_file::read_regular_file_snapshot(&path)?.bytes;
             let content = std::str::from_utf8(&bytes).map_err(|_| unknown_contest_owner_error())?;
-            // Ownership must be checked independently of schema and URL repairability.
-            // TOML parsing still rejects duplicate keys; only the root contest_id is trusted.
-            let metadata: toml::Value =
-                toml::from_str(content).map_err(|_| unknown_contest_owner_error())?;
-            let contest_id = metadata
-                .get("contest_id")
-                .and_then(toml::Value::as_str)
-                .ok_or_else(unknown_contest_owner_error)?;
-            validate_contest_identity(
-                &Contest {
-                    contest_id: contest_id.to_owned(),
-                    problems: Vec::new(),
-                },
-                expected_contest_id,
-            )
+            let contest_id =
+                metadata_contest_owner(content).ok_or_else(unknown_contest_owner_error)?;
+            validate_contest_id_match(&contest_id, expected_contest_id)
         }
         ContestMetadataHealth::UnsupportedVersion(_) => Err(unknown_contest_owner_error()),
     }
+}
+
+fn metadata_contest_owner(content: &str) -> Option<String> {
+    // Ownership is independent of the manifest schema. TOML parsing rejects duplicate keys.
+    let metadata: toml::Value = toml::from_str(content).ok()?;
+    Some(metadata.get("contest_id")?.as_str()?.to_owned())
 }
 
 fn unknown_contest_owner_error() -> io::Error {
@@ -1117,11 +1140,37 @@ pub fn save_samples(destination: &Path, problem: &Problem, samples: &[Sample]) -
     Ok(())
 }
 
-#[derive(Debug)]
-enum SampleFileKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleFileKind {
     Input,
     Output,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleLayoutError {
+    NumberGap { expected: usize, found: usize },
+    MissingFile { number: usize, kind: SampleFileKind },
+}
+
+impl std::fmt::Display for SampleLayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NumberGap { expected, found } => write!(
+                f,
+                "sample numbers must be consecutive from 1: expected {expected}, found {found}"
+            ),
+            Self::MissingFile { number, kind } => {
+                let extension = match kind {
+                    SampleFileKind::Input => "in",
+                    SampleFileKind::Output => "out",
+                };
+                write!(f, "sample-{number}.{extension} is missing")
+            }
+        }
+    }
+}
+
+impl Error for SampleLayoutError {}
 
 #[derive(Debug, Default)]
 struct SampleFiles {
@@ -1194,8 +1243,7 @@ fn open_managed_directory(
     kind: &str,
 ) -> io::Result<Option<CapDir>> {
     let validate = |metadata: cap_std::fs::Metadata| {
-        #[cfg(windows)]
-        if metadata.file_attributes() & 0x400 != 0 {
+        if managed_metadata_is_reparse(&metadata) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{kind} is a reparse point: {}", path.display()),
@@ -1219,6 +1267,16 @@ fn open_managed_directory(
     Ok(Some(directory))
 }
 
+#[cfg(windows)]
+fn managed_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn managed_metadata_is_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
 fn load_samples_in(
     destination: &Path,
     directory: &CapDir,
@@ -1237,6 +1295,10 @@ fn load_samples_in(
         return Ok(Vec::new());
     };
 
+    load_problem_samples(&test_dir, &problem_dir)
+}
+
+fn load_problem_samples(test_dir: &Path, problem_dir: &CapDir) -> io::Result<Vec<Sample>> {
     let mut files = BTreeMap::<usize, SampleFiles>::new();
 
     for entry in problem_dir.entries()? {
@@ -1286,29 +1348,36 @@ fn load_samples_in(
         if number != expected_number {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "sample numbers must be consecutive from 1: expected {expected_number}, found {number}"
-                ),
+                SampleLayoutError::NumberGap {
+                    expected: expected_number,
+                    found: number,
+                },
             ));
         }
 
         let input_name = sample_files.input.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("sample-{number}.in is missing"),
+                SampleLayoutError::MissingFile {
+                    number,
+                    kind: SampleFileKind::Input,
+                },
             )
         })?;
 
         let output_name = sample_files.output.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("sample-{number}.out is missing"),
+                SampleLayoutError::MissingFile {
+                    number,
+                    kind: SampleFileKind::Output,
+                },
             )
         })?;
 
         let read_sample = |name: &OsStr| {
             let bytes =
-                safe_file::read_regular_file_snapshot_at(&problem_dir, name, &test_dir.join(name))?
+                safe_file::read_regular_file_snapshot_at(problem_dir, name, &test_dir.join(name))?
                     .bytes;
             String::from_utf8(bytes)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -1735,17 +1804,20 @@ pub(crate) fn validate_problem_index(problem_index: &str) -> io::Result<()> {
 }
 
 pub fn validate_contest_identity(contest: &Contest, expected_contest_id: &str) -> io::Result<()> {
+    validate_contest_id_match(&contest.contest_id, expected_contest_id)
+}
+
+fn validate_contest_id_match(contest_id: &str, expected_contest_id: &str) -> io::Result<()> {
     validate_path_component(expected_contest_id, "contest ID")?;
 
-    if contest.contest_id == expected_contest_id {
+    if contest_id == expected_contest_id {
         return Ok(());
     }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "contest ID mismatch: requested {expected_contest_id:?}, but metadata contains {:?}",
-            contest.contest_id
+            "contest ID mismatch: requested {expected_contest_id:?}, but metadata contains {contest_id:?}"
         ),
     ))
 }
@@ -3113,42 +3185,68 @@ fn validate_refresh_owned_tests(
     owned_problem_indices: &HashSet<String>,
 ) -> io::Result<()> {
     let tests = open_contest_destination_nofollow(tests_directory)?;
+    match find_unowned_test_entry(tests_directory, &tests, owned_problem_indices)? {
+        Some(UnownedTestEntry::Unsafe(path) | UnownedTestEntry::Unrecognized(path)) => {
+            Err(unowned_refresh_test_error(&path))
+        }
+        None => Ok(()),
+    }
+}
+
+enum UnownedTestEntry {
+    Unsafe(PathBuf),
+    Unrecognized(PathBuf),
+}
+
+fn find_unowned_test_entry(
+    tests_directory: &Path,
+    tests: &CapDir,
+    owned_problem_indices: &HashSet<String>,
+) -> io::Result<Option<UnownedTestEntry>> {
     for problem_entry in tests.entries()? {
-        let problem_entry = problem_entry?;
-        let problem_name = problem_entry.file_name();
+        let problem_name = problem_entry?.file_name();
         let problem_path = tests_directory.join(&problem_name);
+        let metadata = tests.symlink_metadata(&problem_name)?;
+        let file_type = metadata.file_type();
+        if managed_metadata_is_reparse(&metadata) || (!file_type.is_dir() && !file_type.is_file()) {
+            return Ok(Some(UnownedTestEntry::Unsafe(problem_path)));
+        }
         let Some(problem_index) = problem_name.to_str() else {
-            return Err(unowned_refresh_test_error(&problem_path));
+            return Ok(Some(UnownedTestEntry::Unrecognized(problem_path)));
         };
-        if refresh_entry_is_reparse(&problem_path)?
-            || !problem_entry.file_type()?.is_dir()
+        if !file_type.is_dir()
             || (!owned_problem_indices.contains(problem_index)
                 && !matches_owned_problem_alias(
-                    &tests,
+                    tests,
                     tests_directory,
                     problem_index,
                     owned_problem_indices,
                 )?)
         {
-            return Err(unowned_refresh_test_error(&problem_path));
+            return Ok(Some(UnownedTestEntry::Unrecognized(problem_path)));
         }
 
-        for sample_entry in fs::read_dir(&problem_path)? {
-            let sample_entry = sample_entry?;
-            let sample_path = sample_entry.path();
-            if refresh_entry_is_reparse(&sample_path)?
-                || !sample_entry.file_type()?.is_file()
-                || !matches!(
-                    parse_sample_filename(&sample_entry.file_name()),
-                    Ok(Some(_))
-                )
-            {
-                return Err(unowned_refresh_test_error(&sample_path));
+        let problem_dir = open_managed_directory(
+            tests,
+            problem_index,
+            &problem_path,
+            "problem tests directory",
+        )?
+        .ok_or_else(|| unowned_refresh_test_error(&problem_path))?;
+        for sample_entry in problem_dir.entries()? {
+            let sample_name = sample_entry?.file_name();
+            let sample_path = problem_path.join(&sample_name);
+            let metadata = problem_dir.symlink_metadata(&sample_name)?;
+            if managed_metadata_is_reparse(&metadata) || !metadata.file_type().is_file() {
+                return Ok(Some(UnownedTestEntry::Unsafe(sample_path)));
+            }
+            if !matches!(parse_sample_filename(&sample_name), Ok(Some(_))) {
+                return Ok(Some(UnownedTestEntry::Unrecognized(sample_path)));
             }
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn matches_owned_problem_alias(
@@ -3196,16 +3294,6 @@ fn validate_previous_tests_snapshot(
         ));
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn refresh_entry_is_reparse(path: &Path) -> io::Result<bool> {
-    Ok(metadata_is_reparse(&fs::symlink_metadata(path)?))
-}
-
-#[cfg(not(windows))]
-fn refresh_entry_is_reparse(_path: &Path) -> io::Result<bool> {
-    Ok(false)
 }
 
 fn unowned_refresh_test_error(path: &Path) -> io::Error {
@@ -3331,6 +3419,8 @@ fn changed_contest_metadata_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    mod diagnosis;
+
     use super::*;
 
     #[derive(Serialize)]

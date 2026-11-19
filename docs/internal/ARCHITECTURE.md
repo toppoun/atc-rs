@@ -67,6 +67,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `atc contest` / `atc c` → `commands::contest` → 配置先を解決し、`inspect_contest_target` で状態を調べる。未作成なら作成し、要修復なら確認後に修復する。健全な Contest を `watch_tui_at` で開く。
 - Workspace Home の Contest オープンと Contest 画面の切替は `watch_tui.rs` の `resolve_contest_open` → `prepare_workspace_contest_entry` をたどる。現在の Workspace 設定で行き先を解決し、作成・修復が必要なら確認を経て `contest.rs` の共通処理を呼ぶ。準備済みの入力で新しいセッションを開始し、切替時は先に旧セッションを終了する。
 - 修復の分岐は `contest.rs` の `plan_repair`。健全なメタデータがあるときはそれを基準にサンプルを取り直す。欠損・不正などの場合は AtCoder の問題一覧とサンプルを取得する。計画に応じて、`workspace.rs` がメタデータのみ、サンプルのみ、または両方を置換する。
+- [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) の `diagnose_contest` は、解決済みの Contest パスと期待する ID を受け取る内部 API。Recovery、メタデータ、既存 `tests` の所有権、サンプルの構造を順に調べる。検査の部品は `workspace.rs` の既存処理と共有し、操作の選択や更新は呼び出し側が担当する。Phase 1 では既存コマンドは従来の判定経路を使う。
 
 ### Refresh と Recovery
 

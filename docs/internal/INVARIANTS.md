@@ -55,6 +55,14 @@
 - **関連する回帰テスト** — [src/commands/contest.rs](../../src/commands/contest.rs) の `matching_official_samples_do_not_establish_ownership_for_either_update`、`unknown_metadata_owner_cannot_offer_repair_or_change_files`。[src/commands/tests.rs](../../src/commands/tests.rs) の `prepared_refresh_rejects_destination_metadata_changes_before_apply`。[src/workspace.rs](../../src/workspace.rs) の `refresh_install_and_rollback_race_preserves_competitor_and_recovery_data`、`completed_contest_refresh_retains_previous_metadata_and_tests`、`failed_contest_completion_record_preserves_staging_and_blocks_read`。[src/stress.rs](../../src/stress.rs) の `interrupted_replacement_blocks_a_new_stress_save_without_touching_recovery`、`installed_failure_with_blocked_staging_cleanup_is_not_reported_as_saved`（Windows）。
 - **未検証事項・プラットフォーム依存事項** — 停電や任意の強制終了時点での耐久性、全ファイルシステムでの復旧可否は未確認。共有違反など OS による移動の失敗もあり得る。
 
+### Contest のローカル診断
+
+- `diagnose_contest` は解決済みのディレクトリを対象とし、ネットワークやファイルへの書き込みを行わない。Contest 直下の Recovery と管理対象のディレクトリ・ファイルを検査し、メタデータは 16 MiB までの UTF-8 を読む。上位の Workspace の経路解決と書き込み直前の再検査は呼び出し側が担当する。
+- `Healthy` は、メタデータと既存 `tests` の所有情報が整合し、サンプル本文が UTF-8 で、ファイル名・連番・入出力の対・件数がローカルの定義に合う状態。全問題のサンプル数が 0 なら `tests` の欠損を許容する。サンプルは `StructureOnly` を返し、AtCoder の公式本文との一致は未確認。
+- `RepairRequired` は、例えば所有権を妨げる既存 `tests` がない場合のメタデータ欠損や不正、所有を確認できるサンプルの欠損や件数違いを表す。ID 不一致、確認できない所有権、管理外の項目、リンク・reparse point などの不正な種類、確認を要する Recovery は `Blocked` を返す。修復可能な旧メタデータで既存の問題テストがある場合、所有の確定には公式の問題一覧との照合が必要。
+- 対象ディレクトリの欠損は `MissingDirectory`。メタデータのルートに同じ Contest ID があり、バージョンが未対応なら `MigrationRequired(UnsupportedVersion)` を返す。未対応の形式では `tests` の照合を省略する。移行手段の有無は呼び出し側で判断する。診断は最初に検出した問題を返し、協調ロックを取得しない。
+- 実装と単体テストは [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) と [workspace/tests/diagnosis.rs](../../src/workspace/tests/diagnosis.rs) を参照。
+
 ## 5. Watch / TUI consistency
 
 - **対象となる操作** — Plain Watch、TUI の監視・実行キュー、Contest 切替、TUI Refresh。
