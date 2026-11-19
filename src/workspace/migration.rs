@@ -5,7 +5,8 @@ use super::{
     CapDir, MAX_CONTEST_METADATA_BYTES, PhysicalDirectoryIdentity, contest_staging_archive,
     entry_exists, lock_contest_update, metadata_contest_owner, missing_contest_directory,
     open_contest_destination_nofollow, open_managed_directory, opened_directory_identity,
-    preserved_staging_error, read_contest_metadata_snapshot_in,
+    preserved_staging_error, read_contest_metadata_snapshot_in, snapshot_tests,
+    validate_contest_update_lock_entry,
 };
 use crate::safe_file::{self, FileSnapshot, PreservedTempDir, TreeSnapshot};
 use std::ffi::OsStr;
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) enum MigrationInspection {
     Healthy,
+    RefreshRequired,
     Ready(Box<MigrationPlan>),
 }
 
@@ -154,15 +156,29 @@ pub(crate) struct MigrationPlan {
 
 pub(crate) fn inspect(destination: PathBuf, contest_id: String) -> io::Result<MigrationInspection> {
     let diagnosis = diagnose_contest(&destination, &contest_id);
-    let Some(cause) = migration_cause(&diagnosis)
-        .map_err(|reason| reason.into_error(&destination, &contest_id))?
-    else {
-        return Ok(MigrationInspection::Healthy);
+    match inspect_with_diagnosis(&destination, &contest_id, diagnosis)? {
+        MigrationInspection::RefreshRequired => {
+            Err(MigrationRefusal::SamplesOnly.into_error(&destination, &contest_id))
+        }
+        inspection => Ok(inspection),
+    }
+}
+
+pub(crate) fn inspect_with_diagnosis(
+    destination: &Path,
+    contest_id: &str,
+    diagnosis: ContestDiagnosis,
+) -> io::Result<MigrationInspection> {
+    let cause = match migration_cause(&diagnosis) {
+        Ok(Some(cause)) => cause,
+        Ok(None) => return Ok(MigrationInspection::Healthy),
+        Err(MigrationRefusal::SamplesOnly) => return Ok(MigrationInspection::RefreshRequired),
+        Err(reason) => return Err(reason.into_error(destination, contest_id)),
     };
 
-    let directories = LiveDirectories::open(&destination)?;
-    let identities = directories.identities(&destination)?;
-    let metadata = directories.metadata(&destination)?;
+    let directories = LiveDirectories::open(destination)?;
+    let identities = directories.identities(destination)?;
+    let metadata = directories.metadata(destination)?;
     if let Some(metadata) = &metadata {
         let owner = std::str::from_utf8(&metadata.bytes)
             .ok()
@@ -173,50 +189,29 @@ pub(crate) fn inspect(destination: PathBuf, contest_id: String) -> io::Result<Mi
             None => Some(BlockReason::MetadataOwnershipUnknown),
         };
         if let Some(reason) = reason {
-            return Err(MigrationRefusal::Diagnosis(reason).into_error(&destination, &contest_id));
+            return Err(MigrationRefusal::Diagnosis(reason).into_error(destination, contest_id));
         }
     }
 
-    safe_file::regular_file_exists_at(
-        &directories.root,
-        OsStr::new(".atc-update.lock"),
-        &destination.join(".atc-update.lock"),
-    )?;
-    let tests = snapshot_tests(&directories.root, &destination, "tests")?;
-    let current = LiveDirectories::open(&destination)?;
-    if diagnose_contest(&destination, &contest_id) != diagnosis
-        || current.identities(&destination)? != identities
-        || current.metadata(&destination)? != metadata
+    validate_contest_update_lock_entry(&directories.root, destination)?;
+    let tests = snapshot_tests(&directories.root, destination, "tests")?;
+    let current = LiveDirectories::open(destination)?;
+    if diagnose_contest(destination, contest_id) != diagnosis
+        || current.identities(destination)? != identities
+        || current.metadata(destination)? != metadata
     {
         return Err(changed_local_data());
     }
 
     Ok(MigrationInspection::Ready(Box::new(MigrationPlan {
-        destination,
-        contest_id,
+        destination: destination.to_owned(),
+        contest_id: contest_id.to_owned(),
         cause,
         diagnosis,
         directories: identities,
         metadata,
         tests,
     })))
-}
-
-fn snapshot_tests(
-    root: &CapDir,
-    destination: &Path,
-    name: &str,
-) -> io::Result<Option<TreeSnapshot>> {
-    let path = destination.join(name);
-    let snapshot = open_managed_directory(root, name, &path, "tests directory")?
-        .map(|tests| safe_file::read_tree_snapshot_in(&tests, &path))
-        .transpose();
-    snapshot.map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("cannot safely back up {}: {error}", path.display()),
-        )
-    })
 }
 
 fn changed_local_data() -> io::Error {
@@ -281,13 +276,33 @@ impl MigrationPlan {
         self.open_unchanged().map(|_| ())
     }
 
-    pub(crate) fn apply(self, staging: PreservedTempDir) -> io::Result<PathBuf> {
-        self.apply_with_hooks(staging, |_| {}, |_| {})
+    pub(crate) fn apply_checked(
+        self,
+        staging: PreservedTempDir,
+        validate_route: impl Fn(&Path) -> io::Result<()>,
+    ) -> io::Result<PathBuf> {
+        self.apply_with_checks(staging, validate_route, |_| {}, |_| {})
     }
 
+    #[cfg(test)]
     fn apply_with_hooks(
         self,
         staging: PreservedTempDir,
+        before_metadata_backup: impl FnOnce(&Path),
+        before_metadata_install: impl FnOnce(&Path),
+    ) -> io::Result<PathBuf> {
+        self.apply_with_checks(
+            staging,
+            |_| Ok(()),
+            before_metadata_backup,
+            before_metadata_install,
+        )
+    }
+
+    fn apply_with_checks(
+        self,
+        staging: PreservedTempDir,
+        validate_route: impl Fn(&Path) -> io::Result<()>,
         before_metadata_backup: impl FnOnce(&Path),
         before_metadata_install: impl FnOnce(&Path),
     ) -> io::Result<PathBuf> {
@@ -296,6 +311,8 @@ impl MigrationPlan {
         let archive = contest_staging_archive(&staging_root, ".atc-recovery-")?;
         let identity = safe_file::RecoveryIdentity::new("contest", &self.contest_id, None);
         let _lock = lock_contest_update(destination, false)
+            .map_err(|error| preserved_staging_error(&staging_root, error))?;
+        validate_route(destination)
             .map_err(|error| preserved_staging_error(&staging_root, error))?;
         let live = self
             .open_unchanged()

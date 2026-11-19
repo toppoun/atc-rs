@@ -300,7 +300,8 @@ fn migrate_dry_run_and_noninteractive_input_leave_the_tree_untouched() {
         .args(["migrate", "--all"])
         .output()
         .unwrap();
-    assert_eq!(out_of_scope.status.code(), Some(2));
+    assert_eq!(out_of_scope.status.code(), Some(1));
+    assert!(stderr(&out_of_scope).contains("run --all from a Workspace root"));
 }
 
 #[test]

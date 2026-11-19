@@ -555,8 +555,7 @@ impl HttpTrackingTransport<'_> {
 
 impl TrackingTransport for HttpTrackingTransport<'_> {
     fn get_text(&mut self, path: &str) -> Result<String, SubmissionTrackingError> {
-        AtCoderClient::get_text(self.http, &format!("{BASE_URL}{path}"))
-            .map_err(SubmissionTrackingError::Fetch)
+        self.get_text_until(path, &|| true)
     }
 
     fn wait(&mut self, duration: Duration) {

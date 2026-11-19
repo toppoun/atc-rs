@@ -74,6 +74,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - CLI の `atc refresh` → `refresh_from` がパス・ID を解決し、`diagnose_contest` で判定する。`RepairRequired` または `Healthy` と `--force` の組み合わせで初めてクライアントを初期化する。公式のサンプル件数変更に対応するため、TUI と共通の準備処理で問題一覧とサンプルを取得する。取得後と適用前に診断結果・メタデータを再確認し、`apply_refresh` が `workspace::replace_refresh_data_with_snapshot` で置換した後に `Healthy` を確認する。
 - Contest 画面の Refresh → `contest_refresh_task` がバックグラウンドで `prepare_refresh` → `rebuild_active_contest_session_after_refresh` が旧セッションを終了し、適用後にディスクから読み直す。適用失敗時も再読込・再起動を試み、成功すれば失敗表示を引き継ぐ。この組み直しには直前の設定・認証を使う。
 - CLI の `atc migrate` → [commands/migrate.rs](../../src/commands/migrate.rs) が対象解決・計画表示・承認・公式データ取得を行う。取得と staging の組み立ては Refresh と共有する。[workspace/migration.rs](../../src/workspace/migration.rs) が診断結果と旧データのスナップショットを使って適用を判定し、Contest 更新ロック下で退避と配置を行う。Recovery を完了し、`Healthy` を確認してからバックアップ先を表示する。
+- CLI の `refresh --all` / `migrate --all` → [commands/batch.rs](../../src/commands/batch.rs) が [workspace/batch.rs](../../src/workspace/batch.rs) でルートと対象を確定し、全 Contest の診断と更新計画を通信前に作る。更新計画では Refresh の診断・メタデータ確認と Migrate の移行判定を共有する。承認済みの更新は同じ取得・置換経路に渡し、Workspace 経路と対象のスナップショットを再照合して直列に適用する。[atcoder.rs](../../src/atcoder.rs) の共通の取得枠を一括用の間隔で使う。
 - ディスク上の Recovery は `workspace.rs` の置換・ロールバック処理と `contest_recovery_state` を起点に追う。`safe_file` が復旧レコードを書き、完了した作業領域を退避先に移す。メタデータやテスト入力の読込でも、確認が必要な中断状態を検出する。Stress 側の対応箇所は `stress.rs` の `ensure_no_interrupted_generation`。
 
 ### 外部ツール向けのソース取得

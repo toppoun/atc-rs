@@ -112,6 +112,18 @@ pub enum ContestCommand {
         /// Re-fetch official data even when local data is healthy
         #[arg(short, long)]
         force: bool,
+
+        /// Refresh contests in the current Workspace
+        #[arg(long, conflicts_with = "contest")]
+        all: bool,
+
+        /// Show the local refresh plan without downloading or writing data
+        #[arg(long, requires = "all")]
+        dry_run: bool,
+
+        /// Allow batch refresh in a non-interactive environment
+        #[arg(long, requires = "all")]
+        yes: bool,
     },
 
     /// Migrate a contest and preserve its previous data
@@ -122,6 +134,10 @@ pub enum ContestCommand {
 pub struct MigrateArgs {
     #[arg(short, long)]
     pub contest: Option<String>,
+
+    /// Migrate contests in the current Workspace with one confirmation
+    #[arg(long, conflicts_with = "contest")]
+    pub all: bool,
 
     /// Show the local migration plan without downloading or writing data
     #[arg(long)]
@@ -727,6 +743,9 @@ mod tests {
             Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: false,
+                all: false,
+                dry_run: false,
+                yes: false,
             })
         ));
 
@@ -738,6 +757,9 @@ mod tests {
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: false,
+                all: false,
+                dry_run: false,
+                yes: false,
             }) if contest == "abc466"
         ));
 
@@ -749,6 +771,9 @@ mod tests {
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
+                all: false,
+                dry_run: false,
+                yes: false,
             }) if contest == "abc350"
         ));
 
@@ -760,6 +785,9 @@ mod tests {
             Command::Contest(ContestCommand::Refresh {
                 contest: None,
                 force: true,
+                all: false,
+                dry_run: false,
+                yes: false,
             })
         ));
 
@@ -771,6 +799,9 @@ mod tests {
             Command::Contest(ContestCommand::Refresh {
                 contest: Some(contest),
                 force: true,
+                all: false,
+                dry_run: false,
+                yes: false,
             }) if contest == "abc350"
         ));
 

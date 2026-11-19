@@ -2,7 +2,7 @@ use super::fetch_contest_data;
 use crate::atcoder;
 use crate::auth::SessionAuth;
 use crate::error::AppError;
-use crate::safe_file::{self, FileSnapshot};
+use crate::safe_file::{self, FileSnapshot, TreeSnapshot};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::diagnosis::{
@@ -21,11 +21,14 @@ pub(crate) struct PreparedRefresh {
     staging: crate::safe_file::PreservedTempDir,
 }
 
-struct RefreshBaseline {
+pub(super) struct RefreshBaseline {
     destination_identity: RefreshDestinationIdentity,
     metadata_snapshot: Option<FileSnapshot>,
     diagnosis: Option<ContestDiagnosis>,
+    batch_tests: Option<BatchTests>,
 }
+
+struct BatchTests(Option<TreeSnapshot>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RefreshDestinationIdentity {
@@ -120,6 +123,7 @@ pub(super) fn refresh_from(
         destination_identity: destination_identity?,
         metadata_snapshot: metadata_snapshot?,
         diagnosis: Some(diagnosis),
+        batch_tests: None,
     };
     baseline.revalidate(&destination, &contest_id, force)?;
     if healthy && !force {
@@ -137,6 +141,7 @@ pub(super) fn refresh_from(
         baseline,
         &atcoder,
         reporter,
+        &|| Ok(()),
     )?;
     apply_refresh(prepared, reporter)
 }
@@ -233,9 +238,18 @@ pub(crate) fn prepare_refresh(
         destination_identity,
         metadata_snapshot: refresh_metadata_snapshot(destination)?,
         diagnosis: None,
+        batch_tests: None,
     };
     baseline.revalidate(destination, contest_id, force)?;
-    prepare_refresh_from_baseline(destination, contest_id, force, baseline, atcoder, reporter)
+    prepare_refresh_from_baseline(
+        destination,
+        contest_id,
+        force,
+        baseline,
+        atcoder,
+        reporter,
+        &|| Ok(()),
+    )
 }
 
 fn prepare_refresh_from_baseline(
@@ -245,6 +259,7 @@ fn prepare_refresh_from_baseline(
     baseline: RefreshBaseline,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
+    validate_route: &dyn Fn() -> io::Result<()>,
 ) -> Result<PreparedRefresh, AppError> {
     let data = fetch_contest_data(contest_id, atcoder, reporter)?;
     workspace::validate_contest_identity(&data.contest, contest_id)?;
@@ -252,8 +267,11 @@ fn prepare_refresh_from_baseline(
 
     // Fetching may take long enough for the destination to change. Revalidate
     // immediately before choosing it as the staging parent.
+    validate_route()?;
     baseline.revalidate_diagnosis(destination, contest_id)?;
     baseline.revalidate(destination, contest_id, force)?;
+    baseline.revalidate_batch_tests(destination)?;
+    atcoder.check_batch_cancellation()?;
 
     let staging = crate::safe_file::PreservedTempDir::new(
         tempfile::Builder::new()
@@ -263,10 +281,12 @@ fn prepare_refresh_from_baseline(
 
     // Creating the staging directory is path-based. Recheck immediately so a
     // replaced destination cannot cause staging to be built in another contest.
+    validate_route()?;
     baseline.revalidate(destination, contest_id, force)?;
 
     data.stage(staging.path())?;
 
+    validate_route()?;
     baseline.revalidate(destination, contest_id, force)?;
 
     Ok(PreparedRefresh {
@@ -282,6 +302,15 @@ pub(crate) fn apply_refresh(
     prepared: PreparedRefresh,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
+    apply_refresh_checked(prepared, reporter, &|| Ok(()))
+}
+
+fn apply_refresh_checked(
+    prepared: PreparedRefresh,
+    reporter: &mut dyn Reporter,
+    validate_route: &dyn Fn() -> io::Result<()>,
+) -> Result<(), AppError> {
+    validate_route()?;
     let PreparedRefresh {
         destination,
         contest_id,
@@ -298,6 +327,15 @@ pub(crate) fn apply_refresh(
         staging.into_temp_dir(),
         force,
         baseline.metadata_snapshot,
+        |tests| {
+            validate_route()?;
+            if let Some(expected) = &baseline.batch_tests
+                && expected.0.as_ref() != tests
+            {
+                return Err(changed_batch_tests_error());
+            }
+            Ok(())
+        },
     )?;
     if verify_diagnosis
         && !matches!(
@@ -316,6 +354,56 @@ pub(crate) fn apply_refresh(
     });
 
     Ok(())
+}
+
+pub(super) fn plan_batch_refresh(
+    destination: &Path,
+    contest_id: &str,
+    force: bool,
+    diagnosis: ContestDiagnosis,
+) -> Result<RefreshBaseline, AppError> {
+    let baseline = RefreshBaseline {
+        destination_identity: refresh_destination_identity(destination)?,
+        metadata_snapshot: workspace::read_contest_metadata_snapshot(destination)?,
+        diagnosis: Some(diagnosis),
+        batch_tests: Some(BatchTests(workspace::snapshot_contest_tests(destination)?)),
+    };
+    baseline.revalidate_diagnosis(destination, contest_id)?;
+    baseline.revalidate(destination, contest_id, force)?;
+    Ok(baseline)
+}
+
+pub(super) fn execute_batch_refresh<'a>(
+    destination: &Path,
+    contest_id: &str,
+    force: bool,
+    baseline: RefreshBaseline,
+    client: impl FnOnce() -> Result<&'a atcoder::AtCoderClient, AppError>,
+    reporter: &mut dyn Reporter,
+    validate_route: &dyn Fn() -> io::Result<()>,
+) -> Result<(), AppError> {
+    validate_route()?;
+    baseline.revalidate_diagnosis(destination, contest_id)?;
+    baseline.revalidate(destination, contest_id, force)?;
+    baseline.revalidate_batch_tests(destination)?;
+    let atcoder = client()?;
+    let prepared = prepare_refresh_from_baseline(
+        destination,
+        contest_id,
+        force,
+        baseline,
+        atcoder,
+        reporter,
+        validate_route,
+    )?;
+    apply_refresh_checked(prepared, reporter, validate_route)
+}
+
+fn changed_batch_tests_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "local tests changed after batch planning; inspect the contest before retrying",
+    )
 }
 
 fn refresh_metadata_snapshot(destination: &Path) -> io::Result<Option<FileSnapshot>> {
@@ -402,6 +490,15 @@ fn changed_refresh_destination_error() -> AppError {
 }
 
 impl RefreshBaseline {
+    fn revalidate_batch_tests(&self, destination: &Path) -> io::Result<()> {
+        if let Some(expected) = &self.batch_tests
+            && workspace::snapshot_contest_tests(destination)? != expected.0
+        {
+            return Err(changed_batch_tests_error());
+        }
+        Ok(())
+    }
+
     fn revalidate(
         &self,
         destination: &Path,

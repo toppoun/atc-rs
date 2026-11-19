@@ -11,6 +11,7 @@ use scraper::{Html, Selector};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ const BASE_URL: &str = "https://atcoder.jp";
 
 // 正常時も短時間に連打しない
 const REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const BATCH_REQUEST_INTERVAL: Duration = Duration::from_millis(1_000);
 
 // 429を受けたとき、Retry-Afterが無い場合の待機時間
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
@@ -50,6 +52,8 @@ pub enum AtCoderError {
         value: String,
     },
     InvalidProblemUrl(String),
+    BatchInterrupted,
+    UnexpectedBatchRedirect(StatusCode),
 
     // 429がretryしても解消しなかった
     RateLimited {
@@ -207,6 +211,13 @@ impl fmt::Display for AtCoderError {
                 write!(formatter, "invalid AtCoder {kind}: {value:?}")
             }
             Self::InvalidProblemUrl(url) => write!(formatter, "invalid AtCoder problem URL: {url}"),
+            Self::BatchInterrupted => formatter.write_str("batch operation interrupted"),
+            Self::UnexpectedBatchRedirect(status) => {
+                write!(
+                    formatter,
+                    "unexpected HTTP redirect during batch operation ({status})"
+                )
+            }
             Self::RateLimited { url } => {
                 write!(formatter, "rate limit persisted after retries: {url}")
             }
@@ -224,6 +235,8 @@ impl std::error::Error for AtCoderError {
             | Self::Parse(_)
             | Self::InvalidIdentifier { .. }
             | Self::InvalidProblemUrl(_)
+            | Self::BatchInterrupted
+            | Self::UnexpectedBatchRedirect(_)
             | Self::RateLimited { .. } => None,
         }
     }
@@ -245,6 +258,7 @@ struct HttpSource {
     submit_client: LazySubmitClient,
     auth: Arc<auth::SessionAuth>,
     last_request: Mutex<Option<Instant>>,
+    batch_interval: Option<Duration>,
 }
 
 enum AuthenticatedSendResult {
@@ -290,19 +304,35 @@ impl LazySubmitClient {
 
 impl HttpSource {
     fn new(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
+        Self::with_interval(auth, None)
+    }
+
+    fn with_interval(
+        auth: Arc<auth::SessionAuth>,
+        batch_interval: Option<Duration>,
+    ) -> Result<Self, AtCoderError> {
         let provider = Arc::new(SessionCookieProvider::for_atcoder(Arc::clone(&auth)));
-        Self::new_with_provider(auth, provider)
+        Self::new_with_provider(auth, provider, batch_interval)
     }
 
     fn new_with_provider(
         auth: Arc<auth::SessionAuth>,
         provider: Arc<SessionCookieProvider>,
+        batch_interval: Option<Duration>,
     ) -> Result<Self, AtCoderError> {
+        let mut builder = http_client_builder(Arc::clone(&provider));
+        if batch_interval.is_some() {
+            // Each batch request must take a slot, including an explicit 429 retry.
+            builder = builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never());
+        }
         Ok(Self {
-            client: build_http_client(Arc::clone(&provider))?,
+            client: builder.build()?,
             submit_client: LazySubmitClient::new(provider),
             auth,
             last_request: Mutex::new(None),
+            batch_interval,
         })
     }
 
@@ -315,7 +345,7 @@ impl HttpSource {
             Arc::clone(&auth),
             origin,
         ));
-        Self::new_with_provider(auth, provider)
+        Self::new_with_provider(auth, provider, None)
     }
 
     #[cfg(test)]
@@ -335,6 +365,7 @@ impl HttpSource {
             submit_client: LazySubmitClient::new(provider),
             auth,
             last_request: Mutex::new(None),
+            batch_interval: None,
         })
     }
 
@@ -485,6 +516,7 @@ impl CookieStore for SessionCookieProvider {
 
 pub struct AtCoderClient {
     source: Source,
+    batch_cancelled: Option<&'static AtomicBool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -514,11 +546,37 @@ impl From<&crate::model::Problem> for ProblemOutline {
 
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
+        Self::load_http(None, None)
+    }
+
+    pub(crate) fn for_batch(
+        interval: Duration,
+        cancelled: &'static AtomicBool,
+    ) -> Result<Self, AtCoderError> {
+        if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
+            return Ok(Self {
+                source: Source::Fixture(path.into()),
+                batch_cancelled: Some(cancelled),
+            });
+        }
+        Self::load_http(Some(interval), Some(cancelled))
+    }
+
+    fn load_http(
+        batch_interval: Option<Duration>,
+        batch_cancelled: Option<&'static AtomicBool>,
+    ) -> Result<Self, AtCoderError> {
         let auth = auth::AuthSnapshot::load();
         if let auth::AuthSnapshot::Invalid(error) = auth.as_ref() {
             return Err(AtCoderError::Auth(*error));
         }
-        Self::from_session_auth(auth::SessionAuth::from_snapshot(&auth))
+        Ok(Self {
+            source: Source::Http(HttpSource::with_interval(
+                auth::SessionAuth::from_snapshot(&auth),
+                batch_interval,
+            )?),
+            batch_cancelled,
+        })
     }
 
     #[cfg(test)]
@@ -529,6 +587,7 @@ impl AtCoderClient {
     pub(crate) fn from_session_auth(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
         Ok(Self {
             source: Source::Http(HttpSource::new(auth)?),
+            batch_cancelled: None,
         })
     }
 
@@ -544,6 +603,7 @@ impl AtCoderClient {
     pub fn fixture(root: impl Into<PathBuf>) -> Self {
         Self {
             source: Source::Fixture(root.into()),
+            batch_cancelled: None,
         }
     }
 
@@ -560,13 +620,14 @@ impl AtCoderClient {
     // ============================================================
 
     pub(crate) fn fetch_contest(&self, contest_id: &str) -> Result<ContestOutline, AtCoderError> {
+        self.check_batch_cancellation()?;
         validate_identifier("contest ID", contest_id)?;
 
         let html = match &self.source {
             Source::Http(http) => {
                 let url = format!("{BASE_URL}/contests/{contest_id}/tasks");
 
-                Self::get_text(http, &url)?
+                self.get_contest_text(http, &url)?
             }
 
             Source::Fixture(root) => {
@@ -587,10 +648,11 @@ impl AtCoderClient {
         &self,
         problem: &ProblemOutline,
     ) -> Result<Vec<Sample>, AtCoderError> {
+        self.check_batch_cancellation()?;
         let html = match &self.source {
             Source::Http(http) => {
                 validate_problem_url(&problem.url)?;
-                Self::get_text(http, &problem.url)?
+                self.get_contest_text(http, &problem.url)?
             }
 
             Source::Fixture(root) => {
@@ -610,11 +672,22 @@ impl AtCoderClient {
     // HTTP
     // ============================================================
 
-    fn get_text(http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
-        match Self::get_text_until(http, url, &|| true)? {
-            Some(text) => Ok(text),
-            None => unreachable!("an always-continue GET cannot be cancelled"),
+    fn batch_should_continue(&self) -> bool {
+        self.batch_cancelled
+            .is_none_or(|flag| !flag.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn check_batch_cancellation(&self) -> Result<(), AtCoderError> {
+        if self.batch_should_continue() {
+            Ok(())
+        } else {
+            Err(AtCoderError::BatchInterrupted)
         }
+    }
+
+    fn get_contest_text(&self, http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
+        Self::get_text_until(http, url, &|| self.batch_should_continue())?
+            .ok_or(AtCoderError::BatchInterrupted)
     }
 
     fn get_text_until(
@@ -629,10 +702,11 @@ impl AtCoderClient {
             if !should_continue() {
                 return Ok(None);
             }
-            let response = http.send(http.client.get(url))?;
+            let response = http.send(http.client.get(url));
             if !should_continue() {
                 return Ok(None);
             }
+            let response = response?;
 
             // 429だけ特別扱い
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -649,6 +723,10 @@ impl AtCoderClient {
                 }
 
                 continue;
+            }
+
+            if http.batch_interval.is_some() && response.status().is_redirection() {
+                return Err(AtCoderError::UnexpectedBatchRedirect(response.status()));
             }
 
             // 404 / 500などは普通のHTTPエラーとして返す
@@ -750,10 +828,6 @@ fn parse_authenticated_username(html: &str) -> Option<String> {
     })
 }
 
-fn build_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
-    Ok(http_client_builder(provider).build()?)
-}
-
 fn build_submit_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
     Ok(http_client_builder(provider)
         .redirect(reqwest::redirect::Policy::none())
@@ -808,7 +882,8 @@ fn validate_problem_url(url: &str) -> Result<(), AtCoderError> {
 }
 
 fn wait_for_request_slot_until(http: &HttpSource, should_continue: &dyn Fn() -> bool) -> bool {
-    reserve_request_slot_until(&http.last_request, REQUEST_INTERVAL, should_continue).is_some()
+    let interval = http.batch_interval.unwrap_or(REQUEST_INTERVAL);
+    reserve_request_slot_until(&http.last_request, interval, should_continue).is_some()
 }
 
 fn reserve_request_slot_until(
@@ -2188,6 +2263,85 @@ mod tests {
         let error = parse_samples(html).expect_err("incomplete sample should fail");
 
         assert!(matches!(error, AtCoderError::Parse(message) if message.contains("mismatch")));
+    }
+
+    #[test]
+    fn batch_slots_cover_each_retry_and_sample_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let session = anonymous_session();
+        let http = Arc::new(
+            HttpSource::new_with_provider(
+                Arc::clone(&session),
+                provider(session),
+                Some(BATCH_REQUEST_INTERVAL),
+            )
+            .unwrap(),
+        );
+        let counter = Arc::clone(&http);
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, headers) in [
+                ("429 Too Many Requests", &["Retry-After: 2"][..]),
+                ("200 OK", &[][..]),
+                ("200 OK", &[][..]),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_wire_request(&mut stream, None);
+                let reserved = counter.last_request.lock().unwrap().unwrap();
+                requests.push((request.path, reserved));
+                write_wire_response(&mut stream, status, headers);
+            }
+            requests
+        });
+        for path in ["/tasks", "/tasks/sample"] {
+            assert_eq!(
+                AtCoderClient::get_text_until(&http, &format!("{origin}{path}"), &|| true).unwrap(),
+                Some(String::new())
+            );
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/tasks", "/tasks", "/tasks/sample"]
+        );
+        assert!(requests[1].1 - requests[0].1 >= Duration::from_secs(2));
+        assert!(requests[2].1 - requests[1].1 >= Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn batch_http_stops_after_persistent_429_and_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let session = anonymous_session();
+        let http = HttpSource::new_with_provider(
+            Arc::clone(&session),
+            provider(session),
+            Some(Duration::from_millis(1)),
+        )
+        .unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..=MAX_429_RETRIES {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(read_wire_request(&mut stream, None).path, "/limited");
+                write_wire_response(&mut stream, "429 Too Many Requests", &["Retry-After: 0"]);
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(read_wire_request(&mut stream, None).path, "/redirect");
+            write_wire_response(&mut stream, "302 Found", &["Location: /unpaced"]);
+        });
+        assert!(matches!(
+            AtCoderClient::get_text_until(&http, &format!("{origin}/limited"), &|| true),
+            Err(AtCoderError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            AtCoderClient::get_text_until(&http, &format!("{origin}/redirect"), &|| true),
+            Err(AtCoderError::UnexpectedBatchRedirect(StatusCode::FOUND))
+        ));
+        server.join().unwrap();
     }
 
     #[test]

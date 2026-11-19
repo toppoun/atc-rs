@@ -6,7 +6,7 @@ use crate::safe_file::PreservedTempDir;
 use crate::ui::Reporter;
 use crate::workspace::{self, migration::MigrationInspection};
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn migrate(args: MigrateArgs, reporter: &mut dyn Reporter) -> Result<(), AppError> {
     migrate_from(
@@ -28,7 +28,10 @@ pub(crate) fn migrate(args: MigrateArgs, reporter: &mut dyn Reporter) -> Result<
     )
 }
 
-fn confirm_migration(input: &mut dyn BufRead, output: &mut dyn Write) -> io::Result<bool> {
+pub(super) fn confirm_migration(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> io::Result<bool> {
     write!(output, "Proceed with migration? [y/N] ")?;
     output.flush()?;
     let mut answer = String::new();
@@ -77,8 +80,8 @@ fn migrate_from(
         return Ok(());
     }
 
-    let revalidate_mapping = || {
-        if workspace::resolve_contest_target(cwd, specified_id)? != plan.destination() {
+    let revalidate_mapping = |destination: &Path| {
+        if workspace::resolve_contest_target(cwd, specified_id)? != destination {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace mapping changed during migration; inspect the new target before retrying",
@@ -87,23 +90,37 @@ fn migrate_from(
         Ok(())
     };
 
-    revalidate_mapping()?;
+    let backup = execute_migration(*plan, create_client, reporter, revalidate_mapping)?;
+    writeln!(output, "Migrated {contest_id}")?;
+    writeln!(output, "Backup: {}", backup.display())?;
+    Ok(())
+}
+
+pub(super) fn execute_migration<C: std::borrow::Borrow<AtCoderClient>>(
+    plan: workspace::migration::MigrationPlan,
+    client: impl FnOnce() -> Result<C, AppError>,
+    reporter: &mut dyn Reporter,
+    revalidate_mapping: impl Fn(&Path) -> io::Result<()>,
+) -> Result<PathBuf, AppError> {
+    revalidate_mapping(plan.destination())?;
     plan.revalidate()?;
-    let data = fetch_contest_data(plan.contest_id(), &create_client()?, reporter)?;
+    let client = client()?;
+    let data = fetch_contest_data(plan.contest_id(), client.borrow(), reporter)?;
     workspace::validate_contest_identity(&data.contest, plan.contest_id())?;
     workspace::validate_contest_paths(&data.contest)?;
-    revalidate_mapping()?;
+    revalidate_mapping(plan.destination())?;
     plan.revalidate()?;
+    client.borrow().check_batch_cancellation()?;
 
     let staging = PreservedTempDir::new(
         tempfile::Builder::new()
             .prefix(".atc-migrate-")
             .tempdir_in(plan.destination())?,
     );
-    revalidate_mapping()
+    revalidate_mapping(plan.destination())
         .and_then(|()| plan.revalidate_directories())
         .and_then(|()| data.stage(staging.path()))
-        .and_then(|()| revalidate_mapping())
+        .and_then(|()| revalidate_mapping(plan.destination()))
         .map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -114,10 +131,7 @@ fn migrate_from(
             )
         })?;
 
-    let backup = plan.apply(staging)?;
-    writeln!(output, "Migrated {contest_id}")?;
-    writeln!(output, "Backup: {}", backup.display())?;
-    Ok(())
+    Ok(plan.apply_checked(staging, revalidate_mapping)?)
 }
 
 #[cfg(test)]
@@ -143,6 +157,7 @@ mod tests {
         let args = MigrateArgs {
             contest: None,
             dry_run: false,
+            all: false,
             yes: false,
         };
         let mut output = Vec::new();
@@ -195,6 +210,7 @@ mod tests {
             let args = MigrateArgs {
                 contest: None,
                 dry_run: false,
+                all: false,
                 yes: true,
             };
             let error = migrate_from(
@@ -227,6 +243,7 @@ mod tests {
         let args = MigrateArgs {
             contest: None,
             dry_run: false,
+            all: false,
             yes: false,
         };
         migrate_from(

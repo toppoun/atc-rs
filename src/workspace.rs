@@ -17,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
+pub(crate) mod batch;
 pub(crate) mod diagnosis;
 pub(crate) mod migration;
 
@@ -124,7 +125,7 @@ struct WorkspacePathRule {
     path: WorkspaceRelativePath,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceRelativePath {
     components: Vec<String>,
 }
@@ -943,6 +944,16 @@ enum ContestRecoveryError {
     Area { path: PathBuf, source: io::Error },
 }
 
+fn is_contest_staging_name(name: &str) -> bool {
+    name.starts_with(".atc-refresh-")
+        || name.starts_with(".atc-repair-")
+        || name.starts_with(".atc-migrate-")
+}
+
+fn is_contest_recovery_name(name: &str) -> bool {
+    name.starts_with(".atc-recovery-") || name.starts_with(".atc-aborted-")
+}
+
 fn inspect_contest_recovery_state(
     destination: &Path,
     directory: &CapDir,
@@ -953,11 +964,8 @@ fn inspect_contest_recovery_state(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let is_staging = name.starts_with(".atc-refresh-")
-            || name.starts_with(".atc-repair-")
-            || name.starts_with(".atc-migrate-");
-        let is_recovery = name.starts_with(".atc-recovery-") || name.starts_with(".atc-aborted-");
-        if !is_staging && !is_recovery {
+        let is_recovery = is_contest_recovery_name(&name);
+        if !is_recovery && !is_contest_staging_name(&name) {
             continue;
         }
         let path = destination.join(&name);
@@ -1107,6 +1115,37 @@ pub(crate) fn metadata_contest_owner(content: &str) -> Option<String> {
     // Ownership is independent of the manifest schema. TOML parsing rejects duplicate keys.
     let metadata: toml::Value = toml::from_str(content).ok()?;
     Some(metadata.get("contest_id")?.as_str()?.to_owned())
+}
+
+fn validate_contest_update_lock_entry(directory: &CapDir, destination: &Path) -> io::Result<()> {
+    const NAME: &str = ".atc-update.lock";
+    safe_file::regular_file_exists_at(directory, OsStr::new(NAME), &destination.join(NAME))?;
+    Ok(())
+}
+
+fn snapshot_tests(
+    root: &CapDir,
+    destination: &Path,
+    name: &str,
+) -> io::Result<Option<safe_file::TreeSnapshot>> {
+    let path = destination.join(name);
+    let snapshot = open_managed_directory(root, name, &path, "tests directory")?
+        .map(|tests| safe_file::read_tree_snapshot_in(&tests, &path))
+        .transpose();
+    snapshot.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot safely back up {}: {error}", path.display()),
+        )
+    })
+}
+
+pub(crate) fn snapshot_contest_tests(
+    destination: &Path,
+) -> io::Result<Option<safe_file::TreeSnapshot>> {
+    let directory = open_contest_destination_nofollow(destination)?;
+    validate_contest_update_lock_entry(&directory, destination)?;
+    snapshot_tests(&directory, destination, "tests")
 }
 
 pub(crate) fn read_contest_metadata_snapshot(
@@ -2217,6 +2256,7 @@ pub fn replace_refresh_data(
         staging,
         allow_missing_marker,
         expected_metadata,
+        |_| Ok(()),
     )
 }
 
@@ -2225,6 +2265,7 @@ pub(crate) fn replace_refresh_data_with_snapshot(
     staging: TempDir,
     allow_missing_marker: bool,
     expected_metadata: Option<safe_file::FileSnapshot>,
+    validate_update: impl FnOnce(Option<&safe_file::TreeSnapshot>) -> io::Result<()>,
 ) -> io::Result<()> {
     let staging = safe_file::PreservedTempDir::new(staging);
     let staged_contest = match load_metadata(staging.path()) {
@@ -2235,12 +2276,16 @@ pub(crate) fn replace_refresh_data_with_snapshot(
     {
         return Err(refresh_update_error(staging, error, Vec::new()));
     }
-    replace_contest_data_with_snapshot(
+    replace_refresh_data_with_cleanup_hook_and_snapshot(
         destination,
         staging.into_temp_dir(),
         allow_missing_marker,
-        ContestDataReplacement::MetadataAndTests,
+        || {},
+        || {},
+        || {},
+        || {},
         expected_metadata,
+        validate_update,
     )
 }
 
@@ -2305,6 +2350,7 @@ fn replace_contest_data_with_hooks_and_snapshot(
                 before_recovery_cleanup,
                 || {},
                 expected_metadata,
+                |_| Ok(()),
             )
         }
     }
@@ -2741,6 +2787,7 @@ fn replace_refresh_data_with_hooks(
         before_recovery_cleanup,
         || {},
         expected_metadata,
+        |_| Ok(()),
     )
 }
 
@@ -2765,6 +2812,7 @@ fn replace_refresh_data_with_cleanup_hook(
         before_recovery_cleanup,
         before_staging_cleanup,
         expected_metadata,
+        |_| Ok(()),
     )
 }
 
@@ -2777,6 +2825,7 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
     before_recovery_cleanup: impl FnOnce(),
     before_staging_cleanup: impl FnOnce(),
     expected_metadata: Option<safe_file::FileSnapshot>,
+    validate_update: impl FnOnce(Option<&safe_file::TreeSnapshot>) -> io::Result<()>,
 ) -> io::Result<()> {
     let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
@@ -2831,6 +2880,8 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
         None
     };
 
+    validate_update(previous_tests_snapshot.as_ref())
+        .map_err(|error| preserved_staging_error(&staging_root, error))?;
     let staged_metadata_snapshot = safe_file::read_regular_file_snapshot(&staged_metadata)?;
     let staged_tests_snapshot = has_staged_tests
         .then(|| safe_file::read_tree_snapshot(&staged_tests))
@@ -6616,8 +6667,9 @@ mod tests {
         let note = staging_path.join("user-note.txt");
         fs::write(&note, "keep me\n").unwrap();
 
-        let error = replace_refresh_data_with_snapshot(&destination, staging, true, None)
-            .expect_err("invalid staged metadata must stop refresh");
+        let error =
+            replace_refresh_data_with_snapshot(&destination, staging, true, None, |_| Ok(()))
+                .expect_err("invalid staged metadata must stop refresh");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error

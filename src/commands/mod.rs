@@ -1,4 +1,5 @@
 mod attempt_executor;
+mod batch;
 mod config;
 mod contest;
 mod create;
@@ -23,6 +24,7 @@ mod watch_worker;
 #[cfg(test)]
 pub(crate) use user_input_run::execute_user_input_for_test;
 
+pub(crate) use batch::{BatchOperation, run_batch};
 pub(crate) use config::{config_init, initialize_config_at};
 pub(crate) use contest::contest;
 #[cfg(test)]
