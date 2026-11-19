@@ -404,28 +404,17 @@ fn rejects_a_fifo_without_blocking() {
     assert_error(run(root, &["abc484", "A", "--json"]), "not a regular file");
 }
 
-#[cfg(unix)]
-fn link_directory(link: &Path, target: &Path) {
-    std::os::unix::fs::symlink(target, link).unwrap();
-}
-
-#[cfg(windows)]
-fn link_directory(link: &Path, target: &Path) {
-    let output = Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-}
+#[cfg(any(unix, windows))]
+mod support;
 
 #[cfg(any(unix, windows))]
 #[test]
 fn rejects_directory_links_in_routing_and_in_the_contest() {
+    use support::link_directory;
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let outside = root.join("real-contests");
+    let outside = root.join("実体 (real contests)");
     let contest = make_contest(outside.join("ABC/abc484"));
     fs::write(contest.join("A.cpp"), CPP).unwrap();
 

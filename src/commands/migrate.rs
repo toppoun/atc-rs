@@ -66,18 +66,24 @@ fn migrate_from(
     if route.is_none() {
         workspace::validate_workspace_update_target(destination)?;
     }
-    let contest_id = specified_id
-        .or_else(|| cwd.file_name().and_then(|name| name.to_str()))
-        .filter(|id| workspace::is_safe_atcoder_id(id))
-        .ok_or_else(|| {
-            io::Error::new(
+    let contest_id = match specified_id {
+        Some(id) if workspace::is_safe_atcoder_id(id) => id.to_owned(),
+        Some(id) => {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cannot determine a safe contest ID; use -c <contest-id> from the workspace root",
+                format!("invalid contest ID: {id:?}"),
             )
-        })?;
-    let MigrationInspection::Ready(plan) =
-        workspace::migration::inspect(destination.to_path_buf(), contest_id.to_owned())?
-    else {
+            .into());
+        }
+        None => workspace::infer_implicit_contest_id(destination)?,
+    };
+    let revalidate_mapping = |destination: &Path| match &route {
+        Some(route) => route.revalidate(cwd, &contest_id),
+        None => workspace::revalidate_implicit_contest_route(destination, &contest_id),
+    };
+    let inspection = workspace::migration::inspect(destination.to_path_buf(), contest_id.clone())?;
+    revalidate_mapping(destination)?;
+    let MigrationInspection::Ready(plan) = inspection else {
         writeln!(
             output,
             "{contest_id}: local data healthy; migration skipped"
@@ -93,11 +99,6 @@ fn migrate_from(
         writeln!(output, "Migration cancelled.")?;
         return Ok(());
     }
-
-    let revalidate_mapping = |destination: &Path| match &route {
-        Some(route) => route.revalidate(cwd, contest_id),
-        None => workspace::validate_workspace_update_target(destination),
-    };
 
     let backup = execute_migration(
         *plan,

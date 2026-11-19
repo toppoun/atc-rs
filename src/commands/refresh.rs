@@ -155,7 +155,7 @@ pub(super) fn refresh_from(
     let baseline = baseline.capture_update(destination, &contest_id, force)?;
     let validate_route = |destination: &Path| match &route {
         Some(route) => route.revalidate(cwd, &contest_id),
-        None => workspace::validate_workspace_update_target(destination),
+        None => workspace::revalidate_implicit_contest_route(destination, &contest_id),
     };
     execute_cli_refresh(
         destination,
@@ -200,21 +200,16 @@ fn resolve_refresh_contest_id(
     if let Some(contest_id) = specified_contest_id {
         return Ok(contest_id.to_owned());
     }
-    if force {
-        return destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "current directory has no UTF-8 directory name: {}",
-                        destination.display()
-                    ),
-                )
-                .into()
-            });
+    let name = workspace::implicit_contest_name(destination)?;
+    if workspace::has_uppercase(&name) || force {
+        let metadata = metadata_snapshot
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        return Ok(workspace::infer_contest_id_from_metadata(
+            destination,
+            &name,
+            metadata.as_ref(),
+        )?);
     }
     workspace::validate_workspace_marker(destination)?;
     let metadata = metadata_snapshot

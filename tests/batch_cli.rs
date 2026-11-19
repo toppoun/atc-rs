@@ -1,6 +1,13 @@
 use std::fs;
+use std::io::{self, Read};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
+
+#[cfg(any(unix, windows))]
+mod support;
 
 #[cfg(windows)]
 #[path = "batch_cli/windows_interrupt.rs"]
@@ -19,6 +26,50 @@ fn cli(root: &Path, args: &[&str], fixtures: &Path) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+fn cli_without_http(root: &Path, args: &[&str]) -> Output {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, finished) = mpsc::channel();
+    let proxy = std::thread::spawn(move || {
+        let mut connections = 0;
+        let mut stopping = false;
+        loop {
+            match listener.accept() {
+                Ok(_) => connections += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && stopping => {
+                    return connections;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    stopping = !matches!(
+                        finished.recv_timeout(Duration::from_millis(5)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    );
+                }
+                Err(error) => panic!("loopback proxy failed: {error}"),
+            }
+        }
+    });
+    let state = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_atc"))
+        .current_dir(root)
+        .env_remove("ATC_FIXTURE_DIR")
+        .env_remove("https_proxy")
+        .env_remove("no_proxy")
+        .env("HTTPS_PROXY", proxy_url)
+        .env("NO_PROXY", "")
+        .env("LOCALAPPDATA", state.path())
+        .env("APPDATA", state.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(args)
+        .output()
+        .unwrap();
+    stop.send(()).unwrap();
+    assert_eq!(proxy.join().unwrap(), 0, "{}", stderr(&output));
+    assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+    output
 }
 
 fn stderr(output: &Output) -> String {
@@ -93,6 +144,175 @@ fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     visit(root, root, &mut entries);
     entries.sort();
     entries
+}
+
+#[test]
+fn current_metadata_resolves_an_uppercase_contest_for_single_and_batch_updates() {
+    let root = workspace("version = 1\n[[paths]]\npattern = '^(?i:abc083)$'\npath = 'ABC'\n");
+    let contest = root.path().join("ABC").join("ABC083");
+    manifest(&contest, "abc083", 1);
+    let fixtures_root = tempfile::tempdir().unwrap();
+    fixtures(fixtures_root.path(), &["abc083"]);
+
+    let output = cli_without_http(root.path(), &["refresh", "--all", "--dry-run"]);
+    let message = stderr(&output);
+    assert!(output.status.success(), "{message}");
+    summary_count(&message, "Scanned:", 1);
+    summary_count(&message, "Refresh planned:", 1);
+    let relative = Path::new("ABC").join("ABC083");
+    assert!(
+        message.contains(&relative.display().to_string()),
+        "{message}"
+    );
+
+    let output = cli(
+        root.path(),
+        &["refresh", "--all", "--yes"],
+        fixtures_root.path(),
+    );
+    let message = stderr(&output);
+    assert!(output.status.success(), "{message}");
+    summary_count(&message, "Repaired:", 1);
+    let output = cli(&contest, &["refresh", "--force"], fixtures_root.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(contest.join("tests/A/sample-1.in")).unwrap(),
+        b"42"
+    );
+    let before = tree(root.path());
+    for (cwd, args) in [
+        (contest.as_path(), &["refresh"][..]),
+        (contest.as_path(), &["migrate", "--dry-run"][..]),
+        (root.path(), &["refresh", "-c", "abc083"][..]),
+        (root.path(), &["migrate", "-c", "abc083", "--dry-run"][..]),
+        (root.path(), &["refresh", "--all"][..]),
+    ] {
+        let output = cli_without_http(cwd, args);
+        let message = stderr(&output);
+        assert!(output.status.success(), "{args:?}: {message}");
+        assert!(
+            message.contains("abc083") && message.contains("healthy"),
+            "{message}"
+        );
+    }
+    for args in [
+        &["refresh", "-c", "ABC083", "--force"][..],
+        &["migrate", "-c", "ABC083", "--yes"][..],
+    ] {
+        let output = cli_without_http(root.path(), args);
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{message}");
+        assert!(message.contains("contest ID mismatch"), "{message}");
+    }
+    assert_eq!(tree(root.path()), before);
+}
+
+#[test]
+fn case_variant_legacy_contests_are_reported_without_authorizing_an_update() {
+    let root = workspace("version = 1\n[[paths]]\npattern = '^abc083$'\npath = 'abc'\n");
+    let contest = root.path().join("abc").join("ABC083");
+    legacy(&contest);
+    for metadata in [None, Some("version = 99\ncontest_id = 'abc083'\n")] {
+        if let Some(metadata) = metadata {
+            fs::create_dir(contest.join(".atc")).unwrap();
+            fs::write(contest.join(".atc/contest.toml"), metadata).unwrap();
+        }
+        let before = tree(root.path());
+        for args in [
+            &["migrate", "--all", "--dry-run"][..],
+            &["migrate", "--all", "--yes"][..],
+            &["refresh", "--all", "--force", "--yes"][..],
+        ] {
+            let output = cli_without_http(root.path(), args);
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(
+                message.contains("Found 1 contests.") && message.contains("ABC083"),
+                "{message}"
+            );
+            assert!(
+                message.contains("cannot confirm contest ownership")
+                    && message.contains("verify the official contest ID"),
+                "{message}"
+            );
+            summary_count(&message, "Failed:", 1);
+        }
+        for (cwd, args) in [
+            (contest.as_path(), &["refresh", "--force"][..]),
+            (contest.as_path(), &["migrate", "--yes"][..]),
+            (root.path(), &["migrate", "-c", "abc083", "--yes"][..]),
+        ] {
+            let output = cli_without_http(cwd, args);
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(
+                message.contains("cannot confirm contest ownership"),
+                "{message}"
+            );
+        }
+        assert_eq!(tree(root.path()), before);
+    }
+}
+
+#[test]
+fn uppercase_contest_rejects_conflicting_metadata_and_a_nested_workspace() {
+    let root = workspace("version = 1\n");
+    let contest = root.path().join("ABC083");
+    manifest(&contest, "abc084", 1);
+    for (name, reason) in [
+        (None, "contest ID mismatch"),
+        (Some(".atc-workspace.toml"), "Workspace boundary at"),
+    ] {
+        if let Some(name) = name {
+            manifest(&contest, "abc083", 1);
+            fs::write(contest.join(name), "version = 1\n").unwrap();
+        }
+        let before = tree(root.path());
+        for (cwd, args) in [
+            (contest.as_path(), &["refresh", "--force"][..]),
+            (contest.as_path(), &["migrate", "--yes"][..]),
+            (root.path(), &["refresh", "-c", "abc083", "--force"][..]),
+            (root.path(), &["refresh", "--all", "--force", "--yes"][..]),
+            (root.path(), &["migrate", "--all", "--dry-run"][..]),
+        ] {
+            let output = cli_without_http(cwd, args);
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(message.contains(reason), "{message}");
+        }
+        assert_eq!(tree(root.path()), before);
+    }
+}
+
+#[test]
+fn batch_deduplicates_parent_aliases_and_refuses_distinct_case_variants() {
+    let root = workspace("version = 1\n[[paths]]\npattern = '^abc083$'\npath = 'abc'\n");
+    let series = root.path().join("abc");
+    let contest = series.join("ABC083");
+    manifest(&contest, "abc083", 0);
+    let output = cli_without_http(root.path(), &["refresh", "--all"]);
+    let message = stderr(&output);
+    assert!(output.status.success(), "{message}");
+    let relative = Path::new("abc").join("ABC083");
+    assert!(
+        message.contains(&relative.display().to_string()),
+        "{message}"
+    );
+    summary_count(&message, "Scanned:", 1);
+    summary_count(&message, "Healthy skipped:", 1);
+
+    let duplicate = root.path().join("abc083");
+    manifest(&duplicate, "abc083", 0);
+    let before = tree(root.path());
+    let output = cli_without_http(root.path(), &["refresh", "--all", "--force", "--yes"]);
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("duplicate contest ID \"abc083\"") && message.contains("ABC083"),
+        "{message}"
+    );
+    summary_count(&message, "Failed:", 1);
+    assert_eq!(tree(root.path()), before);
 }
 
 #[test]
@@ -186,13 +406,7 @@ fn update_routes_reject_junctions_at_intermediate_and_target_directories() {
         } else {
             (series, outside.path())
         };
-        let result = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(target)
-            .output()
-            .unwrap();
-        assert!(result.status.success(), "{}", stderr(&result));
+        support::link_directory(&link, target);
         for args in [
             &["refresh", "-c", "abc466", "--force"][..],
             &["migrate", "-c", "abc466", "--yes"][..],
@@ -211,15 +425,48 @@ fn update_routes_reject_junctions_at_intermediate_and_target_directories() {
 
 #[test]
 fn dry_run_plans_256_contests_with_large_test_files_without_fetching_or_writing() {
-    fn entries(directory: &Path, state: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+    #[derive(Debug, PartialEq, Eq)]
+    enum Entry {
+        Directory,
+        File {
+            digest: Vec<u8>,
+            modified: SystemTime,
+        },
+    }
+
+    fn entries(directory: &Path, state: &mut Vec<(PathBuf, Entry)>) {
         for entry in fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
-            let metadata = entry.metadata().unwrap();
             let path = entry.path();
-            if metadata.is_dir() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
                 entries(&path, state);
+                state.push((path, Entry::Directory));
+            } else {
+                assert!(
+                    kind.is_file(),
+                    "unexpected entry type at {}",
+                    path.display()
+                );
+                let mut file = fs::File::open(&path).unwrap();
+                let mut digest = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+                let mut buffer = [0; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                state.push((
+                    path,
+                    Entry::File {
+                        digest: digest.finish().as_ref().to_vec(),
+                        modified,
+                    },
+                ));
             }
-            state.push((path, metadata.len(), metadata.modified().unwrap()));
         }
     }
 
@@ -254,16 +501,16 @@ fn dry_run_plans_256_contests_with_large_test_files_without_fetching_or_writing(
             state
         };
         let before = snapshot();
-        let output = cli(
-            root.path(),
-            &[operation, "--all", "--dry-run"],
-            &root.path().join("missing-fixtures"),
-        );
+        let output = cli_without_http(root.path(), &[operation, "--all", "--dry-run"]);
         let message = stderr(&output);
         assert!(output.status.success(), "{message}");
         summary_count(&message, label, 256);
         assert!(!message.contains("Fetching"), "{message}");
-        assert_eq!(snapshot(), before);
+        let after = snapshot();
+        assert_eq!(after.len(), before.len());
+        for (actual, expected) in after.iter().zip(&before) {
+            assert_eq!(actual, expected);
+        }
     }
 }
 
@@ -383,30 +630,17 @@ fn batch_rejects_duplicate_ambiguous_and_misrouted_contests() {
 #[cfg(any(unix, windows))]
 #[test]
 fn batch_does_not_follow_links_at_the_contest_or_any_mapping_component() {
-    fn link(target: &Path, link: &Path) {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target, link).unwrap();
-        #[cfg(windows)]
-        {
-            let output = Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{}", stderr(&output));
-        }
-    }
+    use support::link_directory;
 
     let root =
         workspace("version = 1\n[[paths]]\npattern = '^abc466$'\npath = 'redirect/nested'\n");
     let outside = tempfile::tempdir().unwrap();
     legacy(&outside.path().join("nested/abc466"));
     legacy(&outside.path().join("abc467"));
-    link(outside.path(), &root.path().join("redirect"));
-    link(&outside.path().join("abc467"), &root.path().join("abc467"));
+    link_directory(&root.path().join("redirect"), outside.path());
+    link_directory(&root.path().join("ABC467"), &outside.path().join("abc467"));
     fs::create_dir(root.path().join("local")).unwrap();
-    link(outside.path(), &root.path().join("local/unrelated"));
+    link_directory(&root.path().join("local/unrelated"), outside.path());
     let before = tree(outside.path());
 
     let output = cli(
@@ -418,7 +652,10 @@ fn batch_does_not_follow_links_at_the_contest_or_any_mapping_component() {
     assert!(!output.status.success(), "{message}");
     assert!(message.contains("redirect"), "{message}");
     assert!(!message.contains("abc466"), "{message}");
-    assert!(message.contains("abc467"), "{message}");
+    assert!(
+        message.contains("ABC467") && message.contains("symbolic link or reparse point"),
+        "{message}"
+    );
     summary_count(&message, "Failed:", 1);
     summary_count(&message, "Discovery errors:", 1);
     assert!(!message.contains("Fetching"), "{message}");

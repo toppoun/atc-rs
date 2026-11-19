@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod support;
+
 fn cli(cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_atc"));
     command.current_dir(cwd).env(
@@ -232,7 +235,7 @@ fn migrate_uses_workspace_mapping_and_preserves_old_metadata_bytes() {
     .unwrap();
     let decoy = temp.path().join("abc466");
     old_contest(&decoy, false);
-    let destination = temp.path().join("beginner/abc466");
+    let destination = temp.path().join("beginner").join("abc466");
     for original in [
         "version = 99\ncontest_id = 'abc466'\n",
         "version = 1\ncontest_id = 'abc466'\nproblems = 'invalid schema'\n",
@@ -248,7 +251,20 @@ fn migrate_uses_workspace_mapping_and_preserves_old_metadata_bytes() {
             .args(["migrate", "-c", "abc466", "--yes"])
             .output()
             .unwrap();
-        assert!(stderr(&output).contains(&destination.display().to_string()));
+        let message = stderr(&output);
+        let reported = message
+            .lines()
+            .find_map(|line| line.strip_prefix("Migrate abc466 at "));
+        let reported = Path::new(reported.unwrap_or_else(|| panic!("{message}")));
+        assert!(
+            reported.ends_with(Path::new("beginner").join("abc466")),
+            "{message}"
+        );
+        assert_eq!(
+            fs::canonicalize(reported).unwrap(),
+            fs::canonicalize(&destination).unwrap(),
+            "{message}"
+        );
         let backup = backup(&output);
         assert_eq!(
             fs::read(backup.join("previous-contest.toml")).unwrap(),
@@ -483,20 +499,14 @@ fn migrate_refuses_junctions_nested_under_custom_tests() {
         let destination = temp.path().join("abc466");
         let link = if current {
             contest_with_custom_tests(&destination);
-            destination.join("tests/A/custom/junction")
+            destination.join("tests/A/custom/テスト (junction)")
         } else {
             old_contest(&destination, false);
-            destination.join("tests/a/extra/junction")
+            destination.join("tests/a/extra/テスト (junction)")
         };
-        let target = temp.path().join("outside");
+        let target = temp.path().join("外部 (target)");
         fs::create_dir(&target).unwrap();
-        let created = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .output()
-            .unwrap();
-        assert!(created.status.success(), "{}", stderr(&created));
+        support::link_directory(&link, &target);
         let result = cli(&destination)
             .args(["migrate", "--yes"])
             .output()

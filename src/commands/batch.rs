@@ -173,7 +173,7 @@ impl BatchPlan {
                 let mut diagnosis = "Blocked";
                 let planned = (|| {
                     let location = location?;
-                    workspace.revalidate(&id, &location)?;
+                    workspace.revalidate_location(&id, &location)?;
                     let local = diagnose_contest(&path, &id);
                     #[cfg(test)]
                     if let Some(checkpoint) = cancellation.checkpoint {
@@ -184,7 +184,7 @@ impl BatchPlan {
                     diagnosis = diagnosis_label(&local);
                     let action = plan_action(operation, &path, &id, location, local)?;
                     if let Action::Update { location, .. } = &action {
-                        workspace.revalidate(&id, location)?;
+                        workspace.revalidate_location(&id, location)?;
                     }
                     Ok::<_, AppError>(action)
                 })();
@@ -1564,7 +1564,15 @@ mod tests {
             UpdateCancellation::default(),
         )
         .unwrap();
-        let duplicate = repairable(&root.path().join("ABC"), "abc466", 1);
+        let series = root.path().join("ABC");
+        fs::create_dir(&series).unwrap();
+        let duplicate = series.join("ABC466");
+        fs::create_dir_all(duplicate.join(".atc")).unwrap();
+        fs::copy(
+            original.join(".atc/contest.toml"),
+            duplicate.join(".atc/contest.toml"),
+        )
+        .unwrap();
         let before = read_tree_snapshot(root.path()).unwrap();
         let mut output = Vec::new();
         let code = plan
@@ -1585,6 +1593,49 @@ mod tests {
         );
         assert!(!original.join(".atc-update.lock").exists());
         assert!(!duplicate.join(".atc-update.lock").exists());
+        assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn losing_case_variant_ownership_after_planning_refuses_migration() {
+        let root = workspace();
+        let original = repairable(root.path(), "abc466", 1);
+        let destination = root.path().join("ABC466");
+        fs::rename(&original, root.path().join("intermediate")).unwrap();
+        fs::rename(root.path().join("intermediate"), &destination).unwrap();
+        fs::create_dir(destination.join("tests")).unwrap();
+        fs::write(destination.join("tests/legacy.in"), b"legacy").unwrap();
+        let plan = BatchPlan::scan(
+            root.path(),
+            BatchOperation::Migrate,
+            UpdateCancellation::default(),
+        )
+        .unwrap();
+        assert!(plan.has_updates());
+
+        fs::remove_file(destination.join(".atc/contest.toml")).unwrap();
+        let before = read_tree_snapshot(root.path()).unwrap();
+        let mut output = Vec::new();
+        let code = plan
+            .run(
+                true,
+                false,
+                UpdateCancellation::default(),
+                || {
+                    panic!(
+                        "lost ownership evidence must be detected before initializing the client"
+                    )
+                },
+                &mut NullReporter,
+                &mut output,
+            )
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            output.contains("cannot confirm contest ownership"),
+            "{output}"
+        );
         assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
     }
 

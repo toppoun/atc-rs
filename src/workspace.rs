@@ -483,17 +483,23 @@ impl ExplicitContestRoute {
             None => None,
         };
         let parent_path = mapping.map_or_else(|| root.to_path_buf(), |path| path.append_to(root));
-        let destination = parent_path.join(contest_id);
+        let requested = parent_path.join(contest_id);
         let parent = match mapping {
             Some(mapping) => open_workspace_update_parent(root, &directory, mapping)?
-                .ok_or_else(|| missing_contest_directory(&destination))?,
+                .ok_or_else(|| missing_contest_directory(&requested))?,
             None => directory,
         };
         let parent_identity = opened_directory_identity(&parent, &parent_path)?;
-        let target =
-            open_managed_directory(&parent, contest_id, &destination, "contest directory")?
-                .ok_or_else(|| missing_contest_directory(&destination))?;
+        let name = unique_contest_spelling(&parent, &parent_path, contest_id)?
+            .ok_or_else(|| missing_contest_directory(&requested))?;
+        let destination = parent_path.join(&name);
+        let target = open_managed_directory(&parent, &name, &destination, "contest directory")?
+            .ok_or_else(|| missing_contest_directory(&destination))?;
         reject_nested_workspace(&target, &destination)?;
+        if name != contest_id || has_uppercase(&name) {
+            let owner = infer_contest_id(&target, &destination, &name)?;
+            validate_contest_id_match(&owner, contest_id)?;
+        }
         let destination_identity = opened_directory_identity(&target, &destination)?;
         Ok(Self {
             destination,
@@ -1146,6 +1152,136 @@ pub(crate) fn validate_workspace_update_target(destination: &Path) -> io::Result
     }
 }
 
+/// Resolve the actual entry spelling even if the OS opens it through a case alias.
+pub(crate) fn implicit_contest_name(destination: &Path) -> io::Result<String> {
+    let name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "current directory has no UTF-8 directory name",
+            )
+        })?;
+    let parent_path = destination.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_path = parent_path.unwrap_or_else(|| Path::new("."));
+    let parent = CapDir::open_ambient_dir(parent_path, ambient_authority())?;
+    unique_contest_spelling(&parent, parent_path, name)?
+        .ok_or_else(|| missing_contest_directory(destination))
+}
+
+fn contest_spellings(directory: &CapDir, id: &str) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in directory.entries()? {
+        if let Some(name) = entry?
+            .file_name()
+            .to_str()
+            .filter(|name| name.eq_ignore_ascii_case(id))
+        {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+fn unique_contest_spelling(
+    directory: &CapDir,
+    path: &Path,
+    id: &str,
+) -> io::Result<Option<String>> {
+    let mut names = contest_spellings(directory, id)?;
+    if names.len() > 1 {
+        names.sort_unstable();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "duplicate contest ID {id:?}: case-conflicting entries in {}: {}",
+                path.display(),
+                names.join(", ")
+            ),
+        ));
+    }
+    Ok(names.pop())
+}
+
+pub(crate) fn has_uppercase(name: &str) -> bool {
+    name.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+pub(crate) fn infer_implicit_contest_id(destination: &Path) -> io::Result<String> {
+    let name = implicit_contest_name(destination)?;
+    let directory = open_contest_destination_nofollow(destination.components().as_path())?;
+    infer_contest_id(&directory, destination, &name)
+}
+
+pub(crate) fn revalidate_implicit_contest_route(
+    destination: &Path,
+    contest_id: &str,
+) -> io::Result<()> {
+    validate_workspace_update_target(destination)?;
+    let current = infer_implicit_contest_id(destination)?;
+    validate_contest_id_match(&current, contest_id)
+}
+
+fn infer_contest_id(directory: &CapDir, path: &Path, name: &str) -> io::Result<String> {
+    let metadata = if has_uppercase(name) {
+        read_contest_metadata_snapshot_from(directory, path)?
+    } else {
+        None
+    };
+    infer_contest_id_from_metadata(path, name, metadata.as_ref())
+}
+
+pub(crate) fn infer_contest_id_from_metadata(
+    path: &Path,
+    name: &str,
+    metadata: Option<&safe_file::FileSnapshot>,
+) -> io::Result<String> {
+    validate_path_component(name, "contest ID")?;
+    if !is_safe_atcoder_id(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid contest ID: {name:?}"),
+        ));
+    }
+    if !has_uppercase(name) {
+        return Ok(name.to_owned());
+    }
+
+    let unproven = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot confirm contest ownership for {}: a case-variant directory requires current metadata with a matching contest ID; verify the official contest ID and correct the directory name manually before retrying",
+                path.display()
+            ),
+        )
+    };
+    let content = metadata
+        .and_then(|metadata| std::str::from_utf8(&metadata.bytes).ok())
+        .ok_or_else(unproven)?;
+    let owner = metadata_contest_owner(content).ok_or_else(unproven)?;
+    let folded = name.to_ascii_lowercase();
+    if !owner.eq_ignore_ascii_case(name)
+        || (standard_contest_series(&folded).is_some() && owner != folded)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contest ID mismatch: directory {} does not match metadata contest ID {owner:?}",
+                path.display()
+            ),
+        ));
+    }
+    match inspect_contest_metadata_text(content)? {
+        ContestMetadataHealth::Healthy(_) => Ok(owner),
+        ContestMetadataHealth::Repairable(manifest) if manifest.url_mismatches.is_empty() => {
+            Ok(owner)
+        }
+        _ => Err(unproven()),
+    }
+}
+
 pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
     ensure_contest_recovery_state(destination)?;
     inspect_contest_metadata_unchecked(destination)
@@ -1290,9 +1426,15 @@ pub(crate) fn read_contest_metadata_snapshot(
     destination: &Path,
 ) -> io::Result<Option<safe_file::FileSnapshot>> {
     let directory = open_contest_destination_nofollow(destination)?;
+    read_contest_metadata_snapshot_from(&directory, destination)
+}
+
+fn read_contest_metadata_snapshot_from(
+    directory: &CapDir,
+    destination: &Path,
+) -> io::Result<Option<safe_file::FileSnapshot>> {
     let marker_path = destination.join(".atc");
-    let Some(marker) =
-        open_managed_directory(&directory, ".atc", &marker_path, "workspace marker")?
+    let Some(marker) = open_managed_directory(directory, ".atc", &marker_path, "workspace marker")?
     else {
         return Ok(None);
     };
@@ -1971,6 +2113,14 @@ pub(crate) fn is_safe_atcoder_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn standard_contest_series(id: &str) -> Option<&'static str> {
+    ["abc", "arc", "agc", "ahc"].into_iter().find(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
 fn validate_contest_index_components(contest: &Contest) -> io::Result<()> {
     validate_path_component(&contest.contest_id, "contest ID")?;
     let mut problem_indices = HashSet::new();
@@ -2326,7 +2476,15 @@ pub fn validate_refresh_destination(
         )
     })?;
 
-    if directory_name != std::ffi::OsStr::new(contest_id) {
+    if let Some(name) = directory_name
+        .to_str()
+        .filter(|name| name != &contest_id && name.eq_ignore_ascii_case(contest_id))
+    {
+        let metadata = read_contest_metadata_snapshot(cwd)?;
+        let owner = infer_contest_id_from_metadata(cwd, name, metadata.as_ref())?;
+        return validate_contest_id_match(&owner, contest_id);
+    }
+    if directory_name != OsStr::new(contest_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("current directory is not {contest_id}: {}", cwd.display()),
