@@ -50,6 +50,9 @@ use crate::error::AppError;
 use crate::language::Language;
 use crate::model::{Contest, Sample};
 use crate::ui::{Event, Reporter};
+use crate::workspace::update_cancellation::UpdateCancellation;
+use std::io;
+use std::path::Path;
 
 #[cfg(test)]
 use create::create_at;
@@ -72,11 +75,22 @@ use crate::runner::{self, ExecutionOutcome};
 #[cfg(test)]
 use crate::template::{builtin_template, resolve_source_template_in};
 #[cfg(test)]
-use std::io;
-#[cfg(test)]
-use std::path::Path;
-#[cfg(test)]
 use std::time::Duration;
+
+#[derive(Clone, Copy)]
+struct ContestUpdateChecks<'a> {
+    validate_route: &'a dyn Fn(&Path) -> io::Result<()>,
+    cancellation: UpdateCancellation<'a>,
+}
+
+impl Default for ContestUpdateChecks<'_> {
+    fn default() -> Self {
+        Self {
+            validate_route: &|_| Ok(()),
+            cancellation: UpdateCancellation::default(),
+        }
+    }
+}
 
 struct FetchedContestData {
     contest: Contest,

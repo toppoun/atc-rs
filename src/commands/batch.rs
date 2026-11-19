@@ -1,3 +1,4 @@
+use super::ContestUpdateChecks;
 use super::migrate::{confirm_migration, execute_migration};
 use super::refresh::{RefreshBaseline, execute_batch_refresh, plan_batch_refresh};
 use crate::atcoder::{AtCoderClient, AtCoderError, BATCH_REQUEST_INTERVAL};
@@ -8,6 +9,7 @@ use crate::workspace::diagnosis::{
     ContestDiagnosis, MigrationReason, RepairReason, diagnose_contest,
 };
 use crate::workspace::migration::{self, MigrationInspection, MigrationPlan};
+use crate::workspace::update_cancellation::{UpdateCancellation, UpdateCancelled};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ pub(crate) fn run_batch(
     let result = plan.run(
         run,
         dry_run,
-        &INTERRUPTED,
+        UpdateCancellation::for_batch(&INTERRUPTED),
         || {
             Ok(AtCoderClient::for_batch(
                 BATCH_REQUEST_INTERVAL,
@@ -186,7 +188,7 @@ impl BatchPlan {
         self,
         run: bool,
         dry_run: bool,
-        interrupted: &AtomicBool,
+        cancellation: UpdateCancellation<'_>,
         create_client: impl Fn() -> Result<AtCoderClient, AppError>,
         reporter: &mut dyn Reporter,
         output: &mut dyn Write,
@@ -201,7 +203,7 @@ impl BatchPlan {
                 id, path, action, ..
             } = entry;
             let progress = format!("[{}/{}] {id}", index + 1, total);
-            if interrupted.load(Ordering::Relaxed) {
+            if cancellation.is_requested() {
                 stopped = Some(StopReason::Interrupted);
             }
             let (status, reason) = match action {
@@ -217,19 +219,26 @@ impl BatchPlan {
                 ),
                 Action::Update { location, update } => {
                     writeln!(output, "{progress}  {}", update.running_label())?;
-                    let validate_route = || self.workspace.revalidate(&id, &location);
+                    let validate_route = |_: &Path| self.workspace.revalidate(&id, &location);
                     let result = update.execute(
                         &path,
                         &id,
                         || get_client(&mut client, &create_client),
                         reporter,
-                        &validate_route,
+                        ContestUpdateChecks {
+                            validate_route: &validate_route,
+                            cancellation,
+                        },
                     );
                     match result {
                         Ok(result) => result,
                         Err(AppError::AtCoder(AtCoderError::BatchInterrupted)) => {
                             stopped = Some(StopReason::Interrupted);
                             (Status::NotRun, StopReason::Interrupted.message().into())
+                        }
+                        Err(AppError::Io(error)) if UpdateCancelled::is(&error) => {
+                            stopped = Some(StopReason::Interrupted);
+                            (Status::NotRun, error.to_string())
                         }
                         Err(error) => {
                             if matches!(error, AppError::AtCoder(AtCoderError::RateLimited { .. }))
@@ -277,7 +286,7 @@ impl BatchPlan {
                 writeln!(output, "  {id} at {}: {reason}", path.display())?;
             }
         }
-        if interrupted.load(Ordering::Relaxed) {
+        if cancellation.is_requested() {
             stopped = Some(StopReason::Interrupted);
         }
         if let Some(reason) = stopped {
@@ -285,9 +294,7 @@ impl BatchPlan {
         }
         output.flush()?;
         Ok(
-            if interrupted.load(Ordering::Relaxed)
-                || matches!(stopped, Some(StopReason::Interrupted))
-            {
+            if cancellation.is_requested() || matches!(stopped, Some(StopReason::Interrupted)) {
                 ExitCode::from(130)
             } else if failures.is_empty() && self.discovery_errors.is_empty() {
                 ExitCode::SUCCESS
@@ -415,7 +422,7 @@ impl Update {
         id: &str,
         client: impl FnOnce() -> Result<&'a AtCoderClient, AppError>,
         reporter: &mut dyn Reporter,
-        validate_route: &dyn Fn() -> io::Result<()>,
+        checks: ContestUpdateChecks<'_>,
     ) -> Result<(Status, String), AppError> {
         match self {
             Self::Refresh {
@@ -424,15 +431,7 @@ impl Update {
                 healthy,
                 ..
             } => {
-                execute_batch_refresh(
-                    path,
-                    id,
-                    force,
-                    *baseline,
-                    client,
-                    reporter,
-                    validate_route,
-                )?;
+                execute_batch_refresh(path, id, force, *baseline, client, reporter, checks)?;
                 Ok((
                     if healthy {
                         Status::Refreshed
@@ -443,7 +442,7 @@ impl Update {
                 ))
             }
             Self::Migrate(plan) => {
-                let backup = execute_migration(*plan, client, reporter, |_| validate_route())?;
+                let backup = execute_migration(*plan, client, reporter, checks)?;
                 Ok((Status::Migrated, format!("backup at {}", backup.display())))
             }
         }
@@ -512,7 +511,7 @@ impl Status {
 #[cfg(unix)]
 fn install_interrupt_handler() -> io::Result<()> {
     extern "C" fn on_interrupt(_: libc::c_int) {
-        INTERRUPTED.store(true, Ordering::Relaxed);
+        INTERRUPTED.store(true, Ordering::SeqCst);
     }
 
     // SAFETY: action is initialized before installation and the handler only uses an atomic store.
@@ -536,7 +535,7 @@ fn install_interrupt_handler() -> io::Result<()> {
         if event != CTRL_C_EVENT {
             return 0;
         }
-        INTERRUPTED.store(true, Ordering::Relaxed);
+        INTERRUPTED.store(true, Ordering::SeqCst);
         1
     }
 
@@ -558,8 +557,9 @@ fn install_interrupt_handler() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::safe_file::read_tree_snapshot;
+    use crate::safe_file::{self, read_tree_snapshot};
     use crate::ui::{Event, NullReporter};
+    use crate::workspace::{lock_contest_update, update_cancellation::UpdateCheckpoint};
     use std::cell::Cell;
     use std::fs;
 
@@ -588,6 +588,224 @@ mod tests {
         AtCoderClient::fixture(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InterruptionPoint {
+        BeforeStaging,
+        BeforeApply,
+        BeforeIntent,
+        AfterIntent,
+    }
+
+    fn assert_batch_interruption(interrupt_at: InterruptionPoint) {
+        for (operation, name, completed) in [
+            (
+                BatchOperation::Refresh { force: false },
+                "refresh",
+                "REPAIRED",
+            ),
+            (BatchOperation::Migrate, "migrate", "MIGRATED"),
+        ] {
+            let root = workspace();
+            let first = repairable(root.path(), "abc466", 2);
+            let next = repairable(root.path(), "abc467", 2);
+            for contest in [&first, &next] {
+                if matches!(operation, BatchOperation::Migrate) {
+                    let id = contest.file_name().unwrap().to_str().unwrap();
+                    fs::write(
+                        contest.join(".atc/contest.toml"),
+                        format!("version = 99\ncontest_id = '{id}'\n"),
+                    )
+                    .unwrap();
+                }
+                fs::create_dir_all(contest.join("tests/A")).unwrap();
+                fs::write(contest.join("tests/A/sample-1.in"), b"old input\n").unwrap();
+                fs::write(contest.join("tests/A/sample-1.out"), b"old output\n").unwrap();
+                fs::write(contest.join("A.cpp"), b"source\r\n").unwrap();
+                fs::write(contest.join(".atc/user-data"), b"user data\n").unwrap();
+            }
+            let config = fs::read(root.path().join(".atc-workspace.toml")).unwrap();
+            let first_before = read_tree_snapshot(&first).unwrap();
+            let next_before = read_tree_snapshot(&next).unwrap();
+            let metadata = fs::read(first.join(".atc/contest.toml")).unwrap();
+            let tests = read_tree_snapshot(&first.join("tests")).unwrap();
+            let diagnosis = diagnose_contest(&first, "abc466");
+            let interrupted = AtomicBool::new(false);
+            let checkpoint = |checkpoint: UpdateCheckpoint<'_>| {
+                let observed = match checkpoint {
+                    UpdateCheckpoint::BeforeStaging => {
+                        assert_eq!(read_tree_snapshot(&first).unwrap(), first_before);
+                        InterruptionPoint::BeforeStaging
+                    }
+                    UpdateCheckpoint::BeforeApply(staging) => {
+                        assert!(staging.join(".atc/contest.toml").is_file());
+                        assert!(!first.join(".atc-update.lock").exists());
+                        assert!(!staging.join(safe_file::RECOVERY_INTENT).exists());
+                        InterruptionPoint::BeforeApply
+                    }
+                    UpdateCheckpoint::BeforeIntent(staging) => {
+                        assert!(!staging.join(safe_file::RECOVERY_INTENT).exists());
+                        assert_eq!(
+                            lock_contest_update(&first, false).unwrap_err().kind(),
+                            io::ErrorKind::WouldBlock
+                        );
+                        InterruptionPoint::BeforeIntent
+                    }
+                    UpdateCheckpoint::AfterIntent(staging) => {
+                        assert!(staging.join(safe_file::RECOVERY_INTENT).is_file());
+                        assert_eq!(fs::read(first.join(".atc/contest.toml")).unwrap(), metadata);
+                        assert_eq!(read_tree_snapshot(&first.join("tests")).unwrap(), tests);
+                        InterruptionPoint::AfterIntent
+                    }
+                };
+                if observed == interrupt_at {
+                    interrupted.store(true, Ordering::SeqCst);
+                }
+            };
+            let mut cancellation = UpdateCancellation::for_batch(&interrupted);
+            cancellation.checkpoint = Some(&checkpoint);
+            let mut output = Vec::new();
+            let code = BatchPlan::scan(root.path(), operation)
+                .unwrap()
+                .run(
+                    true,
+                    false,
+                    cancellation,
+                    || Ok(fixture_client()),
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(
+                code,
+                ExitCode::from(130),
+                "{name} at {interrupt_at:?}: {output}"
+            );
+            assert!(
+                output.contains("[2/2] abc467  NOT RUN  interrupted by Ctrl+C"),
+                "{output}"
+            );
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|line| line.starts_with("[2/2]"))
+                    .count(),
+                1,
+                "{output}"
+            );
+            let summary = output.split_once("Summary:\n").unwrap().1;
+            let summary_count = |label: &str| {
+                summary
+                    .lines()
+                    .find_map(|line| line.trim_start().strip_prefix(label))
+                    .unwrap_or_else(|| panic!("{label} missing from {summary}"))
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap()
+            };
+            assert_eq!(summary_count("Failed:"), 0, "{output}");
+            assert_eq!(read_tree_snapshot(&next).unwrap(), next_before);
+            assert_eq!(
+                fs::read(root.path().join(".atc-workspace.toml")).unwrap(),
+                config
+            );
+            assert_eq!(fs::read(first.join("A.cpp")).unwrap(), b"source\r\n");
+            assert_eq!(
+                fs::read(first.join(".atc/user-data")).unwrap(),
+                b"user data\n"
+            );
+
+            let prefixed_directories = |prefix: &str| {
+                fs::read_dir(&first)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_name().to_str().unwrap().starts_with(prefix))
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>()
+            };
+            let staging = prefixed_directories(&format!(".atc-{name}-"));
+            let archives = prefixed_directories(&format!(".atc-recovery-{name}-"));
+            if interrupt_at == InterruptionPoint::AfterIntent {
+                assert!(
+                    output.contains(&format!("[1/2] abc466  {completed}")),
+                    "{output}"
+                );
+                assert_eq!(summary_count("Not run:"), 1, "{output}");
+                let completed_label = match operation {
+                    BatchOperation::Refresh { .. } => "Repaired:",
+                    BatchOperation::Migrate => "Migrated:",
+                };
+                assert_eq!(summary_count(completed_label), 1, "{output}");
+                assert!(staging.is_empty());
+                let [archive] = archives.as_slice() else {
+                    panic!("expected one completed recovery archive")
+                };
+                assert_eq!(
+                    safe_file::read_completed_recovery(archive).unwrap(),
+                    safe_file::RecoveryIdentity::new("contest", "abc466", None)
+                );
+                assert_eq!(
+                    fs::read(archive.join("previous-contest.toml")).unwrap(),
+                    metadata
+                );
+                assert_eq!(
+                    read_tree_snapshot(&archive.join("previous-tests")).unwrap(),
+                    tests
+                );
+                assert!(matches!(
+                    diagnose_contest(&first, "abc466"),
+                    ContestDiagnosis::Healthy { .. }
+                ));
+            } else {
+                assert!(
+                    output.contains("[1/2] abc466  NOT RUN  interrupted by Ctrl+C"),
+                    "{output}"
+                );
+                assert_eq!(summary_count("Not run:"), 2, "{output}");
+                assert!(archives.is_empty());
+                assert_eq!(fs::read(first.join(".atc/contest.toml")).unwrap(), metadata);
+                assert_eq!(read_tree_snapshot(&first.join("tests")).unwrap(), tests);
+                assert_eq!(diagnose_contest(&first, "abc466"), diagnosis);
+                assert_eq!(
+                    first.join(".atc-update.lock").is_file(),
+                    interrupt_at == InterruptionPoint::BeforeIntent
+                );
+                if interrupt_at == InterruptionPoint::BeforeStaging {
+                    assert!(staging.is_empty());
+                    assert_eq!(read_tree_snapshot(&first).unwrap(), first_before);
+                } else {
+                    let [staging] = staging.as_slice() else {
+                        panic!("expected one preserved staging directory")
+                    };
+                    assert!(!staging.join(safe_file::RECOVERY_INTENT).exists());
+                    assert!(!staging.join(safe_file::RECOVERY_COMPLETE).exists());
+                    assert!(!staging.join("previous-tests").exists());
+                    assert!(!staging.join("previous-contest.toml").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_interrupt_before_staging_creates_no_files() {
+        assert_batch_interruption(InterruptionPoint::BeforeStaging);
+    }
+
+    #[test]
+    fn batch_interrupt_after_staging_skips_taking_the_update_lock() {
+        assert_batch_interruption(InterruptionPoint::BeforeApply);
+    }
+
+    #[test]
+    fn batch_interrupt_under_lock_skips_recording_intent_and_replacing_data() {
+        assert_batch_interruption(InterruptionPoint::BeforeIntent);
+    }
+
+    #[test]
+    fn batch_interrupt_after_intent_finishes_the_current_contest_only() {
+        assert_batch_interruption(InterruptionPoint::AfterIntent);
+    }
+
     #[test]
     fn one_hundred_healthy_contests_never_initialize_the_http_client() {
         let root = workspace();
@@ -605,7 +823,7 @@ mod tests {
                 .run(
                     true,
                     false,
-                    &AtomicBool::new(false),
+                    UpdateCancellation::default(),
                     || panic!("healthy workspace must not initialize a client"),
                     &mut NullReporter,
                     &mut output,
@@ -636,7 +854,7 @@ mod tests {
             .run(
                 approved,
                 false,
-                &AtomicBool::new(false),
+                UpdateCancellation::default(),
                 || panic!("declined plan must not initialize a client"),
                 &mut NullReporter,
                 &mut output,
@@ -687,7 +905,7 @@ mod tests {
             .run(
                 true,
                 false,
-                &AtomicBool::new(false),
+                UpdateCancellation::default(),
                 || {
                     client_initializations.set(client_initializations.get() + 1);
                     Ok(fixture_client())
@@ -729,7 +947,7 @@ mod tests {
             .run(
                 true,
                 false,
-                &AtomicBool::new(false),
+                UpdateCancellation::default(),
                 || Ok(fixture_client()),
                 &mut reporter,
                 &mut output,
@@ -758,7 +976,7 @@ mod tests {
             .run(
                 true,
                 false,
-                &AtomicBool::new(false),
+                UpdateCancellation::default(),
                 || panic!("a duplicate must be detected before initializing the client"),
                 &mut NullReporter,
                 &mut output,
@@ -788,7 +1006,7 @@ mod tests {
             .run(
                 true,
                 false,
-                &AtomicBool::new(false),
+                UpdateCancellation::default(),
                 || {
                     attempts.set(attempts.get() + 1);
                     Err(AtCoderError::RateLimited {

@@ -350,7 +350,7 @@ fn has_legacy_data(directory: &CapDir) -> io::Result<bool> {
 }
 
 fn reject_nested_workspace(directory: &CapDir, path: &Path) -> io::Result<()> {
-    if super::entry_exists(directory, WORKSPACE_CONFIG_FILE)? {
+    if super::workspace_config_entry_exists(directory)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(

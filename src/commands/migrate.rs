@@ -1,4 +1,4 @@
-use super::{fetch_contest_data, refresh::create_atcoder_client};
+use super::{ContestUpdateChecks, fetch_contest_data, refresh::create_atcoder_client};
 use crate::atcoder::AtCoderClient;
 use crate::cli::MigrateArgs;
 use crate::error::AppError;
@@ -51,6 +51,8 @@ fn migrate_from(
     confirm: impl FnOnce(&mut dyn Write) -> io::Result<bool>,
 ) -> Result<(), AppError> {
     let specified_id = args.contest.as_deref();
+    let destination = workspace::resolve_contest_target(cwd, specified_id)?;
+    workspace::migration::validate_target(&destination)?;
     let contest_id = specified_id
         .or_else(|| cwd.file_name().and_then(|name| name.to_str()))
         .filter(|id| workspace::is_safe_atcoder_id(id))
@@ -60,7 +62,6 @@ fn migrate_from(
                 "cannot determine a safe contest ID; use -c <contest-id> from the workspace root",
             )
         })?;
-    let destination = workspace::resolve_contest_target(cwd, specified_id)?;
     let MigrationInspection::Ready(plan) =
         workspace::migration::inspect(destination, contest_id.to_owned())?
     else {
@@ -90,7 +91,15 @@ fn migrate_from(
         Ok(())
     };
 
-    let backup = execute_migration(*plan, create_client, reporter, revalidate_mapping)?;
+    let backup = execute_migration(
+        *plan,
+        create_client,
+        reporter,
+        ContestUpdateChecks {
+            validate_route: &revalidate_mapping,
+            ..ContestUpdateChecks::default()
+        },
+    )?;
     writeln!(output, "Migrated {contest_id}")?;
     writeln!(output, "Backup: {}", backup.display())?;
     Ok(())
@@ -100,8 +109,9 @@ pub(super) fn execute_migration<C: std::borrow::Borrow<AtCoderClient>>(
     plan: workspace::migration::MigrationPlan,
     client: impl FnOnce() -> Result<C, AppError>,
     reporter: &mut dyn Reporter,
-    revalidate_mapping: impl Fn(&Path) -> io::Result<()>,
+    checks: ContestUpdateChecks<'_>,
 ) -> Result<PathBuf, AppError> {
+    let revalidate_mapping = checks.validate_route;
     revalidate_mapping(plan.destination())?;
     plan.revalidate()?;
     let client = client()?;
@@ -110,7 +120,7 @@ pub(super) fn execute_migration<C: std::borrow::Borrow<AtCoderClient>>(
     workspace::validate_contest_paths(&data.contest)?;
     revalidate_mapping(plan.destination())?;
     plan.revalidate()?;
-    client.borrow().check_batch_cancellation()?;
+    checks.cancellation.before_staging()?;
 
     let staging = PreservedTempDir::new(
         tempfile::Builder::new()
@@ -131,7 +141,7 @@ pub(super) fn execute_migration<C: std::borrow::Borrow<AtCoderClient>>(
             )
         })?;
 
-    Ok(plan.apply_checked(staging, revalidate_mapping)?)
+    Ok(plan.apply_checked(staging, revalidate_mapping, checks.cancellation)?)
 }
 
 #[cfg(test)]

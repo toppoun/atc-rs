@@ -1,4 +1,4 @@
-use super::fetch_contest_data;
+use super::{ContestUpdateChecks, fetch_contest_data};
 use crate::atcoder;
 use crate::auth::SessionAuth;
 use crate::error::AppError;
@@ -141,7 +141,7 @@ pub(super) fn refresh_from(
         baseline,
         &atcoder,
         reporter,
-        &|| Ok(()),
+        ContestUpdateChecks::default(),
     )?;
     apply_refresh(prepared, reporter)
 }
@@ -248,7 +248,7 @@ pub(crate) fn prepare_refresh(
         baseline,
         atcoder,
         reporter,
-        &|| Ok(()),
+        ContestUpdateChecks::default(),
     )
 }
 
@@ -259,7 +259,7 @@ fn prepare_refresh_from_baseline(
     baseline: RefreshBaseline,
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
-    validate_route: &dyn Fn() -> io::Result<()>,
+    checks: ContestUpdateChecks<'_>,
 ) -> Result<PreparedRefresh, AppError> {
     let data = fetch_contest_data(contest_id, atcoder, reporter)?;
     workspace::validate_contest_identity(&data.contest, contest_id)?;
@@ -267,11 +267,11 @@ fn prepare_refresh_from_baseline(
 
     // Fetching may take long enough for the destination to change. Revalidate
     // immediately before choosing it as the staging parent.
-    validate_route()?;
+    (checks.validate_route)(destination)?;
     baseline.revalidate_diagnosis(destination, contest_id)?;
     baseline.revalidate(destination, contest_id, force)?;
     baseline.revalidate_batch_tests(destination)?;
-    atcoder.check_batch_cancellation()?;
+    checks.cancellation.before_staging()?;
 
     let staging = crate::safe_file::PreservedTempDir::new(
         tempfile::Builder::new()
@@ -281,12 +281,12 @@ fn prepare_refresh_from_baseline(
 
     // Creating the staging directory is path-based. Recheck immediately so a
     // replaced destination cannot cause staging to be built in another contest.
-    validate_route()?;
+    (checks.validate_route)(destination)?;
     baseline.revalidate(destination, contest_id, force)?;
 
     data.stage(staging.path())?;
 
-    validate_route()?;
+    (checks.validate_route)(destination)?;
     baseline.revalidate(destination, contest_id, force)?;
 
     Ok(PreparedRefresh {
@@ -302,15 +302,16 @@ pub(crate) fn apply_refresh(
     prepared: PreparedRefresh,
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
-    apply_refresh_checked(prepared, reporter, &|| Ok(()))
+    apply_refresh_checked(prepared, reporter, ContestUpdateChecks::default())
 }
 
 fn apply_refresh_checked(
     prepared: PreparedRefresh,
     reporter: &mut dyn Reporter,
-    validate_route: &dyn Fn() -> io::Result<()>,
+    checks: ContestUpdateChecks<'_>,
 ) -> Result<(), AppError> {
-    validate_route()?;
+    checks.cancellation.before_apply(prepared.staging.path())?;
+    (checks.validate_route)(&prepared.destination)?;
     let PreparedRefresh {
         destination,
         contest_id,
@@ -328,7 +329,7 @@ fn apply_refresh_checked(
         force,
         baseline.metadata_snapshot,
         |tests| {
-            validate_route()?;
+            (checks.validate_route)(&destination)?;
             if let Some(expected) = &baseline.batch_tests
                 && expected.0.as_ref() != tests
             {
@@ -336,6 +337,7 @@ fn apply_refresh_checked(
             }
             Ok(())
         },
+        checks.cancellation,
     )?;
     if verify_diagnosis
         && !matches!(
@@ -380,9 +382,9 @@ pub(super) fn execute_batch_refresh<'a>(
     baseline: RefreshBaseline,
     client: impl FnOnce() -> Result<&'a atcoder::AtCoderClient, AppError>,
     reporter: &mut dyn Reporter,
-    validate_route: &dyn Fn() -> io::Result<()>,
+    checks: ContestUpdateChecks<'_>,
 ) -> Result<(), AppError> {
-    validate_route()?;
+    (checks.validate_route)(destination)?;
     baseline.revalidate_diagnosis(destination, contest_id)?;
     baseline.revalidate(destination, contest_id, force)?;
     baseline.revalidate_batch_tests(destination)?;
@@ -394,9 +396,9 @@ pub(super) fn execute_batch_refresh<'a>(
         baseline,
         atcoder,
         reporter,
-        validate_route,
+        checks,
     )?;
-    apply_refresh_checked(prepared, reporter, validate_route)
+    apply_refresh_checked(prepared, reporter, checks)
 }
 
 fn changed_batch_tests_error() -> io::Error {

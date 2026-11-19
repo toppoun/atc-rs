@@ -48,6 +48,94 @@ fn old_contest(destination: &Path, with_marker: bool) {
     }
 }
 
+fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    fn visit(root: &Path, directory: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            if entry.file_type().unwrap().is_dir() {
+                entries.push((relative, None));
+                visit(root, &path, entries);
+            } else {
+                entries.push((relative, Some(fs::read(path).unwrap())));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort();
+    entries
+}
+
+#[test]
+fn migrate_refuses_a_workspace_root_before_planning_or_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["abc466", "My Workspace"] {
+        let root = temp.path().join(name);
+        old_contest(&root, true);
+        fs::write(root.join(".atc-workspace.toml"), "version = 1\n").unwrap();
+        let before = tree(&root);
+
+        for flag in ["--yes", "--dry-run"] {
+            let output = cli(&root).args(["migrate", flag]).output().unwrap();
+            let message = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(
+                message.contains("cannot migrate a Workspace directory"),
+                "{message}"
+            );
+            assert!(message.contains("atc migrate -c <contest-id>"), "{message}");
+            assert!(message.contains("atc migrate --all"), "{message}");
+            assert!(!message.contains("Migrate abc466"), "{message}");
+            assert!(!message.contains("Fetching"), "{message}");
+            assert_eq!(tree(&root), before);
+        }
+    }
+}
+
+#[test]
+fn migrate_refuses_an_explicit_target_that_resolves_to_a_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join(".atc-workspace.toml"),
+        "version = 1\n[[paths]]\npattern = '^abc'\npath = 'beginner'\n",
+    )
+    .unwrap();
+    let destination = root.join("beginner/abc466");
+    old_contest(&destination, true);
+    let marker = destination.join(".atc-workspace.toml");
+    fs::write(&marker, "version = 1\n").unwrap();
+    let before = tree(root);
+
+    let output = cli(root)
+        .args(["migrate", "-c", "abc466", "--yes"])
+        .output()
+        .unwrap();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("cannot migrate a Workspace directory"),
+        "{message}"
+    );
+    assert!(!message.contains("Fetching"), "{message}");
+    assert_eq!(tree(root), before);
+
+    fs::remove_file(marker).unwrap();
+    let output = cli(root)
+        .args(["migrate", "-c", "abc466", "--yes"])
+        .output()
+        .unwrap();
+    let archive = backup(&output);
+    assert!(archive.join("previous-tests/a/extra/my-case.bin").is_file());
+    assert!(destination.join("tests/A/sample-1.in").is_file());
+    assert_eq!(
+        fs::read(destination.join("A.cpp")).unwrap(),
+        b"// existing source\r\n"
+    );
+}
+
 #[test]
 fn migrate_preserves_sources_and_restorable_tests_with_or_without_a_marker() {
     for with_marker in [true, false] {

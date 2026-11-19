@@ -20,6 +20,9 @@ use tempfile::TempDir;
 pub(crate) mod batch;
 pub(crate) mod diagnosis;
 pub(crate) mod migration;
+pub(crate) mod update_cancellation;
+
+use update_cancellation::UpdateCancellation;
 
 const METADATA_VERSION: u32 = 1;
 const MAX_CONTEST_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -1027,6 +1030,10 @@ fn entry_exists(directory: &CapDir, name: &str) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn workspace_config_entry_exists(directory: &CapDir) -> io::Result<bool> {
+    entry_exists(directory, WORKSPACE_CONFIG_FILE)
 }
 
 pub fn inspect_contest_metadata(destination: &Path) -> io::Result<ContestMetadataHealth> {
@@ -2257,6 +2264,7 @@ pub fn replace_refresh_data(
         allow_missing_marker,
         expected_metadata,
         |_| Ok(()),
+        UpdateCancellation::default(),
     )
 }
 
@@ -2266,6 +2274,7 @@ pub(crate) fn replace_refresh_data_with_snapshot(
     allow_missing_marker: bool,
     expected_metadata: Option<safe_file::FileSnapshot>,
     validate_update: impl FnOnce(Option<&safe_file::TreeSnapshot>) -> io::Result<()>,
+    cancellation: UpdateCancellation<'_>,
 ) -> io::Result<()> {
     let staging = safe_file::PreservedTempDir::new(staging);
     let staged_contest = match load_metadata(staging.path()) {
@@ -2286,6 +2295,7 @@ pub(crate) fn replace_refresh_data_with_snapshot(
         || {},
         expected_metadata,
         validate_update,
+        cancellation,
     )
 }
 
@@ -2351,6 +2361,7 @@ fn replace_contest_data_with_hooks_and_snapshot(
                 || {},
                 expected_metadata,
                 |_| Ok(()),
+                UpdateCancellation::default(),
             )
         }
     }
@@ -2788,6 +2799,7 @@ fn replace_refresh_data_with_hooks(
         || {},
         expected_metadata,
         |_| Ok(()),
+        UpdateCancellation::default(),
     )
 }
 
@@ -2813,6 +2825,7 @@ fn replace_refresh_data_with_cleanup_hook(
         before_staging_cleanup,
         expected_metadata,
         |_| Ok(()),
+        UpdateCancellation::default(),
     )
 }
 
@@ -2826,6 +2839,7 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
     before_staging_cleanup: impl FnOnce(),
     expected_metadata: Option<safe_file::FileSnapshot>,
     validate_update: impl FnOnce(Option<&safe_file::TreeSnapshot>) -> io::Result<()>,
+    cancellation: UpdateCancellation<'_>,
 ) -> io::Result<()> {
     let staging = safe_file::PreservedTempDir::new(staging);
     validate_contest_directory(destination)?;
@@ -2888,7 +2902,9 @@ fn replace_refresh_data_with_cleanup_hook_and_snapshot(
         .transpose()?;
     let recovery_identity =
         safe_file::RecoveryIdentity::new("contest", &staged_contest.contest_id, None);
-    safe_file::write_recovery_intent(&staging_root, &recovery_identity)?;
+    cancellation.record_intent(&staging_root, || {
+        safe_file::write_recovery_intent(&staging_root, &recovery_identity)
+    })?;
 
     let verify_unchanged = || {
         validate_metadata_snapshot(&destination_metadata, &expected_metadata)?;
@@ -6667,9 +6683,15 @@ mod tests {
         let note = staging_path.join("user-note.txt");
         fs::write(&note, "keep me\n").unwrap();
 
-        let error =
-            replace_refresh_data_with_snapshot(&destination, staging, true, None, |_| Ok(()))
-                .expect_err("invalid staged metadata must stop refresh");
+        let error = replace_refresh_data_with_snapshot(
+            &destination,
+            staging,
+            true,
+            None,
+            |_| Ok(()),
+            UpdateCancellation::default(),
+        )
+        .expect_err("invalid staged metadata must stop refresh");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error

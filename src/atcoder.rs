@@ -677,7 +677,7 @@ impl AtCoderClient {
             .is_none_or(|flag| !flag.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn check_batch_cancellation(&self) -> Result<(), AtCoderError> {
+    fn check_batch_cancellation(&self) -> Result<(), AtCoderError> {
         if self.batch_should_continue() {
             Ok(())
         } else {
