@@ -4,18 +4,21 @@ use crate::model::Sample;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::cookie::CookieStore;
-use reqwest::header::{HeaderValue, RETRY_AFTER};
+use reqwest::header::HeaderValue;
+use retry_after::{MAX_RETRY_WAIT, retry_wait};
 
 use scraper::{Html, Selector};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 // Submit parsing and the one-attempt backend are shared with the one-shot CLI command.
+mod retry_after;
 pub(crate) mod submission_diagnostics;
 pub(crate) mod submission_tracking;
 #[allow(dead_code)]
@@ -25,12 +28,7 @@ const BASE_URL: &str = "https://atcoder.jp";
 
 // 正常時も短時間に連打しない
 const REQUEST_INTERVAL: Duration = Duration::from_millis(500);
-
-// 429を受けたとき、Retry-Afterが無い場合の待機時間
-const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
-
-// A malformed or overly defensive server value must not suspend the CLI indefinitely.
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+pub(crate) const BATCH_REQUEST_INTERVAL: Duration = Duration::from_millis(1_000);
 
 // 最初のリクエストとは別に何回retryするか
 const MAX_429_RETRIES: usize = 3;
@@ -50,9 +48,14 @@ pub enum AtCoderError {
         value: String,
     },
     InvalidProblemUrl(String),
+    BatchInterrupted,
+    UnexpectedBatchRedirect(StatusCode),
 
     // 429がretryしても解消しなかった
     RateLimited {
+        url: String,
+    },
+    RetryAfterExceedsLimit {
         url: String,
     },
 }
@@ -207,9 +210,21 @@ impl fmt::Display for AtCoderError {
                 write!(formatter, "invalid AtCoder {kind}: {value:?}")
             }
             Self::InvalidProblemUrl(url) => write!(formatter, "invalid AtCoder problem URL: {url}"),
+            Self::BatchInterrupted => formatter.write_str("batch operation interrupted"),
+            Self::UnexpectedBatchRedirect(status) => {
+                write!(
+                    formatter,
+                    "unexpected HTTP redirect during batch operation ({status})"
+                )
+            }
             Self::RateLimited { url } => {
                 write!(formatter, "rate limit persisted after retries: {url}")
             }
+            Self::RetryAfterExceedsLimit { url } => write!(
+                formatter,
+                "HTTP 429 Retry-After exceeds the {}-second wait limit for {url}",
+                MAX_RETRY_WAIT.as_secs()
+            ),
         }
     }
 }
@@ -224,7 +239,10 @@ impl std::error::Error for AtCoderError {
             | Self::Parse(_)
             | Self::InvalidIdentifier { .. }
             | Self::InvalidProblemUrl(_)
-            | Self::RateLimited { .. } => None,
+            | Self::BatchInterrupted
+            | Self::UnexpectedBatchRedirect(_)
+            | Self::RateLimited { .. }
+            | Self::RetryAfterExceedsLimit { .. } => None,
         }
     }
 }
@@ -245,6 +263,7 @@ struct HttpSource {
     submit_client: LazySubmitClient,
     auth: Arc<auth::SessionAuth>,
     last_request: Mutex<Option<Instant>>,
+    batch_interval: Option<Duration>,
 }
 
 enum AuthenticatedSendResult {
@@ -290,19 +309,35 @@ impl LazySubmitClient {
 
 impl HttpSource {
     fn new(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
+        Self::with_interval(auth, None)
+    }
+
+    fn with_interval(
+        auth: Arc<auth::SessionAuth>,
+        batch_interval: Option<Duration>,
+    ) -> Result<Self, AtCoderError> {
         let provider = Arc::new(SessionCookieProvider::for_atcoder(Arc::clone(&auth)));
-        Self::new_with_provider(auth, provider)
+        Self::new_with_provider(auth, provider, batch_interval)
     }
 
     fn new_with_provider(
         auth: Arc<auth::SessionAuth>,
         provider: Arc<SessionCookieProvider>,
+        batch_interval: Option<Duration>,
     ) -> Result<Self, AtCoderError> {
+        let mut builder = http_client_builder(Arc::clone(&provider));
+        if batch_interval.is_some() {
+            // Each batch request must take a slot, including an explicit 429 retry.
+            builder = builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never());
+        }
         Ok(Self {
-            client: build_http_client(Arc::clone(&provider))?,
+            client: builder.build()?,
             submit_client: LazySubmitClient::new(provider),
             auth,
             last_request: Mutex::new(None),
+            batch_interval,
         })
     }
 
@@ -315,7 +350,7 @@ impl HttpSource {
             Arc::clone(&auth),
             origin,
         ));
-        Self::new_with_provider(auth, provider)
+        Self::new_with_provider(auth, provider, None)
     }
 
     #[cfg(test)]
@@ -335,6 +370,7 @@ impl HttpSource {
             submit_client: LazySubmitClient::new(provider),
             auth,
             last_request: Mutex::new(None),
+            batch_interval: None,
         })
     }
 
@@ -485,6 +521,7 @@ impl CookieStore for SessionCookieProvider {
 
 pub struct AtCoderClient {
     source: Source,
+    batch_cancelled: Option<&'static AtomicBool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -514,11 +551,37 @@ impl From<&crate::model::Problem> for ProblemOutline {
 
 impl AtCoderClient {
     pub fn new() -> Result<Self, AtCoderError> {
+        Self::load_http(None, None)
+    }
+
+    pub(crate) fn for_batch(
+        interval: Duration,
+        cancelled: &'static AtomicBool,
+    ) -> Result<Self, AtCoderError> {
+        if let Some(path) = std::env::var_os("ATC_FIXTURE_DIR") {
+            return Ok(Self {
+                source: Source::Fixture(path.into()),
+                batch_cancelled: Some(cancelled),
+            });
+        }
+        Self::load_http(Some(interval), Some(cancelled))
+    }
+
+    fn load_http(
+        batch_interval: Option<Duration>,
+        batch_cancelled: Option<&'static AtomicBool>,
+    ) -> Result<Self, AtCoderError> {
         let auth = auth::AuthSnapshot::load();
         if let auth::AuthSnapshot::Invalid(error) = auth.as_ref() {
             return Err(AtCoderError::Auth(*error));
         }
-        Self::from_session_auth(auth::SessionAuth::from_snapshot(&auth))
+        Ok(Self {
+            source: Source::Http(HttpSource::with_interval(
+                auth::SessionAuth::from_snapshot(&auth),
+                batch_interval,
+            )?),
+            batch_cancelled,
+        })
     }
 
     #[cfg(test)]
@@ -529,6 +592,7 @@ impl AtCoderClient {
     pub(crate) fn from_session_auth(auth: Arc<auth::SessionAuth>) -> Result<Self, AtCoderError> {
         Ok(Self {
             source: Source::Http(HttpSource::new(auth)?),
+            batch_cancelled: None,
         })
     }
 
@@ -544,6 +608,7 @@ impl AtCoderClient {
     pub fn fixture(root: impl Into<PathBuf>) -> Self {
         Self {
             source: Source::Fixture(root.into()),
+            batch_cancelled: None,
         }
     }
 
@@ -560,13 +625,14 @@ impl AtCoderClient {
     // ============================================================
 
     pub(crate) fn fetch_contest(&self, contest_id: &str) -> Result<ContestOutline, AtCoderError> {
+        self.check_batch_cancellation()?;
         validate_identifier("contest ID", contest_id)?;
 
         let html = match &self.source {
             Source::Http(http) => {
                 let url = format!("{BASE_URL}/contests/{contest_id}/tasks");
 
-                Self::get_text(http, &url)?
+                self.get_contest_text(http, &url)?
             }
 
             Source::Fixture(root) => {
@@ -587,10 +653,11 @@ impl AtCoderClient {
         &self,
         problem: &ProblemOutline,
     ) -> Result<Vec<Sample>, AtCoderError> {
+        self.check_batch_cancellation()?;
         let html = match &self.source {
             Source::Http(http) => {
                 validate_problem_url(&problem.url)?;
-                Self::get_text(http, &problem.url)?
+                self.get_contest_text(http, &problem.url)?
             }
 
             Source::Fixture(root) => {
@@ -610,11 +677,22 @@ impl AtCoderClient {
     // HTTP
     // ============================================================
 
-    fn get_text(http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
-        match Self::get_text_until(http, url, &|| true)? {
-            Some(text) => Ok(text),
-            None => unreachable!("an always-continue GET cannot be cancelled"),
+    fn batch_should_continue(&self) -> bool {
+        self.batch_cancelled
+            .is_none_or(|flag| !flag.load(Ordering::Relaxed))
+    }
+
+    fn check_batch_cancellation(&self) -> Result<(), AtCoderError> {
+        if self.batch_should_continue() {
+            Ok(())
+        } else {
+            Err(AtCoderError::BatchInterrupted)
         }
+    }
+
+    fn get_contest_text(&self, http: &HttpSource, url: &str) -> Result<String, AtCoderError> {
+        Self::get_text_until(http, url, &|| self.batch_should_continue())?
+            .ok_or(AtCoderError::BatchInterrupted)
     }
 
     fn get_text_until(
@@ -629,10 +707,11 @@ impl AtCoderClient {
             if !should_continue() {
                 return Ok(None);
             }
-            let response = http.send(http.client.get(url))?;
+            let response = http.send(http.client.get(url));
             if !should_continue() {
                 return Ok(None);
             }
+            let response = response?;
 
             // 429だけ特別扱い
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -642,13 +721,21 @@ impl AtCoderClient {
                     });
                 }
 
-                let wait = retry_wait(response.headers());
+                let wait = retry_wait(response.headers()).map_err(|_| {
+                    AtCoderError::RetryAfterExceedsLimit {
+                        url: url.to_string(),
+                    }
+                })?;
 
                 if !interruptible_sleep(wait, should_continue) {
                     return Ok(None);
                 }
 
                 continue;
+            }
+
+            if http.batch_interval.is_some() && response.status().is_redirection() {
+                return Err(AtCoderError::UnexpectedBatchRedirect(response.status()));
             }
 
             // 404 / 500などは普通のHTTPエラーとして返す
@@ -750,10 +837,6 @@ fn parse_authenticated_username(html: &str) -> Option<String> {
     })
 }
 
-fn build_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
-    Ok(http_client_builder(provider).build()?)
-}
-
 fn build_submit_http_client(provider: Arc<SessionCookieProvider>) -> Result<Client, AtCoderError> {
     Ok(http_client_builder(provider)
         .redirect(reqwest::redirect::Policy::none())
@@ -808,7 +891,8 @@ fn validate_problem_url(url: &str) -> Result<(), AtCoderError> {
 }
 
 fn wait_for_request_slot_until(http: &HttpSource, should_continue: &dyn Fn() -> bool) -> bool {
-    reserve_request_slot_until(&http.last_request, REQUEST_INTERVAL, should_continue).is_some()
+    let interval = http.batch_interval.unwrap_or(REQUEST_INTERVAL);
+    reserve_request_slot_until(&http.last_request, interval, should_continue).is_some()
 }
 
 fn reserve_request_slot_until(
@@ -874,15 +958,6 @@ fn remaining_request_interval_for(
     previous
         .and_then(|previous| request_interval.checked_sub(now.saturating_duration_since(previous)))
         .filter(|wait| !wait.is_zero())
-}
-
-fn retry_wait(headers: &reqwest::header::HeaderMap) -> Duration {
-    headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_WAIT))
-        .unwrap_or(DEFAULT_RETRY_WAIT)
 }
 
 // ============================================================
@@ -2191,6 +2266,94 @@ mod tests {
     }
 
     #[test]
+    fn batch_slots_cover_each_retry_and_sample_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let session = anonymous_session();
+        let http = Arc::new(
+            HttpSource::new_with_provider(
+                Arc::clone(&session),
+                provider(session),
+                Some(BATCH_REQUEST_INTERVAL),
+            )
+            .unwrap(),
+        );
+        let counter = Arc::clone(&http);
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, headers) in [
+                (
+                    "429 Too Many Requests",
+                    &[
+                        "Date: Sun, 06 Nov 1994 08:49:00 GMT",
+                        "Retry-After: Sun, 06 Nov 1994 08:49:03 GMT",
+                    ][..],
+                ),
+                ("429 Too Many Requests", &["Retry-After: 0"][..]),
+                ("200 OK", &[][..]),
+                ("200 OK", &[][..]),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_wire_request(&mut stream, None);
+                let reserved = counter.last_request.lock().unwrap().unwrap();
+                requests.push((request.path, reserved));
+                write_wire_response(&mut stream, status, headers);
+            }
+            requests
+        });
+        for path in ["/tasks", "/tasks/sample"] {
+            assert_eq!(
+                AtCoderClient::get_text_until(&http, &format!("{origin}{path}"), &|| true).unwrap(),
+                Some(String::new())
+            );
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/tasks", "/tasks", "/tasks", "/tasks/sample"]
+        );
+        assert!(requests[1].1 - requests[0].1 >= Duration::from_secs(3));
+        for pair in requests[1..].windows(2) {
+            assert!(pair[1].1 - pair[0].1 >= BATCH_REQUEST_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn batch_http_stops_after_persistent_429_and_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let session = anonymous_session();
+        let http = HttpSource::new_with_provider(
+            Arc::clone(&session),
+            provider(session),
+            Some(Duration::from_millis(1)),
+        )
+        .unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..=MAX_429_RETRIES {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(read_wire_request(&mut stream, None).path, "/limited");
+                write_wire_response(&mut stream, "429 Too Many Requests", &["Retry-After: 0"]);
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(read_wire_request(&mut stream, None).path, "/redirect");
+            write_wire_response(&mut stream, "302 Found", &["Location: /unpaced"]);
+        });
+        assert!(matches!(
+            AtCoderClient::get_text_until(&http, &format!("{origin}/limited"), &|| true),
+            Err(AtCoderError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            AtCoderClient::get_text_until(&http, &format!("{origin}/redirect"), &|| true),
+            Err(AtCoderError::UnexpectedBatchRedirect(StatusCode::FOUND))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn request_interval_is_measured_between_request_starts() {
         let previous = Instant::now();
 
@@ -2320,22 +2483,32 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_delta_seconds_is_used_with_a_fallback() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("7"));
-        assert_eq!(retry_wait(&headers), Duration::from_secs(7));
-
-        headers.insert(
-            RETRY_AFTER,
-            reqwest::header::HeaderValue::from_static("invalid"),
-        );
-        assert_eq!(retry_wait(&headers), DEFAULT_RETRY_WAIT);
-
-        headers.insert(
-            RETRY_AFTER,
-            reqwest::header::HeaderValue::from_static("18446744073709551615"),
-        );
-        assert_eq!(retry_wait(&headers), MAX_RETRY_WAIT);
+    fn a_server_wait_above_the_limit_stops_batch_and_single_gets() {
+        for interval in [None, Some(BATCH_REQUEST_INTERVAL)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let session = anonymous_session();
+            let http =
+                HttpSource::new_with_provider(Arc::clone(&session), provider(session), interval)
+                    .unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(read_wire_request(&mut stream, None).path, "/limited");
+                write_wire_response(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    &[
+                        "Date: Sun, 06 Nov 1994 08:49:00 GMT",
+                        "Retry-After: Sun, 06 Nov 1994 08:50:01 GMT",
+                    ],
+                );
+            });
+            assert!(matches!(
+                AtCoderClient::get_text_until(&http, &format!("{origin}/limited"), &|| true),
+                Err(AtCoderError::RetryAfterExceedsLimit { .. })
+            ));
+            server.join().unwrap();
+        }
     }
 
     #[test]

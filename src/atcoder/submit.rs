@@ -1095,7 +1095,8 @@ fn fetch_fresh_submit_page_until(
             if retry_count == MAX_429_RETRIES {
                 return Err(SubmitError::RateLimited);
             }
-            if !transport.wait_before_get_retry(retry_wait(&response.headers), should_continue) {
+            let wait = retry_wait(&response.headers).map_err(|_| SubmitError::RateLimited)?;
+            if !transport.wait_before_get_retry(wait, should_continue) {
                 return Ok(SubmitTransportProgress::CancelledBeforeSubmit);
             }
             continue;
@@ -3296,12 +3297,38 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_get_retry_wait_exits_without_posting() {
-        let active = Rc::new(Cell::new(true));
+    fn get_429_above_the_wait_limit_never_retries_or_posts() {
         let mut rate_limited = response(StatusCode::TOO_MANY_REQUESTS, None, "rate limited");
         rate_limited
             .headers
-            .insert(RETRY_AFTER, HeaderValue::from_static("60"));
+            .insert(RETRY_AFTER, HeaderValue::from_static("61"));
+        let mut transport = ScriptedSubmitTransport::new(vec![ScriptStep::Get {
+            path: "/contests/abc466/submit".into(),
+            result: Ok(rate_limited),
+        }]);
+
+        assert_eq!(
+            submit_with_transport(&mut transport, submit_request(Language::Cpp, "dummy")),
+            Err(SubmitError::RateLimited)
+        );
+        assert_eq!(transport.get_count(), 1);
+        assert_eq!(transport.get_retry_waits, 0);
+        assert_eq!(transport.post_count(), 0);
+        transport.assert_complete();
+    }
+
+    #[test]
+    fn cancellation_during_get_retry_wait_exits_without_posting() {
+        let active = Rc::new(Cell::new(true));
+        let mut rate_limited = response(StatusCode::TOO_MANY_REQUESTS, None, "rate limited");
+        rate_limited.headers.insert(
+            reqwest::header::DATE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:00 GMT"),
+        );
+        rate_limited.headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:50:00 GMT"),
+        );
         let mut transport = ScriptedSubmitTransport::new(vec![
             ScriptStep::Get {
                 path: "/contests/abc466/submit".to_string(),

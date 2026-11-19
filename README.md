@@ -7,6 +7,7 @@ AtCoder のコンテスト準備、サンプルテスト、提出までをター
 ## できること
 
 - コンテストを作成し、問題ごとのソースと公式サンプルを用意する
+- ソースを残して旧テストをバックアップし、1 件ずつでも一括でも移行できる。[単一 Contest](docs/workspace.md#migrate)・[一括更新・移行](docs/workspace.md#workspace-内を一括で確認更新する)
 - 画面上で問題を切り替え、サンプルテストを実行する
 - ソースの保存を監視して、自動で再テストする
 - Generator と Brute Force を使って Stress Test を行う
@@ -87,7 +88,7 @@ atc submit --help
 
 - [インストール](docs/installation.md) — 導入、必要な外部ツール、最初の Contest
 - [TUI](docs/tui.md) — 画面ごとの操作とショートカット
-- [ワークスペース](docs/workspace.md) — Contest の保存先、作成、切り替え、更新
+- [ワークスペース](docs/workspace.md) — Contest の保存先、作成、切り替え、更新、外部ツール向けのソース取得
 - [テストと Watch](docs/testing.md) — サンプルテスト、User Input、自動テスト
 - [ストレステスト](docs/stress.md) — Generator / Brute Force と反例の保存
 - [AtCoder 認証](docs/authentication.md) — Cookie の設定、確認、置換、リセット

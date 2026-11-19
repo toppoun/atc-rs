@@ -16,8 +16,9 @@
 
 ## 1. Problem identity
 
-- **対象となる操作** — AtCoder の問題一覧取得、Contest メタデータの保存・読込、Test・Stress・Submit の問題選択。
+- **対象となる操作** — AtCoder の問題一覧取得、Contest メタデータの保存・読込、Test・Stress・Submit・`atc source` の問題選択。
 - **保証する動作** — Contest ID はコンテスト、`index` は表示・ローカルパスの問題ラベル、`task_id` は AtCoder 上の問題を識別する。問題一覧ではラベルとタイトルのリンクが一致し、指定 Contest 配下の有効な task ID を指すことを確認する。確定したメタデータは `https://atcoder.jp/contests/<contest-id>/tasks/<task-id>` と文字列で一致する URL を持つ。CLI のラベル検索は ASCII 大小文字を区別せず、明示した Contest ID はメタデータと完全一致で照合する。
+- `atc source` の task ID 検索は完全一致で行う。ローカルのファイル名は、見つかった問題の `index` と言語の拡張子から決まる。
 - **拒否・失敗・中断時の動作** — 空の問題一覧、重複 task ID、安全なパス要素にならない ID・ラベル、ASCII 大小文字だけが異なるラベル、異なる Contest・task を指す URL を通常のメタデータとして受理しない。Test・Stress は開始時に現在のラベルと task ID の組を確認し、Submit は POST 直前にも Contest と task の対応を確認する。
 - **保証しない範囲と例外** — task ID を Contest ID とラベルから合成しない。安全な形式の URL と task ID の不一致や重複 task ID は、修復用の検査では条件付きで扱う。所有の判定は[契約 4](#4-contest--stress-recovery)を参照。
 - **関連する本番実装** — [src/atcoder.rs](../../src/atcoder.rs) の `parse_contest`、[src/workspace.rs](../../src/workspace.rs) の `validate_contest_paths`、`validate_contest_identity`、`ContestTaskSnapshot::problem`、[src/commands/test.rs](../../src/commands/test.rs) の `find_problem`、[src/commands/submit.rs](../../src/commands/submit.rs) の `verified_post_gate`。
@@ -54,6 +55,36 @@
 - **関連する回帰テスト** — [src/commands/contest.rs](../../src/commands/contest.rs) の `matching_official_samples_do_not_establish_ownership_for_either_update`、`unknown_metadata_owner_cannot_offer_repair_or_change_files`。[src/commands/tests.rs](../../src/commands/tests.rs) の `prepared_refresh_rejects_destination_metadata_changes_before_apply`。[src/workspace.rs](../../src/workspace.rs) の `refresh_install_and_rollback_race_preserves_competitor_and_recovery_data`、`completed_contest_refresh_retains_previous_metadata_and_tests`、`failed_contest_completion_record_preserves_staging_and_blocks_read`。[src/stress.rs](../../src/stress.rs) の `interrupted_replacement_blocks_a_new_stress_save_without_touching_recovery`、`installed_failure_with_blocked_staging_cleanup_is_not_reported_as_saved`（Windows）。
 - **未検証事項・プラットフォーム依存事項** — 停電や任意の強制終了時点での耐久性、全ファイルシステムでの復旧可否は未確認。共有違反など OS による移動の失敗もあり得る。
 
+### Contest のローカル診断と CLI Refresh
+
+- `diagnose_contest` は解決済みのディレクトリを対象とし、ネットワークやファイルへの書き込みを行わない。Contest 直下の Recovery と管理対象のディレクトリ・ファイルを検査し、メタデータは 16 MiB までの UTF-8 を読む。上位の Workspace の経路解決と書き込み直前の再検査は呼び出し側が担当する。
+- `Healthy` は、メタデータと既存 `tests` の所有情報が整合し、サンプル本文が UTF-8 で、ファイル名・連番・入出力の対・件数がローカルの定義に合う状態。全問題のサンプル数が 0 なら `tests` の欠損を許容する。サンプルは `StructureOnly` を返し、AtCoder の公式本文との一致は未確認。
+- `RepairRequired` は、例えば所有権を妨げる既存 `tests` がない場合のメタデータ欠損や不正、所有を確認できるサンプルの欠損や件数違いを表す。ID 不一致、確認できない所有権、管理外の項目、リンク・reparse point などの不正な種類、確認を要する Recovery は `Blocked` を返す。修復可能な旧メタデータで既存の問題テストがある場合、所有の確定には公式の問題一覧との照合が必要。
+- 対象ディレクトリの欠損は `MissingDirectory`。メタデータのルートに同じ Contest ID があり、バージョンが未対応なら `MigrationRequired(UnsupportedVersion)` を返す。未対応の形式では `tests` の照合を省略する。移行手段の有無は呼び出し側で判断する。診断は最初に検出した問題を返し、協調ロックを取得しない。
+- CLI の `atc refresh` は、`Healthy` なら通信・staging 作成・ファイル更新なしで終了する。`--force` は `Healthy` でも取得を行い、`Blocked`・`MigrationRequired`・`MissingDirectory` では取得前に終了する。メタデータが欠けている場合、`-c` は既存の `.atc/` を要求し、`--force` はディレクトリ名で対象を指定できる。どちらの場合も既存の `tests/` の所有確認を行う。
+- 単体と一括の CLI Refresh は、更新対象の診断結果・Contest ディレクトリの実体・メタデータ・`tests/` の構造と内容を取得前に記録する。`-c` と `--all` では Workspace の振り分けルールと解決した経路も記録する。既存更新ロックの種類はクライアント初期化前に読み取り専用で確認する。健全な対象をスキップする場合は更新用の `tests/` スナップショットを作らない。
+- 取得後と適用前に記録した状態を照合し、差異があれば中断する。適用時には更新ロック下のスナップショットを使い、退避後も旧データを照合する。適用後に `Healthy` を確認してから成功を報告する。
+- 実装と単体テストは [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) と [workspace/tests/diagnosis.rs](../../src/workspace/tests/diagnosis.rs) を参照。
+
+### CLI Migrate
+
+- `Healthy` はスキップする。欠損、旧形式、所有 ID を確認できる不正メタデータ、所有確認できない `tests` や管理外の項目は移行候補となる。通常の管理外サブディレクトリも移行候補となり、配下の安全性は再帰検査で確認する。既存メタデータがあれば、ルートの `contest_id` を TOML として曖昧さなく読み取れ、対象 ID と一致する必要がある。サンプルだけの修復は Refresh が扱う。
+- 移行候補でも Recovery の中断、置換対象のリンク・reparse point、非通常ファイル、スナップショット失敗を拒否する。`tests` の全階層を、開いたディレクトリからリンクをたどらずに検査する。`.atc/` 内では `contest.toml` のみを対象とする。CLI はパスと ID を表示し、端末上の承認または `--yes` を得てから取得する。`--dry-run`、計画時の拒否、取得失敗ではファイルに書き込まない。
+- 対象に `.atc-workspace.toml` のエントリがあれば、移行計画の作成前と更新ロック取得後に拒否する。単体 `migrate` の現在のディレクトリと `-c` で解決した経路にも適用する。Workspace マーカーの有無は一括探索と同じ判定を使う。
+- 取得後と更新ロック取得後に、診断、対象ディレクトリと `.atc/` の実体、メタデータと全 `tests` のスナップショットを照合する。Recovery intent を記録してから旧データを同じファイルシステム内で no-clobber 移動し、両方の退避を確認してから公式データを配置する。`previous-tests` には管理外の項目や空ディレクトリも含まれる。完了した `.atc-recovery-migrate-*` と、要確認の `.atc-migrate-*` には既存の Recovery 判定を適用する。
+- 途中で失敗したときは新旧のデータが別々の場所に残り得る。Recovery 領域を維持し、競合相手のファイルを上書きしない。成功報告には Recovery の完了と `Healthy` を要求する。取得中の照合は置換対象に限り、ソースやその他のユーザーデータは変更しない。
+
+### Workspace 一括更新
+
+- `--all` は現在の明示的な Workspace ルートを起点に、直下・設定済み経路・既知のシリーズ別フォルダの各直下を調べる。Workspace 直下からリンクや reparse point をたどらない。振り分けの曖昧さ、同一 ID の重複、別の Workspace、割り当て先と異なる経路を拒否する。ディレクトリ名は診断に渡す期待 ID であり、既存データの所有権の根拠は単一 Contest と共通。
+- 全対象の診断・計画を先に作成し、dry-run と承認前は読み取り専用。計画の照合には相対パス・種類・ファイルサイズ・実体識別子・SHA-256 を使い、空ディレクトリを記録する。テスト本文のハッシュと UTF-8 検査はストリーミングで行う。ハッシュは変更の検出に使い、所有権の判定は既存の診断と検証で行う。置換・Recovery のバイト単位の照合は処理中の Contest に限って行う。
+- 移行は一括で一度承認し、非対話の更新では `--yes` を要求する。最初の更新までクライアントを初期化しない。`--force` のない Refresh と Migrate は健全な対象を通信なしでスキップする。
+- 更新対象は 1 件ずつ再診断し、経路・ディレクトリの実体・メタデータ・更新対象の `tests` を検証する。置換と Recovery は既存の処理を使う。個別の失敗や Recovery の要確認状態を集計し、別の対象への安全な更新は続ける。継続した 429 や Ctrl+C では新しい対象を開始しない。
+- staging 作成前と適用前に中断を確認する。更新ロック下で Recovery intent の書き込みを開始する直前に、中断フラグを原子的に確認して置換開始を確定する。中断が先に確定した更新対象は `NOT RUN` とし、準備済み staging は保持する。置換開始が先に確定した対象は、既存の置換・復旧処理で終了する。
+- 同じ HTTP クライアントの取得枠でリクエスト開始時刻を 1,000 ms 以上離す。429 の再試行も取得枠を使う。暗黙の再試行とリダイレクトを無効にする。未対応の形式やサンプルの修復待ちは案内として集計し、探索エラー・拒否・実行失敗は非ゼロ終了にする。中断は終了コード 130。
+- 429 の GET 再試行では `Retry-After` の秒数と HTTP 日付を受け付ける。日時の基準は有効な応答 `Date`、なければ端末の UTC 現在時刻。経過済みの日時は追加待機 0 秒で、既存の取得枠を通す。不正・未指定は 2 秒。60 秒を超える有効な指定では、単体の取得も再試行せず、一括では以降の対象を `NOT RUN` とする。再試行は最多 3 回で、待機中の中断を受け付ける。
+- CLI の回帰テストは [tests/batch_cli.rs](../../tests/batch_cli.rs)。計画後の変更とクライアントの初期化は [commands/batch.rs](../../src/commands/batch.rs)、取得枠と再試行は [atcoder.rs](../../src/atcoder.rs) のテストを参照。
+
 ## 5. Watch / TUI consistency
 
 - **対象となる操作** — Plain Watch、TUI の監視・実行キュー、Contest 切替、TUI Refresh。
@@ -67,6 +98,7 @@
 ## 6. User file preservation
 
 - **対象となる操作** — Contest・ソース作成、Workspace 初期化、Config・テンプレート・Stress 補助ファイルの初期化、Global Settings と TUI の User Input の保存。
+- `atc source` は Workspace と Contest の管理ファイルを読み取り専用で開く。Workspace ルートの末端、その配下の振り分け先、Contest、`.atc` と対象ファイルはリンク・reparse point を拒否する。Contest メタデータは 16 MiB、ソースは 1 MiB までの UTF-8 を受理する。出力は `schema_version` が `1` の JSON オブジェクト1つと末尾の改行で、実行時のエラーは標準エラー出力へ出る。
 - **保証する動作** — Contest 新規配置はステージ済みディレクトリの no-clobber 移動、ソース作成は `create_new` を使う。初期化で既存の有効な設定やテンプレートは内容を書き換えず、欠けたファイルだけを no-clobber で配置する。Global Settings の既存ファイル保存は、読込時のバイト列・ファイルの同一性・対象属性を照合し、同じ親ディレクトリの一時ファイルから置換する。未作成の設定は no-clobber で公開する。既存の User Input の編集保存は問題単位のロック下で編集開始時の内容を照合し、差分や欠損があれば書き込まない。
 - **拒否・失敗・中断時の動作** — ソース作成は同名の既存エントリを上書きしない。Workspace マーカーと Stress 補助ファイルの初期化は最終要素に `symlink_metadata` を使い、通常ファイルとして扱えない既存項目を拒否する。Contest の管理ファイルは操作ごとに通常ファイル・実ディレクトリを確認し、Windows の reparse point も検査する。Global Settings の構造化保存は末端の symlink / reparse point を拒否し、外部変更や同じ内容での差し替えを検出したら競合として扱う。
 - **保証しない範囲と例外** — Global Config・テンプレートの初期化は、既存の有効なリンク先ファイルやディレクトリを許容する。壊れたリンクや種類が違う対象は拒否する。Global Settings もリンク先が通常ファイルなら閲覧できる場合がある。これらの規則は各操作の対象要素に適用される。複数ファイルの初期化や直接のソース書込に一括ロールバックはなく、Settings は置換後の同期・再検査の失敗で新しい内容が既に見える場合がある。

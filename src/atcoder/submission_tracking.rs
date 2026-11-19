@@ -336,9 +336,9 @@ impl SubmissionTrackingError {
                 SubmissionTrackingErrorKind::HttpStatus
             }
             Self::Fetch(AtCoderError::Http(_)) => SubmissionTrackingErrorKind::HttpTransport,
-            Self::Fetch(AtCoderError::RateLimited { .. }) => {
-                SubmissionTrackingErrorKind::RateLimited
-            }
+            Self::Fetch(
+                AtCoderError::RateLimited { .. } | AtCoderError::RetryAfterExceedsLimit { .. },
+            ) => SubmissionTrackingErrorKind::RateLimited,
             Self::Fetch(_) => SubmissionTrackingErrorKind::Fetch,
             Self::InvalidIdentity(_) => SubmissionTrackingErrorKind::InvalidIdentity,
             Self::MalformedSubmissionList(_) => {
@@ -555,8 +555,7 @@ impl HttpTrackingTransport<'_> {
 
 impl TrackingTransport for HttpTrackingTransport<'_> {
     fn get_text(&mut self, path: &str) -> Result<String, SubmissionTrackingError> {
-        AtCoderClient::get_text(self.http, &format!("{BASE_URL}{path}"))
-            .map_err(SubmissionTrackingError::Fetch)
+        self.get_text_until(path, &|| true)
     }
 
     fn wait(&mut self, duration: Duration) {

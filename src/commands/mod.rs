@@ -1,13 +1,16 @@
 mod attempt_executor;
+mod batch;
 mod config;
 mod contest;
 mod create;
 mod doctor;
 mod init;
 mod login;
+mod migrate;
 mod new;
 mod refresh;
 mod run_scheduler;
+mod source;
 pub(crate) mod stress;
 pub(crate) mod submit;
 mod template;
@@ -21,6 +24,7 @@ mod watch_worker;
 #[cfg(test)]
 pub(crate) use user_input_run::execute_user_input_for_test;
 
+pub(crate) use batch::{BatchOperation, run_batch};
 pub(crate) use config::{config_init, initialize_config_at};
 pub(crate) use contest::contest;
 #[cfg(test)]
@@ -29,8 +33,10 @@ pub(crate) use create::{create, create_source};
 pub(crate) use doctor::doctor;
 pub(crate) use init::init;
 pub(crate) use login::login;
+pub(crate) use migrate::migrate;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
+pub(crate) use source::source;
 pub(crate) use stress::{stress, stress_init};
 pub(crate) use submit::submit;
 pub(crate) use template::{initialize_source_templates_at, template_init};
@@ -44,6 +50,9 @@ use crate::error::AppError;
 use crate::language::Language;
 use crate::model::{Contest, Sample};
 use crate::ui::{Event, Reporter};
+use crate::workspace::update_cancellation::UpdateCancellation;
+use std::io;
+use std::path::Path;
 
 #[cfg(test)]
 use create::create_at;
@@ -52,7 +61,7 @@ use new::new_at_with_install_hook;
 #[cfg(test)]
 use new::{new_at, new_at_in_workspace, prepare_new};
 #[cfg(test)]
-use refresh::{apply_refresh, prepare_refresh, refresh_at, resolve_refresh_contest_id};
+use refresh::{apply_refresh, prepare_refresh, refresh_at, refresh_from};
 #[cfg(test)]
 use test::{
     find_problem, report_case_result, report_compile_result, run_test_cases, test_problem,
@@ -66,11 +75,22 @@ use crate::runner::{self, ExecutionOutcome};
 #[cfg(test)]
 use crate::template::{builtin_template, resolve_source_template_in};
 #[cfg(test)]
-use std::io;
-#[cfg(test)]
-use std::path::Path;
-#[cfg(test)]
 use std::time::Duration;
+
+#[derive(Clone, Copy)]
+struct ContestUpdateChecks<'a> {
+    validate_route: &'a dyn Fn(&Path) -> io::Result<()>,
+    cancellation: UpdateCancellation<'a>,
+}
+
+impl Default for ContestUpdateChecks<'_> {
+    fn default() -> Self {
+        Self {
+            validate_route: &|_| Ok(()),
+            cancellation: UpdateCancellation::default(),
+        }
+    }
+}
 
 struct FetchedContestData {
     contest: Contest,
@@ -140,6 +160,15 @@ fn fetch_contest_data(
         contest,
         samples_by_problem,
     })
+}
+
+impl FetchedContestData {
+    fn stage(self, destination: &std::path::Path) -> std::io::Result<()> {
+        for (problem, samples) in self.contest.problems.iter().zip(self.samples_by_problem) {
+            crate::workspace::save_samples(destination, problem, &samples)?;
+        }
+        crate::workspace::save_metadata(destination, &self.contest)
+    }
 }
 
 fn fetch_samples_for_manifest(

@@ -67,12 +67,19 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `atc contest` / `atc c` → `commands::contest` → 配置先を解決し、`inspect_contest_target` で状態を調べる。未作成なら作成し、要修復なら確認後に修復する。健全な Contest を `watch_tui_at` で開く。
 - Workspace Home の Contest オープンと Contest 画面の切替は `watch_tui.rs` の `resolve_contest_open` → `prepare_workspace_contest_entry` をたどる。現在の Workspace 設定で行き先を解決し、作成・修復が必要なら確認を経て `contest.rs` の共通処理を呼ぶ。準備済みの入力で新しいセッションを開始し、切替時は先に旧セッションを終了する。
 - 修復の分岐は `contest.rs` の `plan_repair`。健全なメタデータがあるときはそれを基準にサンプルを取り直す。欠損・不正などの場合は AtCoder の問題一覧とサンプルを取得する。計画に応じて、`workspace.rs` がメタデータのみ、サンプルのみ、または両方を置換する。
+- [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) の `diagnose_contest` は、解決済みの Contest パスと期待する ID を受け取る内部 API。Recovery、メタデータ、既存 `tests` の所有権、サンプルの構造を順に調べる。検査の部品は `workspace.rs` の既存処理と共有し、操作の選択や更新は呼び出し側が担当する。CLI の `atc refresh` と `atc migrate` が取得の要否を決めるために使う。
 
 ### Refresh と Recovery
 
-- CLI の `atc refresh` → `resolve_refresh_contest_id` → `prepare_refresh` → `apply_refresh`。準備で問題一覧とサンプルを取得し、適用で `workspace::replace_refresh_data_with_snapshot` に渡す。`--force` による対象決定の違いは `resolve_refresh_contest_id` から追う。
+- CLI の `atc refresh` → `refresh_from` がパス・ID を解決し、`diagnose_contest` で判定する。単体と一括は [commands/refresh.rs](../../src/commands/refresh.rs) の `RefreshBaseline` と `execute_cli_refresh` を共有する。更新対象のロック項目と `tests/` を通信前に検査し、経路とローカルのスナップショットを取得後と適用前に照合する。問題一覧とサンプルの取得・準備は TUI と共通。`workspace::replace_refresh_data_with_snapshot` が更新ロック下で経路と旧データを照合して置換し、CLI は置換後に `Healthy` を確認する。
 - Contest 画面の Refresh → `contest_refresh_task` がバックグラウンドで `prepare_refresh` → `rebuild_active_contest_session_after_refresh` が旧セッションを終了し、適用後にディスクから読み直す。適用失敗時も再読込・再起動を試み、成功すれば失敗表示を引き継ぐ。この組み直しには直前の設定・認証を使う。
+- CLI の `atc migrate` → [commands/migrate.rs](../../src/commands/migrate.rs) が対象解決・計画表示・承認・公式データ取得を行う。取得と staging の組み立ては Refresh と共有する。[workspace/migration.rs](../../src/workspace/migration.rs) が診断結果と旧データのスナップショットを使って適用を判定し、Contest 更新ロック下で退避と配置を行う。Recovery を完了し、`Healthy` を確認してからバックアップ先を表示する。
+- CLI の `refresh --all` / `migrate --all` → [commands/batch.rs](../../src/commands/batch.rs) が [workspace/batch.rs](../../src/workspace/batch.rs) でルートと対象を確定し、全 Contest の診断と更新計画を通信前に作る。[safe_file.rs](../../src/safe_file.rs) は計画用の内容ハッシュと置換・Recovery 用のバイト単位のスナップショットを同じディレクトリ走査で読み取る。承認後は 1 件ずつ経路と計画を再照合し、更新ロック下で旧データを読み取って置換する。[atcoder.rs](../../src/atcoder.rs) が一括用の取得間隔と中断を扱い、[retry_after.rs](../../src/atcoder/retry_after.rs) が 429 の再試行時刻を解釈する。
 - ディスク上の Recovery は `workspace.rs` の置換・ロールバック処理と `contest_recovery_state` を起点に追う。`safe_file` が復旧レコードを書き、完了した作業領域を退避先に移す。メタデータやテスト入力の読込でも、確認が必要な中断状態を検出する。Stress 側の対応箇所は `stress.rs` の `ensure_no_interrupted_generation`。
+
+### 外部ツール向けのソース取得
+
+- `atc source` → [commands/source.rs](../../src/commands/source.rs) → `workspace::open_local_contest`。既存の振り分け規則とメタデータの検証を使い、開いたディレクトリを基準に Contest をたどる。`safe_file` がメタデータと選択されたソースをサイズ制限付きで読み取り、`source.rs` が標準出力へ JSON を返す。[tests/source_cli.rs](../../tests/source_cli.rs) は実行ファイルを通してこの経路を検証する。
 
 ### Sample Test と User Input
 
@@ -113,7 +120,7 @@ Workspace の `paths` に Contest ID と一致する規則があれば、指定�
 | 公式サンプル | `<contest>/tests/<問題>/sample-<番号>.in` と `sample-<番号>.out`。番号は 1 から | `workspace::save_samples` / `load_test_samples` |
 | Stress 反例 | `<contest>/.atc/stress/<問題>/` に `failed.in`、`expected.out`、`actual.out`、`meta.toml` と、内容がある場合は `stderr.txt` | `stress::persist_failure_for_task` / `load_saved_case_for_task` |
 | User Input | `<contest>/.atc/user-inputs/<問題>/<ID>.in` と問題ごとの `meta.toml` | `user_input.rs` |
-| Contest 更新の復旧データ | `<contest>/.atc-refresh-*` / `.atc-repair-*` が作業領域。処理結果に応じて `.atc-recovery-*` / `.atc-aborted-*` に退避し、`previous-tests` や `previous-contest.toml` が残る場合がある | `workspace::contest_recovery_state` / `complete_contest_staging` |
+| Contest 更新の復旧データ | `<contest>/.atc-refresh-*` / `.atc-repair-*` / `.atc-migrate-*` が作業領域。処理結果に応じて `.atc-recovery-*` / `.atc-aborted-*` に退避し、`previous-tests` や `previous-contest.toml` が残る場合がある | `workspace::contest_recovery_state` / `safe_file::complete_recovery` |
 | Stress 保存の復旧データ | `<contest>/.atc/stress/` 内の `.stress-staging-*`、`.stress-recovery-*`、`.stress-aborted-*`。新旧の反例を作業領域の `new` / `previous` に置く | `stress::persist_failure_inner` / `complete_stress_recovery` |
 | グローバル設定 | Windows は `%APPDATA%\atc\config.toml`。macOS / Linux は `XDG_CONFIG_HOME` 配下の `atc/config.toml`（既定 `~/.config/atc/config.toml`） | `paths::config_file` |
 | Cookie | Windows は `%APPDATA%\atc\state\cookie`。macOS / Linux は `XDG_STATE_HOME` 配下の `atc/cookie`（既定 `~/.local/state/atc/cookie`） | `paths::cookie_location` |
@@ -130,6 +137,7 @@ macOS / Linux の XDG ベースは、環境変数が絶対パスの場合に採�
 | Workspace 初期化 | [commands/init.rs](../../src/commands/init.rs) の `init`、[commands/watch_tui.rs](../../src/commands/watch_tui.rs) の `run_application_locations_with` | [init_cli.rs](../../tests/init_cli.rs)、`watch_tui.rs` の `production_wide_init_here_same_batch_opens_workspace_and_discards_later_key` |
 | Contest 作成・切替・修復 | [commands/new.rs](../../src/commands/new.rs)、[commands/contest.rs](../../src/commands/contest.rs) の `inspect_contest_target` / `plan_repair`、[commands/watch_tui.rs](../../src/commands/watch_tui.rs) の `prepare_workspace_contest_entry` | [commands/tests.rs](../../src/commands/tests.rs) の `new_flow_runs_entirely_from_fixtures`、`contest.rs` の `repair_with_healthy_metadata_restores_only_tests`、[contest_owner_cli.rs](../../tests/contest_owner_cli.rs) |
 | Refresh・Recovery | [commands/refresh.rs](../../src/commands/refresh.rs) の `prepare_refresh` / `apply_refresh` → [workspace.rs](../../src/workspace.rs) の `replace_refresh_data_with_snapshot` | [refresh_cli.rs](../../tests/refresh_cli.rs)、[commands/tests.rs](../../src/commands/tests.rs) の `prepared_refresh_rejects_destination_metadata_changes_before_apply`、`workspace.rs` の `incomplete_contest_staging_is_not_a_completed_recovery_area`、[commands/watch_tui.rs](../../src/commands/watch_tui.rs) の `refresh_apply_failure_recovers_a_fresh_session_and_reopens_failed_modal` |
+| Contest 移行 | [commands/migrate.rs](../../src/commands/migrate.rs) → [workspace/migration.rs](../../src/workspace/migration.rs) | [migrate_cli.rs](../../tests/migrate_cli.rs)、`workspace/migration.rs` のバックアップと配置の失敗注入テスト |
 | Test・判定 | [commands/test.rs](../../src/commands/test.rs) の `test_problem` / `run_test_cases` → [runner.rs](../../src/runner.rs)、[comparator.rs](../../src/comparator.rs) | [verdict_exit_cli.rs](../../tests/verdict_exit_cli.rs) の `missing_one_official_sample_fails_before_running_solution` / `valid_saved_stress_case_runs_after_official_sample` |
 | User Input | [tui/mod.rs](../../src/tui/mod.rs) の `run_selected_user_input`、[tui/app/user_input_run.rs](../../src/tui/app/user_input_run.rs)、[commands/user_input_run.rs](../../src/commands/user_input_run.rs)、[user_input.rs](../../src/user_input.rs) | [tui/tests/user_input_runs.rs](../../src/tui/tests/user_input_runs.rs) の `dirty_run_skips_sync_owns_buffer_and_never_saves`、[tui/tests/user_input_delete.rs](../../src/tui/tests/user_input_delete.rs) |
 | Stress 反例 | [commands/stress.rs](../../src/commands/stress.rs) の `build_request` → [stress.rs](../../src/stress.rs) の `run` / `persist_failure_for_task` | `stress.rs` の `interrupted_replacement_blocks_a_new_stress_save_without_touching_recovery`、[verdict_exit_cli.rs](../../tests/verdict_exit_cli.rs) の `stress_counterexample_exits_nonzero_after_reporting_and_saving` |

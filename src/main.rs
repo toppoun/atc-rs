@@ -136,8 +136,34 @@ fn run() -> Result<ExitCode, AppError> {
             commands::new(&contest, language, &mut reporter)?;
         }
 
-        Some(cli::Command::Contest(cli::ContestCommand::Refresh { contest, force })) => {
+        Some(cli::Command::Contest(cli::ContestCommand::Refresh {
+            contest,
+            force,
+            all,
+            dry_run,
+            yes,
+        })) => {
+            if all {
+                return commands::run_batch(
+                    commands::BatchOperation::Refresh { force },
+                    dry_run,
+                    yes,
+                    &mut reporter,
+                );
+            }
             commands::refresh(contest, force, &mut reporter)?;
+        }
+
+        Some(cli::Command::Contest(cli::ContestCommand::Migrate(args))) => {
+            if args.all {
+                return commands::run_batch(
+                    commands::BatchOperation::Migrate,
+                    args.dry_run,
+                    args.yes,
+                    &mut reporter,
+                );
+            }
+            commands::migrate(args, &mut reporter)?;
         }
 
         Some(cli::Command::Contest(cli::ContestCommand::Contest { contest_id })) => {
@@ -198,6 +224,10 @@ fn run() -> Result<ExitCode, AppError> {
 
         Some(cli::Command::Files(cli::FileCommand::Create { name, language })) => {
             commands::create(&name, language, &mut reporter)?;
+        }
+
+        Some(cli::Command::Files(cli::FileCommand::Source(args))) => {
+            commands::source(args)?;
         }
 
         Some(cli::Command::Files(cli::FileCommand::Template {

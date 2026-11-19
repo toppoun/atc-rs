@@ -1,10 +1,13 @@
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use aws_lc_rs::digest::{self, SHA256, SHA256_OUTPUT_LEN};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+const SNAPSHOT_READ_CHUNK: usize = 64 * 1024;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_metadata;
@@ -99,6 +102,14 @@ pub(crate) fn write_recovery_intent(root: &Path, identity: &RecoveryIdentity) ->
     write_recovery_record(&root.join(RECOVERY_INTENT), identity)
 }
 
+pub(crate) fn write_recovery_intent_at(root: &Dir, identity: &RecoveryIdentity) -> io::Result<()> {
+    let file = root.open_with(
+        RECOVERY_INTENT,
+        OpenOptions::new().write(true).create_new(true),
+    )?;
+    write_recovery_record_to(file.into_std(), identity)
+}
+
 /// The staging name remains an interruption signal until the same-volume no-clobber rename.
 /// A completed name is never installed unless the completion record has been flushed.
 pub(crate) fn complete_recovery(
@@ -172,11 +183,15 @@ fn parse_recovery_record(bytes: &[u8]) -> io::Result<RecoveryIdentity> {
 }
 
 fn write_recovery_record(path: &Path, identity: &RecoveryIdentity) -> io::Result<()> {
-    let content = toml::to_string(identity).map_err(io::Error::other)?;
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
+    write_recovery_record_to(file, identity)
+}
+
+fn write_recovery_record_to(mut file: fs::File, identity: &RecoveryIdentity) -> io::Result<()> {
+    let content = toml::to_string(identity).map_err(io::Error::other)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()
 }
@@ -188,27 +203,256 @@ pub(crate) struct FileSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TreeSnapshot {
+pub(crate) struct TreeSnapshot<F = FileSnapshot> {
     directories: std::collections::BTreeMap<PathBuf, FileIdentity>,
-    files: std::collections::BTreeMap<PathBuf, FileSnapshot>,
+    files: std::collections::BTreeMap<PathBuf, F>,
+}
+
+pub(crate) type TreeFingerprint = TreeSnapshot<FileFingerprint>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileFingerprint {
+    identity: FileIdentity,
+    size: u64,
+    sha256: [u8; SHA256_OUTPUT_LEN],
+}
+
+impl FileSnapshot {
+    pub(crate) fn fingerprint(&self) -> FileFingerprint {
+        FileFingerprint {
+            identity: self.identity.clone(),
+            size: self.bytes.len() as u64,
+            sha256: sha256_bytes(digest::digest(&SHA256, &self.bytes)),
+        }
+    }
+}
+
+impl TreeFingerprint {
+    /// Compare the plan with exact bytes already read for a replacement under lock.
+    pub(crate) fn matches_snapshot(&self, snapshot: &TreeSnapshot) -> bool {
+        self.directories == snapshot.directories
+            && self.files.len() == snapshot.files.len()
+            && self.files.iter().zip(&snapshot.files).all(
+                |((expected_path, expected), (path, file))| {
+                    expected_path == path && *expected == file.fingerprint()
+                },
+            )
+    }
+}
+
+pub(crate) fn matches_tree_snapshot(
+    expected: Option<&TreeFingerprint>,
+    actual: Option<&TreeSnapshot>,
+) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => expected.matches_snapshot(actual),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Records the exact files and directory identities in a generation. Callers validate their
 /// ownership rules first; this snapshot only detects changes across the generation move.
 pub(crate) fn read_tree_snapshot(root: &Path) -> io::Result<TreeSnapshot> {
+    let directory = Dir::from_std_file(open_tree_directory(root)?);
+    read_tree_snapshot_in(&directory, root)
+}
+
+pub(crate) fn read_tree_snapshot_in(directory: &Dir, root: &Path) -> io::Result<TreeSnapshot> {
+    read_tree_in(directory, root, read_regular_file_snapshot_at)
+}
+
+pub(crate) fn read_tree_fingerprint_in(
+    directory: &Dir,
+    root: &Path,
+) -> io::Result<TreeFingerprint> {
+    read_tree_in(directory, root, |directory, name, path| {
+        fingerprint_regular_file_at(directory, name, path, |file, limit| {
+            hash_reader(file.take(limit))
+        })
+    })
+}
+
+fn read_tree_in<F>(
+    directory: &Dir,
+    root: &Path,
+    read_file: impl Fn(&Dir, &OsStr, &Path) -> io::Result<F>,
+) -> io::Result<TreeSnapshot<F>> {
     let mut snapshot = TreeSnapshot {
         directories: std::collections::BTreeMap::new(),
         files: std::collections::BTreeMap::new(),
     };
-    read_tree_entry(root, Path::new(""), &mut snapshot)?;
+    read_tree_entries(directory, root, Path::new(""), &mut snapshot, &read_file)?;
     Ok(snapshot)
 }
 
-fn read_tree_entry(path: &Path, relative: &Path, snapshot: &mut TreeSnapshot) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+fn read_tree_entries<F>(
+    directory: &Dir,
+    root: &Path,
+    relative: &Path,
+    snapshot: &mut TreeSnapshot<F>,
+    read_file: &impl Fn(&Dir, &OsStr, &Path) -> io::Result<F>,
+) -> io::Result<()> {
+    let path = root.join(relative);
+    require_tree_directory(&directory.dir_metadata()?, &path)?;
+    let identity = file_identity(&directory.try_clone()?.into_std_file(), &path)?;
+    snapshot
+        .directories
+        .insert(relative.to_path_buf(), identity);
+    for entry in directory.entries()? {
+        let name = entry?.file_name();
+        let entry_relative = relative.join(&name);
+        let entry_path = root.join(&entry_relative);
+        let metadata = directory.symlink_metadata(&name)?;
+        if metadata.is_dir() {
+            require_tree_directory(&metadata, &entry_path)?;
+            let child = directory.open_dir_nofollow(&name)?;
+            read_tree_entries(&child, root, &entry_relative, snapshot, read_file)?;
+        } else if metadata.is_file() {
+            require_regular_file(&metadata, &entry_path)?;
+            let file = read_file(directory, &name, &entry_path)?;
+            snapshot.files.insert(entry_relative, file);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-regular entry in generation: {}", entry_path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+struct FileObservation {
+    identity: FileIdentity,
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+fn observe_regular_file(file: &fs::File, path: &Path) -> io::Result<FileObservation> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    let observation = FileObservation {
+        identity: file_identity(file, path)?,
+        size: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    };
+    require_regular_file(&cap_std::fs::Metadata::from_just_metadata(metadata), path)?;
+    Ok(observation)
+}
+
+/// Check sample encoding without retaining the sample text in a diagnosis.
+pub(crate) fn validate_regular_utf8_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<()> {
+    read_stable_regular_file_at(directory, name, path, |file, limit| {
+        let mut reader = file.take(limit);
+        validate_utf8(&mut reader).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
+        Ok((limit - reader.limit(), ()))
+    })?;
+    Ok(())
+}
+
+fn validate_utf8(mut reader: impl Read) -> io::Result<()> {
+    let mut buffer = [0; SNAPSHOT_READ_CHUNK];
+    let mut pending = 0;
+    loop {
+        let count = match reader.read(&mut buffer[pending..]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        match std::str::from_utf8(&buffer[..pending + count]) {
+            Ok(_) if count == 0 => return Ok(()),
+            Ok(_) => pending = 0,
+            Err(error) if count != 0 && error.error_len().is_none() => {
+                let end = pending + count;
+                pending = end - error.valid_up_to();
+                buffer.copy_within(error.valid_up_to()..end, 0);
+            }
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+    }
+}
+
+fn fingerprint_regular_file_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    read: impl FnOnce(&mut fs::File, u64) -> io::Result<(u64, digest::Digest)>,
+) -> io::Result<FileFingerprint> {
+    let (file, hash) = read_stable_regular_file_at(directory, name, path, read)?;
+    Ok(FileFingerprint {
+        identity: file.identity,
+        size: file.size,
+        sha256: sha256_bytes(hash),
+    })
+}
+
+fn read_stable_regular_file_at<T>(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    read: impl FnOnce(&mut fs::File, u64) -> io::Result<(u64, T)>,
+) -> io::Result<(FileObservation, T)> {
+    let mut file = open_file_nofollow_at(directory, name)?;
+    let before = observe_regular_file(&file, path)?;
+    // Read at most one byte beyond the original length so concurrent growth cannot keep
+    // the scanner reading indefinitely. The reopened file must still name the same object.
+    let (size, value) = read(&mut file, before.size.saturating_add(1))?;
+    if size != before.size
+        || observe_regular_file(&file, path)? != before
+        || observe_regular_file(&open_file_nofollow_at(directory, name)?, path)? != before
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "file changed while reading its snapshot: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok((before, value))
+}
+
+fn hash_reader(mut reader: impl Read) -> io::Result<(u64, digest::Digest)> {
+    let mut hash = digest::Context::new(&SHA256);
+    let mut buffer = [0; SNAPSHOT_READ_CHUNK];
+    let mut size = 0;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok((size, hash.finish())),
+            Ok(read) => {
+                size += read as u64;
+                hash.update(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sha256_bytes(hash: digest::Digest) -> [u8; SHA256_OUTPUT_LEN] {
+    hash.as_ref().try_into().expect("SHA-256 digest length")
+}
+
+fn require_tree_directory(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        use cap_std::fs::MetadataExt as _;
         if metadata.file_attributes() & 0x400 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -216,28 +460,16 @@ fn read_tree_entry(path: &Path, relative: &Path, snapshot: &mut TreeSnapshot) ->
             ));
         }
     }
-    if metadata.file_type().is_dir() {
-        snapshot
-            .directories
-            .insert(relative.to_path_buf(), directory_identity(path)?);
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            read_tree_entry(&entry.path(), &relative.join(entry.file_name()), snapshot)?;
-        }
-    } else if metadata.file_type().is_file() {
-        snapshot
-            .files
-            .insert(relative.to_path_buf(), read_regular_file_snapshot(path)?);
-    } else {
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("non-regular entry in generation: {}", path.display()),
+            format!("generation directory changed: {}", path.display()),
         ));
     }
     Ok(())
 }
 
-fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
+fn open_tree_directory(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -253,14 +485,7 @@ fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
     }
-    let file = options.open(path)?;
-    if !file.metadata()?.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("generation directory changed: {}", path.display()),
-        ));
-    }
-    file_identity(&file, path)
+    options.open(path)
 }
 
 #[cfg(unix)]
@@ -305,13 +530,104 @@ pub(crate) fn read_regular_file_snapshot_at(
     name: &OsStr,
     path: &Path,
 ) -> io::Result<FileSnapshot> {
+    snapshot_regular_file(open_file_nofollow_at(directory, name)?, path)
+}
+
+fn open_file_nofollow_at(directory: &Dir, name: &OsStr) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    snapshot_regular_file(directory.open_with(name, &options)?.into_std(), path)
+    Ok(directory.open_with(name, &options)?.into_std())
 }
 
 fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnapshot> {
-    let metadata = file.metadata()?;
+    require_regular_file(
+        &cap_std::fs::Metadata::from_just_metadata(file.metadata()?),
+        path,
+    )?;
+    let identity = file_identity(&file, path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(FileSnapshot { bytes, identity })
+}
+
+pub(crate) fn regular_file_exists_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<bool> {
+    match directory.symlink_metadata(name) {
+        Ok(metadata) => {
+            require_regular_file(&metadata, path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn read_bounded_regular_text_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<String> {
+    let file = open_file_nofollow_at(directory, name).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file is not valid UTF-8: {}", path.display()),
+        )
+    })
+}
+
+pub(crate) fn read_bounded_regular_file_snapshot_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<FileSnapshot> {
+    let file = open_file_nofollow_at(directory, name)?;
+    let identity = file_identity(&file, path)?;
+    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
+    Ok(FileSnapshot { bytes, identity })
+}
+
+fn read_bounded_regular_bytes(file: fs::File, path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let read_error = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {}: {error}", path.display()),
+        )
+    };
+    let metadata = cap_std::fs::Metadata::from_just_metadata(file.metadata().map_err(read_error)?);
+    require_regular_file(&metadata, path)?;
+
+    let too_large = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} bytes: {}", path.display()),
+        )
+    };
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+fn require_regular_file(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -320,7 +636,7 @@ fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnap
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        use cap_std::fs::MetadataExt as _;
         if metadata.file_attributes() & 0x400 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -328,10 +644,7 @@ fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnap
             ));
         }
     }
-    let identity = file_identity(&file, path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(FileSnapshot { bytes, identity })
+    Ok(())
 }
 
 pub(crate) fn read_optional_regular_file_snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {
@@ -495,6 +808,47 @@ pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> io::Result<
     })
 }
 
+/// Move between verified parent directories. On Windows, callers keep the parent
+/// handles open without delete sharing for the duration of the path-based move.
+pub(crate) fn rename_noclobber_at(
+    source_parent: &Dir,
+    source: &Path,
+    destination_parent: &Dir,
+    destination: &Path,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let name = |path: &Path| {
+            path.file_name().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename path has no filename")
+            })
+        };
+        rename_noclobber_relative(
+            source_parent.as_raw_fd(),
+            &name(source)?,
+            destination_parent.as_raw_fd(),
+            &name(destination)?,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                RenameContext {
+                    source_path: source.to_path_buf(),
+                    destination: destination.to_path_buf(),
+                    source: error,
+                },
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source_parent, destination_parent);
+        rename_noclobber(source, destination)
+    }
+}
+
 /// Atomically replaces an existing regular file with a staged file in the same
 /// directory. The caller is responsible for validating the destination and for
 /// syncing both the staged file and its parent directory.
@@ -586,8 +940,18 @@ pub(crate) fn rename_noclobber_platform(source: &Path, destination: &Path) -> io
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(unix)]
 fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
+    rename_noclobber_relative(libc::AT_FDCWD, source, libc::AT_FDCWD, destination)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noclobber_relative(
+    source_parent: std::os::fd::RawFd,
+    source: &Path,
+    destination_parent: std::os::fd::RawFd,
+    destination: &Path,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -607,9 +971,9 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
     let moved = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            source_parent,
             source.as_ptr(),
-            libc::AT_FDCWD,
+            destination_parent,
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -628,7 +992,12 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
     target_os = "watchos",
     target_os = "visionos"
 ))]
-fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_noclobber_relative(
+    source_parent: std::os::fd::RawFd,
+    source: &Path,
+    destination_parent: std::os::fd::RawFd,
+    destination: &Path,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -645,8 +1014,15 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
         )
     })?;
 
-    let moved =
-        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    let moved = unsafe {
+        libc::renameatx_np(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
     if moved == 0 {
         Ok(())
     } else {
@@ -666,7 +1042,12 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
         target_os = "visionos"
     ))
 ))]
-fn rename_noclobber_platform(_source: &Path, _destination: &Path) -> io::Result<()> {
+fn rename_noclobber_relative(
+    _source_parent: std::os::fd::RawFd,
+    _source: &Path,
+    _destination_parent: std::os::fd::RawFd,
+    _destination: &Path,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-clobber rename is not implemented on this platform",
@@ -725,6 +1106,117 @@ fn install_noclobber_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_fingerprints_match_exact_snapshots_and_detect_content_structure_and_identity() {
+        for change in [
+            "same-size",
+            "new-file",
+            "missing-file",
+            "file",
+            "directory",
+            "new-empty",
+            "missing-empty",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("tests");
+            fs::create_dir_all(root.join("custom/empty")).unwrap();
+            let path = root.join("custom/input");
+            fs::write(&path, b"original").unwrap();
+            let current = || {
+                let directory = Dir::from_std_file(open_tree_directory(&root).unwrap());
+                read_tree_fingerprint_in(&directory, &root).unwrap()
+            };
+            let expected = current();
+            assert!(expected.matches_snapshot(&read_tree_snapshot(&root).unwrap()));
+            match change {
+                "same-size" => fs::write(&path, b"modified").unwrap(),
+                "new-file" => fs::write(root.join("custom/new"), b"").unwrap(),
+                "missing-file" => fs::remove_file(&path).unwrap(),
+                "file" => {
+                    fs::rename(&path, temp.path().join("original-file")).unwrap();
+                    fs::write(&path, b"original").unwrap();
+                }
+                "directory" => {
+                    fs::rename(root.join("custom/empty"), temp.path().join("original-dir"))
+                        .unwrap();
+                    fs::create_dir(root.join("custom/empty")).unwrap();
+                }
+                "new-empty" => fs::create_dir(root.join("custom/new")).unwrap(),
+                "missing-empty" => fs::remove_dir(root.join("custom/empty")).unwrap(),
+                _ => unreachable!(),
+            }
+            let edited = current();
+            let exact = read_tree_snapshot(&root).unwrap();
+            assert_ne!(edited, expected, "{change}");
+            assert!(edited.matches_snapshot(&exact), "{change}");
+            assert!(!expected.matches_snapshot(&exact), "{change}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_rejects_a_same_size_edit_during_read_and_propagates_io_errors() {
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sample");
+        let name = OsStr::new("sample");
+        fs::write(&path, b"before").unwrap();
+        let directory = Dir::from_std_file(open_tree_directory(temp.path()).unwrap());
+        let stable_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stable_time)
+            .unwrap();
+        let error = fingerprint_regular_file_at(&directory, name, &path, |file, limit| {
+            let mut first = [0];
+            file.read_exact(&mut first)?;
+            let mut writer = fs::File::options().write(true).open(&path)?;
+            writer.write_all(b"edited")?;
+            writer.set_modified(stable_time + Duration::from_secs(5))?;
+            drop(writer);
+            hash_reader(io::Cursor::new(first).chain(file.take(limit - 1)))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+        let error = fingerprint_regular_file_at(&directory, name, &path, |_, _| {
+            hash_reader(io::repeat(0).take(1).chain(TestReadError))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    struct TestReadError;
+
+    impl Read for TestReadError {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    #[test]
+    fn streaming_utf8_validates_characters_crossing_the_buffer_boundary() {
+        let mut bytes = vec![b'a'; SNAPSHOT_READ_CHUNK - 1];
+        bytes.extend_from_slice("🦀".as_bytes());
+        assert!(validate_utf8(bytes.as_slice()).is_ok());
+        bytes.pop();
+        assert_eq!(
+            validate_utf8(bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        bytes.push(0xff);
+        assert_eq!(
+            validate_utf8(bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            validate_utf8(TestReadError).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
     use std::ffi::OsStr;
     use std::fs;
 
