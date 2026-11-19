@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
 const METADATA_VERSION: u32 = 1;
+const MAX_CONTEST_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const WORKSPACE_CONFIG_FILE: &str = ".atc-workspace.toml";
 const WORKSPACE_CONFIG_VERSION: u32 = 1;
 
@@ -306,20 +307,7 @@ pub(crate) struct LauncherWorkspace {
 }
 
 pub(crate) fn inspect_launcher_workspace(root: &Path) -> io::Result<LauncherWorkspace> {
-    if !root.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Workspace path must be absolute",
-        ));
-    }
-    // A trailing separator or '/.' can make Unix follow the final symlink despite O_NOFOLLOW.
-    // Check the final named component while preserving the original spelling for the Registry.
-    let lookup = root
-        .file_name()
-        .zip(root.parent())
-        .map_or_else(|| root.to_path_buf(), |(name, parent)| parent.join(name));
-    let directory = open_contest_destination_nofollow(&lookup)
-        .map_err(|error| workspace_directory_error(root, "open Workspace directory", error))?;
+    let directory = open_workspace_root_nofollow(root)?;
     #[cfg(any(unix, windows))]
     let identity = Some(DirectoryIdentity::from_open_directory(
         &directory.try_clone()?.into_std_file(),
@@ -332,6 +320,23 @@ pub(crate) fn inspect_launcher_workspace(root: &Path) -> io::Result<LauncherWork
         identity,
         initialized,
     })
+}
+
+fn open_workspace_root_nofollow(root: &Path) -> io::Result<CapDir> {
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Workspace path must be absolute",
+        ));
+    }
+    // A trailing separator or '/.' can make Unix follow the final symlink despite O_NOFOLLOW.
+    // Check the final named component while leaving the caller's path unchanged.
+    let lookup = root
+        .file_name()
+        .zip(root.parent())
+        .map_or_else(|| root.to_path_buf(), |(name, parent)| parent.join(name));
+    open_contest_destination_nofollow(&lookup)
+        .map_err(|error| workspace_directory_error(root, "open Workspace directory", error))
 }
 
 fn is_regular_workspace_config(metadata: &cap_std::fs::Metadata) -> bool {
@@ -439,6 +444,60 @@ pub fn resolve_contest_path(root: &Path, contest_id: &str) -> io::Result<PathBuf
         }
         None => contest_path(root, contest_id),
     }
+}
+
+/// Keep routing, metadata, and subsequent file access relative to opened directories.
+pub(crate) fn open_local_contest(
+    root: &Path,
+    contest_id: &str,
+) -> io::Result<(PathBuf, CapDir, Contest)> {
+    validate_path_component(contest_id, "contest ID")?;
+    if !is_safe_atcoder_id(contest_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid contest ID: {contest_id:?}"),
+        ));
+    }
+    let directory = open_workspace_root_nofollow(root)?;
+    let config = load_existing_workspace_config(root, &directory)?;
+    let mapping = match config.as_ref() {
+        Some(config) => matching_workspace_path(config, contest_id)?,
+        None => None,
+    };
+    let (destination, parent) = if let Some(mapping) = mapping {
+        let destination = mapping.append_to(root).join(contest_id);
+        let parent = walk_workspace_mapping_in(root, directory, mapping, false)?
+            .ok_or_else(|| missing_contest_directory(&destination))?;
+        (destination, parent)
+    } else {
+        (root.join(contest_id), directory)
+    };
+    let directory = open_managed_directory(&parent, contest_id, &destination, "contest directory")?
+        .ok_or_else(|| missing_contest_directory(&destination))?;
+    contest_recovery_state(&destination, &directory)?;
+
+    let marker_path = destination.join(".atc");
+    let marker = open_managed_directory(&directory, ".atc", &marker_path, "workspace marker")?
+        .ok_or_else(|| missing_workspace_marker(&marker_path))?;
+    let metadata_path = marker_path.join("contest.toml");
+    let name = OsStr::new("contest.toml");
+    if !safe_file::regular_file_exists_at(&marker, name, &metadata_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("contest metadata not found: {}", metadata_path.display()),
+        ));
+    }
+    let content = safe_file::read_bounded_regular_text_at(
+        &marker,
+        name,
+        &metadata_path,
+        MAX_CONTEST_METADATA_BYTES,
+    )?;
+    let contest = parse_contest_metadata(&content).map_err(|error| {
+        workspace_directory_error(&metadata_path, "validate contest metadata", error)
+    })?;
+    validate_contest_identity(&contest, contest_id)?;
+    Ok((destination, directory, contest))
 }
 
 /// Resolve routing for an already-active workspace identity.
@@ -614,8 +673,17 @@ fn walk_workspace_mapping(
     mapping: &WorkspaceRelativePath,
     create_missing: bool,
 ) -> io::Result<()> {
-    let mut current = CapDir::open_ambient_dir(root, ambient_authority())
+    let directory = CapDir::open_ambient_dir(root, ambient_authority())
         .map_err(|error| workspace_directory_error(root, "open workspace root", error))?;
+    walk_workspace_mapping_in(root, directory, mapping, create_missing).map(|_| ())
+}
+
+fn walk_workspace_mapping_in(
+    root: &Path,
+    mut current: CapDir,
+    mapping: &WorkspaceRelativePath,
+    create_missing: bool,
+) -> io::Result<Option<CapDir>> {
     let mut current_path = root.to_path_buf();
 
     for component in mapping.components() {
@@ -626,11 +694,13 @@ fn walk_workspace_mapping(
 
         match current.open_dir_nofollow(component) {
             Ok(directory) => {
+                #[cfg(windows)]
+                validate_windows_mapping_directory(&directory.dir_metadata()?, &current_path)?;
                 current = directory;
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
-                return Ok(());
+                return Ok(None);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match current.create_dir(component) {
@@ -664,28 +734,17 @@ fn walk_workspace_mapping(
                 error,
             )
         })?;
+        #[cfg(windows)]
+        validate_windows_mapping_directory(&current.dir_metadata()?, &current_path)?;
     }
 
-    Ok(())
+    Ok(Some(current))
 }
 
 #[cfg(windows)]
 fn reject_windows_reparse_point(parent: &CapDir, component: &str, path: &Path) -> io::Result<()> {
-    // FILE_ATTRIBUTE_REPARSE_POINT. Keep the numeric value local so the existing
-    // windows-sys feature set does not need to expand for one stable attribute bit.
-    const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
-
     match parent.symlink_metadata(component) {
-        Ok(metadata) if metadata.file_attributes() & REPARSE_POINT_ATTRIBUTE != 0 => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "workspace mapping directory must not be a reparse point: {}",
-                    path.display()
-                ),
-            ))
-        }
-        Ok(_) => Ok(()),
+        Ok(metadata) => validate_windows_mapping_directory(&metadata, path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(workspace_directory_error(
             path,
@@ -693,6 +752,27 @@ fn reject_windows_reparse_point(parent: &CapDir, component: &str, path: &Path) -
             error,
         )),
     }
+}
+
+#[cfg(windows)]
+fn validate_windows_mapping_directory(
+    metadata: &cap_std::fs::Metadata,
+    path: &Path,
+) -> io::Result<()> {
+    // FILE_ATTRIBUTE_REPARSE_POINT. Keep the numeric value local so the existing
+    // windows-sys feature set does not need to expand for one stable attribute bit.
+    const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
+
+    if metadata.file_attributes() & REPARSE_POINT_ATTRIBUTE != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace mapping directory must not be a reparse point: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn resolve_contest_target(root: &Path, contest_id: Option<&str>) -> io::Result<PathBuf> {
@@ -1546,7 +1626,7 @@ fn problem_url_mismatches(contest: &Contest) -> io::Result<HashSet<String>> {
     let mut mismatches = HashSet::new();
 
     for problem in &contest.problems {
-        if !is_safe_task_id(&problem.task_id) {
+        if !is_safe_atcoder_id(&problem.task_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -1594,9 +1674,9 @@ fn problem_url_mismatches(contest: &Contest) -> io::Result<HashSet<String>> {
     Ok(mismatches)
 }
 
-pub(crate) fn is_safe_task_id(task_id: &str) -> bool {
-    !task_id.is_empty()
-        && task_id
+pub(crate) fn is_safe_atcoder_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
@@ -1675,10 +1755,14 @@ fn validate_contest_directory(destination: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    Err(io::Error::new(
+    Err(missing_contest_directory(destination))
+}
+
+fn missing_contest_directory(destination: &Path) -> io::Error {
+    io::Error::new(
         io::ErrorKind::NotFound,
         format!("contest directory not found: {}", destination.display()),
-    ))
+    )
 }
 
 pub fn validate_workspace_marker(destination: &Path) -> io::Result<()> {
@@ -1690,10 +1774,14 @@ pub fn validate_workspace_marker(destination: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    Err(io::Error::new(
+    Err(missing_workspace_marker(&marker))
+}
+
+fn missing_workspace_marker(marker: &Path) -> io::Error {
+    io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("workspace marker not found: {}", marker.display()),
-    ))
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

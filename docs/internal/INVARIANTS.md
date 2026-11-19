@@ -16,8 +16,9 @@
 
 ## 1. Problem identity
 
-- **対象となる操作** — AtCoder の問題一覧取得、Contest メタデータの保存・読込、Test・Stress・Submit の問題選択。
+- **対象となる操作** — AtCoder の問題一覧取得、Contest メタデータの保存・読込、Test・Stress・Submit・`atc source` の問題選択。
 - **保証する動作** — Contest ID はコンテスト、`index` は表示・ローカルパスの問題ラベル、`task_id` は AtCoder 上の問題を識別する。問題一覧ではラベルとタイトルのリンクが一致し、指定 Contest 配下の有効な task ID を指すことを確認する。確定したメタデータは `https://atcoder.jp/contests/<contest-id>/tasks/<task-id>` と文字列で一致する URL を持つ。CLI のラベル検索は ASCII 大小文字を区別せず、明示した Contest ID はメタデータと完全一致で照合する。
+- `atc source` の task ID 検索は完全一致で行う。ローカルのファイル名は、見つかった問題の `index` と言語の拡張子から決まる。
 - **拒否・失敗・中断時の動作** — 空の問題一覧、重複 task ID、安全なパス要素にならない ID・ラベル、ASCII 大小文字だけが異なるラベル、異なる Contest・task を指す URL を通常のメタデータとして受理しない。Test・Stress は開始時に現在のラベルと task ID の組を確認し、Submit は POST 直前にも Contest と task の対応を確認する。
 - **保証しない範囲と例外** — task ID を Contest ID とラベルから合成しない。安全な形式の URL と task ID の不一致や重複 task ID は、修復用の検査では条件付きで扱う。所有の判定は[契約 4](#4-contest--stress-recovery)を参照。
 - **関連する本番実装** — [src/atcoder.rs](../../src/atcoder.rs) の `parse_contest`、[src/workspace.rs](../../src/workspace.rs) の `validate_contest_paths`、`validate_contest_identity`、`ContestTaskSnapshot::problem`、[src/commands/test.rs](../../src/commands/test.rs) の `find_problem`、[src/commands/submit.rs](../../src/commands/submit.rs) の `verified_post_gate`。
@@ -67,6 +68,7 @@
 ## 6. User file preservation
 
 - **対象となる操作** — Contest・ソース作成、Workspace 初期化、Config・テンプレート・Stress 補助ファイルの初期化、Global Settings と TUI の User Input の保存。
+- `atc source` は Workspace と Contest の管理ファイルを読み取り専用で開く。Workspace ルートの末端、その配下の振り分け先、Contest、`.atc` と対象ファイルはリンク・reparse point を拒否する。Contest メタデータは 16 MiB、ソースは 1 MiB までの UTF-8 を受理する。出力は `schema_version` が `1` の JSON オブジェクト1つと末尾の改行で、実行時のエラーは標準エラー出力へ出る。
 - **保証する動作** — Contest 新規配置はステージ済みディレクトリの no-clobber 移動、ソース作成は `create_new` を使う。初期化で既存の有効な設定やテンプレートは内容を書き換えず、欠けたファイルだけを no-clobber で配置する。Global Settings の既存ファイル保存は、読込時のバイト列・ファイルの同一性・対象属性を照合し、同じ親ディレクトリの一時ファイルから置換する。未作成の設定は no-clobber で公開する。既存の User Input の編集保存は問題単位のロック下で編集開始時の内容を照合し、差分や欠損があれば書き込まない。
 - **拒否・失敗・中断時の動作** — ソース作成は同名の既存エントリを上書きしない。Workspace マーカーと Stress 補助ファイルの初期化は最終要素に `symlink_metadata` を使い、通常ファイルとして扱えない既存項目を拒否する。Contest の管理ファイルは操作ごとに通常ファイル・実ディレクトリを確認し、Windows の reparse point も検査する。Global Settings の構造化保存は末端の symlink / reparse point を拒否し、外部変更や同じ内容での差し替えを検出したら競合として扱う。
 - **保証しない範囲と例外** — Global Config・テンプレートの初期化は、既存の有効なリンク先ファイルやディレクトリを許容する。壊れたリンクや種類が違う対象は拒否する。Global Settings もリンク先が通常ファイルなら閲覧できる場合がある。これらの規則は各操作の対象要素に適用される。複数ファイルの初期化や直接のソース書込に一括ロールバックはなく、Settings は置換後の同期・再検査の失敗で新しい内容が既に見える場合がある。

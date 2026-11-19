@@ -229,6 +229,37 @@ abc466/
 
 使用する言語が Python の場合、通常のソースは `.py` で作成されます。
 
+## 外部ツールからローカルソースを取得する
+
+`atc source` は、保存済みの問題情報とソースコードを読み取り、JSON を返します。問題は Contest の `index` か AtCoder の `task_id` のどちらか一方で指定します。
+
+```bash
+atc source abc484 A --workspace /path/to/workspace --json
+atc source abc484 --task-id abc484_a --workspace /path/to/workspace --json
+atc source abc484 A --language python --json
+```
+
+`/path/to/workspace` は自分のワークスペースのパスに置き換えてください。`--workspace` を省略すると、現在のディレクトリから[ワークスペースの振り分け](#contest-の保存先)に従って Contest を探します。問題ラベルの比較では ASCII の大文字小文字を区別せず、task ID は `.atc/contest.toml` の値と完全一致で照合します。
+
+候補は `.cpp` と `.py` です。両方ある場合は `--language cpp` または `--language python` を指定してください。指定した場合は、その言語のファイルだけを調べます。ソースは UTF-8 で 1 MiB 以下の通常ファイルが対象です。シンボリックリンクや Windows の reparse point は拒否します。ファイルの作成・更新や AtCoder への通信は行いません。
+
+`--json` は必須です。成功時の標準出力には JSON オブジェクトが1つだけ出ます。失敗時は非ゼロの終了コードを返し、標準エラー出力に理由を表示します。
+
+```json
+{
+  "schema_version": 1,
+  "contest_id": "abc484",
+  "index": "A",
+  "task_id": "abc484_a",
+  "url": "https://atcoder.jp/contests/abc484/tasks/abc484_a",
+  "language": "cpp",
+  "source_path": "/path/to/workspace/ABC/abc484/A.cpp",
+  "source": "int main() {}\n"
+}
+```
+
+`source_path` はローカルの絶対パスです。公開用のノートを生成する場合は、既定で公開内容から外してください。取得結果には現在のローカルソースが入ります。AC や提出履歴を確認するときは AtCoder の提出結果を参照してください。
+
 ## `refresh`
 
 現在のコンテストで問題情報とサンプルを更新します。

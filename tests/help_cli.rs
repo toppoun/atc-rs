@@ -32,6 +32,7 @@ const HELP_GOLDEN: &str = concat!(
     "\n",
     "Files\n",
     "  create    Create a source file\n",
+    "  source    Read local source and problem metadata as JSON\n",
     "  template  Manage source templates\n",
     "\n",
     "Account\n",

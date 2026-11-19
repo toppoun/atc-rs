@@ -87,7 +87,7 @@ atc submit --help
 
 - [インストール](docs/installation.md) — 導入、必要な外部ツール、最初の Contest
 - [TUI](docs/tui.md) — 画面ごとの操作とショートカット
-- [ワークスペース](docs/workspace.md) — Contest の保存先、作成、切り替え、更新
+- [ワークスペース](docs/workspace.md) — Contest の保存先、作成、切り替え、更新、外部ツール向けのソース取得
 - [テストと Watch](docs/testing.md) — サンプルテスト、User Input、自動テスト
 - [ストレステスト](docs/stress.md) — Generator / Brute Force と反例の保存
 - [AtCoder 認証](docs/authentication.md) — Cookie の設定、確認、置換、リセット

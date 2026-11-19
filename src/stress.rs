@@ -1358,7 +1358,7 @@ fn valid_failure_metadata(
             FAILURE_FORMAT_VERSION => metadata
                 .task_id
                 .as_deref()
-                .is_some_and(workspace::is_safe_task_id),
+                .is_some_and(workspace::is_safe_atcoder_id),
             _ => metadata.task_id.is_none(),
         }
         && metadata.case != 0

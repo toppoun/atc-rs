@@ -200,6 +200,10 @@ fn run() -> Result<ExitCode, AppError> {
             commands::create(&name, language, &mut reporter)?;
         }
 
+        Some(cli::Command::Files(cli::FileCommand::Source(args))) => {
+            commands::source(args)?;
+        }
+
         Some(cli::Command::Files(cli::FileCommand::Template {
             command: cli::TemplateCommand::Init { language },
         })) => {

@@ -3,6 +3,7 @@ use crate::language::{Language, PythonRuntime};
 use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 const GRAY: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
@@ -236,11 +237,43 @@ pub enum FileCommand {
         language: Option<Language>,
     },
 
+    /// Read local source and problem metadata as JSON
+    Source(SourceArgs),
+
     /// Manage source templates
     Template {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+}
+
+#[derive(Args, Debug)]
+#[command(
+    group(clap::ArgGroup::new("problem").required(true).args(["index", "task_id"])),
+    override_usage = "atc source <CONTEST_ID> <INDEX> --json [OPTIONS]\n       atc source <CONTEST_ID> --task-id <TASK_ID> --json [OPTIONS]"
+)]
+pub struct SourceArgs {
+    /// AtCoder contest ID
+    pub contest_id: String,
+
+    /// Problem index as shown in the contest
+    pub index: Option<String>,
+
+    /// Exact AtCoder task ID from contest metadata
+    #[arg(long)]
+    pub task_id: Option<String>,
+
+    /// Workspace root (defaults to the current working directory)
+    #[arg(long, value_name = "ROOT")]
+    pub workspace: Option<PathBuf>,
+
+    /// Select a source language (cpp or python)
+    #[arg(short = 'l', long)]
+    pub language: Option<Language>,
+
+    /// Output a schema-versioned JSON object
+    #[arg(long = "json", required = true, action = clap::ArgAction::SetTrue)]
+    _json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -426,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_top_level_help_output_is_unchanged() {
+    fn plain_top_level_help_matches_the_command_list() {
         let mut command_tree = <Cli as CommandFactory>::command();
         command_tree.build();
         let help = render_help(&command_tree, false);
@@ -455,6 +488,7 @@ mod tests {
             "\n",
             "Files\n",
             "  create    Create a source file\n",
+            "  source    Read local source and problem metadata as JSON\n",
             "  template  Manage source templates\n",
             "\n",
             "Account\n",

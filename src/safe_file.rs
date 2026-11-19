@@ -305,13 +305,82 @@ pub(crate) fn read_regular_file_snapshot_at(
     name: &OsStr,
     path: &Path,
 ) -> io::Result<FileSnapshot> {
+    snapshot_regular_file(open_file_nofollow_at(directory, name)?, path)
+}
+
+fn open_file_nofollow_at(directory: &Dir, name: &OsStr) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    snapshot_regular_file(directory.open_with(name, &options)?.into_std(), path)
+    Ok(directory.open_with(name, &options)?.into_std())
 }
 
 fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnapshot> {
-    let metadata = file.metadata()?;
+    require_regular_file(
+        &cap_std::fs::Metadata::from_just_metadata(file.metadata()?),
+        path,
+    )?;
+    let identity = file_identity(&file, path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(FileSnapshot { bytes, identity })
+}
+
+pub(crate) fn regular_file_exists_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<bool> {
+    match directory.symlink_metadata(name) {
+        Ok(metadata) => {
+            require_regular_file(&metadata, path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn read_bounded_regular_text_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<String> {
+    let read_error = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {}: {error}", path.display()),
+        )
+    };
+    let file = open_file_nofollow_at(directory, name).map_err(read_error)?;
+    let metadata = cap_std::fs::Metadata::from_just_metadata(file.metadata().map_err(read_error)?);
+    require_regular_file(&metadata, path)?;
+
+    let too_large = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} bytes: {}", path.display()),
+        )
+    };
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file is not valid UTF-8: {}", path.display()),
+        )
+    })
+}
+
+fn require_regular_file(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -320,7 +389,7 @@ fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnap
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        use cap_std::fs::MetadataExt as _;
         if metadata.file_attributes() & 0x400 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -328,10 +397,7 @@ fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnap
             ));
         }
     }
-    let identity = file_identity(&file, path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(FileSnapshot { bytes, identity })
+    Ok(())
 }
 
 pub(crate) fn read_optional_regular_file_snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {

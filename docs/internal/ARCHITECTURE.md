@@ -74,6 +74,10 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - Contest 画面の Refresh → `contest_refresh_task` がバックグラウンドで `prepare_refresh` → `rebuild_active_contest_session_after_refresh` が旧セッションを終了し、適用後にディスクから読み直す。適用失敗時も再読込・再起動を試み、成功すれば失敗表示を引き継ぐ。この組み直しには直前の設定・認証を使う。
 - ディスク上の Recovery は `workspace.rs` の置換・ロールバック処理と `contest_recovery_state` を起点に追う。`safe_file` が復旧レコードを書き、完了した作業領域を退避先に移す。メタデータやテスト入力の読込でも、確認が必要な中断状態を検出する。Stress 側の対応箇所は `stress.rs` の `ensure_no_interrupted_generation`。
 
+### 外部ツール向けのソース取得
+
+- `atc source` → [commands/source.rs](../../src/commands/source.rs) → `workspace::open_local_contest`。既存の振り分け規則とメタデータの検証を使い、開いたディレクトリを基準に Contest をたどる。`safe_file` がメタデータと選択されたソースをサイズ制限付きで読み取り、`source.rs` が標準出力へ JSON を返す。[tests/source_cli.rs](../../tests/source_cli.rs) は実行ファイルを通してこの経路を検証する。
+
 ### Sample Test と User Input
 
 - `atc test` → `commands::test` → `test_problem`。TUI の Sample Test は `AttemptExecutor` から `test_problem_with_cancel` に入る。共通処理で `workspace::load_test_samples` と `stress::load_saved_case_for_task` を呼び、公式サンプルの後に再実行可能な保存済み反例を回す。`runner` が実行し、`comparator` が期待出力と照合する。
