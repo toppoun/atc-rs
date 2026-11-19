@@ -1,4 +1,4 @@
-use super::{FetchedContestData, fetch_contest_data};
+use super::fetch_contest_data;
 use crate::atcoder;
 use crate::auth::SessionAuth;
 use crate::error::AppError;
@@ -107,7 +107,7 @@ pub(super) fn refresh_from(
                 io::ErrorKind::InvalidData,
                 format!(
                     "refresh refused by local diagnosis for {contest_id}: unsupported contest \
-                     metadata version {version}; a future `atc migrate` is required"
+                     metadata version {version}; inspect with `atc migrate --dry-run` in the contest directory"
                 ),
             )
             .into());
@@ -246,12 +246,9 @@ fn prepare_refresh_from_baseline(
     atcoder: &atcoder::AtCoderClient,
     reporter: &mut dyn Reporter,
 ) -> Result<PreparedRefresh, AppError> {
-    let FetchedContestData {
-        contest,
-        samples_by_problem,
-    } = fetch_contest_data(contest_id, atcoder, reporter)?;
-    workspace::validate_contest_identity(&contest, contest_id)?;
-    workspace::validate_contest_paths(&contest)?;
+    let data = fetch_contest_data(contest_id, atcoder, reporter)?;
+    workspace::validate_contest_identity(&data.contest, contest_id)?;
+    workspace::validate_contest_paths(&data.contest)?;
 
     // Fetching may take long enough for the destination to change. Revalidate
     // immediately before choosing it as the staging parent.
@@ -268,10 +265,7 @@ fn prepare_refresh_from_baseline(
     // replaced destination cannot cause staging to be built in another contest.
     baseline.revalidate(destination, contest_id, force)?;
 
-    for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
-        workspace::save_samples(staging.path(), problem, &samples)?;
-    }
-    workspace::save_metadata(staging.path(), &contest)?;
+    data.stage(staging.path())?;
 
     baseline.revalidate(destination, contest_id, force)?;
 
@@ -452,39 +446,7 @@ impl RefreshBaseline {
 }
 
 fn blocked_refresh_error(contest_id: &str, reason: &BlockReason) -> AppError {
-    let (kind, message) = match reason {
-        BlockReason::InvalidContestId => (io::ErrorKind::InvalidInput, "invalid contest ID".into()),
-        BlockReason::ContestIdMismatch { actual } => (
-            io::ErrorKind::InvalidData,
-            format!("contest ID mismatch: metadata contains {actual:?}"),
-        ),
-        BlockReason::MetadataOwnershipUnknown => (
-            io::ErrorKind::InvalidData,
-            "cannot confirm ownership of existing contest metadata".into(),
-        ),
-        BlockReason::UnsafeMetadata => {
-            (io::ErrorKind::InvalidData, "unsafe contest metadata".into())
-        }
-        BlockReason::TestsOwnershipUnknown(_) => (
-            io::ErrorKind::InvalidData,
-            "cannot confirm ownership of existing tests".into(),
-        ),
-        BlockReason::UnownedTestsEntry { path } => (
-            io::ErrorKind::InvalidData,
-            format!("unowned entry in tests: {}", path.display()),
-        ),
-        BlockReason::UnsafeEntry { path } => (
-            io::ErrorKind::InvalidInput,
-            format!("unsafe filesystem entry: {}", path.display()),
-        ),
-        BlockReason::RecoveryRequired { path } => (
-            io::ErrorKind::InvalidData,
-            format!("contest update requires recovery check: {}", path.display()),
-        ),
-        BlockReason::Filesystem { path, kind } => {
-            (*kind, format!("cannot inspect {}: {kind}", path.display()))
-        }
-    };
+    let (kind, message) = reason.error_details();
     io::Error::new(
         kind,
         format!("refresh refused by local diagnosis for {contest_id}: {message}"),

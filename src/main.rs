@@ -140,6 +140,10 @@ fn run() -> Result<ExitCode, AppError> {
             commands::refresh(contest, force, &mut reporter)?;
         }
 
+        Some(cli::Command::Contest(cli::ContestCommand::Migrate(args))) => {
+            commands::migrate(args, &mut reporter)?;
+        }
+
         Some(cli::Command::Contest(cli::ContestCommand::Contest { contest_id })) => {
             commands::contest(&contest_id, &mut reporter)?;
         }

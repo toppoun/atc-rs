@@ -1,4 +1,4 @@
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -99,6 +99,14 @@ pub(crate) fn write_recovery_intent(root: &Path, identity: &RecoveryIdentity) ->
     write_recovery_record(&root.join(RECOVERY_INTENT), identity)
 }
 
+pub(crate) fn write_recovery_intent_at(root: &Dir, identity: &RecoveryIdentity) -> io::Result<()> {
+    let file = root.open_with(
+        RECOVERY_INTENT,
+        OpenOptions::new().write(true).create_new(true),
+    )?;
+    write_recovery_record_to(file.into_std(), identity)
+}
+
 /// The staging name remains an interruption signal until the same-volume no-clobber rename.
 /// A completed name is never installed unless the completion record has been flushed.
 pub(crate) fn complete_recovery(
@@ -172,11 +180,15 @@ fn parse_recovery_record(bytes: &[u8]) -> io::Result<RecoveryIdentity> {
 }
 
 fn write_recovery_record(path: &Path, identity: &RecoveryIdentity) -> io::Result<()> {
-    let content = toml::to_string(identity).map_err(io::Error::other)?;
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
+    write_recovery_record_to(file, identity)
+}
+
+fn write_recovery_record_to(mut file: fs::File, identity: &RecoveryIdentity) -> io::Result<()> {
+    let content = toml::to_string(identity).map_err(io::Error::other)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()
 }
@@ -196,19 +208,58 @@ pub(crate) struct TreeSnapshot {
 /// Records the exact files and directory identities in a generation. Callers validate their
 /// ownership rules first; this snapshot only detects changes across the generation move.
 pub(crate) fn read_tree_snapshot(root: &Path) -> io::Result<TreeSnapshot> {
+    let directory = Dir::from_std_file(open_tree_directory(root)?);
+    read_tree_snapshot_in(&directory, root)
+}
+
+pub(crate) fn read_tree_snapshot_in(directory: &Dir, root: &Path) -> io::Result<TreeSnapshot> {
     let mut snapshot = TreeSnapshot {
         directories: std::collections::BTreeMap::new(),
         files: std::collections::BTreeMap::new(),
     };
-    read_tree_entry(root, Path::new(""), &mut snapshot)?;
+    read_tree_entries(directory, root, Path::new(""), &mut snapshot)?;
     Ok(snapshot)
 }
 
-fn read_tree_entry(path: &Path, relative: &Path, snapshot: &mut TreeSnapshot) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+fn read_tree_entries(
+    directory: &Dir,
+    root: &Path,
+    relative: &Path,
+    snapshot: &mut TreeSnapshot,
+) -> io::Result<()> {
+    let path = root.join(relative);
+    require_tree_directory(&directory.dir_metadata()?, &path)?;
+    let identity = file_identity(&directory.try_clone()?.into_std_file(), &path)?;
+    snapshot
+        .directories
+        .insert(relative.to_path_buf(), identity);
+    for entry in directory.entries()? {
+        let name = entry?.file_name();
+        let entry_relative = relative.join(&name);
+        let entry_path = root.join(&entry_relative);
+        let metadata = directory.symlink_metadata(&name)?;
+        if metadata.is_dir() {
+            require_tree_directory(&metadata, &entry_path)?;
+            let child = directory.open_dir_nofollow(&name)?;
+            read_tree_entries(&child, root, &entry_relative, snapshot)?;
+        } else if metadata.is_file() {
+            require_regular_file(&metadata, &entry_path)?;
+            let file = read_regular_file_snapshot_at(directory, &name, &entry_path)?;
+            snapshot.files.insert(entry_relative, file);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-regular entry in generation: {}", entry_path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_tree_directory(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        use cap_std::fs::MetadataExt as _;
         if metadata.file_attributes() & 0x400 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -216,28 +267,16 @@ fn read_tree_entry(path: &Path, relative: &Path, snapshot: &mut TreeSnapshot) ->
             ));
         }
     }
-    if metadata.file_type().is_dir() {
-        snapshot
-            .directories
-            .insert(relative.to_path_buf(), directory_identity(path)?);
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            read_tree_entry(&entry.path(), &relative.join(entry.file_name()), snapshot)?;
-        }
-    } else if metadata.file_type().is_file() {
-        snapshot
-            .files
-            .insert(relative.to_path_buf(), read_regular_file_snapshot(path)?);
-    } else {
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("non-regular entry in generation: {}", path.display()),
+            format!("generation directory changed: {}", path.display()),
         ));
     }
     Ok(())
 }
 
-fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
+fn open_tree_directory(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -253,14 +292,7 @@ fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
     }
-    let file = options.open(path)?;
-    if !file.metadata()?.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("generation directory changed: {}", path.display()),
-        ));
-    }
-    file_identity(&file, path)
+    options.open(path)
 }
 
 #[cfg(unix)]
@@ -583,6 +615,47 @@ pub(crate) fn rename_noclobber(source: &Path, destination: &Path) -> io::Result<
     })
 }
 
+/// Move between verified parent directories. On Windows, callers keep the parent
+/// handles open without delete sharing for the duration of the path-based move.
+pub(crate) fn rename_noclobber_at(
+    source_parent: &Dir,
+    source: &Path,
+    destination_parent: &Dir,
+    destination: &Path,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let name = |path: &Path| {
+            path.file_name().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename path has no filename")
+            })
+        };
+        rename_noclobber_relative(
+            source_parent.as_raw_fd(),
+            &name(source)?,
+            destination_parent.as_raw_fd(),
+            &name(destination)?,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                RenameContext {
+                    source_path: source.to_path_buf(),
+                    destination: destination.to_path_buf(),
+                    source: error,
+                },
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source_parent, destination_parent);
+        rename_noclobber(source, destination)
+    }
+}
+
 /// Atomically replaces an existing regular file with a staged file in the same
 /// directory. The caller is responsible for validating the destination and for
 /// syncing both the staged file and its parent directory.
@@ -674,8 +747,18 @@ pub(crate) fn rename_noclobber_platform(source: &Path, destination: &Path) -> io
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(unix)]
 fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
+    rename_noclobber_relative(libc::AT_FDCWD, source, libc::AT_FDCWD, destination)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noclobber_relative(
+    source_parent: std::os::fd::RawFd,
+    source: &Path,
+    destination_parent: std::os::fd::RawFd,
+    destination: &Path,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -695,9 +778,9 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
     let moved = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            source_parent,
             source.as_ptr(),
-            libc::AT_FDCWD,
+            destination_parent,
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -716,7 +799,12 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
     target_os = "watchos",
     target_os = "visionos"
 ))]
-fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_noclobber_relative(
+    source_parent: std::os::fd::RawFd,
+    source: &Path,
+    destination_parent: std::os::fd::RawFd,
+    destination: &Path,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -733,8 +821,15 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
         )
     })?;
 
-    let moved =
-        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    let moved = unsafe {
+        libc::renameatx_np(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
     if moved == 0 {
         Ok(())
     } else {
@@ -754,7 +849,12 @@ fn rename_noclobber_platform(source: &Path, destination: &Path) -> io::Result<()
         target_os = "visionos"
     ))
 ))]
-fn rename_noclobber_platform(_source: &Path, _destination: &Path) -> io::Result<()> {
+fn rename_noclobber_relative(
+    _source_parent: std::os::fd::RawFd,
+    _source: &Path,
+    _destination_parent: std::os::fd::RawFd,
+    _destination: &Path,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-clobber rename is not implemented on this platform",

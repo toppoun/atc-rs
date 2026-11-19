@@ -65,6 +65,13 @@
 - CLI の取得後と適用前に、開始時の診断結果・ディレクトリの実体・メタデータのスナップショットを再検証する。診断結果またはメタデータの変更を検出した場合は中断する。適用後に `Healthy` を確認してから成功を報告する。
 - 実装と単体テストは [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) と [workspace/tests/diagnosis.rs](../../src/workspace/tests/diagnosis.rs) を参照。
 
+### CLI Migrate
+
+- `Healthy` はスキップする。欠損、旧形式、所有 ID を確認できる不正メタデータ、所有確認できない `tests` や管理外の項目は移行候補となる。既存メタデータがあれば、ルートの `contest_id` を TOML として曖昧さなく読み取れ、対象 ID と一致する必要がある。サンプルだけの修復は Refresh が扱う。
+- 移行候補でも Recovery の中断、置換対象のリンク・reparse point、非通常ファイル、スナップショット失敗を拒否する。`tests` の全階層を、開いたディレクトリからリンクをたどらずに検査する。`.atc/` 内では `contest.toml` のみを対象とする。CLI はパスと ID を表示し、端末上の承認または `--yes` を得てから取得する。`--dry-run`、拒否、取得失敗ではファイルに書き込まない。
+- 取得後と更新ロック取得後に、診断、対象ディレクトリと `.atc/` の実体、メタデータと全 `tests` のスナップショットを照合する。Recovery intent を記録してから旧データを同じファイルシステム内で no-clobber 移動し、両方の退避を確認してから公式データを配置する。`previous-tests` には管理外の項目や空ディレクトリも含まれる。完了した `.atc-recovery-migrate-*` と、要確認の `.atc-migrate-*` には既存の Recovery 判定を適用する。
+- 途中で失敗したときは新旧のデータが別々の場所に残り得る。Recovery 領域を維持し、競合相手のファイルを上書きしない。成功報告には Recovery の完了と `Healthy` を要求する。取得中の照合は置換対象に限り、ソースやその他のユーザーデータは変更しない。
+
 ## 5. Watch / TUI consistency
 
 - **対象となる操作** — Plain Watch、TUI の監視・実行キュー、Contest 切替、TUI Refresh。

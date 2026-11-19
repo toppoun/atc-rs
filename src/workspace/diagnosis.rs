@@ -60,11 +60,11 @@ pub(crate) enum RepairReason {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MigrationReason {
-    /// The schema needs separate handling. No migration path has been established.
+    /// The schema needs separate handling before the contest can be refreshed.
     UnsupportedVersion(u32),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlockReason {
     InvalidContestId,
     ContestIdMismatch { actual: String },
@@ -75,6 +75,42 @@ pub(crate) enum BlockReason {
     UnsafeEntry { path: PathBuf },
     RecoveryRequired { path: PathBuf },
     Filesystem { path: PathBuf, kind: io::ErrorKind },
+}
+
+impl BlockReason {
+    pub(crate) fn error_details(&self) -> (io::ErrorKind, String) {
+        match self {
+            Self::InvalidContestId => (io::ErrorKind::InvalidInput, "invalid contest ID".into()),
+            Self::ContestIdMismatch { actual } => (
+                io::ErrorKind::InvalidData,
+                format!("contest ID mismatch: metadata contains {actual:?}"),
+            ),
+            Self::MetadataOwnershipUnknown => (
+                io::ErrorKind::InvalidData,
+                "cannot confirm ownership of existing contest metadata".into(),
+            ),
+            Self::UnsafeMetadata => (io::ErrorKind::InvalidData, "unsafe contest metadata".into()),
+            Self::TestsOwnershipUnknown(_) => (
+                io::ErrorKind::InvalidData,
+                "cannot confirm ownership of existing tests".into(),
+            ),
+            Self::UnownedTestsEntry { path } => (
+                io::ErrorKind::InvalidData,
+                format!("unowned entry in tests: {}", path.display()),
+            ),
+            Self::UnsafeEntry { path } => (
+                io::ErrorKind::InvalidInput,
+                format!("unsafe filesystem entry: {}", path.display()),
+            ),
+            Self::RecoveryRequired { path } => (
+                io::ErrorKind::InvalidData,
+                format!("contest update requires recovery check: {}", path.display()),
+            ),
+            Self::Filesystem { path, kind } => {
+                (*kind, format!("cannot inspect {}: {kind}", path.display()))
+            }
+        }
+    }
 }
 
 /// Inspect an already-resolved contest destination. Enclosing workspace routing is the

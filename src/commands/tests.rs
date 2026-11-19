@@ -2068,7 +2068,7 @@ fn refresh_refusals_leave_the_tree_unchanged_and_do_not_initialize_the_client() 
                     "version = 99\ncontest_id = 'abc466'\n",
                 )
                 .unwrap();
-                "a future `atc migrate` is required"
+                "inspect with `atc migrate --dry-run`"
             }
             "unowned" => {
                 workspace::save_metadata(&destination, &refresh_manifest(0)).unwrap();

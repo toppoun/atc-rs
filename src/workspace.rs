@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
 pub(crate) mod diagnosis;
+pub(crate) mod migration;
 
 const METADATA_VERSION: u32 = 1;
 const MAX_CONTEST_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -952,7 +953,9 @@ fn inspect_contest_recovery_state(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let is_staging = name.starts_with(".atc-refresh-") || name.starts_with(".atc-repair-");
+        let is_staging = name.starts_with(".atc-refresh-")
+            || name.starts_with(".atc-repair-")
+            || name.starts_with(".atc-migrate-");
         let is_recovery = name.starts_with(".atc-recovery-") || name.starts_with(".atc-aborted-");
         if !is_staging && !is_recovery {
             continue;
@@ -1116,13 +1119,20 @@ pub(crate) fn read_contest_metadata_snapshot(
     else {
         return Ok(None);
     };
+    read_contest_metadata_snapshot_in(&marker, &marker_path)
+}
+
+fn read_contest_metadata_snapshot_in(
+    marker: &CapDir,
+    marker_path: &Path,
+) -> io::Result<Option<safe_file::FileSnapshot>> {
     let name = OsStr::new("contest.toml");
     let path = marker_path.join(name);
-    if !safe_file::regular_file_exists_at(&marker, name, &path)? {
+    if !safe_file::regular_file_exists_at(marker, name, &path)? {
         return Ok(None);
     }
     safe_file::read_bounded_regular_file_snapshot_at(
-        &marker,
+        marker,
         name,
         &path,
         MAX_CONTEST_METADATA_BYTES,
@@ -3122,7 +3132,11 @@ fn contest_staging_archive(root: &Path, prefix: &str) -> io::Result<PathBuf> {
         })?;
     let suffix = name
         .strip_prefix(".atc-")
-        .filter(|suffix| suffix.starts_with("refresh-") || suffix.starts_with("repair-"))
+        .filter(|suffix| {
+            suffix.starts_with("refresh-")
+                || suffix.starts_with("repair-")
+                || suffix.starts_with("migrate-")
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -113,6 +113,23 @@ pub enum ContestCommand {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Migrate a contest and preserve its previous data
+    Migrate(MigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    #[arg(short, long)]
+    pub contest: Option<String>,
+
+    /// Show the local migration plan without downloading or writing data
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Approve the migration without prompting
+    #[arg(long)]
+    pub yes: bool,
 }
 
 // ============================================================
@@ -479,6 +496,7 @@ mod tests {
             "  new       Create a contest workspace\n",
             "  contest   Open or create a contest\n",
             "  refresh   Refresh contest metadata and samples\n",
+            "  migrate   Migrate a contest and preserve its previous data\n",
             "\n",
             "Run & Test\n",
             "  test      Run samples and the saved stress regression\n",

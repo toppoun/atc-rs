@@ -5,6 +5,7 @@ mod create;
 mod doctor;
 mod init;
 mod login;
+mod migrate;
 mod new;
 mod refresh;
 mod run_scheduler;
@@ -30,6 +31,7 @@ pub(crate) use create::{create, create_source};
 pub(crate) use doctor::doctor;
 pub(crate) use init::init;
 pub(crate) use login::login;
+pub(crate) use migrate::migrate;
 pub(crate) use new::new;
 pub(crate) use refresh::refresh;
 pub(crate) use source::source;
@@ -142,6 +144,15 @@ fn fetch_contest_data(
         contest,
         samples_by_problem,
     })
+}
+
+impl FetchedContestData {
+    fn stage(self, destination: &std::path::Path) -> std::io::Result<()> {
+        for (problem, samples) in self.contest.problems.iter().zip(self.samples_by_problem) {
+            crate::workspace::save_samples(destination, problem, &samples)?;
+        }
+        crate::workspace::save_metadata(destination, &self.contest)
+    }
 }
 
 fn fetch_samples_for_manifest(
