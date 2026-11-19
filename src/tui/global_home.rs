@@ -1665,6 +1665,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Instant;
 
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
@@ -1729,6 +1730,7 @@ mod tests {
         discarded_events: usize,
         batch_file_writes: VecDeque<Option<(PathBuf, String)>>,
         editor_file_contents: Option<String>,
+        authentication_frame_wait: Option<(&'static str, Instant)>,
     }
 
     impl ScriptedGlobalTerminal {
@@ -1756,6 +1758,7 @@ mod tests {
                 discarded_events: 0,
                 batch_file_writes: VecDeque::new(),
                 editor_file_contents: None,
+                authentication_frame_wait: None,
             }
         }
     }
@@ -1784,6 +1787,30 @@ mod tests {
             let Some(batch) = self.batches.pop_front() else {
                 return Err(io::Error::other("scripted Global Home input exhausted"));
             };
+            if batch.is_empty()
+                && let Some((expected, deadline)) = self.authentication_frame_wait
+            {
+                if self
+                    .frames
+                    .last()
+                    .is_some_and(|frame| frame.contains(expected))
+                {
+                    self.authentication_frame_wait = None;
+                } else if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "Global Home did not render {expected:?} within 5 seconds ({} frames drawn)",
+                            self.frames.len()
+                        ),
+                    ));
+                } else {
+                    // Keep the next input queued while the production loop polls the worker.
+                    self.batches.push_front(batch);
+                    std::thread::yield_now();
+                }
+                return Ok(false);
+            }
             if let Some(Some((path, contents))) = self.batch_file_writes.pop_front() {
                 std::fs::write(path, contents)?;
             }
@@ -2285,16 +2312,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn authentication_modal_reports_invalid_regular_file_without_rendering_its_value() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("config.toml");
-        let cookie = cookie_location(temp.path());
-        std::fs::create_dir_all(&cookie.state_dir).unwrap();
-        let secret = "super-secret-invalid-cookie-value";
-        write_cookie(&cookie.file, secret);
-        let paths = HomeActionPaths::for_test(config, cookie.clone());
-        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
+    fn run_authentication_status_fixture(
+        root: &Path,
+        paths: &HomeActionPaths,
+        expected: &'static str,
+    ) -> ScriptedGlobalTerminal {
+        let mut state = GlobalHomeState::new(root.to_path_buf());
+        state.authentication = AuthenticationModalController::new_with_verifier(|_| {
+            panic!("missing or invalid cookie fixture unexpectedly reached the verifier");
+        });
         let mut terminal = ScriptedGlobalTerminal::new(
             100,
             30,
@@ -2305,18 +2331,34 @@ mod tests {
                 vec![event(KeyCode::Char('q'))],
             ],
         );
+        terminal.authentication_frame_wait =
+            Some((expected, Instant::now() + Duration::from_secs(5)));
 
         assert_eq!(
             run_with_terminal_and_paths(
                 &mut terminal,
                 &mut state,
-                &paths,
+                paths,
                 Err("Registry unavailable in this test")
             )
             .unwrap(),
             GlobalHomeExit::Quit
         );
         assert!(terminal.editor_targets.is_empty());
+        terminal
+    }
+
+    #[test]
+    fn authentication_modal_reports_invalid_regular_file_without_rendering_its_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let cookie = cookie_location(temp.path());
+        std::fs::create_dir_all(&cookie.state_dir).unwrap();
+        let secret = "super-secret-invalid-cookie-value";
+        write_cookie(&cookie.file, secret);
+        let paths = HomeActionPaths::for_test(config, cookie);
+        let terminal = run_authentication_status_fixture(temp.path(), &paths, "Status   Invalid");
+
         assert!(terminal.frames.iter().any(|frame| {
             frame.contains("Status   Invalid")
                 && frame.contains("Repair Cookie")
@@ -2330,30 +2372,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cookie = cookie_location(temp.path());
         let paths = HomeActionPaths::for_test(temp.path().join("config.toml"), cookie.clone());
-        let mut state = GlobalHomeState::new(temp.path().to_path_buf());
-        let mut terminal = ScriptedGlobalTerminal::new(
-            100,
-            30,
-            [
-                vec![event(KeyCode::Char('a'))],
-                vec![],
-                vec![event(KeyCode::Escape)],
-                vec![event(KeyCode::Char('q'))],
-            ],
-        );
+        let terminal =
+            run_authentication_status_fixture(temp.path(), &paths, "Status   Not configured");
 
-        assert_eq!(
-            run_with_terminal_and_paths(
-                &mut terminal,
-                &mut state,
-                &paths,
-                Err("Registry unavailable in this test")
-            )
-            .unwrap(),
-            GlobalHomeExit::Quit
-        );
         assert!(!cookie.file.exists());
-        assert!(terminal.editor_targets.is_empty());
         assert!(terminal.frames.iter().any(|frame| {
             frame.contains("Status   Not configured")
                 && frame.contains("Paste Cookie")
