@@ -336,9 +336,9 @@ impl SubmissionTrackingError {
                 SubmissionTrackingErrorKind::HttpStatus
             }
             Self::Fetch(AtCoderError::Http(_)) => SubmissionTrackingErrorKind::HttpTransport,
-            Self::Fetch(AtCoderError::RateLimited { .. }) => {
-                SubmissionTrackingErrorKind::RateLimited
-            }
+            Self::Fetch(
+                AtCoderError::RateLimited { .. } | AtCoderError::RetryAfterExceedsLimit { .. },
+            ) => SubmissionTrackingErrorKind::RateLimited,
             Self::Fetch(_) => SubmissionTrackingErrorKind::Fetch,
             Self::InvalidIdentity(_) => SubmissionTrackingErrorKind::InvalidIdentity,
             Self::MalformedSubmissionList(_) => {

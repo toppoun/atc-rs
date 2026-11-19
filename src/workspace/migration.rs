@@ -4,12 +4,14 @@ use super::diagnosis::{
 use super::update_cancellation::{UpdateCancellation, UpdateCancelled};
 use super::{
     CapDir, MAX_CONTEST_METADATA_BYTES, PhysicalDirectoryIdentity, contest_staging_archive,
-    entry_exists, lock_contest_update, metadata_contest_owner, missing_contest_directory,
-    open_contest_destination_nofollow, open_managed_directory, opened_directory_identity,
-    preserved_staging_error, read_contest_metadata_snapshot_in, snapshot_tests,
-    validate_contest_update_lock_entry, workspace_config_entry_exists,
+    entry_exists, fingerprint_tests, lock_contest_update, metadata_contest_owner,
+    missing_contest_directory, open_contest_destination_nofollow, open_managed_directory,
+    opened_directory_identity, preserved_staging_error, read_contest_metadata_snapshot_in,
+    snapshot_tests, validate_contest_update_lock_entry, workspace_config_entry_exists,
 };
-use crate::safe_file::{self, FileSnapshot, PreservedTempDir, TreeSnapshot};
+use crate::safe_file::{
+    self, FileFingerprint, FileSnapshot, PreservedTempDir, TreeFingerprint, TreeSnapshot,
+};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -151,6 +153,12 @@ pub(crate) struct MigrationPlan {
     cause: MigrationCause,
     diagnosis: ContestDiagnosis,
     directories: DirectoryIdentities,
+    metadata: Option<FileFingerprint>,
+    tests: Option<TreeFingerprint>,
+}
+
+/// Exact bytes used only while applying one migration and verifying its Recovery.
+struct PreviousMigrationData {
     metadata: Option<FileSnapshot>,
     tests: Option<TreeSnapshot>,
 }
@@ -217,7 +225,7 @@ pub(crate) fn inspect_with_diagnosis(
     }
 
     validate_contest_update_lock_entry(&directories.root, destination)?;
-    let tests = snapshot_tests(&directories.root, destination, "tests")?;
+    let tests = fingerprint_tests(&directories.root, destination)?;
     let current = LiveDirectories::open(destination)?;
     if diagnose_contest(destination, contest_id) != diagnosis
         || current.identities(destination)? != identities
@@ -232,7 +240,7 @@ pub(crate) fn inspect_with_diagnosis(
         cause,
         diagnosis,
         directories: identities,
-        metadata,
+        metadata: metadata.as_ref().map(FileSnapshot::fingerprint),
         tests,
     })))
 }
@@ -285,15 +293,23 @@ impl MigrationPlan {
 
     pub(crate) fn revalidate(&self) -> io::Result<()> {
         let live = self.open_unchanged()?;
-        reject_workspace_target(&live.root, &self.destination)?;
-        if diagnose_contest(&self.destination, &self.contest_id) != self.diagnosis
-            || live.metadata(&self.destination)? != self.metadata
-            || snapshot_tests(&live.root, &self.destination, "tests")? != self.tests
-        {
+        self.unchanged_metadata(&live)?;
+        if fingerprint_tests(&live.root, &self.destination)? != self.tests {
             return Err(changed_local_data());
         }
         self.open_unchanged()?;
         Ok(())
+    }
+
+    fn unchanged_metadata(&self, live: &LiveDirectories) -> io::Result<Option<FileSnapshot>> {
+        reject_workspace_target(&live.root, &self.destination)?;
+        let metadata = live.metadata(&self.destination)?;
+        if diagnose_contest(&self.destination, &self.contest_id) != self.diagnosis
+            || metadata.as_ref().map(FileSnapshot::fingerprint) != self.metadata
+        {
+            return Err(changed_local_data());
+        }
+        Ok(metadata)
     }
 
     pub(crate) fn revalidate_directories(&self) -> io::Result<()> {
@@ -421,13 +437,19 @@ impl MigrationPlan {
         safe_file::require_absent(&backup_tests)?;
         safe_file::require_absent(&backup_metadata)?;
         verify_staging()?;
-        self.revalidate()?;
+        let metadata = self.unchanged_metadata(live)?;
+        let tests = snapshot_tests(&live.root, destination, "tests")?;
+        if !safe_file::matches_tree_snapshot(self.tests.as_ref(), tests.as_ref()) {
+            return Err(changed_local_data());
+        }
+        let previous = PreviousMigrationData { metadata, tests };
+        self.open_unchanged()?;
         reject_workspace_target(&live.root, destination)?;
         cancellation.record_intent(staging_root, || {
             safe_file::write_recovery_intent_at(&staged.root, identity)
         })?;
 
-        if self.tests.is_some() {
+        if previous.tests.is_some() {
             safe_file::rename_noclobber_at(
                 &live.root,
                 &destination_tests,
@@ -438,10 +460,10 @@ impl MigrationPlan {
         before_metadata_backup(staging_root);
         self.open_unchanged()?;
         verify_staging()?;
-        if live.metadata(destination)? != self.metadata {
+        if live.metadata(destination)? != previous.metadata {
             return Err(changed_local_data());
         }
-        if let Some(marker) = live.marker.as_ref().filter(|_| self.metadata.is_some())
+        if let Some(marker) = live.marker.as_ref().filter(|_| previous.metadata.is_some())
             && let Err(error) = safe_file::rename_noclobber_at(
                 marker,
                 &destination_metadata,
@@ -451,11 +473,13 @@ impl MigrationPlan {
         {
             // The second backup failed. Restore the verified tests only if
             // their former name is still free. Keep recovery data on failure.
-            if self.tests.is_some() {
+            if previous.tests.is_some() {
                 let restore = || {
                     self.open_unchanged()?;
                     verify_staging()?;
-                    if snapshot_tests(&staged.root, staging_root, "previous-tests")? != self.tests {
+                    if snapshot_tests(&staged.root, staging_root, "previous-tests")?
+                        != previous.tests
+                    {
                         return Err(changed_local_data());
                     }
                     safe_file::rename_noclobber_at(
@@ -477,7 +501,7 @@ impl MigrationPlan {
 
         verify_staging()?;
         self.open_unchanged()?;
-        self.verify_backups(&staged.root, staging_root)?;
+        previous.verify_backups(&staged.root, staging_root)?;
         if entry_exists(&live.root, "tests")?
             || live.metadata(destination)?.is_some()
             || staged.metadata(staging_root)?.as_ref() != Some(&staged_metadata)
@@ -539,14 +563,16 @@ impl MigrationPlan {
         {
             return Err(changed_local_data());
         }
-        self.verify_backups(&staged.root, staging_root)?;
+        previous.verify_backups(&staged.root, staging_root)?;
         let current_staging = LiveDirectories::open(staging_root)?.identities(staging_root)?;
         if current_staging.root != staged_identities.root {
             return Err(changed_local_data());
         }
         Ok(staged_identities.root)
     }
+}
 
+impl PreviousMigrationData {
     fn verify_backups(&self, staging: &CapDir, root: &Path) -> io::Result<()> {
         let name = "previous-contest.toml";
         let actual_metadata = if entry_exists(staging, name)? {

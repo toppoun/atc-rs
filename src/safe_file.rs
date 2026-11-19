@@ -1,3 +1,4 @@
+use aws_lc_rs::digest::{self, SHA256, SHA256_OUTPUT_LEN};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+const SNAPSHOT_READ_CHUNK: usize = 64 * 1024;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_metadata;
@@ -200,9 +203,52 @@ pub(crate) struct FileSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TreeSnapshot {
+pub(crate) struct TreeSnapshot<F = FileSnapshot> {
     directories: std::collections::BTreeMap<PathBuf, FileIdentity>,
-    files: std::collections::BTreeMap<PathBuf, FileSnapshot>,
+    files: std::collections::BTreeMap<PathBuf, F>,
+}
+
+pub(crate) type TreeFingerprint = TreeSnapshot<FileFingerprint>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileFingerprint {
+    identity: FileIdentity,
+    size: u64,
+    sha256: [u8; SHA256_OUTPUT_LEN],
+}
+
+impl FileSnapshot {
+    pub(crate) fn fingerprint(&self) -> FileFingerprint {
+        FileFingerprint {
+            identity: self.identity.clone(),
+            size: self.bytes.len() as u64,
+            sha256: sha256_bytes(digest::digest(&SHA256, &self.bytes)),
+        }
+    }
+}
+
+impl TreeFingerprint {
+    /// Compare the plan with exact bytes already read for a replacement under lock.
+    pub(crate) fn matches_snapshot(&self, snapshot: &TreeSnapshot) -> bool {
+        self.directories == snapshot.directories
+            && self.files.len() == snapshot.files.len()
+            && self.files.iter().zip(&snapshot.files).all(
+                |((expected_path, expected), (path, file))| {
+                    expected_path == path && *expected == file.fingerprint()
+                },
+            )
+    }
+}
+
+pub(crate) fn matches_tree_snapshot(
+    expected: Option<&TreeFingerprint>,
+    actual: Option<&TreeSnapshot>,
+) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => expected.matches_snapshot(actual),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Records the exact files and directory identities in a generation. Callers validate their
@@ -213,19 +259,39 @@ pub(crate) fn read_tree_snapshot(root: &Path) -> io::Result<TreeSnapshot> {
 }
 
 pub(crate) fn read_tree_snapshot_in(directory: &Dir, root: &Path) -> io::Result<TreeSnapshot> {
+    read_tree_in(directory, root, read_regular_file_snapshot_at)
+}
+
+pub(crate) fn read_tree_fingerprint_in(
+    directory: &Dir,
+    root: &Path,
+) -> io::Result<TreeFingerprint> {
+    read_tree_in(directory, root, |directory, name, path| {
+        fingerprint_regular_file_at(directory, name, path, |file, limit| {
+            hash_reader(file.take(limit))
+        })
+    })
+}
+
+fn read_tree_in<F>(
+    directory: &Dir,
+    root: &Path,
+    read_file: impl Fn(&Dir, &OsStr, &Path) -> io::Result<F>,
+) -> io::Result<TreeSnapshot<F>> {
     let mut snapshot = TreeSnapshot {
         directories: std::collections::BTreeMap::new(),
         files: std::collections::BTreeMap::new(),
     };
-    read_tree_entries(directory, root, Path::new(""), &mut snapshot)?;
+    read_tree_entries(directory, root, Path::new(""), &mut snapshot, &read_file)?;
     Ok(snapshot)
 }
 
-fn read_tree_entries(
+fn read_tree_entries<F>(
     directory: &Dir,
     root: &Path,
     relative: &Path,
-    snapshot: &mut TreeSnapshot,
+    snapshot: &mut TreeSnapshot<F>,
+    read_file: &impl Fn(&Dir, &OsStr, &Path) -> io::Result<F>,
 ) -> io::Result<()> {
     let path = root.join(relative);
     require_tree_directory(&directory.dir_metadata()?, &path)?;
@@ -241,10 +307,10 @@ fn read_tree_entries(
         if metadata.is_dir() {
             require_tree_directory(&metadata, &entry_path)?;
             let child = directory.open_dir_nofollow(&name)?;
-            read_tree_entries(&child, root, &entry_relative, snapshot)?;
+            read_tree_entries(&child, root, &entry_relative, snapshot, read_file)?;
         } else if metadata.is_file() {
             require_regular_file(&metadata, &entry_path)?;
-            let file = read_regular_file_snapshot_at(directory, &name, &entry_path)?;
+            let file = read_file(directory, &name, &entry_path)?;
             snapshot.files.insert(entry_relative, file);
         } else {
             return Err(io::Error::new(
@@ -254,6 +320,133 @@ fn read_tree_entries(
         }
     }
     Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+struct FileObservation {
+    identity: FileIdentity,
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+fn observe_regular_file(file: &fs::File, path: &Path) -> io::Result<FileObservation> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    let observation = FileObservation {
+        identity: file_identity(file, path)?,
+        size: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    };
+    require_regular_file(&cap_std::fs::Metadata::from_just_metadata(metadata), path)?;
+    Ok(observation)
+}
+
+/// Check sample encoding without retaining the sample text in a diagnosis.
+pub(crate) fn validate_regular_utf8_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<()> {
+    read_stable_regular_file_at(directory, name, path, |file, limit| {
+        let mut reader = file.take(limit);
+        validate_utf8(&mut reader).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
+        Ok((limit - reader.limit(), ()))
+    })?;
+    Ok(())
+}
+
+fn validate_utf8(mut reader: impl Read) -> io::Result<()> {
+    let mut buffer = [0; SNAPSHOT_READ_CHUNK];
+    let mut pending = 0;
+    loop {
+        let count = match reader.read(&mut buffer[pending..]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        match std::str::from_utf8(&buffer[..pending + count]) {
+            Ok(_) if count == 0 => return Ok(()),
+            Ok(_) => pending = 0,
+            Err(error) if count != 0 && error.error_len().is_none() => {
+                let end = pending + count;
+                pending = end - error.valid_up_to();
+                buffer.copy_within(error.valid_up_to()..end, 0);
+            }
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+    }
+}
+
+fn fingerprint_regular_file_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    read: impl FnOnce(&mut fs::File, u64) -> io::Result<(u64, digest::Digest)>,
+) -> io::Result<FileFingerprint> {
+    let (file, hash) = read_stable_regular_file_at(directory, name, path, read)?;
+    Ok(FileFingerprint {
+        identity: file.identity,
+        size: file.size,
+        sha256: sha256_bytes(hash),
+    })
+}
+
+fn read_stable_regular_file_at<T>(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    read: impl FnOnce(&mut fs::File, u64) -> io::Result<(u64, T)>,
+) -> io::Result<(FileObservation, T)> {
+    let mut file = open_file_nofollow_at(directory, name)?;
+    let before = observe_regular_file(&file, path)?;
+    // Read at most one byte beyond the original length so concurrent growth cannot keep
+    // the scanner reading indefinitely. The reopened file must still name the same object.
+    let (size, value) = read(&mut file, before.size.saturating_add(1))?;
+    if size != before.size
+        || observe_regular_file(&file, path)? != before
+        || observe_regular_file(&open_file_nofollow_at(directory, name)?, path)? != before
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "file changed while reading its snapshot: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok((before, value))
+}
+
+fn hash_reader(mut reader: impl Read) -> io::Result<(u64, digest::Digest)> {
+    let mut hash = digest::Context::new(&SHA256);
+    let mut buffer = [0; SNAPSHOT_READ_CHUNK];
+    let mut size = 0;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok((size, hash.finish())),
+            Ok(read) => {
+                size += read as u64;
+                hash.update(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sha256_bytes(hash: digest::Digest) -> [u8; SHA256_OUTPUT_LEN] {
+    hash.as_ref().try_into().expect("SHA-256 digest length")
 }
 
 fn require_tree_directory(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
@@ -913,6 +1106,117 @@ fn install_noclobber_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_fingerprints_match_exact_snapshots_and_detect_content_structure_and_identity() {
+        for change in [
+            "same-size",
+            "new-file",
+            "missing-file",
+            "file",
+            "directory",
+            "new-empty",
+            "missing-empty",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("tests");
+            fs::create_dir_all(root.join("custom/empty")).unwrap();
+            let path = root.join("custom/input");
+            fs::write(&path, b"original").unwrap();
+            let current = || {
+                let directory = Dir::from_std_file(open_tree_directory(&root).unwrap());
+                read_tree_fingerprint_in(&directory, &root).unwrap()
+            };
+            let expected = current();
+            assert!(expected.matches_snapshot(&read_tree_snapshot(&root).unwrap()));
+            match change {
+                "same-size" => fs::write(&path, b"modified").unwrap(),
+                "new-file" => fs::write(root.join("custom/new"), b"").unwrap(),
+                "missing-file" => fs::remove_file(&path).unwrap(),
+                "file" => {
+                    fs::rename(&path, temp.path().join("original-file")).unwrap();
+                    fs::write(&path, b"original").unwrap();
+                }
+                "directory" => {
+                    fs::rename(root.join("custom/empty"), temp.path().join("original-dir"))
+                        .unwrap();
+                    fs::create_dir(root.join("custom/empty")).unwrap();
+                }
+                "new-empty" => fs::create_dir(root.join("custom/new")).unwrap(),
+                "missing-empty" => fs::remove_dir(root.join("custom/empty")).unwrap(),
+                _ => unreachable!(),
+            }
+            let edited = current();
+            let exact = read_tree_snapshot(&root).unwrap();
+            assert_ne!(edited, expected, "{change}");
+            assert!(edited.matches_snapshot(&exact), "{change}");
+            assert!(!expected.matches_snapshot(&exact), "{change}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_rejects_a_same_size_edit_during_read_and_propagates_io_errors() {
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sample");
+        let name = OsStr::new("sample");
+        fs::write(&path, b"before").unwrap();
+        let directory = Dir::from_std_file(open_tree_directory(temp.path()).unwrap());
+        let stable_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stable_time)
+            .unwrap();
+        let error = fingerprint_regular_file_at(&directory, name, &path, |file, limit| {
+            let mut first = [0];
+            file.read_exact(&mut first)?;
+            let mut writer = fs::File::options().write(true).open(&path)?;
+            writer.write_all(b"edited")?;
+            writer.set_modified(stable_time + Duration::from_secs(5))?;
+            drop(writer);
+            hash_reader(io::Cursor::new(first).chain(file.take(limit - 1)))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+        let error = fingerprint_regular_file_at(&directory, name, &path, |_, _| {
+            hash_reader(io::repeat(0).take(1).chain(TestReadError))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    struct TestReadError;
+
+    impl Read for TestReadError {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    #[test]
+    fn streaming_utf8_validates_characters_crossing_the_buffer_boundary() {
+        let mut bytes = vec![b'a'; SNAPSHOT_READ_CHUNK - 1];
+        bytes.extend_from_slice("🦀".as_bytes());
+        assert!(validate_utf8(bytes.as_slice()).is_ok());
+        bytes.pop();
+        assert_eq!(
+            validate_utf8(bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        bytes.push(0xff);
+        assert_eq!(
+            validate_utf8(bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            validate_utf8(TestReadError).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
     use std::ffi::OsStr;
     use std::fs;
 

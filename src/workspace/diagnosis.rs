@@ -1,9 +1,9 @@
 use super::{
     CapDir, ContestMetadataHealth, ContestRecoveryError, MAX_CONTEST_METADATA_BYTES,
     SampleLayoutError, UnownedTestEntry, contest_directory_exists, find_unowned_test_entry,
-    inspect_contest_metadata_text, inspect_contest_recovery_state, load_problem_samples,
-    metadata_contest_owner, open_contest_destination_nofollow, open_managed_directory,
-    problem_indices, validate_path_component,
+    inspect_contest_metadata_text, inspect_contest_recovery_state, metadata_contest_owner,
+    open_contest_destination_nofollow, open_managed_directory, problem_indices,
+    validate_path_component, visit_problem_sample_pairs,
 };
 use crate::model::Contest;
 use crate::safe_file;
@@ -255,13 +255,17 @@ fn inspect_samples(
             }
             continue;
         };
-        match load_problem_samples(&path, &directory) {
-            Ok(samples) if samples.len() == problem.sample_count => {}
-            Ok(samples) => {
+        let count = visit_problem_sample_pairs(&path, &directory, |input, output| {
+            safe_file::validate_regular_utf8_at(&directory, input, &path.join(input))?;
+            safe_file::validate_regular_utf8_at(&directory, output, &path.join(output))
+        });
+        match count {
+            Ok(found) if found == problem.sample_count => {}
+            Ok(found) => {
                 return Ok(Some(RepairReason::SampleCountMismatch {
                     index: index.clone(),
                     expected: problem.sample_count,
-                    found: samples.len(),
+                    found,
                 }));
             }
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {

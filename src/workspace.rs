@@ -1194,9 +1194,30 @@ fn snapshot_tests(
     destination: &Path,
     name: &str,
 ) -> io::Result<Option<safe_file::TreeSnapshot>> {
+    read_tests_snapshot(root, destination, name, safe_file::read_tree_snapshot_in)
+}
+
+fn fingerprint_tests(
+    root: &CapDir,
+    destination: &Path,
+) -> io::Result<Option<safe_file::TreeFingerprint>> {
+    read_tests_snapshot(
+        root,
+        destination,
+        "tests",
+        safe_file::read_tree_fingerprint_in,
+    )
+}
+
+fn read_tests_snapshot<T>(
+    root: &CapDir,
+    destination: &Path,
+    name: &str,
+    read: impl FnOnce(&CapDir, &Path) -> io::Result<T>,
+) -> io::Result<Option<T>> {
     let path = destination.join(name);
     let snapshot = open_managed_directory(root, name, &path, "tests directory")?
-        .map(|tests| safe_file::read_tree_snapshot_in(&tests, &path))
+        .map(|tests| read(&tests, &path))
         .transpose();
     snapshot.map_err(|error| {
         io::Error::new(
@@ -1206,12 +1227,12 @@ fn snapshot_tests(
     })
 }
 
-pub(crate) fn snapshot_contest_tests(
+pub(crate) fn fingerprint_contest_tests(
     destination: &Path,
-) -> io::Result<Option<safe_file::TreeSnapshot>> {
+) -> io::Result<Option<safe_file::TreeFingerprint>> {
     let directory = open_contest_destination_nofollow(destination)?;
     validate_contest_update_lock_entry(&directory, destination)?;
-    snapshot_tests(&directory, destination, "tests")
+    fingerprint_tests(&directory, destination)
 }
 
 pub(crate) fn read_contest_metadata_snapshot(
@@ -1436,6 +1457,28 @@ fn load_samples_in(
 }
 
 fn load_problem_samples(test_dir: &Path, problem_dir: &CapDir) -> io::Result<Vec<Sample>> {
+    let mut samples = Vec::new();
+    let read_sample = |name: &OsStr| {
+        let bytes =
+            safe_file::read_regular_file_snapshot_at(problem_dir, name, &test_dir.join(name))?
+                .bytes;
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    };
+    visit_problem_sample_pairs(test_dir, problem_dir, |input, output| {
+        samples.push(Sample {
+            input: read_sample(input)?,
+            output: read_sample(output)?,
+        });
+        Ok(())
+    })?;
+    Ok(samples)
+}
+
+fn visit_problem_sample_pairs(
+    test_dir: &Path,
+    problem_dir: &CapDir,
+    mut visit: impl FnMut(&OsStr, &OsStr) -> io::Result<()>,
+) -> io::Result<usize> {
     let mut files = BTreeMap::<usize, SampleFiles>::new();
 
     for entry in problem_dir.entries()? {
@@ -1479,7 +1522,7 @@ fn load_problem_samples(test_dir: &Path, problem_dir: &CapDir) -> io::Result<Vec
         }
     }
 
-    let mut samples = Vec::with_capacity(files.len());
+    let count = files.len();
 
     for (expected_number, (number, sample_files)) in (1usize..).zip(files) {
         if number != expected_number {
@@ -1512,20 +1555,10 @@ fn load_problem_samples(test_dir: &Path, problem_dir: &CapDir) -> io::Result<Vec
             )
         })?;
 
-        let read_sample = |name: &OsStr| {
-            let bytes =
-                safe_file::read_regular_file_snapshot_at(problem_dir, name, &test_dir.join(name))?
-                    .bytes;
-            String::from_utf8(bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        };
-        let input = read_sample(&input_name)?;
-        let output = read_sample(&output_name)?;
-
-        samples.push(Sample { input, output });
+        visit(&input_name, &output_name)?;
     }
 
-    Ok(samples)
+    Ok(count)
 }
 
 pub fn load_verified_samples(destination: &Path, problem: &Problem) -> io::Result<Vec<Sample>> {

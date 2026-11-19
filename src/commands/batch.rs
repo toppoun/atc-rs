@@ -241,9 +241,16 @@ impl BatchPlan {
                             (Status::NotRun, error.to_string())
                         }
                         Err(error) => {
-                            if matches!(error, AppError::AtCoder(AtCoderError::RateLimited { .. }))
-                            {
-                                stopped = Some(StopReason::RateLimited);
+                            match &error {
+                                AppError::AtCoder(AtCoderError::RateLimited { .. }) => {
+                                    stopped = Some(StopReason::RateLimited);
+                                }
+                                AppError::AtCoder(AtCoderError::RetryAfterExceedsLimit {
+                                    ..
+                                }) => {
+                                    stopped = Some(StopReason::RetryAfterExceedsLimit);
+                                }
+                                _ => {}
                             }
                             (Status::Failed, error.to_string())
                         }
@@ -453,6 +460,7 @@ impl Update {
 enum StopReason {
     Interrupted,
     RateLimited,
+    RetryAfterExceedsLimit,
 }
 
 impl StopReason {
@@ -460,6 +468,7 @@ impl StopReason {
         match self {
             Self::Interrupted => "interrupted by Ctrl+C",
             Self::RateLimited => "HTTP 429 persisted after retries",
+            Self::RetryAfterExceedsLimit => "HTTP 429 Retry-After exceeds the wait limit",
         }
     }
 }
@@ -1076,7 +1085,7 @@ mod tests {
         fs::write(changed.join("sample-1.out"), b"original output").unwrap();
         let repairable = repairable(root.path(), "abc466", 1);
         let mut reporter = DuringFetch(Box::new(|| {
-            fs::write(changed.join("sample-1.in"), b"new local input").unwrap()
+            fs::write(changed.join("sample-1.in"), b"modified").unwrap()
         }));
         let plan = BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
         let mut output = Vec::new();
@@ -1102,10 +1111,7 @@ mod tests {
             "{output}"
         );
         assert!(!root.path().join("abc461/.atc-update.lock").exists());
-        assert_eq!(
-            fs::read(changed.join("sample-1.in")).unwrap(),
-            b"new local input"
-        );
+        assert_eq!(fs::read(changed.join("sample-1.in")).unwrap(), b"modified");
         assert!(repairable.join("tests/A/sample-1.in").is_file());
     }
 
@@ -1175,36 +1181,92 @@ mod tests {
 
     #[test]
     fn persistent_rate_limit_marks_later_updates_not_run() {
-        let root = workspace();
-        repairable(root.path(), "abc460", 1);
-        repairable(root.path(), "abc466", 1);
-        let before = read_tree_snapshot(root.path()).unwrap();
-        let plan = BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
-        let mut output = Vec::new();
-        let attempts = Cell::new(0);
-        let code = plan
-            .run(
-                true,
-                false,
-                UpdateCancellation::default(),
-                || {
-                    attempts.set(attempts.get() + 1);
-                    Err(AtCoderError::RateLimited {
-                        url: "https://atcoder.jp/contests/abc460/tasks".into(),
-                    }
-                    .into())
+        for (error, reason) in [
+            (
+                AtCoderError::RateLimited {
+                    url: "https://atcoder.jp/contests/abc460/tasks".into(),
                 },
-                &mut NullReporter,
-                &mut output,
-            )
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(code, ExitCode::FAILURE);
-        assert_eq!(attempts.get(), 1);
-        assert!(
-            output.contains("abc466  NOT RUN  HTTP 429 persisted after retries"),
-            "{output}"
-        );
-        assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
+                "HTTP 429 persisted after retries",
+            ),
+            (
+                AtCoderError::RetryAfterExceedsLimit {
+                    url: "https://atcoder.jp/contests/abc460/tasks".into(),
+                },
+                "HTTP 429 Retry-After exceeds the wait limit",
+            ),
+        ] {
+            let root = workspace();
+            repairable(root.path(), "abc460", 1);
+            repairable(root.path(), "abc466", 1);
+            let before = read_tree_snapshot(root.path()).unwrap();
+            let plan =
+                BatchPlan::scan(root.path(), BatchOperation::Refresh { force: false }).unwrap();
+            let mut output = Vec::new();
+            let error = Cell::new(Some(error));
+            let code = plan
+                .run(
+                    true,
+                    false,
+                    UpdateCancellation::default(),
+                    || {
+                        Err(error
+                            .take()
+                            .expect("batch should stop after the first update fails")
+                            .into())
+                    },
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(code, ExitCode::FAILURE);
+            assert!(error.into_inner().is_none());
+            assert!(
+                output.contains(&format!("abc466  NOT RUN  {reason}")),
+                "{output}"
+            );
+            assert_eq!(read_tree_snapshot(root.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn migration_revalidates_empty_directory_changes_after_planning_without_downloading() {
+        for change in ["add", "remove", "replace"] {
+            let root = workspace();
+            let contest = root.path().join("abc466");
+            let tests = contest.join("tests/legacy");
+            let empty = tests.join("empty");
+            fs::create_dir_all(&empty).unwrap();
+            fs::write(tests.join("custom.in"), b"preserve me").unwrap();
+            let plan = BatchPlan::scan(root.path(), BatchOperation::Migrate).unwrap();
+            match change {
+                "add" => fs::create_dir(tests.join("extra")).unwrap(),
+                "remove" => fs::remove_dir(&empty).unwrap(),
+                "replace" => {
+                    fs::rename(&empty, root.path().join("original-empty")).unwrap();
+                    fs::create_dir(&empty).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let edited = read_tree_snapshot(root.path()).unwrap();
+            let mut output = Vec::new();
+            let code = plan
+                .run(
+                    true,
+                    false,
+                    UpdateCancellation::default(),
+                    || panic!("changed tests must be rejected before the client is initialized"),
+                    &mut NullReporter,
+                    &mut output,
+                )
+                .unwrap();
+            let message = String::from_utf8(output).unwrap();
+            assert_eq!(code, ExitCode::FAILURE, "{change}: {message}");
+            assert!(
+                message.contains("local contest data changed during migration"),
+                "{change}: {message}"
+            );
+            assert_eq!(read_tree_snapshot(root.path()).unwrap(), edited);
+        }
     }
 }

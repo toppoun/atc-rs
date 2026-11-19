@@ -92,6 +92,64 @@ fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
 }
 
 #[test]
+fn dry_run_plans_256_contests_with_large_test_files_without_fetching_or_writing() {
+    fn entries(directory: &Path, state: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            let path = entry.path();
+            if metadata.is_dir() {
+                entries(&path, state);
+            }
+            state.push((path, metadata.len(), metadata.modified().unwrap()));
+        }
+    }
+
+    for (operation, label) in [
+        ("refresh", "Refresh planned:"),
+        ("migrate", "Migration planned:"),
+    ] {
+        let root = workspace("version = 1\n");
+        for n in 100..356 {
+            let id = format!("abc{n}");
+            let contest = root.path().join(&id);
+            let test_file = if operation == "refresh" {
+                manifest(&contest, &id, 2);
+                let samples = contest.join("tests/A");
+                fs::create_dir_all(&samples).unwrap();
+                fs::write(samples.join("sample-1.out"), "42\n").unwrap();
+                samples.join("sample-1.in")
+            } else {
+                let tests = contest.join("tests/custom");
+                fs::create_dir_all(tests.join("empty")).unwrap();
+                tests.join("legacy.in")
+            };
+            fs::File::create(test_file)
+                .unwrap()
+                .set_len(1024 * 1024)
+                .unwrap();
+        }
+        let snapshot = || {
+            let mut state = Vec::new();
+            entries(root.path(), &mut state);
+            state.sort_by(|left, right| left.0.cmp(&right.0));
+            state
+        };
+        let before = snapshot();
+        let output = cli(
+            root.path(),
+            &[operation, "--all", "--dry-run"],
+            &root.path().join("missing-fixtures"),
+        );
+        let message = stderr(&output);
+        assert!(output.status.success(), "{message}");
+        summary_count(&message, label, 256);
+        assert!(!message.contains("Fetching"), "{message}");
+        assert_eq!(snapshot(), before);
+    }
+}
+
+#[test]
 fn batch_discovery_is_bounded_sorted_and_finds_mapped_and_legacy_contests() {
     let root =
         workspace("version = 1\n[[paths]]\npattern = '^special-2026$'\npath = 'custom/deep'\n");

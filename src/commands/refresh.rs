@@ -2,11 +2,11 @@ use super::{ContestUpdateChecks, fetch_contest_data};
 use crate::atcoder;
 use crate::auth::SessionAuth;
 use crate::error::AppError;
-use crate::safe_file::{self, FileSnapshot, TreeSnapshot};
+use crate::safe_file::{self, FileFingerprint, FileSnapshot, TreeFingerprint};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
 use crate::workspace::diagnosis::{
-    BlockReason, ContestDiagnosis, MigrationReason, diagnose_contest,
+    BlockReason, ContestDiagnosis, MigrationReason, RepairReason, diagnose_contest,
 };
 use crate::workspace::{
     PhysicalDirectoryIdentity, contest_directory_identity, validate_refresh_destination,
@@ -25,13 +25,38 @@ pub(crate) struct PreparedRefresh {
 
 pub(super) struct RefreshBaseline {
     destination_identity: PhysicalDirectoryIdentity,
-    metadata_snapshot: Option<FileSnapshot>,
-    diagnosis: Option<ContestDiagnosis>,
+    metadata_snapshot: Option<FileFingerprint>,
+    diagnosis: Option<RefreshDiagnosis>,
     tests: Option<RefreshTests>,
 }
 
 // A CLI update checks the original generation, including when `tests/` was absent.
-struct RefreshTests(Option<TreeSnapshot>);
+struct RefreshTests(Option<TreeFingerprint>);
+
+enum RefreshDiagnosis {
+    Healthy,
+    RepairRequired(RepairReason),
+}
+
+impl RefreshDiagnosis {
+    fn for_update(diagnosis: ContestDiagnosis) -> Self {
+        match diagnosis {
+            ContestDiagnosis::Healthy { .. } => Self::Healthy,
+            ContestDiagnosis::RepairRequired(reason) => Self::RepairRequired(reason),
+            _ => unreachable!("only healthy or repairable contests can reach refresh planning"),
+        }
+    }
+
+    fn matches(&self, diagnosis: ContestDiagnosis) -> bool {
+        match (self, diagnosis) {
+            (Self::Healthy, ContestDiagnosis::Healthy { .. }) => true,
+            (Self::RepairRequired(expected), ContestDiagnosis::RepairRequired(actual)) => {
+                *expected == actual
+            }
+            _ => false,
+        }
+    }
+}
 
 impl PreparedRefresh {
     pub(crate) fn destination(&self) -> &Path {
@@ -112,8 +137,8 @@ pub(super) fn refresh_from(
     };
     let baseline = RefreshBaseline {
         destination_identity: destination_identity?,
-        metadata_snapshot: metadata_snapshot?,
-        diagnosis: Some(diagnosis),
+        metadata_snapshot: metadata_snapshot?.as_ref().map(FileSnapshot::fingerprint),
+        diagnosis: Some(RefreshDiagnosis::for_update(diagnosis)),
         tests: None,
     };
     if healthy && !force {
@@ -233,7 +258,9 @@ pub(crate) fn prepare_refresh(
     validate_refresh_destination(destination, contest_id, force)?;
     let baseline = RefreshBaseline {
         destination_identity,
-        metadata_snapshot: refresh_metadata_snapshot(destination)?,
+        metadata_snapshot: refresh_metadata_snapshot(destination)?
+            .as_ref()
+            .map(FileSnapshot::fingerprint),
         diagnosis: None,
         tests: None,
     };
@@ -316,17 +343,19 @@ fn apply_refresh_checked(
 
     let verify_diagnosis = baseline.diagnosis.is_some();
     baseline.revalidate_diagnosis(&destination, &contest_id)?;
-    baseline.revalidate(&destination, &contest_id, force)?;
+    let metadata = baseline.revalidate(&destination, &contest_id, force)?;
     workspace::replace_refresh_data_with_snapshot(
         &destination,
         staging.into_temp_dir(),
         force,
-        baseline.metadata_snapshot,
+        metadata,
         |tests| {
             (checks.validate_route)(&destination)?;
             validate_destination_identity(&destination, &baseline.destination_identity)?;
-            if let Some(expected) = &baseline.tests {
-                expected.validate(tests)?;
+            if let Some(expected) = &baseline.tests
+                && !safe_file::matches_tree_snapshot(expected.0.as_ref(), tests)
+            {
+                return Err(changed_tests());
             }
             Ok(())
         },
@@ -359,8 +388,10 @@ pub(super) fn plan_refresh_update(
 ) -> Result<RefreshBaseline, AppError> {
     RefreshBaseline {
         destination_identity: contest_directory_identity(destination)?,
-        metadata_snapshot: workspace::read_contest_metadata_snapshot(destination)?,
-        diagnosis: Some(diagnosis),
+        metadata_snapshot: workspace::read_contest_metadata_snapshot(destination)?
+            .as_ref()
+            .map(FileSnapshot::fingerprint),
+        diagnosis: Some(RefreshDiagnosis::for_update(diagnosis)),
         tests: None,
     }
     .capture_update(destination, contest_id, force)
@@ -389,16 +420,11 @@ pub(super) fn execute_cli_refresh<C: Borrow<atcoder::AtCoderClient>>(
     apply_refresh_checked(prepared, reporter, checks)
 }
 
-impl RefreshTests {
-    fn validate(&self, actual: Option<&TreeSnapshot>) -> io::Result<()> {
-        if self.0.as_ref() != actual {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "local tests changed while refresh was being prepared; inspect the contest before retrying",
-            ));
-        }
-        Ok(())
-    }
+fn changed_tests() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "local tests changed while refresh was being prepared; inspect the contest before retrying",
+    )
 }
 
 fn refresh_metadata_snapshot(destination: &Path) -> io::Result<Option<FileSnapshot>> {
@@ -427,7 +453,7 @@ impl RefreshBaseline {
         contest_id: &str,
         force: bool,
     ) -> Result<Self, AppError> {
-        self.tests = Some(RefreshTests(workspace::snapshot_contest_tests(
+        self.tests = Some(RefreshTests(workspace::fingerprint_contest_tests(
             destination,
         )?));
         self.revalidate_diagnosis(destination, contest_id)?;
@@ -447,8 +473,10 @@ impl RefreshBaseline {
         (checks.validate_route)(destination)?;
         self.revalidate_diagnosis(destination, contest_id)?;
         self.revalidate(destination, contest_id, force)?;
-        if let Some(expected) = &self.tests {
-            expected.validate(workspace::snapshot_contest_tests(destination)?.as_ref())?;
+        if let Some(expected) = &self.tests
+            && workspace::fingerprint_contest_tests(destination)? != expected.0
+        {
+            return Err(changed_tests().into());
         }
         Ok(())
     }
@@ -458,7 +486,7 @@ impl RefreshBaseline {
         destination: &Path,
         contest_id: &str,
         force: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<FileSnapshot>, AppError> {
         validate_destination_identity(destination, &self.destination_identity)?;
         validate_refresh_destination(destination, contest_id, force)?;
         let current_metadata = if self.diagnosis.is_some() {
@@ -466,7 +494,7 @@ impl RefreshBaseline {
         } else {
             refresh_metadata_snapshot(destination)?
         };
-        if current_metadata != self.metadata_snapshot {
+        if current_metadata.as_ref().map(FileSnapshot::fingerprint) != self.metadata_snapshot {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "contest metadata changed while refresh was being prepared; retry refresh",
@@ -475,12 +503,12 @@ impl RefreshBaseline {
         }
         workspace::validate_existing_contest_identity(destination, contest_id)?;
         validate_destination_identity(destination, &self.destination_identity)?;
-        Ok(())
+        Ok(current_metadata)
     }
 
     fn revalidate_diagnosis(&self, destination: &Path, contest_id: &str) -> Result<(), AppError> {
         if let Some(expected) = &self.diagnosis
-            && diagnose_contest(destination, contest_id) != *expected
+            && !expected.matches(diagnose_contest(destination, contest_id))
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,

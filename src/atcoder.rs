@@ -4,7 +4,8 @@ use crate::model::Sample;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::cookie::CookieStore;
-use reqwest::header::{HeaderValue, RETRY_AFTER};
+use reqwest::header::HeaderValue;
+use retry_after::{MAX_RETRY_WAIT, retry_wait};
 
 use scraper::{Html, Selector};
 
@@ -17,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Submit parsing and the one-attempt backend are shared with the one-shot CLI command.
+mod retry_after;
 pub(crate) mod submission_diagnostics;
 pub(crate) mod submission_tracking;
 #[allow(dead_code)]
@@ -27,12 +29,6 @@ const BASE_URL: &str = "https://atcoder.jp";
 // 正常時も短時間に連打しない
 const REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const BATCH_REQUEST_INTERVAL: Duration = Duration::from_millis(1_000);
-
-// 429を受けたとき、Retry-Afterが無い場合の待機時間
-const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
-
-// A malformed or overly defensive server value must not suspend the CLI indefinitely.
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 // 最初のリクエストとは別に何回retryするか
 const MAX_429_RETRIES: usize = 3;
@@ -57,6 +53,9 @@ pub enum AtCoderError {
 
     // 429がretryしても解消しなかった
     RateLimited {
+        url: String,
+    },
+    RetryAfterExceedsLimit {
         url: String,
     },
 }
@@ -221,6 +220,11 @@ impl fmt::Display for AtCoderError {
             Self::RateLimited { url } => {
                 write!(formatter, "rate limit persisted after retries: {url}")
             }
+            Self::RetryAfterExceedsLimit { url } => write!(
+                formatter,
+                "HTTP 429 Retry-After exceeds the {}-second wait limit for {url}",
+                MAX_RETRY_WAIT.as_secs()
+            ),
         }
     }
 }
@@ -237,7 +241,8 @@ impl std::error::Error for AtCoderError {
             | Self::InvalidProblemUrl(_)
             | Self::BatchInterrupted
             | Self::UnexpectedBatchRedirect(_)
-            | Self::RateLimited { .. } => None,
+            | Self::RateLimited { .. }
+            | Self::RetryAfterExceedsLimit { .. } => None,
         }
     }
 }
@@ -716,7 +721,11 @@ impl AtCoderClient {
                     });
                 }
 
-                let wait = retry_wait(response.headers());
+                let wait = retry_wait(response.headers()).map_err(|_| {
+                    AtCoderError::RetryAfterExceedsLimit {
+                        url: url.to_string(),
+                    }
+                })?;
 
                 if !interruptible_sleep(wait, should_continue) {
                     return Ok(None);
@@ -949,15 +958,6 @@ fn remaining_request_interval_for(
     previous
         .and_then(|previous| request_interval.checked_sub(now.saturating_duration_since(previous)))
         .filter(|wait| !wait.is_zero())
-}
-
-fn retry_wait(headers: &reqwest::header::HeaderMap) -> Duration {
-    headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_WAIT))
-        .unwrap_or(DEFAULT_RETRY_WAIT)
 }
 
 // ============================================================
@@ -2282,7 +2282,14 @@ mod tests {
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
             for (status, headers) in [
-                ("429 Too Many Requests", &["Retry-After: 2"][..]),
+                (
+                    "429 Too Many Requests",
+                    &[
+                        "Date: Sun, 06 Nov 1994 08:49:00 GMT",
+                        "Retry-After: Sun, 06 Nov 1994 08:49:03 GMT",
+                    ][..],
+                ),
+                ("429 Too Many Requests", &["Retry-After: 0"][..]),
                 ("200 OK", &[][..]),
                 ("200 OK", &[][..]),
             ] {
@@ -2306,10 +2313,12 @@ mod tests {
                 .iter()
                 .map(|(path, _)| path.as_str())
                 .collect::<Vec<_>>(),
-            ["/tasks", "/tasks", "/tasks/sample"]
+            ["/tasks", "/tasks", "/tasks", "/tasks/sample"]
         );
-        assert!(requests[1].1 - requests[0].1 >= Duration::from_secs(2));
-        assert!(requests[2].1 - requests[1].1 >= Duration::from_millis(1_000));
+        assert!(requests[1].1 - requests[0].1 >= Duration::from_secs(3));
+        for pair in requests[1..].windows(2) {
+            assert!(pair[1].1 - pair[0].1 >= BATCH_REQUEST_INTERVAL);
+        }
     }
 
     #[test]
@@ -2474,22 +2483,32 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_delta_seconds_is_used_with_a_fallback() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("7"));
-        assert_eq!(retry_wait(&headers), Duration::from_secs(7));
-
-        headers.insert(
-            RETRY_AFTER,
-            reqwest::header::HeaderValue::from_static("invalid"),
-        );
-        assert_eq!(retry_wait(&headers), DEFAULT_RETRY_WAIT);
-
-        headers.insert(
-            RETRY_AFTER,
-            reqwest::header::HeaderValue::from_static("18446744073709551615"),
-        );
-        assert_eq!(retry_wait(&headers), MAX_RETRY_WAIT);
+    fn a_server_wait_above_the_limit_stops_batch_and_single_gets() {
+        for interval in [None, Some(BATCH_REQUEST_INTERVAL)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let session = anonymous_session();
+            let http =
+                HttpSource::new_with_provider(Arc::clone(&session), provider(session), interval)
+                    .unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(read_wire_request(&mut stream, None).path, "/limited");
+                write_wire_response(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    &[
+                        "Date: Sun, 06 Nov 1994 08:49:00 GMT",
+                        "Retry-After: Sun, 06 Nov 1994 08:50:01 GMT",
+                    ],
+                );
+            });
+            assert!(matches!(
+                AtCoderClient::get_text_until(&http, &format!("{origin}/limited"), &|| true),
+                Err(AtCoderError::RetryAfterExceedsLimit { .. })
+            ));
+            server.join().unwrap();
+        }
     }
 
     #[test]

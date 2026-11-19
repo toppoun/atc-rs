@@ -92,6 +92,7 @@ dependencies = [
 name = "atc-rs"
 version = "0.1.0-rc.13"
 dependencies = [
+ "aws-lc-rs",
  "cap-fs-ext",
  "cap-std",
  "clap",
