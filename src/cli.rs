@@ -109,7 +109,7 @@ pub enum ContestCommand {
         #[arg(short, long)]
         contest: Option<String>,
 
-        /// Rebuild the current directory without trusting workspace metadata
+        /// Re-fetch official data even when local data is healthy
         #[arg(short, long)]
         force: bool,
     },
@@ -764,7 +764,7 @@ mod tests {
         let help = refresh.render_long_help().to_string();
 
         assert!(help.contains("-f, --force"));
-        assert!(help.contains("Rebuild the current directory without trusting workspace metadata"));
+        assert!(help.contains("Re-fetch official data even when local data is healthy"));
     }
 
     #[test]

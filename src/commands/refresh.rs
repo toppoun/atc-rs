@@ -5,6 +5,9 @@ use crate::error::AppError;
 use crate::safe_file::{self, FileSnapshot};
 use crate::ui::{Event, Reporter};
 use crate::workspace;
+use crate::workspace::diagnosis::{
+    BlockReason, ContestDiagnosis, MigrationReason, diagnose_contest,
+};
 use crate::workspace::validate_refresh_destination;
 use std::fs;
 use std::io;
@@ -12,11 +15,16 @@ use std::path::{Path, PathBuf};
 
 pub(crate) struct PreparedRefresh {
     destination: PathBuf,
-    destination_identity: RefreshDestinationIdentity,
     contest_id: String,
     force: bool,
-    metadata_snapshot: Option<FileSnapshot>,
+    baseline: RefreshBaseline,
     staging: crate::safe_file::PreservedTempDir,
+}
+
+struct RefreshBaseline {
+    destination_identity: RefreshDestinationIdentity,
+    metadata_snapshot: Option<FileSnapshot>,
+    diagnosis: Option<ContestDiagnosis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,13 +61,84 @@ pub(crate) fn refresh(
     reporter: &mut dyn Reporter,
 ) -> Result<(), AppError> {
     let cwd = std::env::current_dir()?;
-    let destination = workspace::resolve_contest_target(&cwd, contest.as_deref())?;
+    refresh_from(
+        &cwd,
+        contest.as_deref(),
+        force,
+        create_atcoder_client,
+        reporter,
+    )
+}
 
-    let contest_id = resolve_refresh_contest_id(&destination, contest.as_deref(), force)?;
+pub(super) fn refresh_from(
+    cwd: &Path,
+    specified_contest_id: Option<&str>,
+    force: bool,
+    create_client: impl FnOnce() -> Result<atcoder::AtCoderClient, AppError>,
+    reporter: &mut dyn Reporter,
+) -> Result<(), AppError> {
+    let destination = workspace::resolve_contest_target(cwd, specified_contest_id)?;
+    // Capture the directory and metadata before diagnosis so the decision cannot
+    // authorize an update to a different directory or manifest generation.
+    let destination_identity = refresh_destination_identity(&destination);
+    let metadata_snapshot = workspace::read_contest_metadata_snapshot(&destination);
+    let contest_id = resolve_refresh_contest_id(
+        &destination,
+        specified_contest_id,
+        force,
+        &metadata_snapshot,
+    )?;
+    if !workspace::is_safe_atcoder_id(&contest_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid contest ID: {contest_id:?}"),
+        )
+        .into());
+    }
+    let diagnosis = diagnose_contest(&destination, &contest_id);
+    let healthy = match &diagnosis {
+        ContestDiagnosis::Healthy { .. } => true,
+        ContestDiagnosis::RepairRequired(_) => false,
+        ContestDiagnosis::MissingDirectory => {
+            return Err(workspace::missing_contest_directory(&destination).into());
+        }
+        ContestDiagnosis::MigrationRequired(MigrationReason::UnsupportedVersion(version)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refresh refused by local diagnosis for {contest_id}: unsupported contest \
+                     metadata version {version}; a future `atc migrate` is required"
+                ),
+            )
+            .into());
+        }
+        ContestDiagnosis::Blocked(reason) => {
+            return Err(blocked_refresh_error(&contest_id, reason));
+        }
+    };
+    let baseline = RefreshBaseline {
+        destination_identity: destination_identity?,
+        metadata_snapshot: metadata_snapshot?,
+        diagnosis: Some(diagnosis),
+    };
+    baseline.revalidate(&destination, &contest_id, force)?;
+    if healthy && !force {
+        reporter.report(Event::WorkspaceRefreshSkipped {
+            contest_id: &contest_id,
+        });
+        return Ok(());
+    }
 
-    let atcoder = create_atcoder_client()?;
-
-    refresh_at(&destination, &contest_id, force, &atcoder, reporter)
+    let atcoder = create_client()?;
+    let prepared = prepare_refresh_from_baseline(
+        &destination,
+        &contest_id,
+        force,
+        baseline,
+        &atcoder,
+        reporter,
+    )?;
+    apply_refresh(prepared, reporter)
 }
 
 pub(super) fn create_atcoder_client() -> Result<atcoder::AtCoderClient, AppError> {
@@ -82,49 +161,54 @@ pub(super) fn create_atcoder_client_from_auth(
     }
 }
 
-pub(super) fn resolve_refresh_contest_id(
+fn resolve_refresh_contest_id(
     destination: &Path,
     specified_contest_id: Option<&str>,
     force: bool,
+    metadata_snapshot: &io::Result<Option<FileSnapshot>>,
 ) -> Result<String, AppError> {
+    if let Some(contest_id) = specified_contest_id {
+        return Ok(contest_id.to_owned());
+    }
     if force {
-        let contest_id = match specified_contest_id {
-            Some(contest_id) => contest_id.to_string(),
-            None => destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "current directory has no UTF-8 directory name: {}",
-                            destination.display()
-                        ),
-                    )
-                })?
-                .to_string(),
-        };
-
-        validate_refresh_destination(destination, &contest_id, true)?;
-        workspace::validate_existing_contest_identity(destination, &contest_id)?;
-        return Ok(contest_id);
+        return destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "current directory has no UTF-8 directory name: {}",
+                        destination.display()
+                    ),
+                )
+                .into()
+            });
     }
-
-    match specified_contest_id {
-        Some(contest_id) => {
-            validate_refresh_destination(destination, contest_id, false)?;
-
-            workspace::validate_existing_contest_identity(destination, contest_id)?;
-
-            Ok(contest_id.to_string())
-        }
-        None => {
-            workspace::validate_workspace_marker(destination)?;
-            Ok(workspace::load_metadata(destination)?.contest_id)
-        }
-    }
+    workspace::validate_workspace_marker(destination)?;
+    let metadata = metadata_snapshot
+        .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))?
+        .as_ref()
+        .ok_or_else(|| io::Error::new(
+            io::ErrorKind::NotFound,
+            "contest metadata not found; specify the contest ID with `atc refresh -c <contest-id>` from its parent or workspace root",
+        ))?;
+    std::str::from_utf8(&metadata.bytes)
+        .ok()
+        .and_then(workspace::metadata_contest_owner)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot confirm ownership of existing contest metadata",
+            )
+            .into()
+        })
 }
 
+#[cfg(test)]
+// Exercise the shared prepare/apply path used by the TUI.
 pub(super) fn refresh_at(
     destination: &Path,
     contest_id: &str,
@@ -145,15 +229,23 @@ pub(crate) fn prepare_refresh(
 ) -> Result<PreparedRefresh, AppError> {
     let destination_identity = refresh_destination_identity(destination)?;
     validate_refresh_destination(destination, contest_id, force)?;
-    let metadata_snapshot = refresh_metadata_snapshot(destination)?;
-    revalidate_prepared_destination(
-        destination,
-        &destination_identity,
-        contest_id,
-        force,
-        metadata_snapshot.as_ref(),
-    )?;
+    let baseline = RefreshBaseline {
+        destination_identity,
+        metadata_snapshot: refresh_metadata_snapshot(destination)?,
+        diagnosis: None,
+    };
+    baseline.revalidate(destination, contest_id, force)?;
+    prepare_refresh_from_baseline(destination, contest_id, force, baseline, atcoder, reporter)
+}
 
+fn prepare_refresh_from_baseline(
+    destination: &Path,
+    contest_id: &str,
+    force: bool,
+    baseline: RefreshBaseline,
+    atcoder: &atcoder::AtCoderClient,
+    reporter: &mut dyn Reporter,
+) -> Result<PreparedRefresh, AppError> {
     let FetchedContestData {
         contest,
         samples_by_problem,
@@ -163,13 +255,8 @@ pub(crate) fn prepare_refresh(
 
     // Fetching may take long enough for the destination to change. Revalidate
     // immediately before choosing it as the staging parent.
-    revalidate_prepared_destination(
-        destination,
-        &destination_identity,
-        contest_id,
-        force,
-        metadata_snapshot.as_ref(),
-    )?;
+    baseline.revalidate_diagnosis(destination, contest_id)?;
+    baseline.revalidate(destination, contest_id, force)?;
 
     let staging = crate::safe_file::PreservedTempDir::new(
         tempfile::Builder::new()
@@ -179,33 +266,20 @@ pub(crate) fn prepare_refresh(
 
     // Creating the staging directory is path-based. Recheck immediately so a
     // replaced destination cannot cause staging to be built in another contest.
-    revalidate_prepared_destination(
-        destination,
-        &destination_identity,
-        contest_id,
-        force,
-        metadata_snapshot.as_ref(),
-    )?;
+    baseline.revalidate(destination, contest_id, force)?;
 
     for (problem, samples) in contest.problems.iter().zip(samples_by_problem) {
         workspace::save_samples(staging.path(), problem, &samples)?;
     }
     workspace::save_metadata(staging.path(), &contest)?;
 
-    revalidate_prepared_destination(
-        destination,
-        &destination_identity,
-        contest_id,
-        force,
-        metadata_snapshot.as_ref(),
-    )?;
+    baseline.revalidate(destination, contest_id, force)?;
 
     Ok(PreparedRefresh {
         destination: destination.to_path_buf(),
-        destination_identity,
         contest_id: contest_id.to_owned(),
         force,
-        metadata_snapshot,
+        baseline,
         staging,
     })
 }
@@ -216,26 +290,33 @@ pub(crate) fn apply_refresh(
 ) -> Result<(), AppError> {
     let PreparedRefresh {
         destination,
-        destination_identity,
         contest_id,
         force,
-        metadata_snapshot,
+        baseline,
         staging,
     } = prepared;
 
-    revalidate_prepared_destination(
-        &destination,
-        &destination_identity,
-        &contest_id,
-        force,
-        metadata_snapshot.as_ref(),
-    )?;
+    let verify_diagnosis = baseline.diagnosis.is_some();
+    baseline.revalidate_diagnosis(&destination, &contest_id)?;
+    baseline.revalidate(&destination, &contest_id, force)?;
     workspace::replace_refresh_data_with_snapshot(
         &destination,
         staging.into_temp_dir(),
         force,
-        metadata_snapshot,
+        baseline.metadata_snapshot,
     )?;
+    if verify_diagnosis
+        && !matches!(
+            diagnose_contest(&destination, &contest_id),
+            ContestDiagnosis::Healthy { .. }
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refresh installed new data for {contest_id}, but local verification failed"),
+        )
+        .into());
+    }
     reporter.report(Event::WorkspaceRefreshed {
         destination: &destination,
     });
@@ -326,28 +407,87 @@ fn changed_refresh_destination_error() -> AppError {
     .into()
 }
 
-fn revalidate_prepared_destination(
-    destination: &Path,
-    expected_identity: &RefreshDestinationIdentity,
-    contest_id: &str,
-    force: bool,
-    expected_metadata: Option<&FileSnapshot>,
-) -> Result<(), AppError> {
-    if refresh_destination_identity(destination)? != *expected_identity {
-        return Err(changed_refresh_destination_error());
+impl RefreshBaseline {
+    fn revalidate(
+        &self,
+        destination: &Path,
+        contest_id: &str,
+        force: bool,
+    ) -> Result<(), AppError> {
+        if refresh_destination_identity(destination)? != self.destination_identity {
+            return Err(changed_refresh_destination_error());
+        }
+        validate_refresh_destination(destination, contest_id, force)?;
+        let current_metadata = if self.diagnosis.is_some() {
+            workspace::read_contest_metadata_snapshot(destination)?
+        } else {
+            refresh_metadata_snapshot(destination)?
+        };
+        if current_metadata != self.metadata_snapshot {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "contest metadata changed while refresh was being prepared; retry refresh",
+            )
+            .into());
+        }
+        workspace::validate_existing_contest_identity(destination, contest_id)?;
+        if refresh_destination_identity(destination)? != self.destination_identity {
+            return Err(changed_refresh_destination_error());
+        }
+        Ok(())
     }
-    validate_refresh_destination(destination, contest_id, force)?;
-    let current_metadata = refresh_metadata_snapshot(destination)?;
-    if current_metadata.as_ref() != expected_metadata {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "contest metadata changed while refresh was being prepared; retry refresh",
-        )
-        .into());
+
+    fn revalidate_diagnosis(&self, destination: &Path, contest_id: &str) -> Result<(), AppError> {
+        if let Some(expected) = &self.diagnosis
+            && diagnose_contest(destination, contest_id) != *expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "local contest diagnosis changed while refresh was being prepared; retry refresh",
+            )
+            .into());
+        }
+        Ok(())
     }
-    workspace::validate_existing_contest_identity(destination, contest_id)?;
-    if refresh_destination_identity(destination)? != *expected_identity {
-        return Err(changed_refresh_destination_error());
-    }
-    Ok(())
+}
+
+fn blocked_refresh_error(contest_id: &str, reason: &BlockReason) -> AppError {
+    let (kind, message) = match reason {
+        BlockReason::InvalidContestId => (io::ErrorKind::InvalidInput, "invalid contest ID".into()),
+        BlockReason::ContestIdMismatch { actual } => (
+            io::ErrorKind::InvalidData,
+            format!("contest ID mismatch: metadata contains {actual:?}"),
+        ),
+        BlockReason::MetadataOwnershipUnknown => (
+            io::ErrorKind::InvalidData,
+            "cannot confirm ownership of existing contest metadata".into(),
+        ),
+        BlockReason::UnsafeMetadata => {
+            (io::ErrorKind::InvalidData, "unsafe contest metadata".into())
+        }
+        BlockReason::TestsOwnershipUnknown(_) => (
+            io::ErrorKind::InvalidData,
+            "cannot confirm ownership of existing tests".into(),
+        ),
+        BlockReason::UnownedTestsEntry { path } => (
+            io::ErrorKind::InvalidData,
+            format!("unowned entry in tests: {}", path.display()),
+        ),
+        BlockReason::UnsafeEntry { path } => (
+            io::ErrorKind::InvalidInput,
+            format!("unsafe filesystem entry: {}", path.display()),
+        ),
+        BlockReason::RecoveryRequired { path } => (
+            io::ErrorKind::InvalidData,
+            format!("contest update requires recovery check: {}", path.display()),
+        ),
+        BlockReason::Filesystem { path, kind } => {
+            (*kind, format!("cannot inspect {}: {kind}", path.display()))
+        }
+    };
+    io::Error::new(
+        kind,
+        format!("refresh refused by local diagnosis for {contest_id}: {message}"),
+    )
+    .into()
 }

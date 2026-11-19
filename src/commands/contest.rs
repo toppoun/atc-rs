@@ -1366,9 +1366,14 @@ mod tests {
         )
         .unwrap();
         assert!(inspect_contest_target(&destination, "abc466").is_err());
-        let error =
-            super::super::refresh::resolve_refresh_contest_id(&destination, Some("abc466"), false)
-                .unwrap_err();
+        let error = super::super::refresh::refresh_from(
+            temp.path(),
+            Some("abc466"),
+            false,
+            || panic!("identity mismatch must be detected before client initialization"),
+            &mut NullReporter,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("contest ID mismatch"));
     }
 

@@ -67,11 +67,11 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `atc contest` / `atc c` → `commands::contest` → 配置先を解決し、`inspect_contest_target` で状態を調べる。未作成なら作成し、要修復なら確認後に修復する。健全な Contest を `watch_tui_at` で開く。
 - Workspace Home の Contest オープンと Contest 画面の切替は `watch_tui.rs` の `resolve_contest_open` → `prepare_workspace_contest_entry` をたどる。現在の Workspace 設定で行き先を解決し、作成・修復が必要なら確認を経て `contest.rs` の共通処理を呼ぶ。準備済みの入力で新しいセッションを開始し、切替時は先に旧セッションを終了する。
 - 修復の分岐は `contest.rs` の `plan_repair`。健全なメタデータがあるときはそれを基準にサンプルを取り直す。欠損・不正などの場合は AtCoder の問題一覧とサンプルを取得する。計画に応じて、`workspace.rs` がメタデータのみ、サンプルのみ、または両方を置換する。
-- [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) の `diagnose_contest` は、解決済みの Contest パスと期待する ID を受け取る内部 API。Recovery、メタデータ、既存 `tests` の所有権、サンプルの構造を順に調べる。検査の部品は `workspace.rs` の既存処理と共有し、操作の選択や更新は呼び出し側が担当する。Phase 1 では既存コマンドは従来の判定経路を使う。
+- [workspace/diagnosis.rs](../../src/workspace/diagnosis.rs) の `diagnose_contest` は、解決済みの Contest パスと期待する ID を受け取る内部 API。Recovery、メタデータ、既存 `tests` の所有権、サンプルの構造を順に調べる。検査の部品は `workspace.rs` の既存処理と共有し、操作の選択や更新は呼び出し側が担当する。CLI の `atc refresh` が取得の要否を決めるために使う。
 
 ### Refresh と Recovery
 
-- CLI の `atc refresh` → `resolve_refresh_contest_id` → `prepare_refresh` → `apply_refresh`。準備で問題一覧とサンプルを取得し、適用で `workspace::replace_refresh_data_with_snapshot` に渡す。`--force` による対象決定の違いは `resolve_refresh_contest_id` から追う。
+- CLI の `atc refresh` → `refresh_from` がパス・ID を解決し、`diagnose_contest` で判定する。`RepairRequired` または `Healthy` と `--force` の組み合わせで初めてクライアントを初期化する。公式のサンプル件数変更に対応するため、TUI と共通の準備処理で問題一覧とサンプルを取得する。取得後と適用前に診断結果・メタデータを再確認し、`apply_refresh` が `workspace::replace_refresh_data_with_snapshot` で置換した後に `Healthy` を確認する。
 - Contest 画面の Refresh → `contest_refresh_task` がバックグラウンドで `prepare_refresh` → `rebuild_active_contest_session_after_refresh` が旧セッションを終了し、適用後にディスクから読み直す。適用失敗時も再読込・再起動を試み、成功すれば失敗表示を引き継ぐ。この組み直しには直前の設定・認証を使う。
 - ディスク上の Recovery は `workspace.rs` の置換・ロールバック処理と `contest_recovery_state` を起点に追う。`safe_file` が復旧レコードを書き、完了した作業領域を退避先に移す。メタデータやテスト入力の読込でも、確認が必要な中断状態を検出する。Stress 側の対応箇所は `stress.rs` の `ensure_no_interrupted_generation`。
 

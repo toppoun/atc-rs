@@ -17,8 +17,6 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
-// The diagnostic entry point will be called by later refresh and migration phases.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod diagnosis;
 
 const METADATA_VERSION: u32 = 1;
@@ -1102,10 +1100,34 @@ pub(crate) fn validate_existing_contest_identity(
     }
 }
 
-fn metadata_contest_owner(content: &str) -> Option<String> {
+pub(crate) fn metadata_contest_owner(content: &str) -> Option<String> {
     // Ownership is independent of the manifest schema. TOML parsing rejects duplicate keys.
     let metadata: toml::Value = toml::from_str(content).ok()?;
     Some(metadata.get("contest_id")?.as_str()?.to_owned())
+}
+
+pub(crate) fn read_contest_metadata_snapshot(
+    destination: &Path,
+) -> io::Result<Option<safe_file::FileSnapshot>> {
+    let directory = open_contest_destination_nofollow(destination)?;
+    let marker_path = destination.join(".atc");
+    let Some(marker) =
+        open_managed_directory(&directory, ".atc", &marker_path, "workspace marker")?
+    else {
+        return Ok(None);
+    };
+    let name = OsStr::new("contest.toml");
+    let path = marker_path.join(name);
+    if !safe_file::regular_file_exists_at(&marker, name, &path)? {
+        return Ok(None);
+    }
+    safe_file::read_bounded_regular_file_snapshot_at(
+        &marker,
+        name,
+        &path,
+        MAX_CONTEST_METADATA_BYTES,
+    )
+    .map(Some)
 }
 
 fn unknown_contest_owner_error() -> io::Error {
@@ -1830,7 +1852,7 @@ fn validate_contest_directory(destination: &Path) -> io::Result<()> {
     Err(missing_contest_directory(destination))
 }
 
-fn missing_contest_directory(destination: &Path) -> io::Error {
+pub(crate) fn missing_contest_directory(destination: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
         format!("contest directory not found: {}", destination.display()),

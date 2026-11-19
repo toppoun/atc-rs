@@ -158,6 +158,9 @@ impl Reporter for RecordingReporter {
             Event::WorkspaceRefreshed { destination } => {
                 format!("refreshed:{}", destination.display())
             }
+            Event::WorkspaceRefreshSkipped { contest_id } => {
+                format!("refresh-skipped:{contest_id}")
+            }
             Event::WorkspaceRepaired { destination } => {
                 format!("repaired:{}", destination.display())
             }
@@ -1701,12 +1704,21 @@ fn prepared_refresh_rejects_a_replaced_destination_with_identical_metadata() {
 fn refresh_sample_failure_is_fatal_and_preserves_old_metadata_and_tests() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("mini");
-    create_workspace(&destination, "mini");
+    let mut contest = old_contest("mini");
+    contest.problems[0] = crate::model::Problem {
+        index: "B".into(),
+        title: "B".into(),
+        task_id: "mini_b".into(),
+        url: "https://atcoder.jp/contests/mini/tasks/mini_b".into(),
+        sample_count: 2,
+    };
+    workspace::save_metadata(&destination, &contest).unwrap();
     let old_b_tests = destination.join("tests").join("B");
     std::fs::create_dir_all(&old_b_tests).expect("old tests should be created");
     std::fs::write(old_b_tests.join("sample-1.in"), "old").expect("old input should be written");
     std::fs::write(old_b_tests.join("sample-1.out"), "old").expect("old output should be written");
     let old_metadata = std::fs::read(destination.join(".atc/contest.toml")).unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
 
     let fixtures = temp.path().join("fixtures");
     std::fs::create_dir_all(fixtures.join("contests")).expect("contest fixtures should be created");
@@ -1728,12 +1740,21 @@ fn refresh_sample_failure_is_fatal_and_preserves_old_metadata_and_tests() {
     )
     .expect("problem fixture should be written");
 
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
     let mut reporter = RecordingReporter::default();
-    let error = refresh_at(&destination, "mini", false, &client, &mut reporter)
-        .expect_err("a partial remote snapshot must fail");
+    let error = refresh_from(
+        &destination,
+        None,
+        false,
+        || Ok(atcoder::AtCoderClient::fixture(&fixtures)),
+        &mut reporter,
+    )
+    .expect_err("a partial remote snapshot must fail");
 
     assert!(matches!(error, AppError::AtCoder(_)));
+    assert_eq!(
+        crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+        before
+    );
     assert_eq!(
         std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
         old_metadata
@@ -1849,120 +1870,156 @@ fn strict_fetch_builds_authoritative_abc466_sample_counts() {
     );
 }
 
-#[test]
-fn refresh_without_override_does_not_infer_id_from_directory_name() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc466");
-    std::fs::create_dir(&destination).expect("directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("marker should be created");
-    std::fs::write(
-        destination.join(".atc").join("contest.toml"),
-        "version = ???",
-    )
-    .expect("broken metadata should be written");
-
-    let error = resolve_refresh_contest_id(&destination, None, false)
-        .expect_err("broken metadata must not fall back to the directory name");
-
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == std::io::ErrorKind::InvalidData
-    ));
+fn fixture_refresh_client() -> Result<atcoder::AtCoderClient, AppError> {
+    Ok(atcoder::AtCoderClient::fixture(fixture_root()))
 }
 
-#[test]
-fn refresh_override_requires_workspace_marker() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc466");
-    std::fs::create_dir(&destination).expect("directory should be created");
-
-    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false)
-        .expect_err("an arbitrary matching directory must be rejected");
-
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput
-    ));
-
-    assert_eq!(
-        resolve_refresh_contest_id(&destination, None, true)
-            .expect("force should infer the contest ID from the directory name"),
-        "abc466"
-    );
+fn unexpected_refresh_client() -> Result<atcoder::AtCoderClient, AppError> {
+    panic!("local refresh decision must not initialize an AtCoder client");
 }
 
-#[test]
-fn forced_refresh_refuses_markerless_tests_without_touching_sources() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc350");
-    std::fs::create_dir(&destination).expect("old contest directory should be created");
-    std::fs::write(destination.join("A.cpp"), "user source").expect("source should be written");
-    let stale_tests = destination.join("tests").join("A");
-    std::fs::create_dir_all(&stale_tests).expect("stale tests should be created");
-    std::fs::write(stale_tests.join("sample-99.in"), "stale")
-        .expect("stale input should be written");
-    std::fs::write(stale_tests.join("sample-99.out"), "stale")
-        .expect("stale output should be written");
+fn refresh_manifest(sample_count: usize) -> Contest {
+    Contest {
+        contest_id: "abc466".into(),
+        problems: vec![crate::model::Problem {
+            index: "A".into(),
+            title: "A".into(),
+            task_id: "abc466_a".into(),
+            url: "https://atcoder.jp/contests/abc466/tasks/abc466_a".into(),
+            sample_count,
+        }],
+    }
+}
 
-    let fixtures = temp.path().join("fixtures");
-    create_single_problem_fixture(&fixtures, "abc350");
-
-    let contest_id = resolve_refresh_contest_id(&destination, None, true)
-        .expect("force should infer a missing workspace from its directory name");
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
-    let mut reporter = RecordingReporter::default();
-
-    let error = refresh_at(&destination, &contest_id, true, &client, &mut reporter)
-        .expect_err("force must not claim tests without an old manifest");
-    assert!(error.to_string().contains("cannot confirm ownership"));
-
-    assert!(!destination.join(".atc").exists());
+fn assert_refresh_downloaded_fixture(reporter: &RecordingReporter) {
     assert_eq!(
-        std::fs::read_to_string(stale_tests.join("sample-99.in")).unwrap(),
-        "stale"
-    );
-    assert_eq!(
-        std::fs::read_to_string(stale_tests.join("sample-99.out")).unwrap(),
-        "stale"
-    );
-    assert_eq!(
-        std::fs::read_to_string(destination.join("A.cpp")).expect("source should remain readable"),
-        "user source"
-    );
-    assert!(
-        !reporter
+        reporter
             .events
-            .contains(&format!("refreshed:{}", destination.display()))
+            .iter()
+            .filter(|event| event.starts_with("contest-fetching:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        reporter
+            .events
+            .iter()
+            .filter(|event| event.starts_with("problem-fetched:"))
+            .count(),
+        7
     );
 }
 
 #[test]
-fn forced_refresh_reconstructs_a_markerless_workspace_without_existing_tests() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc350");
-    std::fs::create_dir(&destination).expect("old contest directory should be created");
-    std::fs::write(destination.join("A.cpp"), "user source").expect("source should be written");
-    let fixtures = temp.path().join("fixtures");
-    create_single_problem_fixture(&fixtures, "abc350");
-    let contest_id = resolve_refresh_contest_id(&destination, None, true).unwrap();
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
+fn healthy_refresh_skips_client_and_all_writes_but_force_downloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    let contest = refresh_manifest(1);
+    workspace::save_metadata(&destination, &contest).unwrap();
+    let sample = Sample {
+        input: "local input\n".into(),
+        output: "local output\n".into(),
+    };
+    workspace::save_samples(&destination, &contest.problems[0], &[sample]).unwrap();
+    std::fs::write(destination.join("A.cpp"), "user source").unwrap();
+    std::fs::write(destination.join(".atc/notes.txt"), "user data").unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
     let mut reporter = RecordingReporter::default();
 
-    refresh_at(&destination, &contest_id, true, &client, &mut reporter)
-        .expect("force can install tests when there are no previous tests to remove");
+    refresh_from(
+        &destination,
+        None,
+        false,
+        unexpected_refresh_client,
+        &mut reporter,
+    )
+    .unwrap();
 
+    assert_eq!(reporter.events, ["refresh-skipped:abc466"]);
     assert_eq!(
-        workspace::load_metadata(&destination).unwrap().contest_id,
-        "abc350"
+        crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+        before
+    );
+
+    let mut reporter = RecordingReporter::default();
+    refresh_from(
+        &destination,
+        None,
+        true,
+        fixture_refresh_client,
+        &mut reporter,
+    )
+    .unwrap();
+    assert_refresh_downloaded_fixture(&reporter);
+    assert_eq!(
+        workspace::load_metadata(&destination).unwrap().problems[0].sample_count,
+        3
     );
     assert_eq!(
-        std::fs::read_to_string(destination.join("tests/A/sample-1.in")).unwrap(),
-        "ABC349\n"
+        std::fs::read(destination.join("A.cpp")).unwrap(),
+        b"user source"
     );
     assert_eq!(
-        std::fs::read_to_string(destination.join("A.cpp")).unwrap(),
-        "user source"
+        std::fs::read(destination.join(".atc/notes.txt")).unwrap(),
+        b"user data"
     );
+    let recovery = std::fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|entry| {
+            entry
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".atc-recovery-refresh-")
+        })
+        .expect("forced refresh should retain previous data");
+    assert!(recovery.join(crate::safe_file::RECOVERY_COMPLETE).is_file());
+    assert_eq!(
+        std::fs::read(recovery.join("previous-tests/A/sample-1.in")).unwrap(),
+        b"local input\n"
+    );
+
+    // Completed recovery archives remain readable and need no network on the next refresh.
+    let mut reporter = RecordingReporter::default();
+    refresh_from(
+        &destination,
+        None,
+        false,
+        unexpected_refresh_client,
+        &mut reporter,
+    )
+    .unwrap();
+    assert_eq!(reporter.events, ["refresh-skipped:abc466"]);
+}
+
+#[test]
+fn ordinary_refresh_repairs_samples_even_when_the_official_count_changed() {
+    use crate::workspace::diagnosis::{ContestDiagnosis, diagnose_contest};
+
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    workspace::save_metadata(&destination, &refresh_manifest(2)).unwrap();
+    assert!(matches!(
+        diagnose_contest(&destination, "abc466"),
+        ContestDiagnosis::RepairRequired(_)
+    ));
+    let mut reporter = RecordingReporter::default();
+
+    refresh_from(
+        &destination,
+        None,
+        false,
+        fixture_refresh_client,
+        &mut reporter,
+    )
+    .unwrap();
+
+    assert_refresh_downloaded_fixture(&reporter);
+    let ContestDiagnosis::Healthy { contest, .. } = diagnose_contest(&destination, "abc466") else {
+        panic!("refreshed contest should be healthy");
+    };
+    assert_eq!(contest.problems[0].sample_count, 3);
     assert!(
         reporter
             .events
@@ -1971,263 +2028,439 @@ fn forced_refresh_reconstructs_a_markerless_workspace_without_existing_tests() {
 }
 
 #[test]
-fn forced_refresh_rebuilds_versionless_metadata_using_the_directory_name() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc350");
-    std::fs::create_dir(&destination).expect("old contest directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("old marker should be created");
+fn ordinary_refresh_uses_known_owner_from_an_invalid_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    std::fs::create_dir_all(destination.join(".atc")).unwrap();
     std::fs::write(
-        destination.join(".atc").join("config.toml"),
-        "language = \"cpp\"\n",
+        destination.join(".atc/contest.toml"),
+        "version = 1\ncontest_id = 'abc466'\nproblems = []\n",
     )
-    .expect("versionless legacy metadata should be written");
-    std::fs::write(destination.join("A.py"), "user source").expect("source should be written");
-    let fixtures = temp.path().join("fixtures");
-    create_single_problem_fixture(&fixtures, "abc350");
+    .unwrap();
 
-    let error = resolve_refresh_contest_id(&destination, None, false)
-        .expect_err("normal refresh must reject versionless metadata");
-    assert!(matches!(error, AppError::Io(_)));
-
-    let contest_id = resolve_refresh_contest_id(&destination, None, true)
-        .expect("force must not read the old metadata");
-    assert_eq!(contest_id, "abc350");
-
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
-    let mut reporter = NullReporter;
-    refresh_at(&destination, &contest_id, true, &client, &mut reporter)
-        .expect("forced refresh should replace versionless metadata");
-
+    refresh_from(
+        &destination,
+        None,
+        false,
+        fixture_refresh_client,
+        &mut NullReporter,
+    )
+    .unwrap();
     assert_eq!(
         workspace::load_metadata(&destination)
-            .expect("rebuilt metadata should load")
-            .contest_id,
-        "abc350"
-    );
-    assert_eq!(
-        std::fs::read_to_string(destination.join("A.py")).expect("source should remain readable"),
-        "user source"
+            .unwrap()
+            .problems
+            .len(),
+        7
     );
 }
 
 #[test]
-fn forced_refresh_with_override_preserves_malformed_metadata() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc350");
-    std::fs::create_dir(&destination).expect("old contest directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("old marker should be created");
-    std::fs::write(
-        destination.join(".atc").join("contest.toml"),
-        "version = ???",
+fn refresh_refusals_leave_the_tree_unchanged_and_do_not_initialize_the_client() {
+    for scenario in ["migration", "unowned", "recovery", "wrong-id", "missing"] {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let expected_reason = match scenario {
+            "migration" => {
+                std::fs::create_dir_all(destination.join(".atc")).unwrap();
+                std::fs::write(
+                    destination.join(".atc/contest.toml"),
+                    "version = 99\ncontest_id = 'abc466'\n",
+                )
+                .unwrap();
+                "a future `atc migrate` is required"
+            }
+            "unowned" => {
+                workspace::save_metadata(&destination, &refresh_manifest(0)).unwrap();
+                std::fs::create_dir(destination.join("tests")).unwrap();
+                std::fs::write(destination.join("tests/notes.txt"), "user data").unwrap();
+                "unowned entry in tests"
+            }
+            "recovery" => {
+                workspace::save_metadata(&destination, &refresh_manifest(0)).unwrap();
+                let staging = destination.join(".atc-refresh-interrupted");
+                std::fs::create_dir(&staging).unwrap();
+                std::fs::write(staging.join("previous-contest.toml"), "previous data").unwrap();
+                "contest update requires recovery check"
+            }
+            "wrong-id" => {
+                workspace::save_metadata(&destination, &old_contest("arc001")).unwrap();
+                "contest ID mismatch"
+            }
+            "missing" => "contest directory not found",
+            _ => unreachable!(),
+        };
+        let before = crate::safe_file::read_tree_snapshot(temp.path()).unwrap();
+        for force in [false, true] {
+            let error = refresh_from(
+                temp.path(),
+                Some("abc466"),
+                force,
+                unexpected_refresh_client,
+                &mut NullReporter,
+            )
+            .expect_err("local diagnosis should refuse refresh");
+            assert!(
+                error.to_string().contains(expected_reason),
+                "{scenario}: {error}"
+            );
+            assert_eq!(
+                crate::safe_file::read_tree_snapshot(temp.path()).unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_refresh_aborts_before_staging_if_metadata_or_diagnosis_changes_during_fetch() {
+    struct ChangeDuringFetch<F>(Option<F>);
+    impl<F: FnOnce()> Reporter for ChangeDuringFetch<F> {
+        fn report(&mut self, event: Event<'_>) {
+            if matches!(event, Event::ProblemFetched { index: "G", .. }) {
+                self.0.take().unwrap()();
+            }
+        }
+    }
+
+    for change_metadata in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        let contest = refresh_manifest(1);
+        workspace::save_metadata(&destination, &contest).unwrap();
+        let metadata = destination.join(".atc/contest.toml");
+        let original = std::fs::read_to_string(&metadata).unwrap();
+        let changed = format!("# concurrent edit\n{original}");
+        let mut reporter = ChangeDuringFetch(Some(|| {
+            if change_metadata {
+                // Keep the diagnosis identical while changing the metadata bytes.
+                std::fs::write(&metadata, &changed).unwrap();
+            } else {
+                let sample = Sample {
+                    input: "concurrent input\n".into(),
+                    output: "concurrent output\n".into(),
+                };
+                workspace::save_samples(&destination, &contest.problems[0], &[sample]).unwrap();
+            }
+        }));
+
+        let error = refresh_from(
+            &destination,
+            None,
+            false,
+            fixture_refresh_client,
+            &mut reporter,
+        )
+        .expect_err("a changed contest must invalidate refresh preparation");
+
+        assert!(reporter.0.is_none());
+        let files = std::fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        if change_metadata {
+            assert!(error.to_string().contains("contest metadata changed"));
+            assert_eq!(std::fs::read_to_string(&metadata).unwrap(), changed);
+            assert_eq!(
+                files.len(),
+                1,
+                "no staging or locks should have been created"
+            );
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("local contest diagnosis changed")
+            );
+            assert_eq!(std::fs::read_to_string(&metadata).unwrap(), original);
+            assert_eq!(
+                std::fs::read(destination.join("tests/A/sample-1.in")).unwrap(),
+                b"concurrent input\n"
+            );
+            assert_eq!(
+                files.len(),
+                2,
+                "only the concurrent sample change is allowed"
+            );
+        }
+    }
+}
+
+#[test]
+fn refresh_without_override_does_not_infer_id_from_directory_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    std::fs::create_dir_all(destination.join(".atc")).unwrap();
+    let metadata = destination.join(".atc/contest.toml");
+
+    let error = refresh_from(
+        &destination,
+        None,
+        false,
+        unexpected_refresh_client,
+        &mut NullReporter,
     )
-    .expect("malformed metadata should be written");
-    let fixtures = temp.path().join("fixtures");
-    create_single_problem_fixture(&fixtures, "abc350");
+    .expect_err("ordinary refresh needs a known contest ID");
+    assert!(error.to_string().contains("atc refresh -c"));
 
-    let error = resolve_refresh_contest_id(&destination, Some("abc350"), true).unwrap_err();
-    assert!(error.to_string().contains("cannot confirm ownership"));
+    std::fs::write(&metadata, "version = ???").unwrap();
+    let error = refresh_from(
+        &destination,
+        None,
+        false,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("broken metadata must not fall back to the directory name");
+    assert!(matches!(error, AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData));
+    assert_eq!(std::fs::read(&metadata).unwrap(), b"version = ???");
+}
 
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
-    let mut reporter = NullReporter;
-    let error = refresh_at(&destination, "abc350", true, &client, &mut reporter).unwrap_err();
-    assert!(error.to_string().contains("cannot confirm ownership"));
-    assert_eq!(
-        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
-        b"version = ???"
+#[test]
+fn refresh_override_requires_workspace_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    std::fs::create_dir(&destination).unwrap();
+
+    let error = refresh_from(
+        temp.path(),
+        Some("abc466"),
+        false,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("an arbitrary matching directory must be rejected");
+    assert!(error.to_string().contains("workspace marker not found"));
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+}
+
+#[test]
+fn forced_refresh_refuses_markerless_tests_without_touching_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    let stale_tests = destination.join("tests/A");
+    std::fs::create_dir_all(&stale_tests).unwrap();
+    std::fs::write(stale_tests.join("sample-99.in"), "stale").unwrap();
+    std::fs::write(stale_tests.join("sample-99.out"), "stale").unwrap();
+    std::fs::write(destination.join("A.cpp"), "user source").unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
+
+    let error = refresh_from(
+        &destination,
+        None,
+        true,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("force must not claim tests without an old manifest");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot confirm ownership of existing tests")
     );
-    assert!(!destination.join("tests").exists());
+    assert_eq!(
+        crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn forced_refresh_reconstructs_a_markerless_workspace_without_existing_tests() {
+    for marker in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc466");
+        std::fs::create_dir(&destination).unwrap();
+        if marker {
+            std::fs::create_dir(destination.join(".atc")).unwrap();
+            std::fs::write(
+                destination.join(".atc/config.toml"),
+                b"language = \"cpp\"\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(destination.join("A.cpp"), "user source").unwrap();
+        let mut reporter = RecordingReporter::default();
+
+        refresh_from(
+            &destination,
+            None,
+            true,
+            fixture_refresh_client,
+            &mut reporter,
+        )
+        .expect("force can reconstruct a contest without existing metadata or tests");
+
+        assert_eq!(
+            workspace::load_metadata(&destination).unwrap().contest_id,
+            "abc466"
+        );
+        assert!(destination.join("tests/A/sample-1.in").is_file());
+        assert_eq!(
+            std::fs::read(destination.join("A.cpp")).unwrap(),
+            b"user source"
+        );
+        if marker {
+            assert_eq!(
+                std::fs::read(destination.join(".atc/config.toml")).unwrap(),
+                b"language = \"cpp\"\n"
+            );
+        }
+        assert!(
+            reporter
+                .events
+                .contains(&format!("refreshed:{}", destination.display()))
+        );
+    }
+}
+
+#[test]
+fn refresh_override_preserves_malformed_metadata_inside_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    std::fs::create_dir_all(destination.join(".atc")).unwrap();
+    let metadata = destination.join(".atc/contest.toml");
+    std::fs::write(&metadata, "version = ???").unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
+
+    for force in [false, true] {
+        let error = refresh_from(
+            temp.path(),
+            Some("abc466"),
+            force,
+            unexpected_refresh_client,
+            &mut NullReporter,
+        )
+        .expect_err("unknown metadata ownership must block refresh");
+        assert!(error.to_string().contains("cannot confirm ownership"));
+        assert_eq!(
+            crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+            before
+        );
+    }
 }
 
 #[test]
 fn forced_refresh_of_unknown_directory_is_a_fetch_error_without_partial_workspace() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
+    let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("not-a-contest");
-    std::fs::create_dir(&destination).expect("legacy directory should be created");
-    std::fs::write(destination.join("main.cpp"), "user source").expect("source should be written");
-    let fixtures = temp.path().join("fixtures");
-    std::fs::create_dir_all(fixtures.join("contests"))
-        .expect("empty contest fixture directory should be created");
-    let contest_id = resolve_refresh_contest_id(&destination, None, true)
-        .expect("force should infer the directory name before fetching");
-    assert_eq!(contest_id, "not-a-contest");
-
-    let client = atcoder::AtCoderClient::fixture(&fixtures);
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("main.cpp"), "user source").unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
     let mut reporter = RecordingReporter::default();
-    let error = refresh_at(&destination, &contest_id, true, &client, &mut reporter)
-        .expect_err("a missing contest fixture must be a fetch error");
+
+    let error = refresh_from(
+        &destination,
+        None,
+        true,
+        fixture_refresh_client,
+        &mut reporter,
+    )
+    .expect_err("a missing contest fixture must be a fetch error");
 
     assert!(matches!(error, AppError::AtCoder(_)));
-    assert!(!destination.join(".atc").exists());
-    assert!(!destination.join("tests").exists());
+    assert_eq!(reporter.events, ["contest-fetching:not-a-contest"]);
     assert_eq!(
-        std::fs::read_to_string(destination.join("main.cpp"))
-            .expect("source should remain readable"),
-        "user source"
-    );
-    assert!(
-        std::fs::read_dir(&destination)
-            .expect("legacy directory should remain readable")
-            .all(|entry| !entry
-                .expect("directory entry should be readable")
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".atc-refresh-"))
-    );
-    assert!(
-        !reporter
-            .events
-            .iter()
-            .any(|event| event.starts_with("refreshed:"))
+        crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+        before
     );
 }
 
 #[test]
-fn failed_forced_refresh_does_not_leave_a_workspace_marker() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
+fn forced_refresh_refuses_unsafe_tests_without_leaving_a_workspace_marker() {
+    let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("abc466");
-    std::fs::create_dir(&destination).expect("old contest directory should be created");
-    std::fs::write(destination.join("A.cpp"), "user source").expect("source should be written");
-    std::fs::write(destination.join("tests"), "user-owned file")
-        .expect("conflicting tests file should be written");
-    let client = atcoder::AtCoderClient::fixture(fixture_root());
-    let mut reporter = RecordingReporter::default();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("A.cpp"), "user source").unwrap();
+    std::fs::write(destination.join("tests"), "user-owned file").unwrap();
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
 
-    let error = refresh_at(&destination, "abc466", true, &client, &mut reporter)
-        .expect_err("an unsafe existing tests path must fail");
+    let error = refresh_from(
+        &destination,
+        None,
+        true,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("an unsafe existing tests path must fail");
 
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput
-    ));
-    assert!(!destination.join(".atc").exists());
+    assert!(matches!(error, AppError::Io(source) if source.kind() == io::ErrorKind::InvalidInput));
     assert_eq!(
-        std::fs::read_to_string(destination.join("tests"))
-            .expect("existing tests file should remain readable"),
-        "user-owned file"
-    );
-    assert_eq!(
-        std::fs::read_to_string(destination.join("A.cpp")).expect("source should remain readable"),
-        "user source"
-    );
-    assert!(
-        !reporter
-            .events
-            .iter()
-            .any(|event| event.starts_with("refreshed:"))
+        crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+        before
     );
 }
 
 #[test]
 fn refresh_override_recovers_missing_metadata_inside_workspace() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc466");
-    std::fs::create_dir(&destination).expect("directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("marker should be created");
-
-    let contest_id = resolve_refresh_contest_id(&destination, Some("abc466"), false)
-        .expect("override should not require contest.toml");
-
-    assert_eq!(contest_id, "abc466");
-
-    let client = atcoder::AtCoderClient::fixture(fixture_root());
-    let mut reporter = NullReporter;
-    refresh_at(&destination, &contest_id, false, &client, &mut reporter)
-        .expect("override refresh should reconstruct missing metadata");
-    assert_eq!(
-        workspace::load_metadata(&destination)
-            .expect("reconstructed metadata should load")
-            .contest_id,
-        "abc466"
-    );
-}
-
-#[test]
-fn refresh_override_preserves_malformed_metadata_inside_workspace() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc466");
-    std::fs::create_dir(&destination).expect("directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("marker should be created");
-    std::fs::write(
-        destination.join(".atc").join("contest.toml"),
-        "version = ???",
-    )
-    .expect("malformed metadata should be written");
-
-    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false).unwrap_err();
-    assert!(error.to_string().contains("cannot confirm ownership"));
-    let client = atcoder::AtCoderClient::fixture(fixture_root());
-    let mut reporter = NullReporter;
-    let error = refresh_at(&destination, "abc466", false, &client, &mut reporter).unwrap_err();
-    assert!(error.to_string().contains("cannot confirm ownership"));
-    assert_eq!(
-        std::fs::read(destination.join(".atc/contest.toml")).unwrap(),
-        b"version = ???"
-    );
-    assert!(!destination.join("tests").exists());
-}
-
-#[test]
-fn refresh_override_rejects_healthy_metadata_id_mismatch_and_newer_versions() {
     let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("abc466");
-    create_workspace(&destination, "arc001");
+    std::fs::create_dir_all(destination.join(".atc")).unwrap();
 
-    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false)
-        .expect_err("healthy metadata for a different contest must not be overwritten");
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
-    ));
-
-    std::fs::write(
-        destination.join(".atc").join("contest.toml"),
-        "version = 99\ncontest_id = \"abc466\"\nproblems = []\n",
+    refresh_from(
+        temp.path(),
+        Some("abc466"),
+        false,
+        fixture_refresh_client,
+        &mut NullReporter,
     )
-    .unwrap();
-    let error = resolve_refresh_contest_id(&destination, Some("abc466"), false)
-        .expect_err("a newer metadata schema must not be overwritten implicitly");
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == io::ErrorKind::InvalidData
-    ));
+    .expect("explicit ID should allow reconstruction of missing metadata");
+
+    assert_eq!(
+        workspace::load_metadata(&destination).unwrap().contest_id,
+        "abc466"
+    );
+    assert!(destination.join("tests/A/sample-1.in").is_file());
 }
 
 #[test]
-fn refresh_override_rejects_wrong_directory_name() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
+fn refresh_rejects_a_directory_name_that_differs_from_the_manifest() {
+    let temp = tempfile::tempdir().unwrap();
     let destination = temp.path().join("other");
-    std::fs::create_dir(&destination).expect("directory should be created");
-    std::fs::create_dir(destination.join(".atc")).expect("marker should be created");
+    create_workspace(&destination, "abc466");
+    let before = crate::safe_file::read_tree_snapshot(&destination).unwrap();
 
     for force in [false, true] {
-        let error = resolve_refresh_contest_id(&destination, Some("abc466"), force)
-            .expect_err("override must match the directory name even with force");
-
-        assert!(matches!(error, AppError::Io(_)));
+        refresh_from(
+            &destination,
+            None,
+            force,
+            unexpected_refresh_client,
+            &mut NullReporter,
+        )
+        .expect_err("the directory name and manifest ID must agree");
+        assert_eq!(
+            crate::safe_file::read_tree_snapshot(&destination).unwrap(),
+            before
+        );
     }
 }
 
 #[test]
-fn forced_refresh_still_rejects_unsafe_contest_ids_and_invalid_markers() {
-    let temp = tempfile::tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("abc350");
-    std::fs::create_dir(&destination).expect("directory should be created");
+fn forced_refresh_rejects_unsafe_contest_ids_and_invalid_markers() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("abc466");
+    std::fs::create_dir(&destination).unwrap();
 
-    let error = resolve_refresh_contest_id(&destination, Some("../abc350"), true)
-        .expect_err("force must not bypass contest path validation");
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput
-    ));
+    let error = refresh_from(
+        temp.path(),
+        Some("../abc466"),
+        true,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("force must not bypass contest path validation");
+    assert!(matches!(error, AppError::Io(source) if source.kind() == io::ErrorKind::InvalidInput));
 
-    std::fs::write(destination.join(".atc"), "not a directory")
-        .expect("invalid marker should be written");
-    let error = resolve_refresh_contest_id(&destination, Some("abc350"), true)
-        .expect_err("force must only permit a missing marker");
-    assert!(matches!(
-        error,
-        AppError::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput
-    ));
+    std::fs::write(destination.join(".atc"), "not a directory").unwrap();
+    let error = refresh_from(
+        temp.path(),
+        Some("abc466"),
+        true,
+        unexpected_refresh_client,
+        &mut NullReporter,
+    )
+    .expect_err("force must only permit a missing marker");
+    assert!(matches!(error, AppError::Io(source) if source.kind() == io::ErrorKind::InvalidInput));
 }
 
 #[test]

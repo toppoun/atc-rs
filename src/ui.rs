@@ -34,6 +34,9 @@ pub enum Event<'a> {
     WorkspaceRefreshed {
         destination: &'a Path,
     },
+    WorkspaceRefreshSkipped {
+        contest_id: &'a str,
+    },
     WorkspaceRepaired {
         destination: &'a Path,
     },
@@ -303,6 +306,9 @@ impl Reporter for TerminalReporter {
 
             Event::WorkspaceRefreshed { destination } => {
                 eprintln!("Refreshed {}", destination.display());
+            }
+            Event::WorkspaceRefreshSkipped { contest_id } => {
+                eprintln!("{contest_id}: local data healthy; refresh skipped");
             }
             Event::WorkspaceRepaired { destination } => {
                 eprintln!("Repaired {}", destination.display());

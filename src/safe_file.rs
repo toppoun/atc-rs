@@ -346,13 +346,40 @@ pub(crate) fn read_bounded_regular_text_at(
     path: &Path,
     max_bytes: u64,
 ) -> io::Result<String> {
+    let file = open_file_nofollow_at(directory, name).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file is not valid UTF-8: {}", path.display()),
+        )
+    })
+}
+
+pub(crate) fn read_bounded_regular_file_snapshot_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<FileSnapshot> {
+    let file = open_file_nofollow_at(directory, name)?;
+    let identity = file_identity(&file, path)?;
+    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
+    Ok(FileSnapshot { bytes, identity })
+}
+
+fn read_bounded_regular_bytes(file: fs::File, path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let read_error = |error: io::Error| {
         io::Error::new(
             error.kind(),
             format!("failed to read {}: {error}", path.display()),
         )
     };
-    let file = open_file_nofollow_at(directory, name).map_err(read_error)?;
     let metadata = cap_std::fs::Metadata::from_just_metadata(file.metadata().map_err(read_error)?);
     require_regular_file(&metadata, path)?;
 
@@ -372,12 +399,7 @@ pub(crate) fn read_bounded_regular_text_at(
     if bytes.len() as u64 > max_bytes {
         return Err(too_large());
     }
-    String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("file is not valid UTF-8: {}", path.display()),
-        )
-    })
+    Ok(bytes)
 }
 
 fn require_regular_file(metadata: &cap_std::fs::Metadata, path: &Path) -> io::Result<()> {
