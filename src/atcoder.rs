@@ -652,7 +652,7 @@ impl AtCoderClient {
     pub(crate) fn fetch_samples(
         &self,
         problem: &ProblemOutline,
-    ) -> Result<Vec<Sample>, AtCoderError> {
+    ) -> Result<ProblemSamples, AtCoderError> {
         self.check_batch_cancellation()?;
         let html = match &self.source {
             Source::Http(http) => {
@@ -1053,7 +1053,13 @@ fn parse_contest(contest_id: &str, html: &str) -> Result<ContestOutline, AtCoder
 // Sample Parser
 // ============================================================
 
-fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProblemSamples {
+    Normal(Vec<Sample>),
+    ExternalZip,
+}
+
+fn parse_samples(html: &str) -> Result<ProblemSamples, AtCoderError> {
     let document = Html::parse_document(html);
 
     let ja_selector = Selector::parse("#task-statement span.lang-ja")
@@ -1075,13 +1081,18 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
     // 無ければ英語statementを使う。
     let (statement, input_prefix, output_prefix) =
         if let Some(ja) = document.select(&ja_selector).next() {
-            (ja, "入力例 ", "出力例 ")
+            (ja, "入力例", "出力例")
         } else if let Some(en) = document.select(&en_selector).next() {
             (en, "Sample Input ", "Sample Output ")
         } else {
-            return Err(AtCoderError::Parse(
-                "problem statement not found".to_string(),
-            ));
+            // Older AtCoder statements can nest a second task-statement div without a language span.
+            let legacy_selector = Selector::parse("#task-statement > div#task-statement")
+                .expect("valid legacy statement selector");
+            let legacy = document
+                .select(&legacy_selector)
+                .next()
+                .ok_or_else(|| AtCoderError::Parse("problem statement not found".to_string()))?;
+            (legacy, "入力例", "出力例")
         };
 
     let mut inputs = BTreeMap::new();
@@ -1110,6 +1121,11 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
         let Some((is_input, number)) = sample_kind else {
             continue;
         };
+        if input_prefix == "入力例"
+            && !number.starts_with(|c: char| c.is_whitespace() || c.is_ascii_digit())
+        {
+            continue;
+        }
 
         let number: usize = number
             .trim()
@@ -1137,9 +1153,28 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
     }
 
     if inputs.is_empty() && outputs.is_empty() {
-        if statement_confidently_has_no_normal_samples(&statement, &section_selector, &h3_selector)
-        {
-            return Ok(Vec::new());
+        let headings = Selector::parse("h1, h2, h3, h4, h5, h6").expect("valid headings selector");
+        let has_unparsed_sample_heading = statement.select(&headings).any(|heading| {
+            let text = heading.text().collect::<String>();
+            let text = text.trim();
+            text.starts_with(input_prefix.trim_end()) || text.starts_with(output_prefix.trim_end())
+        });
+        if !has_unparsed_sample_heading {
+            if statement_has_external_sample_zip(
+                &statement,
+                &section_selector,
+                &h3_selector,
+                &pre_selector,
+            ) {
+                return Ok(ProblemSamples::ExternalZip);
+            }
+            if statement_confidently_has_no_normal_samples(
+                &statement,
+                &section_selector,
+                &h3_selector,
+            ) {
+                return Ok(ProblemSamples::Normal(Vec::new()));
+            }
         }
 
         return Err(AtCoderError::Parse(
@@ -1178,7 +1213,63 @@ fn parse_samples(html: &str) -> Result<Vec<Sample>, AtCoderError> {
         ));
     }
 
-    Ok(samples)
+    Ok(ProblemSamples::Normal(samples))
+}
+
+fn statement_has_external_sample_zip(
+    statement: &scraper::ElementRef<'_>,
+    section_selector: &Selector,
+    h3_selector: &Selector,
+    pre_selector: &Selector,
+) -> bool {
+    let link_selector = Selector::parse("a[href]").expect("valid link selector");
+    let mut has_problem = false;
+    let mut has_input = false;
+    let mut has_output = false;
+    let mut has_zip = false;
+
+    for section in statement.select(section_selector) {
+        let Some(h3) = section.select(h3_selector).next() else {
+            continue;
+        };
+        let heading = h3.text().collect::<String>();
+        match heading.trim() {
+            "問題文" => {
+                let text = section.text().collect::<String>();
+                has_problem |= text.trim() != "問題文";
+            }
+            "入力" => has_input |= section.select(pre_selector).next().is_some(),
+            "出力" => has_output |= section.select(pre_selector).next().is_some(),
+            heading if heading.starts_with("入出力例") => {
+                let number = heading["入出力例".len()..].trim().parse::<usize>();
+                let mut links = section.select(&link_selector);
+                let Some(link) = links.next() else {
+                    return false;
+                };
+                let Ok(url) = reqwest::Url::parse(link.attr("href").unwrap_or_default()) else {
+                    return false;
+                };
+                let label = link.text().collect::<String>();
+                if !number.is_ok_and(|number| number > 0)
+                    || links.next().is_some()
+                    || section.select(pre_selector).next().is_some()
+                    || !label.contains("入出力ファイル")
+                    || url.scheme() != "https"
+                    || url.host_str() != Some("img.atcoder.jp")
+                    || url.port().is_some()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || !url.path().ends_with(".zip")
+                {
+                    return false;
+                }
+                has_zip = true;
+            }
+            _ => {}
+        }
+    }
+
+    has_problem && has_input && has_output && has_zip
 }
 
 fn statement_confidently_has_no_normal_samples(
@@ -1220,7 +1311,9 @@ fn statement_confidently_has_no_normal_samples(
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        let Some(rest) = compact.strip_prefix("この問題はインタラクティブな問題")
+        let Some(rest) = compact
+            .strip_prefix("この問題はインタラクティブな問題")
+            .or_else(|| compact.strip_prefix("これはインタラクティブな問題"))
         else {
             continue;
         };
@@ -2106,6 +2199,9 @@ mod tests {
         let samples = client
             .fetch_samples(&problem)
             .expect("problem fixture should parse");
+        let ProblemSamples::Normal(samples) = samples else {
+            panic!("expected inline samples");
+        };
 
         assert_eq!(samples.len(), 3);
         assert_eq!(
@@ -2115,6 +2211,99 @@ mod tests {
                 output: "No\n".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn legacy_abc007_statement_has_three_inline_pairs() {
+        let html = include_str!("../fixtures/problems/abc007_3.html");
+        let ProblemSamples::Normal(samples) = parse_samples(html).unwrap() else {
+            panic!("expected inline samples");
+        };
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.output.as_str())
+                .collect::<Vec<_>>(),
+            ["11\n", "10\n", "94\n"]
+        );
+        assert!(samples[0].input.starts_with("7 8\n2 2\n4 5\n"));
+    }
+
+    #[test]
+    fn typical90_053_dialogue_examples_leave_zero_normal_samples() {
+        let html = include_str!("../fixtures/problems/typical90_ba.html");
+        assert_eq!(parse_samples(html).unwrap(), ProblemSamples::Normal(vec![]));
+    }
+
+    #[test]
+    fn mountain_addition_statement_identifies_external_zip_examples() {
+        let html = include_str!("../fixtures/problems/future_contest_2018_qual_a.html");
+        assert_eq!(parse_samples(html).unwrap(), ProblemSamples::ExternalZip);
+    }
+
+    #[test]
+    fn only_an_official_zip_in_a_numbered_sample_section_establishes_external_examples() {
+        let html = include_str!("../fixtures/problems/future_contest_2018_qual_a.html");
+        for (original, replacement) in [
+            ("入出力例1", "入力データのサンプル"),
+            ("入出力例1", "入出力例"),
+            ("<h3>入出力例1</h3>", "<h4>入出力例1</h4>"),
+            (
+                "https://img.atcoder.jp/",
+                "https://img.atcoder.jp.example.org/",
+            ),
+            ("https://img.atcoder.jp/", "http://img.atcoder.jp/"),
+            ("入出力ファイルはこちらから", "入力ファイルはこちらから"),
+            ("<h3>入力</h3>", "<h3>入力の説明</h3>"),
+        ] {
+            let replaced = html.replace(original, replacement);
+            assert_ne!(replaced, html, "{original}");
+            assert!(
+                matches!(parse_samples(&replaced), Err(AtCoderError::Parse(_))),
+                "{replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_samples_preserve_empty_output_and_ignore_explanatory_pre_blocks() {
+        let html = include_str!("../fixtures/problems/future_contest_2018_qual_a.html");
+        let html = html.replace(
+            "<h3>入出力例1</h3>",
+            r#"<h3>入力例 1</h3><pre>3</pre></section></div>
+               <div class="part"><section><h3>出力例1</h3><pre></pre>
+               <p>解説</p><pre>not sample output</pre></section></div>
+               <div class="part"><section><h3>入出力例1</h3>"#,
+        );
+        assert_eq!(
+            parse_samples(&html).unwrap(),
+            ProblemSamples::Normal(vec![Sample {
+                input: "3".to_string(),
+                output: String::new(),
+            }])
+        );
+    }
+
+    #[test]
+    fn incomplete_or_unrecognized_inline_samples_are_not_hidden_by_external_zip() {
+        let html = include_str!("../fixtures/problems/future_contest_2018_qual_a.html");
+        for sample in [
+            "<h3>入力例1</h3><pre>1</pre>",
+            "<h3>入力例 1</h3>",
+            "<h4>入力例1</h4><pre>1</pre>",
+        ] {
+            let html = html.replace(
+                "<h3>入出力例1</h3>",
+                &format!(
+                    r#"{sample}</section></div>
+                       <div class="part"><section><h3>入出力例1</h3>"#
+                ),
+            );
+            assert!(
+                matches!(parse_samples(&html), Err(AtCoderError::Parse(_))),
+                "{sample}"
+            );
+        }
     }
 
     #[test]
@@ -2129,7 +2318,7 @@ mod tests {
 
         let samples = parse_samples(html).expect("interactive statement should parse");
 
-        assert!(samples.is_empty());
+        assert_eq!(samples, ProblemSamples::Normal(vec![]));
     }
 
     #[test]
@@ -2168,6 +2357,11 @@ mod tests {
             (
                 "lang-ja",
                 "問題文",
+                "これはインタラクティブな問題ではありません。",
+            ),
+            (
+                "lang-ja",
+                "問題文",
                 "インタラクティブな問題とは異なり、通常の入力を用います。",
             ),
         ] {
@@ -2195,7 +2389,7 @@ mod tests {
         let samples = client.fetch_samples(problem).unwrap();
 
         assert_eq!(problem.index, "C");
-        assert!(samples.is_empty());
+        assert_eq!(samples, ProblemSamples::Normal(vec![]));
     }
 
     #[test]
@@ -2245,6 +2439,9 @@ mod tests {
         let samples = client
             .fetch_samples(&problem)
             .expect("fixture lookup should not inspect or request the URL");
+        let ProblemSamples::Normal(samples) = samples else {
+            panic!("expected inline samples");
+        };
 
         assert_eq!(samples.len(), 3);
         assert!(matches!(client.source, Source::Fixture(_)));

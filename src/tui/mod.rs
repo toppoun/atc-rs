@@ -1604,6 +1604,7 @@ pub(crate) enum ContestOperationProgress {
     ProblemFetched {
         index: String,
         samples: usize,
+        external_zip: bool,
     },
     ProblemFetchFailed {
         index: String,
@@ -1633,9 +1634,14 @@ impl ContestOperationProgress {
                 current,
                 total,
             } => format!("[{current}/{total}] Fetching {index}..."),
-            Self::ProblemFetched { index, samples } => {
-                format!("Fetched {index} ({samples} samples)")
-            }
+            Self::ProblemFetched {
+                index,
+                samples,
+                external_zip,
+            } => format!(
+                "Fetched {index} ({})",
+                crate::ui::sample_fetch_summary(*samples, *external_zip)
+            ),
             Self::ProblemFetchFailed { index, error } => {
                 format!("Failed to fetch {index}: {error}")
             }
@@ -1700,9 +1706,14 @@ impl Reporter for ContestOperationReporter {
                 current,
                 total,
             },
-            Event::ProblemFetched { index, samples } => ContestOperationProgress::ProblemFetched {
+            Event::ProblemFetched {
+                index,
+                samples,
+                external_zip,
+            } => ContestOperationProgress::ProblemFetched {
                 index: index.to_owned(),
                 samples,
+                external_zip,
             },
             Event::ProblemFetchFailed { index, error } => {
                 ContestOperationProgress::ProblemFetchFailed {
@@ -10516,6 +10527,7 @@ mod tests {
         reporter.report(Event::ProblemFetched {
             index: &problem,
             samples: 3,
+            external_zip: false,
         });
         reporter.report(Event::ProblemFetchFailed {
             index: &problem,
@@ -10559,6 +10571,7 @@ mod tests {
                 ContestOperationProgress::ProblemFetched {
                     index: "A".to_string(),
                     samples: 3,
+                    external_zip: false,
                 },
                 ContestOperationProgress::ProblemFetchFailed {
                     index: "A".to_string(),
@@ -10620,6 +10633,7 @@ mod tests {
             reporter.report(Event::ProblemFetched {
                 index: "A",
                 samples: 3,
+                external_zip: false,
             });
             task_ready.store(true, std::sync::atomic::Ordering::Release);
             Ok(())
@@ -10656,7 +10670,8 @@ mod tests {
                 },
                 ContestOperationProgress::ProblemFetched {
                     index: "A".to_string(),
-                    samples: 3
+                    samples: 3,
+                    external_zip: false,
                 },
             ]
         );

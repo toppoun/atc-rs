@@ -27,10 +27,10 @@
 
 ## 2. Verdict integrity
 
-- **対象となる操作** — CLI の `atc test`・`atc stress`、Watch / TUI の Sample Test。
+- **対象となる操作** — AtCoder からの公式サンプル取得、CLI の `atc test`・`atc stress`、Watch / TUI の Sample Test。
 - **保証する動作** — 現在のメタデータの `sample_count` と、1 から連番の UTF-8 入出力ペアを照合する。取得時も、サンプル見出しがないだけでは 0 件と判断しない。公式サンプルを番号順に実行し、再実行可能な保存反例を最後に追加する。実行が正常終了し、stdout が UTF-8 で切り詰められておらず、比較が一致した場合に AC とする。比較は CRLF、行末空白、末尾改行の有無を吸収する。単発 CLI は失敗イベントを累積するので、後続の AC が先行の失敗を消すことはない。
 - **拒否・失敗・中断時の動作** — 件数やペアの欠落、破損した保存反例などは実行前にエラーにする。タイムアウトは TLE、異常終了は RE、正常終了でも不正・切り詰め済みの stdout は WA。Stress の生成器・参照解の実行や stdout が不正な場合は比較を成立させずエラーにする。単発 CLI は判定失敗、コンパイル失敗、Test での反例の未検証スキップ、Stress の中断、操作エラーで非ゼロ終了する。
-- **保証しない範囲と例外** — 公式件数が 0 で再実行できる反例もなければ、コンパイルや解答の実行をせず `NoSamples` を通知する。このイベント自体は CLI の失敗に数えない。未検証スキップを伴う場合は非ゼロ。TUI では `NoSamples` が終端状態となる。判定をプロセス終了コードに変換する規則は単発 CLI に適用する。
+- **保証しない範囲と例外** — 通常のペアがなく、問題文の明示的な対話型宣言や、番号付き入出力例の節にある公式 ZIP 配布を確認できた場合は、通常サンプルを 0 件とする。ZIP 配布は取得時に表示し、ZIP 自体は取得しない。公式件数が 0 で再実行できる反例もなければ、コンパイルや解答の実行をせず `NoSamples` を通知する。このイベント自体は CLI の失敗に数えない。未検証スキップを伴う場合は非ゼロ。TUI では `NoSamples` が終端状態となる。判定をプロセス終了コードに変換する規則は単発 CLI に適用する。
 - **関連する本番実装** — [src/atcoder.rs](../../src/atcoder.rs) の `parse_samples`、[src/workspace.rs](../../src/workspace.rs) の `load_test_samples`、[src/commands/test.rs](../../src/commands/test.rs) の `test_problem_with_debug_header_and_cancel`、`run_test_cases`、`judge_case`、[src/comparator.rs](../../src/comparator.rs) の `compare`、[src/stress.rs](../../src/stress.rs) の `run`、`candidate_failure_kind`、[src/main.rs](../../src/main.rs) の `run_verdict_command`。
 - **関連する回帰テスト** — [src/atcoder.rs](../../src/atcoder.rs) の `statement_without_samples_or_positive_zero_evidence_is_a_parse_error`。[tests/verdict_exit_cli.rs](../../tests/verdict_exit_cli.rs) の `missing_one_official_sample_fails_before_running_solution`、`valid_saved_stress_case_runs_after_official_sample`、`a_later_ac_does_not_erase_an_earlier_failed_verdict`、`runtime_error_exits_nonzero`、`runtime_timeout_exits_nonzero`、`stress_counterexample_exits_nonzero_after_reporting_and_saving`。[src/commands/tests.rs](../../src/commands/tests.rs) の `invalid_utf8_candidate_output_cannot_be_accepted_as_replacement_text`、`truncated_candidate_output_cannot_be_accepted_as_displayed_prefix`、`no_samples_is_reported_without_starting_a_runner`。[src/tui/app.rs](../../src/tui/app.rs) の `no_samples_is_terminal_and_is_not_overwritten_by_completed`。
 - **未検証事項・プラットフォーム依存事項** — AtCoder の本番ジャッジとの同値性は未確認。ここでの AC はローカルの実行と比較に対する判定。

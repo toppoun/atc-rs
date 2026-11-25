@@ -23,6 +23,7 @@ pub enum Event<'a> {
     ProblemFetched {
         index: &'a str,
         samples: usize,
+        external_zip: bool,
     },
     ProblemFetchFailed {
         index: &'a str,
@@ -189,6 +190,15 @@ pub trait Reporter {
     fn report(&mut self, event: Event<'_>);
 }
 
+pub(crate) fn sample_fetch_summary(samples: usize, external_zip: bool) -> String {
+    let suffix = if external_zip {
+        ", examples distributed in an external ZIP"
+    } else {
+        ""
+    };
+    format!("{samples} samples{suffix}")
+}
+
 pub(crate) fn write_contest_update_event(
     output: &mut dyn std::io::Write,
     event: &Event<'_>,
@@ -210,9 +220,15 @@ pub(crate) fn write_contest_update_event(
         } => {
             writeln!(output, "[{current}/{total}] Fetching {index}...")
         }
-        Event::ProblemFetched { index, samples } => {
-            writeln!(output, "  {index}: {samples} samples")
-        }
+        Event::ProblemFetched {
+            index,
+            samples,
+            external_zip,
+        } => writeln!(
+            output,
+            "  {index}: {}",
+            sample_fetch_summary(*samples, *external_zip)
+        ),
         Event::ProblemFetchFailed { index, error } => {
             writeln!(output, "  failed to fetch {index}: {error}")
         }

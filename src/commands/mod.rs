@@ -126,32 +126,15 @@ fn fetch_contest_data(
             current: i + 1,
             total,
         });
-        match atcoder.fetch_samples(&problem) {
-            Ok(samples) => {
-                reporter.report(Event::ProblemFetched {
-                    index: &problem.index,
-                    samples: samples.len(),
-                });
-                problems.push(crate::model::Problem {
-                    index: problem.index,
-                    title: problem.title,
-                    task_id: problem.task_id,
-                    url: problem.url,
-                    sample_count: samples.len(),
-                });
-                samples_by_problem.push(samples);
-            }
-
-            Err(err) => {
-                let message = err.to_string();
-
-                reporter.report(Event::ProblemFetchFailed {
-                    index: &problem.index,
-                    error: &message,
-                });
-                return Err(err.into());
-            }
-        }
+        let samples = fetch_problem_samples(atcoder, &problem, reporter)?;
+        problems.push(crate::model::Problem {
+            index: problem.index,
+            title: problem.title,
+            task_id: problem.task_id,
+            url: problem.url,
+            sample_count: samples.len(),
+        });
+        samples_by_problem.push(samples);
     }
     let contest = Contest {
         contest_id: outline.contest_id,
@@ -192,21 +175,7 @@ fn fetch_samples_for_manifest(
             total,
         });
         let outline = atcoder::ProblemOutline::from(problem);
-        let samples = match atcoder.fetch_samples(&outline) {
-            Ok(samples) => samples,
-            Err(error) => {
-                let message = error.to_string();
-                reporter.report(Event::ProblemFetchFailed {
-                    index: &problem.index,
-                    error: &message,
-                });
-                return Err(error.into());
-            }
-        };
-        reporter.report(Event::ProblemFetched {
-            index: &problem.index,
-            samples: samples.len(),
-        });
+        let samples = fetch_problem_samples(atcoder, &outline, reporter)?;
 
         if samples.len() != problem.sample_count {
             return Err(std::io::Error::new(
@@ -225,6 +194,30 @@ fn fetch_samples_for_manifest(
     }
 
     Ok(samples_by_problem)
+}
+
+fn fetch_problem_samples(
+    atcoder: &atcoder::AtCoderClient,
+    problem: &atcoder::ProblemOutline,
+    reporter: &mut dyn Reporter,
+) -> Result<Vec<Sample>, AppError> {
+    let (samples, external_zip) = match atcoder.fetch_samples(problem) {
+        Ok(atcoder::ProblemSamples::Normal(samples)) => (samples, false),
+        Ok(atcoder::ProblemSamples::ExternalZip) => (Vec::new(), true),
+        Err(error) => {
+            reporter.report(Event::ProblemFetchFailed {
+                index: &problem.index,
+                error: &error.to_string(),
+            });
+            return Err(error.into());
+        }
+    };
+    reporter.report(Event::ProblemFetched {
+        index: &problem.index,
+        samples: samples.len(),
+        external_zip,
+    });
+    Ok(samples)
 }
 
 fn resolve_language(cli_language: Option<Language>, config: &Config) -> Language {

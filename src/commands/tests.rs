@@ -148,7 +148,7 @@ impl Reporter for RecordingReporter {
                 problems,
             } => format!("contest-fetched:{contest_id}:{problems}"),
             Event::ProblemFetching { index, .. } => format!("problem-fetching:{index}"),
-            Event::ProblemFetched { index, samples } => {
+            Event::ProblemFetched { index, samples, .. } => {
                 format!("problem-fetched:{index}:{samples}")
             }
             Event::ProblemFetchFailed { index, .. } => format!("problem-failed:{index}"),
