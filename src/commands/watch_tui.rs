@@ -482,7 +482,7 @@ pub(super) fn watch_tui_at(
     config: Config,
     auth: Arc<SessionAuth>,
 ) -> Result<(), AppError> {
-    let runs = WorkspaceRuns::with_internal_watch();
+    let runs = WorkspaceRuns::default();
     let session = start_direct_contest_session_with_hooks(
         destination,
         expected_contest_id,
@@ -549,20 +549,12 @@ struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
 struct WorkspaceRuns {
     worker: OnceCell<Arc<RunWorker>>,
     closed: Cell<bool>,
-    cross_contest: bool,
+    // Keep the chosen mode through display switches and Refresh until Workspace Home.
+    cross_contest: Cell<Option<bool>>,
     workspace_watcher: RefCell<Option<WorkspaceWatcher>>,
 }
 
 impl WorkspaceRuns {
-    fn with_internal_watch() -> Self {
-        Self {
-            cross_contest: cfg!(debug_assertions)
-                && std::env::var_os("ATC_INTERNAL_CROSS_CONTEST_WATCH").as_deref()
-                    == Some(std::ffi::OsStr::new("1")),
-            ..Self::default()
-        }
-    }
-
     fn worker(&self) -> io::Result<&Arc<RunWorker>> {
         if self.closed.get() {
             return Err(io::Error::new(
@@ -624,22 +616,37 @@ impl WorkspaceRuns {
     fn shutdown(&mut self) -> io::Result<()> {
         self.request_stop();
         let watching = self.stop_workspace_watch();
-        let execution = self.worker.take().map_or(Ok(()), |worker| {
-            Arc::into_inner(worker)
-                .ok_or_else(|| io::Error::other("Workspace watcher still owns the run worker"))?
-                .stop_and_join()
-        });
+        let execution = self.stop_worker();
         combine_primary_and_cleanup_results(execution, [("Workspace watcher shutdown", watching)])
     }
 
-    fn return_home(&self, session: ContestSession) -> io::Result<()> {
+    fn stop_worker(&mut self) -> io::Result<()> {
+        self.worker.take().map_or(Ok(()), |worker| {
+            Arc::into_inner(worker)
+                .ok_or_else(|| io::Error::other("Workspace watcher still owns the run worker"))?
+                .stop_and_join()
+        })
+    }
+
+    fn return_home(&mut self, session: ContestSession) -> io::Result<()> {
+        let workspace_watched = session.workspace_watched;
         if let Some(watcher) = self.workspace_watcher.borrow().as_ref() {
             watcher.request_stop();
         }
         let view = self.retire_contest(session);
+        let watching = self.stop_workspace_watch();
+        let execution = if workspace_watched {
+            self.stop_worker()
+        } else {
+            Ok(())
+        };
+        self.cross_contest.set(None);
         combine_primary_and_cleanup_results(
             view,
-            [("Workspace watcher shutdown", self.stop_workspace_watch())],
+            [
+                ("Workspace watcher shutdown", watching),
+                ("Workspace execution shutdown", execution),
+            ],
         )
     }
 
@@ -706,7 +713,7 @@ fn open_workspace_runtime_with<S>(
             },
             submissions: create_submissions(),
             location: RootLocation::WorkspaceHome,
-            runs: WorkspaceRuns::with_internal_watch(),
+            runs: WorkspaceRuns::default(),
         },
         checked.identity,
     ))
@@ -1380,7 +1387,7 @@ where
     let app_context = &runtime.app_context;
     let submissions = &mut runtime.submissions;
     let location = &mut runtime.location;
-    let runs = &runtime.runs;
+    let runs = &mut runtime.runs;
     let prepared_switch = Arc::new(Mutex::new(None));
     let prepared_home_open = Arc::new(Mutex::new(None));
     let prepared_refresh = Arc::new(Mutex::new(None));
@@ -1413,8 +1420,28 @@ where
                 Arc::clone(&home_open_task),
                 || {
                     let prepared = take_prepared_open(&start_prepared)?;
-                    start_prepared_contest_entry(prepared, app_context, runs)
-                        .map_err(|error| error.to_string())
+                    match start_prepared_contest_entry(prepared, app_context, runs) {
+                        Ok(session) => Ok(session),
+                        Err(error) => {
+                            // A failed entry must not leave a Workspace watcher running in Home.
+                            let workspace_watched = runs.workspace_watcher.borrow().is_some();
+                            let watching = runs.stop_workspace_watch();
+                            let execution = if workspace_watched {
+                                runs.stop_worker()
+                            } else {
+                                Ok(())
+                            };
+                            let error = combine_primary_and_cleanup_results(
+                                Err(error),
+                                [
+                                    ("Workspace watcher shutdown", watching),
+                                    ("Workspace execution shutdown", execution),
+                                ],
+                            )
+                            .expect_err("contest entry failed");
+                            Err(error.to_string())
+                        }
+                    }
                 },
                 || first_home_draw.take().and_then(|record| record()),
             ) {
@@ -2316,7 +2343,11 @@ impl ContestSession {
         mut after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
         let PreparedContestEntry { input, environment } = entry;
-        let workspace_root = app_context.workspace_root().filter(|_| runs.cross_contest);
+        let workspace_root = app_context.workspace_root().filter(|_| {
+            runs.cross_contest
+                .get()
+                .unwrap_or(environment.config.watch.cross_contest)
+        });
         let local_context = workspace_root
             .is_none()
             .then(|| {
@@ -2405,6 +2436,9 @@ impl ContestSession {
                 .expect_err("detail worker startup failure must remain an error"));
             }
         };
+        if app_context.workspace_root().is_some() {
+            runs.cross_contest.set(Some(workspace_root.is_some()));
+        }
         Ok(Self::with_view_workers(
             PreparedContestEntry { input, environment },
             watcher_thread,
@@ -3463,21 +3497,15 @@ mod tests {
             )
             .unwrap();
         }
-        let runs = if std::env::var_os("ATC_INTERNAL_CROSS_CONTEST_WATCH").is_some() {
-            let runs = WorkspaceRuns::with_internal_watch();
-            assert!(runs.cross_contest);
-            runs
-        } else {
-            WorkspaceRuns {
-                cross_contest: true,
-                ..WorkspaceRuns::default()
-            }
-        };
+        let runs = WorkspaceRuns::default();
+        let config_path = root.path().join("global-config.toml");
+        std::fs::write(&config_path, "[watch]\ncross_contest = true\n").unwrap();
+        let config = Config::load_from(&config_path).unwrap();
         let input = PreparedWatchInput::load(&root.path().join("abc481"), Some("abc481")).unwrap();
         let session = ContestSession::start_entry(
             PreparedContestEntry {
                 input,
-                environment: ContestEnvironment::new(Config::default()),
+                environment: ContestEnvironment::new(config),
             },
             &context,
             &runs,
@@ -6816,35 +6844,55 @@ mod tests {
     }
 
     #[test]
-    fn internally_enabled_workspace_reuses_watcher_across_views_and_stops_at_home() {
-        let mut runs = WorkspaceRuns {
-            cross_contest: true,
-            ..WorkspaceRuns::default()
-        };
+    fn cross_contest_config_applies_at_entry_from_home_and_keeps_the_active_watcher() {
+        use crate::settings::{SettingKey, SettingValue};
+        let mut runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let open = |id| {
+        let config_path = root.path().join("global-config.toml");
+        let open = |runs: &WorkspaceRuns, id| {
             let destination = root.path().join(id);
             let input = PreparedWatchInput::load(&destination, Some(id)).unwrap();
             ContestSession::start_entry(
                 PreparedContestEntry {
                     input,
-                    environment: ContestEnvironment::new(Config::default()),
+                    environment: ContestEnvironment::new(Config::load_from(&config_path).unwrap()),
                 },
                 &app_context,
-                &runs,
+                runs,
             )
             .unwrap()
         };
         save_healthy_contest(&root.path().join("abc483"), "abc483");
         save_healthy_contest(&root.path().join("abc480"), "abc480");
-        let first = open("abc483");
+        let disabled = open(&runs, "abc483");
+        assert!(disabled.watcher_thread.is_some());
+        assert!(runs.workspace_watcher.borrow().is_none());
+        let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
+        settings
+            .document_mut()
+            .set(SettingKey::WatchCrossContest, SettingValue::Bool(true))
+            .unwrap();
+        settings.save().unwrap();
+        runs.retire_contest(disabled).unwrap();
+        let switched = open(&runs, "abc480");
+        assert!(switched.watcher_thread.is_some());
+        assert!(runs.workspace_watcher.borrow().is_none());
+        runs.return_home(switched).unwrap();
+
+        let first = open(&runs, "abc483");
         let scope = first.run_generation.scope().clone();
         let results = first.results.clone();
         assert!(first.workspace_watched && first.watcher_thread.is_none());
         runs.retire_contest(first).unwrap();
-        let second = open("abc480");
+        let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
+        settings
+            .document_mut()
+            .set(SettingKey::WatchCrossContest, SettingValue::Bool(false))
+            .unwrap();
+        settings.save().unwrap();
+        let second = open(&runs, "abc480");
         assert!(second.workspace_watched && second.watcher_thread.is_none());
         let (generation, _) = runs
             .workspace_watcher
@@ -6861,9 +6909,12 @@ mod tests {
         assert_eq!(generation.scope(), &scope);
         runs.return_home(second).unwrap();
         assert!(runs.workspace_watcher.borrow().is_none());
+        assert!(runs.worker.get().is_none());
         assert!(results.attach(mpsc::channel().0).is_err());
-        let reopened = open("abc483");
+        let reopened = open(&runs, "abc483");
         assert_ne!(reopened.run_generation.scope(), &scope);
+        assert!(reopened.watcher_thread.is_some());
+        assert!(runs.workspace_watcher.borrow().is_none());
         runs.return_home(reopened).unwrap();
         runs.shutdown().unwrap();
     }

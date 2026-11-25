@@ -55,6 +55,30 @@ fn warn_only_doctor_exits_zero_and_redirected_output_has_no_ansi() {
 }
 
 #[test]
+fn doctor_reports_cross_contest_watch_setting_and_its_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_base = temp.path().join("config");
+
+    for (override_config, setting, source) in [
+        ("", "false", "built-in"),
+        ("watch.cross_contest = false\n", "false", "user override"),
+        ("watch.cross_contest = true\n", "true", "user override"),
+    ] {
+        let config = format!("{}{override_config}", runner_config("python"));
+        let output = run_doctor(temp.path(), &config_base, &config);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "stdout: {stdout}");
+        assert!(
+            stdout.lines().any(|line| {
+                line.contains("watch.cross_contest")
+                    && line.ends_with(&format!("{setting} ({source})"))
+            }),
+            "stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn doctor_reports_effective_submit_policy_without_remote_details() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");

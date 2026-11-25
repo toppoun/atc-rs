@@ -30,6 +30,9 @@ pub struct Config {
     pub submit: SubmitConfig,
 
     #[serde(default)]
+    pub(crate) watch: WatchConfig,
+
+    #[serde(default)]
     pub(crate) editor: Option<EditorConfig>,
 }
 
@@ -48,6 +51,7 @@ pub(crate) struct ConfigSources {
     pub(crate) timeout_seconds: ConfigValueSource,
     pub(crate) compile_timeout_seconds: ConfigValueSource,
     pub(crate) python_runtime: ConfigValueSource,
+    pub(crate) cross_contest: ConfigValueSource,
 }
 
 impl Default for ConfigSources {
@@ -60,6 +64,7 @@ impl Default for ConfigSources {
             timeout_seconds: ConfigValueSource::BuiltIn,
             compile_timeout_seconds: ConfigValueSource::BuiltIn,
             python_runtime: ConfigValueSource::BuiltIn,
+            cross_contest: ConfigValueSource::BuiltIn,
         }
     }
 }
@@ -77,6 +82,7 @@ struct ConfigOverrides {
     defaults: DefaultsOverrides,
     runner: RunnerOverrides,
     submit: SubmitOverrides,
+    watch: WatchOverrides,
     editor: Option<EditorConfig>,
 }
 
@@ -101,6 +107,18 @@ struct RunnerOverrides {
 #[serde(default, deny_unknown_fields)]
 struct SubmitOverrides {
     python_runtime: Option<PythonRuntime>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct WatchOverrides {
+    cross_contest: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WatchConfig {
+    pub(crate) cross_contest: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -302,6 +320,7 @@ impl ConfigOverrides {
             timeout_seconds: value_source(&self.runner.timeout_seconds),
             compile_timeout_seconds: value_source(&self.runner.compile_timeout_seconds),
             python_runtime: value_source(&self.submit.python_runtime),
+            cross_contest: value_source(&self.watch.cross_contest),
         };
 
         let runner_defaults = RunnerConfig::default();
@@ -327,6 +346,9 @@ impl ConfigOverrides {
             },
             submit: SubmitConfig {
                 python_runtime: self.submit.python_runtime.unwrap_or_default(),
+            },
+            watch: WatchConfig {
+                cross_contest: self.watch.cross_contest.unwrap_or_default(),
             },
             editor: self.editor,
         };
@@ -580,7 +602,9 @@ mod tests {
              timeout_seconds = 4.5\n\
              compile_timeout_seconds = 12.0\n\
              [submit]\n\
-             python_runtime = \"pypy\"\n",
+             python_runtime = \"pypy\"\n\
+             [watch]\n\
+             cross_contest = true\n",
         )
         .unwrap();
         std::fs::write(
@@ -591,7 +615,8 @@ mod tests {
              runner.cpp_flags = [\"-O0\"]\n\
              runner.timeout_seconds = 4.5\n\
              runner.compile_timeout_seconds = 12.0\n\
-             submit.python_runtime = \"pypy\"\n",
+             submit.python_runtime = \"pypy\"\n\
+             watch.cross_contest = true\n",
         )
         .unwrap();
 
@@ -610,6 +635,7 @@ mod tests {
                 timeout_seconds: ConfigValueSource::UserOverride,
                 compile_timeout_seconds: ConfigValueSource::UserOverride,
                 python_runtime: ConfigValueSource::UserOverride,
+                cross_contest: ConfigValueSource::UserOverride,
             }
         );
     }
@@ -765,6 +791,32 @@ mod tests {
         ] {
             let error = Config::parse(contents).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn cross_contest_watch_is_opt_in_and_invalid_values_are_rejected() {
+        let (omitted, sources) = Config::parse_with_sources(
+            "[defaults]\nlanguage = \"python\"\n[submit]\npython_runtime = \"pypy\"\n",
+        )
+        .unwrap();
+        assert_eq!(omitted.defaults.language, Language::Python);
+        assert_eq!(omitted.submit.python_runtime, PythonRuntime::PyPy);
+        assert!(!omitted.watch.cross_contest);
+        assert_eq!(sources.cross_contest, ConfigValueSource::BuiltIn);
+        assert!(!Config::parse("[watch]\n").unwrap().watch.cross_contest);
+
+        for enabled in [false, true] {
+            let (config, sources) =
+                Config::parse_with_sources(&format!("[watch]\ncross_contest = {enabled}\n"))
+                    .unwrap();
+            assert_eq!(config.watch.cross_contest, enabled);
+            assert_eq!(sources.cross_contest, ConfigValueSource::UserOverride);
+        }
+        for value in ["\"true\"", "1", "[]"] {
+            let error = Config::parse(&format!("[watch]\ncross_contest = {value}\n")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("cross_contest"));
         }
     }
 }

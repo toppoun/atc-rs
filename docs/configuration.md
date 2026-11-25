@@ -1,6 +1,6 @@
 # 設定
 
-`atc` は設定ファイルを作らなくても動作します。デフォルト言語、実行コマンド、timeout、editor、Python の提出 runtime を変えたい場合だけ、必要な項目を `config.toml` に追加します。
+`atc` は設定ファイルを作らなくても動作します。デフォルト言語や実行コマンドを変更したり、Cross-Contest Watch を有効にしたりする場合は、必要な項目を `config.toml` に追加します。
 
 ## 設定ファイルを作る
 
@@ -16,7 +16,7 @@ Global Home または Workspace Home の `s` から Settings を開いて編集�
 
 ## TUI の Settings で編集する
 
-Global Home または Workspace Home で `s` を押すと、Global Config の全10項目を一覧で確認できます。`Default` はそのキーが `config.toml` に書かれていない状態、`Modified` は明示的に書かれている状態です。組み込み値と同じ値を明示しても `Modified` になります。
+Global Home または Workspace Home で `s` を押すと、Global Config の項目を一覧で確認できます。`Default` はそのキーが `config.toml` に書かれていない状態、`Modified` は明示的に書かれている状態です。組み込み値と同じ値を明示しても `Modified` になります。
 
 選択中の項目には、現在使われる値、組み込み値、`config.toml` に明示された値が表示されます。
 
@@ -88,6 +88,9 @@ python_runtime = "cpython"
 command = "nvim"
 args = []
 mode = "terminal"
+
+[watch]
+cross_contest = false
 ```
 
 必要な項目だけを書けばよく、書かれていない項目には組み込みのデフォルト値が使われます。
@@ -110,6 +113,8 @@ C++ を使う場合は、通常は設定なしで `g++` と `-std=c++23 -O2 -Wal
 
 設定は Contest を開くときに読み込まれます。Settingsで保存すると一覧には新しい値が表示されますが、開いている Contest の実行設定は変わりません。Workspace Home へ戻って開き直すか、`Switch Contest` で入り直してください。`Refresh Contest` だけでは新しい設定を読み直しません。
 
+Cross-Contest Watch の ON / OFF は Workspace Home から次に Contest を開くとき、または CLI から Contest TUI を起動するときに反映されます。手動・自動の Contest 切り替え中は監視モードを維持します。有効時の実行キューは、同じ期間に読み込んだ `[runner]` の設定を使います。これらを変更したら Workspace Home に戻ってから Contest を開き直してください。
+
 Home で変更した認証情報も、同様に次に Contest を開いたときに反映されます。詳しくは[AtCoder 認証](authentication.md#変更が反映されるタイミング)を参照してください。
 
 ## 設定項目と組み込みデフォルト
@@ -126,8 +131,15 @@ Home で変更した認証情報も、同様に次に Contest を開いたとき
 | `editor.command` | なし | エディタの実行コマンド |
 | `editor.args` | `[]` | `command` の後、対象パスの前に渡す引数 |
 | `editor.mode` | コマンド名から推測 | `"terminal"` または `"external"` |
+| `watch.cross_contest` | `false` | Workspace の Contest TUI で、管理対象 Contest のソースをまとめて監視する |
 
 `[editor]` セクションは任意ですが、書く場合は `command` が必要です。
+
+### Cross-Contest Watch
+
+Settings の `Watch` で `Cross-Contest Watch` を選び、`Enter` で開きます。`ON` または `OFF` を選び、もう一度 `Enter` を押すと保存します。`Esc` は編集の取り消し、設定一覧での `r` は組み込み値の `OFF` へ戻す操作です。
+
+直接編集する場合は `[watch]` の `cross_contest = true` を設定します。指定できる値は `true` と `false` です。省略時は `false` になります。`atc doctor` の Global Config 欄で設定値とその出所を確認できます。適用範囲と保存時の動作は [Cross-Contest Watch](testing.md#cross-contest-watch) を参照してください。
 
 ## `[defaults]`
 

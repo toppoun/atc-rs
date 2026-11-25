@@ -448,6 +448,15 @@ fn config_details(resolved: &ResolvedConfig) -> Vec<String> {
             &format_seconds(config.runner.compile_timeout_seconds),
             sources.compile_timeout_seconds,
         ),
+        setting(
+            "watch.cross_contest",
+            if config.watch.cross_contest {
+                "true"
+            } else {
+                "false"
+            },
+            sources.cross_contest,
+        ),
     ]
 }
 

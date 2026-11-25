@@ -11,6 +11,7 @@ pub(crate) enum SettingsCategory {
     Runner,
     Submit,
     Editor,
+    Watch,
 }
 
 impl SettingsCategory {
@@ -20,6 +21,7 @@ impl SettingsCategory {
             Self::Runner => "Runner",
             Self::Submit => "Submit",
             Self::Editor => "Editor",
+            Self::Watch => "Watch",
         }
     }
 }
@@ -44,10 +46,11 @@ pub(crate) enum SettingKey {
     EditorCommand,
     EditorArgs,
     EditorMode,
+    WatchCrossContest,
 }
 
 impl SettingKey {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::DefaultLanguage,
         Self::RunnerPython,
         Self::RunnerCppCompiler,
@@ -58,6 +61,7 @@ impl SettingKey {
         Self::EditorCommand,
         Self::EditorArgs,
         Self::EditorMode,
+        Self::WatchCrossContest,
     ];
 
     pub(crate) const fn category(self) -> SettingsCategory {
@@ -70,6 +74,7 @@ impl SettingKey {
             | Self::RunnerCompileTimeoutSeconds => SettingsCategory::Runner,
             Self::SubmitPythonRuntime => SettingsCategory::Submit,
             Self::EditorCommand | Self::EditorArgs | Self::EditorMode => SettingsCategory::Editor,
+            Self::WatchCrossContest => SettingsCategory::Watch,
         }
     }
 
@@ -85,6 +90,7 @@ impl SettingKey {
             Self::EditorCommand => "editor.command",
             Self::EditorArgs => "editor.args",
             Self::EditorMode => "editor.mode",
+            Self::WatchCrossContest => "watch.cross_contest",
         }
     }
 
@@ -100,6 +106,7 @@ impl SettingKey {
             Self::EditorCommand => "Editor command",
             Self::EditorArgs => "Editor arguments",
             Self::EditorMode => "Editor mode",
+            Self::WatchCrossContest => "Cross-Contest Watch",
         }
     }
 
@@ -119,14 +126,18 @@ impl SettingKey {
             }
             Self::EditorArgs => "Arguments inserted between the editor command and target path.",
             Self::EditorMode => "Whether the editor owns the terminal or launches externally.",
+            Self::WatchCrossContest => {
+                "Watch source files across managed contests and switch to the latest saved problem."
+            }
         }
     }
 
     pub(crate) const fn input(self) -> SettingInput {
         match self {
-            Self::DefaultLanguage | Self::SubmitPythonRuntime | Self::EditorMode => {
-                SettingInput::Enum
-            }
+            Self::DefaultLanguage
+            | Self::SubmitPythonRuntime
+            | Self::EditorMode
+            | Self::WatchCrossContest => SettingInput::Enum,
             Self::RunnerPython | Self::RunnerCppCompiler | Self::EditorCommand => {
                 SettingInput::String
             }
@@ -147,6 +158,7 @@ impl SettingKey {
             Self::EditorCommand => ("editor", "command"),
             Self::EditorArgs => ("editor", "args"),
             Self::EditorMode => ("editor", "mode"),
+            Self::WatchCrossContest => ("watch", "cross_contest"),
         }
     }
 }
@@ -166,6 +178,7 @@ pub(crate) enum SettingValue {
     Number(f64),
     PythonRuntime(PythonRuntime),
     EditorMode(EditorModeValue),
+    Bool(bool),
 }
 
 impl SettingValue {
@@ -181,6 +194,7 @@ impl SettingValue {
             Self::EditorMode(EditorModeValue::Auto) => "Auto".to_string(),
             Self::EditorMode(EditorModeValue::Terminal) => "Terminal".to_string(),
             Self::EditorMode(EditorModeValue::External) => "External".to_string(),
+            Self::Bool(value) => if *value { "ON" } else { "OFF" }.to_string(),
         }
     }
 }
@@ -328,6 +342,7 @@ impl SettingsDocument {
             SettingKey::EditorCommand => SettingValue::String("Auto-detected".to_string()),
             SettingKey::EditorArgs => SettingValue::StringList(Vec::new()),
             SettingKey::EditorMode => SettingValue::EditorMode(EditorModeValue::Auto),
+            SettingKey::WatchCrossContest => SettingValue::Bool(config.watch.cross_contest),
         }
     }
 
@@ -455,6 +470,7 @@ fn effective_value_from_config(config: &Config, key: SettingKey) -> SettingValue
                 .as_ref()
                 .map_or_else(Vec::new, |editor| editor.args.clone()),
         ),
+        SettingKey::WatchCrossContest => SettingValue::Bool(config.watch.cross_contest),
         SettingKey::EditorMode => SettingValue::EditorMode(config.editor.as_ref().map_or(
             EditorModeValue::Auto,
             |editor| match editor.mode {
@@ -500,6 +516,7 @@ fn validate_value_type(key: SettingKey, value: &SettingValue) -> Result<(), Sett
                 SettingValue::PythonRuntime(_)
             )
             | (SettingKey::EditorMode, SettingValue::EditorMode(_))
+            | (SettingKey::WatchCrossContest, SettingValue::Bool(_))
             | (
                 SettingKey::RunnerPython
                     | SettingKey::RunnerCppCompiler
@@ -538,6 +555,7 @@ fn toml_value(value: SettingValue) -> Value {
             Value::Array(array)
         }
         SettingValue::Number(value) => Value::from(value),
+        SettingValue::Bool(value) => Value::from(value),
         SettingValue::PythonRuntime(PythonRuntime::CPython) => Value::from("cpython"),
         SettingValue::PythonRuntime(PythonRuntime::PyPy) => Value::from("pypy"),
         SettingValue::EditorMode(EditorModeValue::Terminal) => Value::from("terminal"),
@@ -625,16 +643,20 @@ python_runtime = \"cpython\"\n\
 [editor]\n\
 command = \"nvim\"\n\
 args = []\n\
-mode = \"terminal\"\n"
+mode = \"terminal\"\n\
+\n\
+[watch]\n\
+cross_contest = false\n"
     }
 
     #[test]
-    fn definitions_cover_all_ten_settings_in_category_order() {
-        assert_eq!(SettingKey::ALL.len(), 10);
+    fn definitions_cover_all_supported_settings_in_category_order() {
+        assert_eq!(SettingKey::ALL.len(), 11);
         assert_eq!(SettingKey::ALL[0].category(), SettingsCategory::Defaults);
         assert_eq!(SettingKey::ALL[1].category(), SettingsCategory::Runner);
         assert_eq!(SettingKey::ALL[6].category(), SettingsCategory::Submit);
         assert_eq!(SettingKey::ALL[7].category(), SettingsCategory::Editor);
+        assert_eq!(SettingKey::ALL[10].category(), SettingsCategory::Watch);
         assert_eq!(SettingKey::EditorMode.input(), SettingInput::Enum);
     }
 

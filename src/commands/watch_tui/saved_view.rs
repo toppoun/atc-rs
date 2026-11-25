@@ -271,10 +271,8 @@ mod tests {
                 )
                 .unwrap();
             }
-            let runs = WorkspaceRuns {
-                cross_contest: true,
-                ..WorkspaceRuns::default()
-            };
+            let runs = WorkspaceRuns::default();
+            let config = crate::config::Config::parse("[watch]\ncross_contest = true\n").unwrap();
             let context = AppContext::from_launch_root(root.path()).unwrap();
             let input =
                 super::super::PreparedWatchInput::load(&root.path().join("abc481"), Some("abc481"))
@@ -282,7 +280,7 @@ mod tests {
             let session = ContestSession::start_entry(
                 super::super::PreparedContestEntry {
                     input,
-                    environment: ContestEnvironment::new(crate::config::Config::default()),
+                    environment: ContestEnvironment::new(config),
                 },
                 &context,
                 &runs,

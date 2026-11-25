@@ -557,6 +557,16 @@ impl EnumEditor {
                     value: SettingValue::EditorMode(EditorModeValue::External),
                 },
             ],
+            SettingKey::WatchCrossContest => vec![
+                EnumChoice {
+                    label: "OFF",
+                    value: SettingValue::Bool(false),
+                },
+                EnumChoice {
+                    label: "ON",
+                    value: SettingValue::Bool(true),
+                },
+            ],
             _ => unreachable!("only enum settings create an enum editor"),
         };
         let current = document.effective_value(key);
@@ -1181,6 +1191,11 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, screen: &SettingsScreen) {
         )),
         Line::raw(format!("Configured: {configured}")),
     ];
+    if key == SettingKey::WatchCrossContest {
+        lines.push(Line::raw(
+            "More watched contests may increase system resource usage.",
+        ));
+    }
     if !document.editable(key) {
         lines.push(Line::styled(
             "Set editor.command before editing this setting.",
@@ -1513,7 +1528,7 @@ mod tests {
         let (_temp, mut screen) = screen("[defaults]\nlanguage = \"cpp\"\n");
         let rendered = buffer_text(&draw(&mut screen, 110, 34));
 
-        for category in ["Defaults", "Runner", "Submit", "Editor"] {
+        for category in ["Defaults", "Runner", "Submit", "Editor", "Watch"] {
             assert!(rendered.contains(category), "missing category {category}");
         }
         for key in SettingKey::ALL {
@@ -1548,9 +1563,13 @@ mod tests {
         }
         let rendered = buffer_text(&draw(&mut screen, 42, 9));
 
-        assert_eq!(screen.selected_key(), SettingKey::EditorMode);
-        assert!(rendered.contains("Editor mode"), "{rendered}");
+        assert_eq!(screen.selected_key(), SettingKey::WatchCrossContest);
+        assert!(rendered.contains("Cross-Conte… OFF"), "{rendered}");
         assert!(!rendered.contains("Built-in:"));
+        screen.handle_key(key(KeyCode::Up));
+        assert_eq!(screen.selected_key(), SettingKey::EditorMode);
+        let rendered = buffer_text(&draw(&mut screen, 42, 9));
+        assert!(rendered.contains("Editor mode"), "{rendered}");
     }
 
     #[test]
@@ -1811,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_settings_select_the_expected_editor_when_dependencies_are_satisfied() {
+    fn all_settings_select_the_expected_editor_when_dependencies_are_satisfied() {
         let document = SettingsDocument::parse(
             "[editor]\ncommand = \"code\"\nargs = []\nmode = \"external\"\n",
         )
@@ -1826,6 +1845,44 @@ mod tests {
                 SettingInput::StringList => assert!(matches!(editor, EditModal::List(_))),
             }
         }
+    }
+
+    #[test]
+    fn cross_contest_watch_uses_on_off_editor_and_preserves_other_settings() {
+        let original = "# keep this comment\n[defaults]\nlanguage = \"python\"\n";
+        let (temp, mut screen) = screen(original);
+        let path = temp.path().join("config.toml");
+        move_to(&mut screen, SettingKey::WatchCrossContest);
+        assert!(buffer_text(&draw(&mut screen, 110, 34)).contains("Built-in: OFF"));
+
+        screen.handle_event(event(KeyCode::Enter));
+        screen.handle_event(event(KeyCode::Down));
+        screen.handle_event(event(KeyCode::Escape));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        screen.handle_event(event(KeyCode::Enter));
+        screen.handle_event(event(KeyCode::Down));
+        screen.handle_event(event(KeyCode::Enter));
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("cross_contest = true"));
+        assert!(saved.starts_with(original));
+        assert!(
+            crate::config::Config::load_from(&path)
+                .unwrap()
+                .watch
+                .cross_contest
+        );
+
+        screen.handle_event(event(KeyCode::Char('r')));
+        let reset = fs::read_to_string(&path).unwrap();
+        assert!(!reset.contains("cross_contest"));
+        assert!(reset.starts_with(original));
+        assert!(
+            !crate::config::Config::load_from(&path)
+                .unwrap()
+                .watch
+                .cross_contest
+        );
     }
 
     #[test]

@@ -166,6 +166,8 @@ terminal の幅が狭い場合は side pane を表示せず、detail pane を優
 
 modal や入力欄を開いている間は、そちらの操作が通常のショートカットより優先されます。原則として `Esc` で閉じ、`Enter` で選択を確定します。
 
+Workspace の Contest TUI では、[Cross-Contest Watch](testing.md#cross-contest-watch) を有効にすると、操作が終わったあとに最新の保存先を自動表示できます。
+
 ### 表示を切り替える
 
 | キー | 操作 |

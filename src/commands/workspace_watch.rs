@@ -1137,6 +1137,13 @@ mod tests {
         let (worker, watcher) = start(root, RunnerConfig::default());
         assert!(watcher.status().warning.unwrap().contains("bad-parent"));
         let (old, results) = watcher.attach_registration(&active, &a).unwrap();
+        let (warning_tx, warning_rx) = mpsc::channel();
+        let view = results.attach(warning_tx).unwrap();
+        assert!(matches!(
+            warning_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Message::WorkspaceWatchWarning(Some(warning)) if warning.contains("bad-parent")
+        ));
+        drop(view);
         let (other_generation, _) = watcher.attach_registration(&other, &b).unwrap();
         a.problems[0].title = "Updated externally".into();
         workspace::save_metadata(&active, &a).unwrap();

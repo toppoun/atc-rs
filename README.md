@@ -10,6 +10,7 @@ AtCoder のコンテスト準備、サンプルテスト、提出までをター
 - ソースを残して旧テストをバックアップし、1 件ずつでも一括でも移行できる。[単一 Contest](docs/workspace.md#migrate)・[一括更新・移行](docs/workspace.md#workspace-内を一括で確認更新する)
 - 画面上で問題を切り替え、サンプルテストを実行する
 - ソースの保存を監視して、自動で再テストする
+- [Cross-Contest Watch](docs/testing.md#cross-contest-watch) を有効にし、Workspace 内の最新の保存先へ自動で切り替える
 - Generator と Brute Force を使って Stress Test を行う
 - C++ / Python の解答を AtCoder へ提出し、結果を確認する
 - ソーステンプレート、実行コマンド、エディタなどを自分の環境に合わせる
