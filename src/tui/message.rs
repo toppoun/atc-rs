@@ -100,14 +100,14 @@ impl RunGeneration {
         }
     }
 
-    pub(super) fn next_run_id(&self) -> RunId {
+    pub(crate) fn next_run_id(&self) -> RunId {
         self.state
             .next_run_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("run ID space exhausted")
     }
 
-    pub(super) fn source_gate(&self, task_id: &str) -> UserInputRunStartGate {
+    pub(crate) fn source_gate(&self, task_id: &str) -> UserInputRunStartGate {
         self.state
             .source_gates
             .lock()
@@ -211,6 +211,7 @@ pub struct UserInputRunStartGate(Arc<Mutex<SourceRevisions>>);
 struct SourceRevisions {
     current: u64,
     retired_before: u64,
+    language: Option<Language>,
 }
 
 impl UserInputRunStartGate {
@@ -221,19 +222,27 @@ impl UserInputRunStartGate {
             .current
     }
 
-    pub(super) fn advance(&self, removed: bool) -> u64 {
+    pub(crate) fn select_source(&self, language: Language) -> u64 {
         let mut revisions = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        revisions.current = revisions
-            .current
-            .checked_add(1)
-            .expect("source revision space exhausted");
-        if removed {
-            revisions.retired_before = revisions.current;
+        revisions.language = Some(language);
+        revisions.advance()
+    }
+
+    pub(crate) fn remove_source(&self, language: Language) -> Option<u64> {
+        let mut revisions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if revisions.language != Some(language) {
+            return None;
         }
-        revisions.current
+        revisions.language = None;
+        let revision = revisions.advance();
+        revisions.retired_before = revision;
+        Some(revision)
     }
 
     #[cfg(test)]
@@ -272,6 +281,16 @@ impl UserInputRunStartGate {
         let started = start();
         drop(revisions);
         Some(started)
+    }
+}
+
+impl SourceRevisions {
+    fn advance(&mut self) -> u64 {
+        self.current = self
+            .current
+            .checked_add(1)
+            .expect("source revision space exhausted");
+        self.current
     }
 }
 
@@ -481,6 +500,13 @@ pub enum StressEvent {
 #[derive(Debug)]
 pub enum Message {
     ExecutionChanged,
+    WorkspaceSource {
+        target: RunTarget,
+        revision: u64,
+        source: Option<(PathBuf, Language)>,
+    },
+    WorkspaceWatchWarning(Option<String>),
+    WorkspaceWatchInvalidated,
     UserInputRunEvent {
         run_id: RunId,
         target: RunTarget,

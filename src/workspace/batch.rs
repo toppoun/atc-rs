@@ -41,10 +41,83 @@ pub(crate) struct ContestLocation {
     identity: PhysicalDirectoryIdentity,
 }
 
+pub(crate) struct WatchParent {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: io::Result<Option<PhysicalDirectoryIdentity>>,
+}
+
 impl BatchWorkspace {
+    pub(crate) fn watch_route(
+        &self,
+        id: &str,
+        location: &ContestLocation,
+    ) -> io::Result<Option<super::ExplicitContestRoute>> {
+        let mapping = matching_workspace_path(&self.config, id)?;
+        if mapping.map_or(!location.parent.components.is_empty(), |path| {
+            *path != location.parent
+        }) {
+            // Batch additionally recognizes legacy series directories. Watch follows the active route.
+            return Ok(None);
+        }
+        Ok(Some(super::ExplicitContestRoute {
+            destination: location.path.clone(),
+            config: Some(self.config.clone()),
+            root_identity: self.identity.clone(),
+            parent_identity: location.parent_identity.clone(),
+            destination_identity: location.identity.clone(),
+        }))
+    }
+
+    pub(crate) fn watch_parents(&self) -> io::Result<Vec<WatchParent>> {
+        let root = open_workspace_root_nofollow(&self.root)?;
+        if opened_directory_identity(&root, &self.root)? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Workspace directory changed during discovery",
+            ));
+        }
+        let prefixes: BTreeSet<_> = self
+            .config
+            .paths
+            .iter()
+            .flat_map(|rule| {
+                (1..=rule.path.components.len()).map(|len| rule.path.components[..len].to_vec())
+            })
+            .collect();
+        let mut parents = vec![WatchParent {
+            path: self.root.clone(),
+            identity: Ok(Some(self.identity.clone())),
+        }];
+        for components in prefixes {
+            let parent = WorkspaceRelativePath { components };
+            let path = parent.append_to(&self.root);
+            let identity = self.open_parent(&root, &parent).and_then(|opened| {
+                opened
+                    .map(|directory| opened_directory_identity(&directory, &path))
+                    .transpose()
+            });
+            parents.push(WatchParent { path, identity });
+        }
+        Ok(parents)
+    }
     pub(crate) fn scan(
         root: &Path,
         cancellation: UpdateCancellation<'_>,
+    ) -> io::Result<(Self, Discovery)> {
+        Self::scan_layout(root, cancellation, false)
+    }
+
+    pub(crate) fn scan_watch(
+        root: &Path,
+        cancellation: UpdateCancellation<'_>,
+    ) -> io::Result<(Self, Discovery)> {
+        Self::scan_layout(root, cancellation, true)
+    }
+
+    fn scan_layout(
+        root: &Path,
+        cancellation: UpdateCancellation<'_>,
+        active_routes_only: bool,
     ) -> io::Result<(Self, Discovery)> {
         let directory = open_workspace_root_nofollow(root)?;
         let config = load_existing_workspace_config(root, &directory)?.ok_or_else(|| {
@@ -58,7 +131,9 @@ impl BatchWorkspace {
         })?;
         let mut parents = BTreeSet::from([Vec::new()]);
         parents.extend(config.paths.iter().map(|rule| rule.path.components.clone()));
-        parents.extend(SERIES_DIRECTORIES.map(|(name, _)| vec![name.to_owned()]));
+        if !active_routes_only {
+            parents.extend(SERIES_DIRECTORIES.map(|(name, _)| vec![name.to_owned()]));
+        }
         let workspace = Self {
             root: root.to_path_buf(),
             identity: opened_directory_identity(&directory, root)?,
@@ -86,12 +161,27 @@ impl BatchWorkspace {
         let contests = candidates
             .into_iter()
             .take_while(|_| !cancellation.is_requested())
-            .map(|(id, candidates)| {
-                let path = candidates[0].path.clone();
-                match workspace.select(&id, candidates) {
+            .filter_map(|(id, mut candidates)| {
+                if active_routes_only {
+                    candidates.retain(|candidate| {
+                        let owner = candidate
+                            .inspection
+                            .as_ref()
+                            .ok()
+                            .and_then(|found| found.id.as_deref().ok())
+                            .unwrap_or(&id);
+                        match matching_workspace_path(&workspace.config, owner) {
+                            Ok(Some(mapping)) => *mapping == candidate.parent,
+                            Ok(None) => candidate.parent.components.is_empty(),
+                            Err(_) => true, // Preserve the ambiguous-route diagnosis.
+                        }
+                    });
+                }
+                let path = candidates.first()?.path.clone();
+                Some(match workspace.select(&id, candidates) {
                     Ok((id, location)) => (id, location.path.clone(), Ok(location)),
                     Err(error) => (id, path, Err(error)),
-                }
+                })
             })
             .collect();
         let complete = !cancellation.is_requested();

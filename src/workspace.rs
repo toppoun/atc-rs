@@ -107,7 +107,7 @@ struct WorkspacePathRuleFile {
     path: String,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct WorkspaceConfig {
     paths: Vec<WorkspacePathRule>,
 }
@@ -124,6 +124,7 @@ pub(crate) enum WorkspaceConfigFileState {
     Existing,
 }
 
+#[derive(Clone)]
 struct WorkspacePathRule {
     pattern: Regex,
     path: WorkspaceRelativePath,
@@ -547,11 +548,7 @@ impl ExplicitContestRoute {
         contest_id: &str,
     ) -> io::Result<()> {
         let current = Self::resolve(root, contest_id)?.require_workspace()?;
-        if current.destination != self.destination
-            || current.root_identity != self.root_identity
-            || current.parent_identity != self.parent_identity
-            || current.destination_identity != self.destination_identity
-        {
+        if !self.same_owner(&current) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!(
@@ -562,6 +559,75 @@ impl ExplicitContestRoute {
         }
         Ok(())
     }
+
+    pub(crate) fn same_owner(&self, current: &Self) -> bool {
+        current.destination == self.destination
+            && current.root_identity == self.root_identity
+            && current.parent_identity == self.parent_identity
+            && current.destination_identity == self.destination_identity
+    }
+
+    pub(crate) fn destination_identity(&self) -> &PhysicalDirectoryIdentity {
+        &self.destination_identity
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct WatchManifestStamp {
+    size: u64,
+    created: Option<std::time::SystemTime>,
+    modified: Option<std::time::SystemTime>,
+}
+
+pub(crate) fn watch_manifest_stamp(destination: &Path) -> Option<WatchManifestStamp> {
+    let marker = destination.join(".atc");
+    let directory = fs::symlink_metadata(&marker).ok()?;
+    if !directory.is_dir() || metadata_is_reparse(&directory) {
+        return None;
+    }
+    let manifest = fs::symlink_metadata(marker.join("contest.toml")).ok()?;
+    if !manifest.is_file() || metadata_is_reparse(&manifest) {
+        return None;
+    }
+    // A discovery hint. RunContext verifies identity and metadata before admission.
+    Some(WatchManifestStamp {
+        size: manifest.len(),
+        created: manifest.created().ok(),
+        modified: manifest.modified().ok(),
+    })
+}
+
+pub(crate) fn watched_source_fingerprint(
+    path: &Path,
+    expected_directory: &PhysicalDirectoryIdentity,
+) -> io::Result<Option<safe_file::FileFingerprint>> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid watched source path",
+        ));
+    };
+    let directory = open_contest_destination_nofollow(parent)?;
+    if &opened_directory_identity(&directory, parent)? != expected_directory {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "watched source directory changed",
+        ));
+    }
+    // Use the exact spelling also when the filesystem itself ignores case.
+    if !safe_file::regular_file_exists_at(&directory, name, path)? {
+        return Ok(None);
+    }
+    for entry in directory.entries()? {
+        if entry?.file_name() == name {
+            return match safe_file::read_regular_file_fingerprint_at(&directory, name, path) {
+                Ok(stamp) => Ok(Some(stamp)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
+    }
+    Ok(None)
 }
 
 /// Keep routing, metadata, and subsequent file access relative to opened directories.
@@ -1058,7 +1124,7 @@ enum ContestRecoveryError {
     Area { path: PathBuf, source: io::Error },
 }
 
-fn is_contest_staging_name(name: &str) -> bool {
+pub(crate) fn is_contest_staging_name(name: &str) -> bool {
     name.starts_with(".atc-refresh-")
         || name.starts_with(".atc-repair-")
         || name.starts_with(".atc-migrate-")

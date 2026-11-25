@@ -38,6 +38,7 @@ pub(super) struct RunContext {
     runner_config: RunnerConfig,
     binding: Option<RunBinding>,
     stale: AtomicBool,
+    workspace_watch: bool,
 }
 
 impl RunContext {
@@ -70,9 +71,56 @@ impl RunContext {
             runner_config,
             binding: Some(RunBinding { metadata, route }),
             stale: AtomicBool::new(false),
+            workspace_watch: false,
         };
         context.revalidate()?;
         Ok(context)
+    }
+
+    pub(super) fn from_watch_route(
+        root: &Path,
+        route: ExplicitContestRoute,
+        contest: &Contest,
+        runner_config: RunnerConfig,
+    ) -> io::Result<Self> {
+        let destination = route.destination.clone();
+        if &workspace::contest_directory_identity(&destination)? != route.destination_identity() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "contest changed during Workspace discovery",
+            ));
+        }
+        let metadata = ContestTaskSnapshot::capture_contest(&destination, contest)?;
+        Ok(Self {
+            destination,
+            generation: RunGeneration::new(&contest.contest_id),
+            problems: contest.problems.clone(),
+            runner_config,
+            binding: Some(RunBinding {
+                metadata,
+                route: Some((root.to_path_buf(), route)),
+            }),
+            stale: AtomicBool::new(false),
+            workspace_watch: true,
+        })
+    }
+
+    pub(super) fn matches_watch_route(&self, route: &ExplicitContestRoute) -> bool {
+        !self.is_stale()
+            && self.binding.as_ref().is_some_and(|binding| {
+                binding
+                    .route
+                    .as_ref()
+                    .is_some_and(|(_, current)| current.same_owner(route))
+                    && binding.metadata.revalidate(&self.destination).is_ok()
+            })
+    }
+
+    pub(super) fn matches_view(&self, destination: &Path, contest: &Contest) -> io::Result<bool> {
+        Ok(self.generation.scope().contest_id() == contest.contest_id
+            && self.problems == contest.problems
+            && workspace::contest_directory_identity(destination)?
+                == workspace::contest_directory_identity(&self.destination)?)
     }
 
     #[cfg(test)]
@@ -89,10 +137,11 @@ impl RunContext {
             runner_config,
             binding: None,
             stale: AtomicBool::new(false),
+            workspace_watch: false,
         }
     }
 
-    fn revalidate(&self) -> io::Result<()> {
+    pub(super) fn revalidate(&self) -> io::Result<()> {
         if let Some(binding) = &self.binding {
             if let Some((root, route)) = &binding.route {
                 route.revalidate_workspace_owner(root, self.generation.scope().contest_id())?;
@@ -104,6 +153,23 @@ impl RunContext {
 
     pub(super) fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Acquire)
+    }
+
+    pub(super) fn is_workspace_watch(&self) -> bool {
+        self.workspace_watch
+    }
+
+    pub(super) fn source_fingerprint(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<crate::safe_file::FileFingerprint>> {
+        let route = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.route.as_ref())
+            .map(|(_, route)| route)
+            .expect("Workspace watch source has a validated route");
+        workspace::watched_source_fingerprint(path, route.destination_identity())
     }
 
     pub(super) fn sample_count(&self, task_id: &str) -> Option<usize> {
@@ -152,6 +218,20 @@ impl AttemptExecutor {
                     if let Err(error) = context.revalidate() {
                         context.stale.store(true, Ordering::Release);
                         return Err(error.into());
+                    }
+                    if context.workspace_watch {
+                        let source = workspace::source_file_path(
+                            &context.destination,
+                            &problem.index,
+                            request.language,
+                        )?;
+                        if context.source_fingerprint(&source)?.is_none() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("source file not found: {}", source.display()),
+                            )
+                            .into());
+                        }
                     }
 
                     match &request.kind {

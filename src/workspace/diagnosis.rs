@@ -116,10 +116,18 @@ impl BlockReason {
 /// Inspect an already-resolved contest destination. Enclosing workspace routing is the
 /// caller's responsibility. This read-only scan does not lock or authorize a later write.
 pub(crate) fn diagnose_contest(destination: &Path, contest_id: &str) -> ContestDiagnosis {
-    inspect(destination, contest_id).unwrap_or_else(ContestDiagnosis::Blocked)
+    inspect(destination, contest_id, true).unwrap_or_else(ContestDiagnosis::Blocked)
 }
 
-fn inspect(destination: &Path, contest_id: &str) -> Result<ContestDiagnosis, BlockReason> {
+pub(crate) fn diagnose_watch_contest(destination: &Path, contest_id: &str) -> ContestDiagnosis {
+    inspect(destination, contest_id, false).unwrap_or_else(ContestDiagnosis::Blocked)
+}
+
+fn inspect(
+    destination: &Path,
+    contest_id: &str,
+    require_owned_tests: bool,
+) -> Result<ContestDiagnosis, BlockReason> {
     use ContestDiagnosis::{Healthy, MigrationRequired, RepairRequired};
 
     validate_path_component(contest_id, "contest ID").map_err(|_| BlockReason::InvalidContestId)?;
@@ -162,7 +170,7 @@ fn inspect(destination: &Path, contest_id: &str) -> Result<ContestDiagnosis, Blo
     };
 
     let tests = open_tests()?;
-    if let Some(tests) = &tests {
+    if require_owned_tests && let Some(tests) = &tests {
         let unowned = find_unowned_test_entry(&tests_path, tests, &problem_indices(&contest))
             .map_err(|error| entry_error(&tests_path, error))?;
         match unowned {

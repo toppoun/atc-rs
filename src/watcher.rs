@@ -1,12 +1,178 @@
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
+const MAX_WORKSPACE_PATHS_PER_BATCH: usize = 4096;
+
+/// Shared backend for the Workspace path registrations. Callback storage contains one
+/// entry per interested path. The backend never waits on an application channel.
+pub(crate) struct WorkspaceFileWatcher {
+    watcher: RecommendedWatcher,
+    inbox: Arc<Mutex<WorkspaceInbox>>,
+}
+
+#[derive(Default)]
+pub(crate) struct WatchInterests {
+    /// Backend spelling -> registration generation. Management paths have no generation.
+    pub(crate) paths: HashMap<PathBuf, Option<u64>>,
+    pub(crate) parents: std::collections::HashSet<PathBuf>,
+    pub(crate) contests: std::collections::HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct WorkspaceInbox {
+    interests: WatchInterests,
+    deadline: Option<Instant>,
+    paths: HashMap<PathBuf, (u64, u64)>,
+    sequence: u64,
+    reconcile: bool,
+    rescan: bool,
+    error: Option<String>,
+    peak_paths: usize,
+}
+
+pub(crate) struct WorkspaceBatch {
+    pub(crate) paths: Vec<(PathBuf, u64)>,
+    pub(crate) reconcile: bool,
+    pub(crate) rescan: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) peak_paths: usize,
+}
+
+impl WorkspaceInbox {
+    fn record(&mut self, result: notify::Result<Event>, now: Instant) {
+        match result {
+            Ok(event) => {
+                if event.need_rescan() {
+                    self.rescan = true;
+                    self.deadline.get_or_insert(now + DEBOUNCE_DURATION);
+                }
+                if !is_path_change(event.kind) {
+                    return;
+                }
+                for path in event.paths {
+                    let interest = self.interests.paths.get(&path).copied().or_else(|| {
+                        let name = path.file_name()?.to_str()?;
+                        let parent = path.parent()?;
+                        ((is_topology_event(event.kind)
+                            && self.interests.parents.contains(parent)
+                            && crate::workspace::is_safe_atcoder_id(name))
+                            || (self.interests.contests.contains(parent)
+                                && crate::workspace::is_contest_staging_name(name)))
+                        .then_some(None)
+                    });
+                    let Some(interest) = interest else {
+                        continue;
+                    };
+                    self.deadline.get_or_insert(now + DEBOUNCE_DURATION);
+                    if let Some(generation) = interest {
+                        if self.paths.len() == MAX_WORKSPACE_PATHS_PER_BATCH
+                            && !self.paths.contains_key(&path)
+                        {
+                            self.rescan = true;
+                            continue;
+                        }
+                        self.sequence += 1;
+                        self.paths.insert(path, (generation, self.sequence));
+                        self.peak_paths = self.peak_paths.max(self.paths.len());
+                    } else {
+                        self.reconcile = true;
+                    }
+                }
+            }
+            Err(error) => {
+                self.rescan = true;
+                self.error.get_or_insert_with(|| error.to_string());
+                self.deadline.get_or_insert(now + DEBOUNCE_DURATION);
+            }
+        }
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Option<WorkspaceBatch> {
+        if self.deadline? > now {
+            return None;
+        }
+        self.deadline = None;
+        let mut ordered: Vec<_> = self.paths.drain().collect();
+        ordered.sort_unstable_by_key(|(_, (_, sequence))| *sequence);
+        Some(WorkspaceBatch {
+            paths: ordered
+                .into_iter()
+                .map(|(path, (generation, _))| (path, generation))
+                .collect(),
+            reconcile: std::mem::take(&mut self.reconcile),
+            rescan: std::mem::take(&mut self.rescan),
+            error: self.error.take(),
+            peak_paths: self.peak_paths,
+        })
+    }
+}
+
+impl WorkspaceFileWatcher {
+    pub(crate) fn new() -> io::Result<Self> {
+        let inbox = Arc::new(Mutex::new(WorkspaceInbox::default()));
+        let callback = inbox.clone();
+        let watcher = notify::recommended_watcher(move |result| {
+            callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(result, Instant::now());
+        })
+        .map_err(io::Error::other)?;
+        Ok(Self { watcher, inbox })
+    }
+
+    pub(crate) fn set_interests(&self, interests: WatchInterests) {
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .interests = interests;
+    }
+
+    pub(crate) fn register(&mut self, directory: &Path) -> io::Result<()> {
+        self.watcher
+            .watch(directory, RecursiveMode::NonRecursive)
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn unregister(&mut self, directory: &Path) -> io::Result<()> {
+        match self.watcher.unwatch(directory) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => Ok(()),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
+    pub(crate) fn take_ready(&self) -> Option<WorkspaceBatch> {
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_ready(Instant::now())
+    }
+}
+
+fn is_path_change(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
+}
+
+fn is_topology_event(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
 
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
@@ -55,12 +221,12 @@ impl FileWatcher {
 }
 
 #[cfg(target_os = "macos")]
-fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
+pub(crate) fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
     directory.canonicalize()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
+pub(crate) fn watch_directory(directory: &Path) -> io::Result<PathBuf> {
     Ok(directory.to_path_buf())
 }
 
@@ -232,10 +398,7 @@ fn collect_result_ordered(
 ) -> io::Result<()> {
     let event = result.map_err(io::Error::other)?;
 
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) {
+    if !is_path_change(event.kind) {
         return Ok(());
     }
 
@@ -278,6 +441,68 @@ mod tests {
 
     fn identity_mapper() -> EventPathMapper {
         EventPathMapper::new(PathBuf::new(), PathBuf::new())
+    }
+
+    #[test]
+    fn workspace_batches_keep_last_occurrence_order_and_bound_memory_on_overflow() {
+        use notify::event::Flag;
+        let start = Instant::now();
+        let mut inbox = WorkspaceInbox::default();
+        let files: Vec<_> = (0..=MAX_WORKSPACE_PATHS_PER_BATCH)
+            .map(|index| PathBuf::from(format!("workspace/abc{index}/A.py")))
+            .collect();
+        for path in &files {
+            inbox.interests.paths.insert(path.clone(), Some(7));
+        }
+        for path in &files {
+            inbox.record(event(EventKind::Modify(ModifyKind::Any), path), start);
+        }
+        inbox.record(
+            event(EventKind::Modify(ModifyKind::Any), &files[0]),
+            start + Duration::from_millis(149),
+        );
+        inbox.record(
+            Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            start,
+        );
+        assert!(
+            inbox
+                .take_ready(start + Duration::from_millis(149))
+                .is_none()
+        );
+        let batch = inbox.take_ready(start + DEBOUNCE_DURATION).unwrap();
+        assert_eq!(batch.paths.len(), MAX_WORKSPACE_PATHS_PER_BATCH);
+        assert_eq!(batch.peak_paths, MAX_WORKSPACE_PATHS_PER_BATCH);
+        assert_eq!(batch.paths.first(), Some(&(files[1].clone(), 7)));
+        assert_eq!(batch.paths.last(), Some(&(files[0].clone(), 7)));
+        assert!(batch.rescan);
+    }
+
+    #[test]
+    fn workspace_backend_keeps_healthy_registration_when_another_registration_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = watch_directory(directory.path()).unwrap();
+        let file = root.join("A.py");
+        let mut watcher = WorkspaceFileWatcher::new().unwrap();
+        let mut interests = WatchInterests::default();
+        interests.paths.insert(file.clone(), Some(1));
+        watcher.set_interests(interests);
+        watcher.register(&root).unwrap();
+        assert!(watcher.register(&root.join("missing")).is_err());
+        std::fs::write(&file, "pass\n").unwrap();
+        let timeout = Instant::now() + Duration::from_secs(4);
+        let batch = loop {
+            if let Some(batch) = watcher.take_ready() {
+                break batch;
+            }
+            assert!(
+                Instant::now() < timeout,
+                "healthy directory lost its watcher"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(batch.paths, [(file, 1)]);
+        watcher.unregister(&root).unwrap();
     }
 
     #[test]

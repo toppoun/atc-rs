@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ struct RegisteredRun {
 type RunContexts = HashMap<RunScope, RegisteredRun>;
 
 struct ScopeRetirement {
-    scope: RunScope,
+    scopes: HashSet<RunScope>,
     joined: Sender<()>,
 }
 
@@ -221,6 +221,13 @@ impl RunWorker {
         &self,
         context: RunContext,
     ) -> io::Result<(RunGeneration, RunResults)> {
+        self.register_shared(Arc::new(context))
+    }
+
+    pub(super) fn register_shared(
+        &self,
+        context: Arc<RunContext>,
+    ) -> io::Result<(RunGeneration, RunResults)> {
         self.register_with(context, |scope| self.results.register(scope))
     }
 
@@ -230,13 +237,13 @@ impl RunWorker {
         context: RunContext,
         results: RunResults,
     ) -> io::Result<RunGeneration> {
-        self.register_with(context, |_| results)
+        self.register_with(Arc::new(context), |_| results)
             .map(|(generation, _)| generation)
     }
 
     fn register_with(
         &self,
-        context: RunContext,
+        context: Arc<RunContext>,
         make_results: impl FnOnce(&RunScope) -> RunResults,
     ) -> io::Result<(RunGeneration, RunResults)> {
         self.control
@@ -256,7 +263,7 @@ impl RunWorker {
                 contexts.insert(
                     scope.clone(),
                     RegisteredRun {
-                        context: Arc::new(context),
+                        context,
                         results: results.clone(),
                     },
                 );
@@ -266,15 +273,24 @@ impl RunWorker {
     }
 
     pub(super) fn invalidate_and_join(&self, scope: &RunScope) -> io::Result<()> {
+        self.invalidate_scopes_and_join(std::iter::once(scope.clone()).collect())
+    }
+
+    pub(super) fn invalidate_scopes_and_join(&self, scopes: HashSet<RunScope>) -> io::Result<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
         let (done, joined) = mpsc::channel();
         self.control
             .while_running(|contexts| {
-                if let Some(entry) = contexts.remove(scope) {
-                    entry.results.invalidate();
+                for scope in &scopes {
+                    if let Some(entry) = contexts.remove(scope) {
+                        entry.results.invalidate();
+                    }
                 }
                 self.retire_tx
                     .send(ScopeRetirement {
-                        scope: scope.clone(),
+                        scopes,
                         joined: done,
                     })
                     .map_err(|_| stopped_worker())
@@ -285,6 +301,10 @@ impl RunWorker {
 
     pub fn request_stop(&self) {
         self.control.begin_shutdown();
+    }
+
+    pub(super) fn is_stopping(&self) -> bool {
+        self.control.is_stopping()
     }
 
     fn join(&mut self) -> io::Result<()> {
@@ -371,11 +391,11 @@ fn scheduler_loop_inner(
         for retirement in retire_rx.try_iter() {
             if scheduler
                 .active_request()
-                .is_some_and(|request| request.target.scope == retirement.scope)
+                .is_some_and(|request| retirement.scopes.contains(&request.target.scope))
             {
                 cleanup_active(scheduler, active.take())?;
             }
-            scheduler.discard_scope(&retirement.scope);
+            scheduler.discard_scopes(&retirement.scopes);
             let _ = retirement.joined.send(());
         }
 
@@ -550,6 +570,21 @@ fn process_command(
             target,
             before_source_revision,
         } => {
+            if entry.context.is_workspace_watch() {
+                let running = scheduler.active_request();
+                let stress = [scheduler.foreground_request(), running.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|request| {
+                        request.target == target && matches!(request.kind, RunKind::Stress { .. })
+                    })
+                    .map(|request| request.run_id);
+                if let Some(run_id) = stress
+                    && process_stress_cancellation(scheduler, active, &target, run_id)?
+                {
+                    entry.results.cancel(&target, run_id);
+                }
+            }
             let waiting = scheduler
                 .foreground_request()
                 .filter(|request| {

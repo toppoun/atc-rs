@@ -20,6 +20,7 @@ mod watch;
 mod watch_source;
 mod watch_tui;
 mod watch_worker;
+mod workspace_watch;
 
 #[cfg(test)]
 pub(crate) use user_input_run::execute_user_input_for_test;

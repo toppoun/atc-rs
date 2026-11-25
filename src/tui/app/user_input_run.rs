@@ -226,6 +226,9 @@ impl WatchApp {
         target: UserInputRunTarget,
         input: &str,
     ) -> bool {
+        if self.watch_generation_invalid {
+            return false;
+        }
         let state = &self.problems[problem];
         let language = state.source.as_ref().map(|source| source.language);
         let snapshot = Arc::new(UserInputRunSnapshot {

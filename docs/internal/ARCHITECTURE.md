@@ -104,6 +104,14 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - 画面は `RunView` で同じ世代を購読する。購読の登録と初回更新対象の決定を同じロックで行い、通知が来たら変更された task の最新状態を取得する。`WatchApp` は表示位置への対応付けと、選択・スクロール・折りたたみ・編集中の内容を管理する。画面終了で購読が外れても正本への更新は続く。現行の手動切り替え、Workspace Home への復帰、Refresh では旧世代を明示的に失効させる。
 - 状態は実行要求を受理した task にだけ作る。Workspace 全体で完了済み 64 task・推計 64 MiB を上限とし、古い完了から取り除く。単体で上限を超えた結果はまず詳細テキストを外し、収まらなければ破棄する。実行中と待機中はこの上限から除外する。User Input は task ごとに最新 8 入力まで保持し、表示へ渡す出力文字列は共有する。
 
+#### Workspace 監視の内部経路
+
+- デバッグビルドで内部フラグ `ATC_INTERNAL_CROSS_CONTEST_WATCH=1` を指定すると、`WorkspaceRuns` が最初の Contest 表示時に `WorkspaceWatcher` を開始する。既存の単一 Contest Watcher をこの経路では生成しない。表示を開き直しても同じ Watcher を使用し、Workspace Home 復帰・Workspace 終了で停止する。Standalone と Plain Watch は従来の経路を使う。
+- `BatchWorkspace::scan_watch` が優先する配置ルールと管理対象の所有権を照合する。Workspace 用の診断でマニフェストとサンプル構造・UTF-8 を確認し、サンプル本文を常駐させずに `RunContext` を登録する。索引は正規ソースのパスを task ID・言語・登録世代へ対応付ける。既存の `RunContext` と `RunResultStore` を切替後も共有する。
+- `WorkspaceFileWatcher` は単一の notify Watcher に Workspace の配置先と Contest 直下を非再帰登録する。150 ms の固定窓で対象パスを最後の通知順に集約し、4,096 パスまで保持する。エラー・Rescan・上限超過・登録差分では照合後に正規ソースの指紋を確認し、検出済みの順序を処理したあと、欠落分をパス順で回収する。`.atc` 内には監視ハンドルを置かず、マニフェストの属性を 1 秒ごとに、全体を 15 秒ごとに再照合する。
+- 保存通知は登録世代と現行の所有権を照合して `RunWorker` へ送る。ワーカーは実行直前にメタデータと正規ソースを再検証する。受付順と対象は物理 attempt から独立した `SaveReceipt` に記録し、表示中の選択は変更しない。保存先の言語を使い、C++ の Debug は当該 Contest の購読中の値を使う。非表示の Debug は無効。
+- Refresh は対象を一時停止し、旧世代の取消・join を終えてから適用する。再開時に新しい世代を登録する。外部操作による所有経路・メタデータの失効も同じ選択的な取消経路を使う。部分的な登録エラーはほかの登録を保ちながら状態行に表示する。
+
 ### AtCoder への提出と結果追跡
 
 - CLI の `atc submit` は `resolve_submit_plan` で問題・ソース・ランタイムを決める。TUI は選択中のソースから計画を作り、`SubmissionHub::start` で提出時点のソースを `prepare_submit` で読み取って、提出専用ワーカーを起動する。両経路は `execute_prepared_with_client` に合流する。

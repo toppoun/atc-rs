@@ -65,30 +65,38 @@ impl RunScheduler {
 
     /// The worker has already joined and retired any active attempt in this scope.
     pub(super) fn discard_scope(&mut self, scope: &RunScope) -> Vec<RunRequest> {
+        self.discard_matching(|target| &target.scope == scope)
+    }
+
+    pub(super) fn discard_scopes(&mut self, scopes: &HashSet<RunScope>) {
+        self.discard_matching(|target| scopes.contains(&target.scope));
+    }
+
+    fn discard_matching(&mut self, matches: impl Fn(&RunTarget) -> bool) -> Vec<RunRequest> {
         debug_assert!(
             self.active
                 .as_ref()
-                .is_none_or(|active| active.request.target.scope != *scope)
+                .is_none_or(|active| !matches(&active.request.target))
         );
         let mut discarded = Vec::new();
         if self
             .foreground
             .as_ref()
-            .is_some_and(|request| request.target.scope == *scope)
+            .is_some_and(|request| matches(&request.target))
         {
             discarded.extend(self.foreground.take());
         }
         self.pending.retain(|request| {
-            if request.target.scope == *scope {
+            if matches(&request.target) {
                 discarded.push(request.clone());
                 false
             } else {
                 true
             }
         });
-        self.latest_seen.retain(|target, _| target.scope != *scope);
+        self.latest_seen.retain(|target, _| !matches(target));
         self.retired_user_input_revisions
-            .retain(|target, _| target.scope != *scope);
+            .retain(|target, _| !matches(target));
         debug_assert!(self.invariants_hold());
         discarded
     }

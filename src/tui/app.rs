@@ -687,6 +687,8 @@ pub struct WatchApp {
 
     run_generation: RunGeneration,
     run_view: Option<super::run_results::RunView>,
+    pub(super) workspace_watch_warning: Option<String>,
+    watch_generation_invalid: bool,
     problems: Vec<ProblemState>,
 
     selected_problem: usize,
@@ -948,6 +950,7 @@ impl WatchApp {
                 "execution view belongs to a different contest generation",
             ));
         }
+        view.set_debug(self.debug);
         self.run_view = Some(view);
         self.apply_execution_updates();
         Ok(())
@@ -1202,6 +1205,8 @@ impl WatchApp {
             shortcut_help_visible: false,
             run_generation,
             run_view: None,
+            workspace_watch_warning: None,
+            watch_generation_invalid: false,
             problems,
             selected_problem: 0,
             case_selection,
@@ -2051,6 +2056,9 @@ impl WatchApp {
 
     pub fn toggle_debug(&mut self) {
         self.debug = !self.debug;
+        if let Some(view) = &self.run_view {
+            view.set_debug(self.debug);
+        }
     }
 
     pub fn current_source_language(&self) -> Option<Language> {
@@ -2249,21 +2257,74 @@ impl WatchApp {
         {
             return None;
         }
-        let before_source_revision = state.user_input_start_gate.advance(true);
+        let before_source_revision = state.user_input_start_gate.remove_source(language)?;
+        let target = self.run_target(problem);
+        self.clear_removed_source(problem, &target, before_source_revision);
+        Some((target, before_source_revision))
+    }
+
+    fn clear_removed_source(&mut self, problem: usize, target: &RunTarget, revision: u64) {
+        let state = &mut self.problems[problem];
         state.source = None;
-        state.source_revision = before_source_revision;
+        state.source_revision = revision;
         state.user_input_delete_armed = None;
         if let Some(ready) = state.user_inputs.ready_mut() {
             ready.runs.clear();
         }
-        let target = self.run_generation.scope().target(&state.task_id);
         self.pending_user_input_runs
-            .retain(|request| request.target != target);
+            .retain(|request| &request.target != target);
         state.cleared_execution_id = state.latest_execution_id;
         state.execution.reset_source();
         // Removal invalidates results, but is not a navigation action or an editor action.
         self.invalidate_detail();
-        Some((target, before_source_revision))
+    }
+
+    pub(super) fn workspace_source(
+        &mut self,
+        target: RunTarget,
+        revision: u64,
+        source: Option<(PathBuf, Language)>,
+    ) -> bool {
+        if self.watch_generation_invalid {
+            return false;
+        }
+        let Some(problem) = self.problem_for_run_target(&target) else {
+            return false;
+        };
+        let state = &mut self.problems[problem];
+        if revision != state.user_input_start_gate.current() || revision <= state.source_revision {
+            return false;
+        }
+        if let Some((path, language)) = source {
+            state.source = Some(SourceState { path, language });
+            state.source_revision = revision;
+            state.user_input_delete_armed = None;
+            if let Some(ready) = state.user_inputs.ready_mut() {
+                ready.runs.clear();
+            }
+            self.invalidate_detail();
+        } else {
+            self.clear_removed_source(problem, &target, revision);
+        }
+        true
+    }
+
+    pub(super) fn workspace_watch_invalidated(&mut self) {
+        self.watch_generation_invalid = true;
+        self.run_view = None;
+        self.pending_user_input_runs.clear();
+        for problem in &mut self.problems {
+            problem.execution.reset_source();
+            problem.execution.stress = StressState::default();
+            if let Some(ready) = problem.user_inputs.ready_mut() {
+                ready.runs.clear();
+            }
+        }
+        self.workspace_watch_warning = Some(
+            "Workspace watch generation changed. Reopen the contest to display current results."
+                .into(),
+        );
+        self.invalidate_detail();
     }
 
     pub fn select_source(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
@@ -2291,8 +2352,9 @@ impl WatchApp {
         // Notifications invalidate results even if edits were coalesced by the watcher.
         // Merely opening the already-selected source does not constitute a source change.
         if changed || !same_source {
-            self.problems[problem].source_revision =
-                self.problems[problem].user_input_start_gate.advance(false);
+            self.problems[problem].source_revision = self.problems[problem]
+                .user_input_start_gate
+                .select_source(language);
             if let Some(ready) = self.problems[problem].user_inputs.ready_mut() {
                 ready.runs.clear();
             }
@@ -2381,6 +2443,9 @@ impl WatchApp {
     }
 
     pub fn queue_run(&mut self, problem: usize) -> Option<RunRequest> {
+        if self.watch_generation_invalid {
+            return None;
+        }
         self.disarm_user_input_delete();
         let language = self.problems.get(problem)?.source.as_ref()?.language;
         self.retire_user_input_runs();
@@ -2417,6 +2482,9 @@ impl WatchApp {
     }
 
     pub fn queue_stress(&mut self, problem: usize, base_seed: u64) -> Option<RunRequest> {
+        if self.watch_generation_invalid {
+            return None;
+        }
         self.disarm_user_input_delete();
         let language = self.problems.get(problem)?.source.as_ref()?.language;
         self.retire_user_input_runs();

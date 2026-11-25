@@ -266,10 +266,16 @@ pub(crate) fn read_tree_fingerprint_in(
     directory: &Dir,
     root: &Path,
 ) -> io::Result<TreeFingerprint> {
-    read_tree_in(directory, root, |directory, name, path| {
-        fingerprint_regular_file_at(directory, name, path, |file, limit| {
-            hash_reader(file.take(limit))
-        })
+    read_tree_in(directory, root, read_regular_file_fingerprint_at)
+}
+
+pub(crate) fn read_regular_file_fingerprint_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<FileFingerprint> {
+    fingerprint_regular_file_at(directory, name, path, |file, limit| {
+        hash_reader(file.take(limit))
     })
 }
 

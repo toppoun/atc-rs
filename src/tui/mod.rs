@@ -3093,6 +3093,21 @@ fn handle_messages_with_destination(
     for _ in 0..MAX_MESSAGES_PER_TICK {
         match message_rx.try_recv() {
             Ok(Message::ExecutionChanged) => changed |= app.apply_execution_updates(),
+            Ok(Message::WorkspaceSource {
+                target,
+                revision,
+                source,
+            }) => {
+                changed |= app.workspace_source(target, revision, source);
+            }
+            Ok(Message::WorkspaceWatchWarning(warning)) => {
+                changed |= app.workspace_watch_warning != warning;
+                app.workspace_watch_warning = warning;
+            }
+            Ok(Message::WorkspaceWatchInvalidated) => {
+                app.workspace_watch_invalidated();
+                changed = true;
+            }
             Ok(Message::RunCancelled { .. }) => {}
             Ok(Message::UserInputRunEvent {
                 target,

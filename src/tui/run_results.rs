@@ -28,12 +28,14 @@ struct Store {
 struct ScopeResults {
     tasks: HashMap<Arc<str>, TaskResult>,
     view: Option<Subscriber>,
+    watch_warning: Option<String>,
 }
 
 struct Subscriber {
     token: Arc<()>,
     sender: Sender<Message>,
     dirty: HashMap<Arc<str>, RunId>,
+    debug: bool,
 }
 
 #[derive(Clone)]
@@ -124,10 +126,16 @@ impl RunResults {
                         .send(Message::ExecutionChanged)
                         .map_err(io::Error::other)?;
                 }
+                if let Some(warning) = &entry.watch_warning {
+                    sender
+                        .send(Message::WorkspaceWatchWarning(Some(warning.clone())))
+                        .map_err(io::Error::other)?;
+                }
                 entry.view = Some(Subscriber {
                     token: token.clone(),
                     sender,
                     dirty,
+                    debug: false,
                 });
                 Ok(RunView {
                     store: store.clone(),
@@ -208,6 +216,18 @@ impl RunResults {
         });
     }
 
+    pub(crate) fn debug_enabled(&self) -> bool {
+        let mut debug = false;
+        self.with_store(|store, scope| {
+            debug = store
+                .scopes
+                .get(scope)
+                .and_then(|results| results.view.as_ref())
+                .is_some_and(|view| view.debug);
+        });
+        debug
+    }
+
     pub(crate) fn source_removed(&self, target: &RunTarget) {
         self.with_store(|state, scope| {
             if scope == &target.scope
@@ -286,6 +306,22 @@ impl Default for RunResults {
 impl RunView {
     pub(super) fn scope(&self) -> &RunScope {
         &self.scope
+    }
+
+    pub(super) fn set_debug(&self, debug: bool) {
+        let mut store = self
+            .store
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(view) = store
+            .scopes
+            .get_mut(&self.scope)
+            .and_then(|entry| entry.view.as_mut())
+            && Arc::ptr_eq(&self.token, &view.token)
+        {
+            view.debug = debug;
+        }
     }
 
     pub(super) fn take_updates(&self) -> Vec<ExecutionUpdate> {
@@ -405,6 +441,21 @@ impl Store {
             return;
         };
         let (target, run_id) = match &message {
+            Message::WorkspaceSource { target, .. } if &target.scope == scope => {
+                if let Some(view) = &entry.view {
+                    let _ = view.sender.send(message);
+                }
+                return;
+            }
+            Message::WorkspaceWatchWarning(warning) => {
+                if entry.watch_warning != *warning {
+                    entry.watch_warning = warning.clone();
+                    if let Some(view) = &entry.view {
+                        let _ = view.sender.send(message);
+                    }
+                }
+                return;
+            }
             Message::RunStarted { target, run_id }
             | Message::RunRequeued { target, run_id }
             | Message::RunCancelled { target, run_id }
@@ -414,7 +465,7 @@ impl Store {
             | Message::RunEvent { target, run_id, .. }
             | Message::StressEvent { target, run_id, .. }
             | Message::UserInputRunEvent { target, run_id, .. } => (target.clone(), *run_id),
-            Message::WorkerFailed(_) => {
+            Message::WorkerFailed(_) | Message::WorkspaceWatchInvalidated => {
                 if let Some(view) = &entry.view {
                     let _ = view.sender.send(message);
                 }

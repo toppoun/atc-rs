@@ -1018,6 +1018,11 @@ fn render_footer(
             workspace_available,
             content_width,
         ))
+    } else if let Some(warning) = &app.workspace_watch_warning {
+        Line::styled(
+            fit_command_palette_row(warning, content_width),
+            Style::default().fg(Color::Yellow),
+        )
     } else {
         submission_receipt_line(
             app.contest_id(),

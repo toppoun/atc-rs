@@ -1,8 +1,6 @@
 use crate::app_context::AppContext;
 use crate::auth::{AuthSnapshot, SessionAuth};
-use crate::config::Config;
-#[cfg(test)]
-use crate::config::RunnerConfig;
+use crate::config::{Config, RunnerConfig};
 use crate::error::AppError;
 use crate::model::Contest;
 use crate::workspace;
@@ -11,7 +9,7 @@ use crate::workspace_registry::{
     DirectoryIdentity, EntryRef, RegistryEntry, RegistryMutation, RegistryMutationResult,
     VerifiedWorkspace,
 };
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,6 +25,7 @@ use super::attempt_executor::RunContext;
 use super::contest::{ContestTargetHealth, inspect_contest_target};
 use super::refresh::PreparedRefresh;
 use super::watch_worker::RunWorker;
+use super::workspace_watch::WorkspaceWatcher;
 use crate::tui::app::{PersistedUserInputState, UserInputState};
 use crate::tui::detail_analysis::DetailAnalysisWorker;
 use crate::tui::message::{Message, RunGeneration, RunResults};
@@ -479,7 +478,7 @@ pub(super) fn watch_tui_at(
     config: Config,
     auth: Arc<SessionAuth>,
 ) -> Result<(), AppError> {
-    let runs = WorkspaceRuns::default();
+    let runs = WorkspaceRuns::with_internal_watch();
     let session = start_direct_contest_session_with_hooks(
         destination,
         expected_contest_id,
@@ -544,12 +543,23 @@ struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
 
 #[derive(Default)]
 struct WorkspaceRuns {
-    worker: OnceCell<RunWorker>,
+    worker: OnceCell<Arc<RunWorker>>,
     closed: Cell<bool>,
+    cross_contest: bool,
+    workspace_watcher: RefCell<Option<WorkspaceWatcher>>,
 }
 
 impl WorkspaceRuns {
-    fn worker(&self) -> io::Result<&RunWorker> {
+    fn with_internal_watch() -> Self {
+        Self {
+            cross_contest: cfg!(debug_assertions)
+                && std::env::var_os("ATC_INTERNAL_CROSS_CONTEST_WATCH").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
+            ..Self::default()
+        }
+    }
+
+    fn worker(&self) -> io::Result<&Arc<RunWorker>> {
         if self.closed.get() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -557,7 +567,11 @@ impl WorkspaceRuns {
             ));
         }
         if self.worker.get().is_none() {
-            assert!(self.worker.set(RunWorker::start_workspace()?).is_ok());
+            assert!(
+                self.worker
+                    .set(Arc::new(RunWorker::start_workspace()?))
+                    .is_ok()
+            );
         }
         Ok(self
             .worker
@@ -565,22 +579,73 @@ impl WorkspaceRuns {
             .expect("workspace run worker was initialized"))
     }
 
+    fn open_workspace_registration(
+        &self,
+        root: &Path,
+        destination: &Path,
+        contest: &Contest,
+        config: &RunnerConfig,
+    ) -> io::Result<(RunGeneration, RunResults)> {
+        let mut watcher = self.workspace_watcher.borrow_mut();
+        if watcher.is_none() {
+            *watcher = Some(WorkspaceWatcher::start(
+                root,
+                config.clone(),
+                self.worker()?.clone(),
+            )?);
+        }
+        watcher
+            .as_ref()
+            .unwrap()
+            .attach_registration(destination, contest)
+    }
+
     fn request_stop(&self) {
         self.closed.set(true);
+        if let Some(watcher) = self.workspace_watcher.borrow().as_ref() {
+            watcher.request_stop();
+        }
         if let Some(worker) = self.worker.get() {
             worker.request_stop();
         }
     }
 
+    fn stop_workspace_watch(&self) -> io::Result<()> {
+        self.workspace_watcher
+            .borrow_mut()
+            .take()
+            .map_or(Ok(()), WorkspaceWatcher::stop)
+    }
+
     fn shutdown(&mut self) -> io::Result<()> {
         self.request_stop();
-        self.worker.take().map_or(Ok(()), RunWorker::stop_and_join)
+        let watching = self.stop_workspace_watch();
+        let execution = self.worker.take().map_or(Ok(()), |worker| {
+            Arc::into_inner(worker)
+                .ok_or_else(|| io::Error::other("Workspace watcher still owns the run worker"))?
+                .stop_and_join()
+        });
+        combine_primary_and_cleanup_results(execution, [("Workspace watcher shutdown", watching)])
+    }
+
+    fn return_home(&self, session: ContestSession) -> io::Result<()> {
+        if let Some(watcher) = self.workspace_watcher.borrow().as_ref() {
+            watcher.request_stop();
+        }
+        let view = self.retire_contest(session);
+        combine_primary_and_cleanup_results(
+            view,
+            [("Workspace watcher shutdown", self.stop_workspace_watch())],
+        )
     }
 
     // Current manual navigation retires the old scope. Dropping a view alone only
     // detaches its result route and leaves registered work available to the worker.
     fn retire_contest(&self, session: ContestSession) -> io::Result<()> {
         session.request_stop();
+        if session.workspace_watched {
+            return session.shutdown();
+        }
         let retirement = self
             .worker
             .get()
@@ -638,7 +703,7 @@ fn open_workspace_runtime_with<S>(
             },
             submissions: create_submissions(),
             location: RootLocation::WorkspaceHome,
-            runs: WorkspaceRuns::default(),
+            runs: WorkspaceRuns::with_internal_watch(),
         },
         checked.identity,
     ))
@@ -1405,7 +1470,7 @@ where
                 location,
                 &mut refresh_frontend_state,
                 &mut root_lifetime,
-                |session| runs.retire_contest(session),
+                |session| runs.return_home(session),
             ) {
                 Ok(root_exit) => root_exit,
                 Err(error) => break Err(error),
@@ -1526,6 +1591,7 @@ fn rebuild_active_contest_session_after_refresh(
             "prepared refresh target does not match the active contest session",
         ));
     }
+    let workspace_watched = old_session.workspace_watched;
     let environment = old_session.environment.clone();
 
     rebuild_contest_session_after_refresh(
@@ -1535,12 +1601,24 @@ fn rebuild_active_contest_session_after_refresh(
         &refresh_contest_id,
         resume,
         RefreshRebuildHooks {
-            shutdown: |session| runs.retire_contest(session),
+            shutdown: |session| {
+                if workspace_watched && let Some(watcher) = runs.workspace_watcher.borrow().as_ref()
+                {
+                    watcher.pause(&refresh_contest_id)?;
+                }
+                runs.retire_contest(session)
+            },
             apply: |prepared| {
                 let mut reporter = RefreshApplyReporter;
                 super::refresh::apply_refresh(prepared, &mut reporter)
             },
-            load: |destination, contest_id| PreparedWatchInput::load(destination, Some(contest_id)),
+            load: |destination, contest_id| {
+                if workspace_watched && let Some(watcher) = runs.workspace_watcher.borrow().as_ref()
+                {
+                    watcher.resume(contest_id)?;
+                }
+                PreparedWatchInput::load(destination, Some(contest_id))
+            },
             start: |input| {
                 ContestSession::start_entry(
                     PreparedContestEntry { input, environment },
@@ -2123,6 +2201,7 @@ fn repair_and_prepare_contest_switch_with_final_hook(
 struct ContestSession {
     // The workspace owns the run worker. Only view-owned workers are joined here.
     watcher_thread: Option<WatcherThread>,
+    workspace_watched: bool,
     detail_analysis_worker: Option<DetailAnalysisWorker>,
     run_generation: RunGeneration,
     results: RunResults,
@@ -2176,52 +2255,90 @@ impl ContestSession {
         mut after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
         let PreparedContestEntry { input, environment } = entry;
-        let context = RunContext::new(
-            input.destination.clone(),
-            &input.contest,
-            environment.config.runner.clone(),
-            app_context.workspace_root(),
-        )?;
+        let workspace_root = app_context.workspace_root().filter(|_| runs.cross_contest);
+        let local_context = workspace_root
+            .is_none()
+            .then(|| {
+                RunContext::new(
+                    input.destination.clone(),
+                    &input.contest,
+                    environment.config.runner.clone(),
+                    app_context.workspace_root(),
+                )
+            })
+            .transpose()?;
         let (message_tx, message_rx) = mpsc::channel();
-        let watcher_thread = start_watcher(&input.destination, &input.contest, message_tx.clone())?;
+        let (watcher_thread, registration) = if let Some(root) = workspace_root {
+            (
+                None,
+                Some(runs.open_workspace_registration(
+                    root,
+                    &input.destination,
+                    &input.contest,
+                    &environment.config.runner,
+                )?),
+            )
+        } else {
+            (
+                Some(start_watcher(
+                    &input.destination,
+                    &input.contest,
+                    message_tx.clone(),
+                )?),
+                None,
+            )
+        };
+        let stop_watcher =
+            |watcher: Option<WatcherThread>| watcher.map_or(Ok(()), WatcherThread::stop);
         if let Err(error) = after_stage(SessionStartStage::WatcherStarted) {
             drop(message_rx);
             drop(message_tx);
             return Err(combine_primary_and_cleanup_results(
                 Err(error),
-                [("filesystem watcher shutdown", watcher_thread.stop())],
+                [("filesystem watcher shutdown", stop_watcher(watcher_thread))],
             )
-            .expect_err("injected startup failure must remain an error"));
+            .expect_err("watcher startup hook failed"));
         }
-        let registration = runs.worker().and_then(|worker| {
-            let (run_generation, results) = worker.register_retained(context)?;
-            Ok((worker, run_generation, results))
-        });
-        let (run_worker, run_generation, results) = match registration {
+        let run_worker = runs.worker();
+        let registration = run_worker
+            .as_ref()
+            .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+            .and_then(|worker| {
+                if let Some(registration) = registration {
+                    return Ok(registration);
+                }
+                worker.register_retained(local_context.expect("local watcher has a run context"))
+            });
+        let (run_generation, results) = match registration {
             Ok(registered) => registered,
             Err(error) => {
                 return Err(combine_primary_and_cleanup_results(
                     Err(error),
-                    [("filesystem watcher shutdown", watcher_thread.stop())],
+                    [("filesystem watcher shutdown", stop_watcher(watcher_thread))],
                 )
-                .expect_err("worker startup failure must remain an error"));
+                .expect_err("execution registration failed"));
             }
         };
+        let run_worker = run_worker.expect("registration requires a worker");
         let run_tx = run_worker.sender();
         let mut detail_analysis_worker = match after_stage(SessionStartStage::RunWorkerStarted)
             .and_then(|()| DetailAnalysisWorker::start())
         {
             Ok(worker) => worker,
             Err(error) => {
-                watcher_thread.request_stop();
+                if let Some(watcher) = &watcher_thread {
+                    watcher.request_stop();
+                }
+                let retirement = if workspace_root.is_none() {
+                    run_worker.invalidate_and_join(run_generation.scope())
+                } else {
+                    Ok(())
+                };
                 return Err(combine_primary_and_cleanup_results(
                     Err(error),
                     [
-                        (
-                            "run scope retirement",
-                            run_worker.invalidate_and_join(run_generation.scope()),
-                        ),
-                        ("filesystem watcher shutdown", watcher_thread.stop()),
+                        ("run scope retirement", retirement),
+                        ("filesystem watcher shutdown", stop_watcher(watcher_thread)),
                     ],
                 )
                 .expect_err("detail worker startup failure must remain an error"));
@@ -2230,7 +2347,8 @@ impl ContestSession {
         let detail_analysis_tx = detail_analysis_worker.request_sender();
         let detail_analysis_rx = detail_analysis_worker.take_result_receiver();
         Ok(Self {
-            watcher_thread: Some(watcher_thread),
+            watcher_thread,
+            workspace_watched: workspace_root.is_some(),
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results,
@@ -6339,6 +6457,59 @@ mod tests {
     }
 
     #[test]
+    fn internally_enabled_workspace_reuses_watcher_across_views_and_stops_at_home() {
+        let mut runs = WorkspaceRuns {
+            cross_contest: true,
+            ..WorkspaceRuns::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let app_context = AppContext::from_launch_root(root.path()).unwrap();
+        let open = |id| {
+            let destination = root.path().join(id);
+            let input = PreparedWatchInput::load(&destination, Some(id)).unwrap();
+            ContestSession::start_entry(
+                PreparedContestEntry {
+                    input,
+                    environment: ContestEnvironment::new(Config::default()),
+                },
+                &app_context,
+                &runs,
+            )
+            .unwrap()
+        };
+        save_healthy_contest(&root.path().join("abc483"), "abc483");
+        save_healthy_contest(&root.path().join("abc480"), "abc480");
+        let first = open("abc483");
+        let scope = first.run_generation.scope().clone();
+        let results = first.results.clone();
+        assert!(first.workspace_watched && first.watcher_thread.is_none());
+        runs.retire_contest(first).unwrap();
+        let second = open("abc480");
+        assert!(second.workspace_watched && second.watcher_thread.is_none());
+        let (generation, _) = runs
+            .workspace_watcher
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .attach_registration(
+                &root.path().join("abc483"),
+                &PreparedWatchInput::load(&root.path().join("abc483"), Some("abc483"))
+                    .unwrap()
+                    .contest,
+            )
+            .unwrap();
+        assert_eq!(generation.scope(), &scope);
+        runs.return_home(second).unwrap();
+        assert!(runs.workspace_watcher.borrow().is_none());
+        assert!(results.attach(mpsc::channel().0).is_err());
+        let reopened = open("abc483");
+        assert_ne!(reopened.run_generation.scope(), &scope);
+        runs.return_home(reopened).unwrap();
+        runs.shutdown().unwrap();
+    }
+
+    #[test]
     fn production_return_home_orchestration_shuts_down_once_without_root_lifetime_cleanup() {
         let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
@@ -6803,9 +6974,10 @@ mod tests {
         let old_probe_tx = message_tx.clone();
         drop(message_tx);
 
-        assert!(runs.worker.set(run_worker).is_ok());
+        assert!(runs.worker.set(Arc::new(run_worker)).is_ok());
         let session = ContestSession {
             watcher_thread: Some(watcher_thread),
+            workspace_watched: false,
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results: RunResults::from(old_probe_tx.clone()),
