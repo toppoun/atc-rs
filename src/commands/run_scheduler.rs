@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::tui::message::{RunId, RunKind, RunRequest, RunTarget};
+use crate::tui::message::{RunId, RunKind, RunRequest, RunScope, RunTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestArrival {
@@ -57,6 +57,36 @@ pub(super) struct RunScheduler {
 impl RunScheduler {
     pub(super) fn active_request(&self) -> Option<RunRequest> {
         self.active.as_ref().map(|active| active.request.clone())
+    }
+
+    /// The worker has already joined and retired any active attempt in this scope.
+    pub(super) fn discard_scope(&mut self, scope: &RunScope) -> Vec<RunRequest> {
+        debug_assert!(
+            self.active
+                .as_ref()
+                .is_none_or(|active| active.request.target.scope != *scope)
+        );
+        let mut discarded = Vec::new();
+        if self
+            .foreground
+            .as_ref()
+            .is_some_and(|request| request.target.scope == *scope)
+        {
+            discarded.extend(self.foreground.take());
+        }
+        self.pending.retain(|request| {
+            if request.target.scope == *scope {
+                discarded.push(request.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.latest_seen.retain(|target, _| target.scope != *scope);
+        self.retired_user_input_revisions
+            .retain(|target, _| target.scope != *scope);
+        debug_assert!(self.invariants_hold());
+        discarded
     }
 
     pub(super) fn request_arrived(&mut self, request: RunRequest) -> RequestArrival {
@@ -382,6 +412,37 @@ mod tests {
         assert_eq!(foreground_id(&scheduler), Some((0, 1)));
         assert!(scheduler.pending.is_empty());
         assert_invariants(&scheduler);
+    }
+
+    #[test]
+    fn discarding_scope_removes_its_foreground_pending_and_history_only() {
+        let mut scheduler = RunScheduler::default();
+        let old_pending = request(0, 1);
+        let old_foreground = request(1, 2);
+        let other_scope = RunScope::new("abc480");
+        let other = RunRequest {
+            target: other_scope.target(&old_pending.target.task_id),
+            ..old_pending.clone()
+        };
+        for request in [&old_pending, &other, &old_foreground] {
+            scheduler.request_arrived(request.clone());
+        }
+        scheduler.retire_user_input_runs(&old_pending.target, 7);
+        scheduler.retire_user_input_runs(&other.target, 5);
+
+        assert_eq!(
+            scheduler.discard_scope(&old_pending.target.scope),
+            [old_foreground, old_pending]
+        );
+        assert_eq!(
+            scheduler.latest_seen,
+            HashMap::from([(other.target.clone(), 1)])
+        );
+        assert_eq!(
+            scheduler.retired_user_input_revisions,
+            HashMap::from([(other.target.clone(), 5)])
+        );
+        assert_eq!(scheduler.start_next(), Some(other));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::mpsc::Sender;
 
 use crate::config::RunnerConfig;
@@ -9,7 +10,8 @@ use crate::language::Language;
 use crate::model::Problem;
 use crate::runner::{self, ExecutionOutcome, ExecutionResult};
 use crate::tui::message::{
-    Message, RunKind, RunRequest, UserInputRunEvent, UserInputRunResult, UserInputRunStatus,
+    Message, RunKind, RunRequest, RunResults, UserInputRunEvent, UserInputRunResult,
+    UserInputRunStatus,
 };
 
 use super::test::duration_from_seconds;
@@ -20,7 +22,7 @@ pub(super) fn run(
     problem: &Problem,
     request: &RunRequest,
     config: &RunnerConfig,
-    messages: &Sender<Message>,
+    messages: &RunResults,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), AppError> {
     let RunKind::UserInput(snapshot) = &request.kind else {
@@ -169,7 +171,7 @@ pub(crate) fn execute_user_input_for_test(
 
 #[cfg(test)]
 mod tests {
-    use super::super::attempt_executor::AttemptExecutor;
+    use super::super::attempt_executor::TestAttemptExecutor;
     use super::*;
     use crate::attempt::AttemptOutcome;
     use crate::tui::message::{RunScope, UserInputRunSnapshot, UserInputRunTarget};
@@ -212,8 +214,8 @@ mod tests {
         }
     }
 
-    fn executor(path: &Path, config: RunnerConfig, tx: Sender<Message>) -> AttemptExecutor {
-        AttemptExecutor::new(
+    fn executor(path: &Path, config: RunnerConfig, tx: Sender<Message>) -> TestAttemptExecutor {
+        TestAttemptExecutor::new(
             path.to_path_buf(),
             RunScope::fixture(),
             vec![Problem {

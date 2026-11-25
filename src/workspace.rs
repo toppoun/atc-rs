@@ -530,6 +530,38 @@ impl ExplicitContestRoute {
         }
         Ok(())
     }
+
+    pub(crate) fn require_workspace(self) -> io::Result<Self> {
+        if self.config.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Workspace Config is missing",
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn revalidate_workspace_owner(
+        &self,
+        root: &Path,
+        contest_id: &str,
+    ) -> io::Result<()> {
+        let current = Self::resolve(root, contest_id)?.require_workspace()?;
+        if current.destination != self.destination
+            || current.root_identity != self.root_identity
+            || current.parent_identity != self.parent_identity
+            || current.destination_identity != self.destination_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "Workspace ownership changed: {}",
+                    self.destination.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Keep routing, metadata, and subsequent file access relative to opened directories.
@@ -1840,6 +1872,19 @@ impl ContestTaskSnapshot {
         Ok(snapshot)
     }
 
+    pub(crate) fn capture_contest(destination: &Path, expected: &Contest) -> io::Result<Self> {
+        let directory = open_contest_destination_nofollow(destination)?;
+        let snapshot = Self::read(destination, &directory)?;
+        if snapshot.contest()? != *expected {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "contest metadata changed while preparing execution",
+            ));
+        }
+        snapshot.revalidate(destination)?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn revalidate(&self, destination: &Path) -> io::Result<()> {
         let directory = open_contest_destination_nofollow(destination)?;
         let current = Self::read(destination, &directory)?;
@@ -1852,11 +1897,15 @@ impl ContestTaskSnapshot {
         ))
     }
 
-    fn problem(&self, contest_id: &str, index: &str, task_id: &str) -> io::Result<Problem> {
-        let contest = parse_contest_metadata(
+    fn contest(&self) -> io::Result<Contest> {
+        parse_contest_metadata(
             std::str::from_utf8(&self.manifest.bytes)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        )?;
+        )
+    }
+
+    fn problem(&self, contest_id: &str, index: &str, task_id: &str) -> io::Result<Problem> {
+        let contest = self.contest()?;
         validate_contest_identity(&contest, contest_id)?;
         contest
             .problems

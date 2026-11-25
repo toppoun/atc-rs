@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,20 +14,19 @@ use crate::stress::CandidateFailureKind;
 
 pub type RunId = u64;
 
-// A fresh token for each ContestSession, including a rebuild after Refresh.
-// In-flight requests hold a clone, so a live generation cannot be reused.
+// In-flight requests retain the token, so a live generation cannot be reused.
 #[derive(Debug, Clone)]
-struct SessionGeneration(Arc<()>);
+struct GenerationToken(Arc<()>);
 
-impl PartialEq for SessionGeneration {
+impl PartialEq for GenerationToken {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl Eq for SessionGeneration {}
+impl Eq for GenerationToken {}
 
-impl Hash for SessionGeneration {
+impl Hash for GenerationToken {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.0).hash(state);
     }
@@ -33,14 +35,14 @@ impl Hash for SessionGeneration {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunScope {
     contest_id: Arc<str>,
-    generation: SessionGeneration,
+    generation: GenerationToken,
 }
 
 impl RunScope {
     pub(crate) fn new(contest_id: &str) -> Self {
         Self {
             contest_id: Arc::from(contest_id),
-            generation: SessionGeneration(Arc::new(())),
+            generation: GenerationToken(Arc::new(())),
         }
     }
 
@@ -62,8 +64,63 @@ impl RunScope {
     }
 }
 
+// Shared by the registered context and each display model built for it.
+#[derive(Debug, Clone)]
+pub(crate) struct RunGeneration {
+    scope: RunScope,
+    state: Arc<RunGenerationState>,
+}
+
+#[derive(Debug)]
+struct RunGenerationState {
+    next_run_id: AtomicU64,
+    source_gates: Mutex<HashMap<String, UserInputRunStartGate>>,
+}
+
+impl RunGeneration {
+    pub(crate) fn new(contest_id: &str) -> Self {
+        Self::with_scope(RunScope::new(contest_id))
+    }
+
+    pub(crate) fn scope(&self) -> &RunScope {
+        &self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(scope: RunScope) -> Self {
+        Self::with_scope(scope)
+    }
+
+    fn with_scope(scope: RunScope) -> Self {
+        Self {
+            scope,
+            state: Arc::new(RunGenerationState {
+                next_run_id: AtomicU64::new(1),
+                source_gates: Mutex::default(),
+            }),
+        }
+    }
+
+    pub(super) fn next_run_id(&self) -> RunId {
+        self.state
+            .next_run_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("run ID space exhausted")
+    }
+
+    pub(super) fn source_gate(&self, task_id: &str) -> UserInputRunStartGate {
+        self.state
+            .source_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(task_id.to_owned())
+            .or_default()
+            .clone()
+    }
+}
+
 // The logical problem is (contest_id, task_id). The scope ties its queued work,
-// source revisions and events to a particular session's metadata.
+// source revisions and events to a particular registered metadata generation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunTarget {
     pub(crate) scope: RunScope,
@@ -138,32 +195,92 @@ impl RunWorkerCommand {
     }
 }
 
+/// One execution scope's result route. With no view attached, events can be discarded.
+#[derive(Clone, Default)]
+pub(crate) struct RunResults(Arc<Mutex<Option<Sender<Message>>>>);
+
+impl From<Sender<Message>> for RunResults {
+    fn from(sender: Sender<Message>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+}
+
+impl RunResults {
+    pub(crate) fn detach(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn send(&self, message: Message) -> io::Result<()> {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sender.send(message).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUI message receiver disconnected from run worker",
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UserInputRunTarget {
     Persisted(u64),
     Draft(u64),
 }
 
-// Shared only by requests for one problem in one contest session. Removal and physical
+// Shared only by requests for one task in one execution generation. Removal and physical
 // attempt admission use the same lock, including when the worker command is still queued.
 #[derive(Debug, Clone, Default)]
-pub struct UserInputRunStartGate(Arc<Mutex<u64>>);
+pub struct UserInputRunStartGate(Arc<Mutex<SourceRevisions>>);
+
+#[derive(Debug, Default)]
+struct SourceRevisions {
+    current: u64,
+    retired_before: u64,
+}
 
 impl UserInputRunStartGate {
-    pub(crate) fn retire_before(&self, source_revision: u64) {
-        let mut minimum = self
+    pub(super) fn advance(&self, removed: bool) -> u64 {
+        let mut revisions = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *minimum = (*minimum).max(source_revision);
+        revisions.current = revisions
+            .current
+            .checked_add(1)
+            .expect("source revision space exhausted");
+        if removed {
+            revisions.retired_before = revisions.current;
+        }
+        revisions.current
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_before(&self, source_revision: u64) {
+        let mut revisions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        revisions.retired_before = revisions.retired_before.max(source_revision);
+        revisions.current = revisions.current.max(source_revision);
     }
 
     pub(crate) fn is_retired(&self, source_revision: u64) -> bool {
         source_revision
-            < *self
+            < self
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retired_before
     }
 
     pub(crate) fn start_if_current<T>(
@@ -171,17 +288,17 @@ impl UserInputRunStartGate {
         source_revision: u64,
         start: impl FnOnce() -> T,
     ) -> Option<T> {
-        let minimum = self
+        let revisions = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if source_revision < *minimum {
+        if source_revision < revisions.retired_before {
             return None;
         }
         // Keep the guard until spawning has finished; a check followed by an unlocked spawn
         // would allow removal to win in between and still start the obsolete request.
         let started = start();
-        drop(minimum);
+        drop(revisions);
         Some(started)
     }
 }

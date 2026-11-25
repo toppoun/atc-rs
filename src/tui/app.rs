@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::detail::DetailSectionKind;
-use super::message::{RunId, RunKind, RunRequest, RunScope, RunTarget, StressEvent, TestEvent};
+use super::message::{
+    RunGeneration, RunId, RunKind, RunRequest, RunTarget, StressEvent, TestEvent,
+};
 use super::message::{
     UserInputRunEvent, UserInputRunSnapshot, UserInputRunStartGate, UserInputRunStatus,
     UserInputRunTarget,
@@ -661,7 +663,7 @@ pub struct WatchApp {
     side_pane: SidePaneState,
     shortcut_help_visible: bool,
 
-    run_scope: RunScope,
+    run_generation: RunGeneration,
     problems: Vec<ProblemState>,
 
     selected_problem: usize,
@@ -671,8 +673,6 @@ pub struct WatchApp {
     detail_revision: u64,
     detail_folds: DetailFoldState,
 
-    // Monotonic across all run kinds in this WatchApp's session generation.
-    next_run_id: RunId,
     pending_user_input_runs: VecDeque<RunRequest>,
 }
 
@@ -956,23 +956,23 @@ impl WatchApp {
         stress_cases: Vec<Option<Sample>>,
         user_inputs: Vec<UserInputState>,
     ) -> io::Result<Self> {
-        Self::new_with_run_scope(
+        Self::new_with_run_generation(
             contest,
-            RunScope::new(&contest.contest_id),
+            RunGeneration::new(&contest.contest_id),
             sample_counts,
             stress_cases,
             user_inputs,
         )
     }
 
-    pub(crate) fn new_with_run_scope(
+    pub(crate) fn new_with_run_generation(
         contest: &Contest,
-        run_scope: RunScope,
+        run_generation: RunGeneration,
         sample_counts: Vec<usize>,
         stress_cases: Vec<Option<Sample>>,
         user_inputs: Vec<UserInputState>,
     ) -> io::Result<Self> {
-        if run_scope.contest_id() != contest.contest_id {
+        if run_generation.scope().contest_id() != contest.contest_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "run scope does not match the contest",
@@ -1026,7 +1026,7 @@ impl WatchApp {
                     saved_stress_case,
                     source: None,
                     source_revision: 0,
-                    user_input_start_gate: UserInputRunStartGate::default(),
+                    user_input_start_gate: run_generation.source_gate(&problem.task_id),
                     run: RunState::default(),
                     stress: StressState::default(),
                     stress_setup: StressSetupState::None,
@@ -1047,14 +1047,13 @@ impl WatchApp {
             debug: false,
             side_pane: SidePaneState::default(),
             shortcut_help_visible: false,
-            run_scope,
+            run_generation,
             problems,
             selected_problem: 0,
             case_selection,
             detail_scroll: 0,
             detail_revision: 0,
             detail_folds: DetailFoldState::default(),
-            next_run_id: 1,
             pending_user_input_runs: VecDeque::new(),
         })
     }
@@ -1124,15 +1123,17 @@ impl WatchApp {
     }
 
     pub fn contest_id(&self) -> &str {
-        self.run_scope.contest_id()
+        self.run_generation.scope().contest_id()
     }
 
     pub(super) fn run_target(&self, problem: usize) -> RunTarget {
-        self.run_scope.target(&self.problems[problem].task_id)
+        self.run_generation
+            .scope()
+            .target(&self.problems[problem].task_id)
     }
 
     pub(super) fn problem_for_run_target(&self, target: &RunTarget) -> Option<usize> {
-        if target.scope != self.run_scope {
+        if &target.scope != self.run_generation.scope() {
             return None;
         }
         self.problems
@@ -2094,17 +2095,14 @@ impl WatchApp {
         {
             return None;
         }
-        let before_source_revision = state.source_revision + 1;
-        state
-            .user_input_start_gate
-            .retire_before(before_source_revision);
+        let before_source_revision = state.user_input_start_gate.advance(true);
         state.source = None;
         state.source_revision = before_source_revision;
         state.user_input_delete_armed = None;
         if let Some(ready) = state.user_inputs.ready_mut() {
             ready.runs.clear();
         }
-        let target = self.run_scope.target(&state.task_id);
+        let target = self.run_generation.scope().target(&state.task_id);
         self.pending_user_input_runs
             .retain(|request| request.target != target);
         state.run = RunState {
@@ -2149,7 +2147,8 @@ impl WatchApp {
         // Notifications invalidate results even if edits were coalesced by the watcher.
         // Merely opening the already-selected source does not constitute a source change.
         if changed || !same_source {
-            self.problems[problem].source_revision += 1;
+            self.problems[problem].source_revision =
+                self.problems[problem].user_input_start_gate.advance(false);
             if let Some(ready) = self.problems[problem].user_inputs.ready_mut() {
                 ready.runs.clear();
             }
@@ -2252,8 +2251,7 @@ impl WatchApp {
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
+        let run_id = self.run_generation.next_run_id();
 
         let previous_detail_case = self.displayed_detail_case();
         self.problems[problem].detail_mode = DetailMode::Samples;
@@ -2307,8 +2305,7 @@ impl WatchApp {
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
 
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
+        let run_id = self.run_generation.next_run_id();
 
         self.problems[problem].detail_mode = DetailMode::Stress;
         if self.problems[problem].run.id.is_some()
@@ -3148,6 +3145,42 @@ mod tests {
         assert!(app.source_changed(0, PathBuf::from("A.cpp"), Language::Cpp));
         let request = app.queue_run(0).unwrap();
         (app, request.run_id)
+    }
+
+    #[test]
+    fn rebuilt_watch_model_keeps_scope_ids_and_task_source_revision_monotonic() {
+        let contest = contest(1);
+        let scope = RunGeneration::new(&contest.contest_id);
+        let model = || {
+            WatchApp::new_with_run_generation(
+                &contest,
+                scope.clone(),
+                vec![0],
+                vec![None],
+                vec![loaded_user_inputs(&[(1, "stdin")])],
+            )
+            .unwrap()
+        };
+        let source = PathBuf::from("A.py");
+        let mut first = model();
+        assert!(first.source_changed(0, source.clone(), Language::Python));
+        let old_run = first.queue_run(0).unwrap();
+        let old_revision = first.problems[0].source_revision;
+        let old_gate = first.problems[0].user_input_start_gate.clone();
+
+        let mut rebuilt = model();
+        assert!(rebuilt.source_changed(0, source.clone(), Language::Python));
+        let new_run = rebuilt.queue_run(0).unwrap();
+        assert_eq!(new_run.target, old_run.target);
+        assert_eq!(new_run.run_id, old_run.run_id + 1);
+        assert!(rebuilt.problems[0].source_revision > old_revision);
+        assert!(!old_gate.is_retired(old_revision));
+        assert!(
+            rebuilt
+                .source_removed(0, &source, Language::Python)
+                .is_some()
+        );
+        assert!(old_gate.is_retired(old_revision));
     }
 
     fn detail_text(app: &WatchApp) -> String {

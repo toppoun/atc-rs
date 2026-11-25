@@ -1,23 +1,22 @@
 use std::io;
-use std::sync::mpsc::Sender;
 
 use crate::ui::{Event, Reporter};
 
-use super::message::{Message, RunId, RunTarget, StressEvent, TestEvent};
+use super::message::{Message, RunId, RunResults, RunTarget, StressEvent, TestEvent};
 
 pub struct ChannelReporter {
     run_id: RunId,
     target: RunTarget,
-    tx: Sender<Message>,
+    tx: RunResults,
     send_error: Option<io::Error>,
 }
 
 impl ChannelReporter {
-    pub fn new(run_id: RunId, target: RunTarget, tx: Sender<Message>) -> Self {
+    pub(crate) fn new(run_id: RunId, target: RunTarget, tx: impl Into<RunResults>) -> Self {
         Self {
             run_id,
             target,
-            tx,
+            tx: tx.into(),
             send_error: None,
         }
     }

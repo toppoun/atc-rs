@@ -141,8 +141,7 @@ impl WatchApp {
         let Some(language) = language else {
             // Match the sample runner's source-selection prerequisite, but make failure visible
             // on this input rather than misreporting it as a User Input storage sync failure.
-            let run_id = self.next_run_id;
-            self.next_run_id += 1;
+            let run_id = self.run_generation.next_run_id();
             self.problems[problem]
                 .user_inputs
                 .ready_mut()
@@ -186,8 +185,7 @@ impl WatchApp {
             state.stress.id = None;
             state.stress.phase = StressPhase::Cancelled;
         }
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
+        let run_id = self.run_generation.next_run_id();
         state
             .user_inputs
             .ready_mut()

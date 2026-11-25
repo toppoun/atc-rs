@@ -49,7 +49,7 @@ impl WatchApp {
         let state = &mut self.problems[problem];
         match result {
             Ok(()) => {
-                let target = self.run_scope.target(&state.task_id);
+                let target = self.run_generation.scope().target(&state.task_id);
                 let ready = state
                     .user_inputs
                     .ready_mut()

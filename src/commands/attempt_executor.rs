@@ -1,15 +1,21 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
 use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
 use crate::config::RunnerConfig;
 use crate::error::AppError;
-use crate::model::Problem;
-use crate::tui::message::{Message, RunId, RunKind, RunRequest, RunScope, RunTarget};
+use crate::model::{Contest, Problem};
+#[cfg(test)]
+use crate::tui::message::RunScope;
+use crate::tui::message::{
+    Message, RunGeneration, RunId, RunKind, RunRequest, RunResults, RunTarget,
+};
 use crate::tui::reporter::ChannelReporter;
+use crate::workspace::{self, ContestTaskSnapshot, ExplicitContestRoute};
 
 use super::stress::build_request as build_stress_request;
 use super::test::test_problem_with_cancel;
@@ -20,56 +26,111 @@ pub(super) struct AttemptCompletion {
     pub(super) target: RunTarget,
 }
 
-pub(super) struct AttemptExecutor {
-    destination: Arc<PathBuf>,
-    scope: RunScope,
-    problems: Arc<Vec<Problem>>,
-    runner_config: Arc<RunnerConfig>,
-    message_tx: Sender<Message>,
+struct RunBinding {
+    metadata: ContestTaskSnapshot,
+    route: Option<(PathBuf, ExplicitContestRoute)>,
 }
 
-impl AttemptExecutor {
+pub(super) struct RunContext {
+    destination: PathBuf,
+    pub(super) generation: RunGeneration,
+    problems: Vec<Problem>,
+    runner_config: RunnerConfig,
+    binding: Option<RunBinding>,
+    stale: AtomicBool,
+}
+
+impl RunContext {
     pub(super) fn new(
+        destination: PathBuf,
+        contest: &Contest,
+        runner_config: RunnerConfig,
+        workspace_root: Option<&Path>,
+    ) -> io::Result<Self> {
+        let metadata = ContestTaskSnapshot::capture_contest(&destination, contest)?;
+        let route = workspace_root
+            .map(|root| {
+                let route = ExplicitContestRoute::resolve(root, &contest.contest_id)?
+                    .require_workspace()?;
+                if workspace::contest_directory_identity(&destination)?
+                    != workspace::contest_directory_identity(&route.destination)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "contest is outside its Workspace route",
+                    ));
+                }
+                Ok((root.to_path_buf(), route))
+            })
+            .transpose()?;
+        let context = Self {
+            destination,
+            generation: RunGeneration::new(&contest.contest_id),
+            problems: contest.problems.clone(),
+            runner_config,
+            binding: Some(RunBinding { metadata, route }),
+            stale: AtomicBool::new(false),
+        };
+        context.revalidate()?;
+        Ok(context)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(
         destination: PathBuf,
         scope: RunScope,
         problems: Vec<Problem>,
         runner_config: RunnerConfig,
-        message_tx: Sender<Message>,
     ) -> Self {
         Self {
-            destination: Arc::new(destination),
-            scope,
-            problems: Arc::new(problems),
-            runner_config: Arc::new(runner_config),
-            message_tx,
+            destination,
+            generation: RunGeneration::fixture(scope),
+            problems,
+            runner_config,
+            binding: None,
+            stale: AtomicBool::new(false),
         }
     }
 
+    fn revalidate(&self) -> io::Result<()> {
+        if let Some(binding) = &self.binding {
+            if let Some((root, route)) = &binding.route {
+                route.revalidate_workspace_owner(root, self.generation.scope().contest_id())?;
+            }
+            binding.metadata.revalidate(&self.destination)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
+    }
+}
+
+pub(super) struct AttemptExecutor;
+
+impl AttemptExecutor {
     pub(super) fn spawn(
-        &self,
+        context: Arc<RunContext>,
+        results: RunResults,
         request: RunRequest,
         completion_tx: Sender<AttemptCompletion>,
     ) -> io::Result<ActiveAttempt> {
-        let destination = Arc::clone(&self.destination);
-        let scope = self.scope.clone();
-        let problems = Arc::clone(&self.problems);
-        let runner_config = Arc::clone(&self.runner_config);
-        let message_tx = self.message_tx.clone();
-
         spawn_with(request.clone(), completion_tx, move |cancellation| {
             run_reported_attempt(
                 request.clone(),
-                message_tx.clone(),
+                results.clone(),
                 &cancellation,
                 |reporter, is_cancelled| {
-                    if request.target.scope != scope {
+                    if &request.target.scope != context.generation.scope() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            "run request does not match the executor's contest session",
+                            "run request does not match the registered contest generation",
                         )
                         .into());
                     }
-                    let problem = problems
+                    let problem = context
+                        .problems
                         .iter()
                         .find(|problem| problem.task_id == request.target.task_id.as_ref())
                         .ok_or_else(|| {
@@ -78,6 +139,10 @@ impl AttemptExecutor {
                                 format!("unknown task ID: {}", request.target.task_id),
                             )
                         })?;
+                    if let Err(error) = context.revalidate() {
+                        context.stale.store(true, Ordering::Release);
+                        return Err(error.into());
+                    }
 
                     match &request.kind {
                         RunKind::UserInput(snapshot) => {
@@ -88,31 +153,31 @@ impl AttemptExecutor {
                                 .into());
                             }
                             super::user_input_run::run(
-                                &destination,
+                                &context.destination,
                                 problem,
                                 &request,
-                                &runner_config,
-                                &message_tx,
+                                &context.runner_config,
+                                &results,
                                 is_cancelled,
                             )
                         }
                         RunKind::Samples => test_problem_with_cancel(
-                            &destination,
-                            scope.contest_id(),
+                            &context.destination,
+                            context.generation.scope().contest_id(),
                             problem,
                             request.language,
-                            &runner_config,
+                            &context.runner_config,
                             request.debug,
                             reporter,
                             is_cancelled,
                         ),
                         RunKind::Stress { base_seed, count } => {
                             let stress_request = build_stress_request(
-                                &destination,
-                                scope.contest_id(),
+                                &context.destination,
+                                context.generation.scope().contest_id(),
                                 problem,
                                 request.language,
-                                &runner_config,
+                                &context.runner_config,
                                 request.debug,
                                 *base_seed,
                                 *count,
@@ -213,10 +278,11 @@ pub(super) fn spawn_with(
 
 fn run_reported_attempt(
     request: RunRequest,
-    message_tx: Sender<Message>,
+    message_tx: impl Into<RunResults>,
     cancellation: &AttemptCancellation,
     run: impl FnOnce(&mut ChannelReporter, &dyn Fn() -> bool) -> Result<(), AppError>,
 ) -> AttemptOutcome {
+    let message_tx = message_tx.into();
     run_attempt(cancellation, |is_cancelled| {
         message_tx
             .send(Message::RunStarted {
@@ -255,6 +321,46 @@ fn combine_run_and_reporter_results(
 }
 
 #[cfg(test)]
+pub(super) struct TestAttemptExecutor {
+    context: Arc<RunContext>,
+    results: RunResults,
+}
+
+#[cfg(test)]
+impl TestAttemptExecutor {
+    pub(super) fn new(
+        destination: PathBuf,
+        scope: RunScope,
+        problems: Vec<Problem>,
+        runner_config: RunnerConfig,
+        results: Sender<Message>,
+    ) -> Self {
+        Self {
+            context: Arc::new(RunContext::fixture(
+                destination,
+                scope,
+                problems,
+                runner_config,
+            )),
+            results: results.into(),
+        }
+    }
+
+    pub(super) fn spawn(
+        &self,
+        request: RunRequest,
+        completion: Sender<AttemptCompletion>,
+    ) -> io::Result<ActiveAttempt> {
+        AttemptExecutor::spawn(
+            self.context.clone(),
+            self.results.clone(),
+            request,
+            completion,
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attempt::{clean_cancellation_io_error, io_error_is_clean_cancellation};
@@ -288,7 +394,7 @@ mod tests {
 
     fn executor_with_no_samples(
         message_tx: Sender<Message>,
-    ) -> (tempfile::TempDir, AttemptExecutor) {
+    ) -> (tempfile::TempDir, TestAttemptExecutor) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("A.py"), "pass\n").unwrap();
         crate::workspace::save_metadata(
@@ -299,7 +405,7 @@ mod tests {
             },
         )
         .unwrap();
-        let executor = AttemptExecutor::new(
+        let executor = TestAttemptExecutor::new(
             temp.path().to_path_buf(),
             RunScope::fixture(),
             vec![problem()],
@@ -361,7 +467,7 @@ mod tests {
             ],
         };
         crate::workspace::save_metadata(temp.path(), &contest).unwrap();
-        let executor = AttemptExecutor::new(
+        let executor = TestAttemptExecutor::new(
             temp.path().to_path_buf(),
             RunScope::fixture(),
             contest.problems,

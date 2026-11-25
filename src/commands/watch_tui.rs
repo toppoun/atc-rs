@@ -11,6 +11,7 @@ use crate::workspace_registry::{
     DirectoryIdentity, EntryRef, RegistryEntry, RegistryMutation, RegistryMutationResult,
     VerifiedWorkspace,
 };
+use std::cell::{Cell, OnceCell};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,12 +23,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use super::attempt_executor::RunContext;
 use super::contest::{ContestTargetHealth, inspect_contest_target};
 use super::refresh::PreparedRefresh;
 use super::watch_worker::RunWorker;
 use crate::tui::app::{PersistedUserInputState, UserInputState};
 use crate::tui::detail_analysis::DetailAnalysisWorker;
-use crate::tui::message::{Message, RunScope};
+use crate::tui::message::{Message, RunGeneration, RunResults};
 use crate::ui::Reporter;
 use crate::watcher;
 
@@ -477,37 +479,40 @@ pub(super) fn watch_tui_at(
     config: Config,
     auth: Arc<SessionAuth>,
 ) -> Result<(), AppError> {
+    let runs = WorkspaceRuns::default();
     let session = start_direct_contest_session_with_hooks(
         destination,
         expected_contest_id,
         &app_context,
-        config,
-        auth,
+        ContestEnvironment::from_snapshots(config, auth),
+        &runs,
         || {},
         |_| Ok(()),
     )?;
 
-    run_root_tui(app_context, RootLocation::Contest(session))
+    run_root_tui(app_context, RootLocation::Contest(session), runs)
 }
 
 fn start_direct_contest_session_with_hooks(
     destination: &Path,
     expected_contest_id: Option<&str>,
     app_context: &AppContext,
-    config: Config,
-    auth: Arc<SessionAuth>,
+    environment: ContestEnvironment,
+    runs: &WorkspaceRuns,
     before_final_revalidation: impl FnOnce(),
     after_start_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
 ) -> Result<ContestSession, AppError> {
     let initial_input = PreparedWatchInput::load(destination, expected_contest_id)?;
     let entry = PreparedContestEntry {
         input: initial_input,
-        environment: ContestEnvironment::from_snapshots(config, auth),
+        environment,
     };
     let finalized =
         finalize_prepared_contest_entry_with_hook(entry, app_context, before_final_revalidation)?;
     Ok(ContestSession::start_finalized_entry_with_hook(
         finalized,
+        app_context,
+        runs,
         after_start_stage,
     )?)
 }
@@ -534,6 +539,58 @@ struct WorkspaceRuntime<S = crate::tui::SubmissionHub> {
     app_context: AppContext,
     submissions: S,
     location: RootLocation,
+    runs: WorkspaceRuns,
+}
+
+#[derive(Default)]
+struct WorkspaceRuns {
+    worker: OnceCell<RunWorker>,
+    closed: Cell<bool>,
+}
+
+impl WorkspaceRuns {
+    fn worker(&self) -> io::Result<&RunWorker> {
+        if self.closed.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "workspace execution is closed",
+            ));
+        }
+        if self.worker.get().is_none() {
+            assert!(self.worker.set(RunWorker::start_workspace()?).is_ok());
+        }
+        Ok(self
+            .worker
+            .get()
+            .expect("workspace run worker was initialized"))
+    }
+
+    fn request_stop(&self) {
+        self.closed.set(true);
+        if let Some(worker) = self.worker.get() {
+            worker.request_stop();
+        }
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        self.request_stop();
+        self.worker.take().map_or(Ok(()), RunWorker::stop_and_join)
+    }
+
+    // Current manual navigation retires the old scope. Dropping a view alone only
+    // detaches its result route and leaves registered work available to the worker.
+    fn retire_contest(&self, session: ContestSession) -> io::Result<()> {
+        session.request_stop();
+        let retirement = self
+            .worker
+            .get()
+            .expect("Contest requires a workspace run worker")
+            .invalidate_and_join(session.run_generation.scope());
+        combine_primary_and_cleanup_results(
+            retirement,
+            [("contest view shutdown", session.shutdown())],
+        )
+    }
 }
 
 enum WorkspaceOpenOutcome<S = crate::tui::SubmissionHub> {
@@ -557,6 +614,7 @@ impl WorkspaceRuntime {
             app_context,
             submissions: crate::tui::SubmissionHub::new(),
             location,
+            runs: WorkspaceRuns::default(),
         }
     }
 
@@ -580,6 +638,7 @@ fn open_workspace_runtime_with<S>(
             },
             submissions: create_submissions(),
             location: RootLocation::WorkspaceHome,
+            runs: WorkspaceRuns::default(),
         },
         checked.identity,
     ))
@@ -587,17 +646,28 @@ fn open_workspace_runtime_with<S>(
 
 impl<S> WorkspaceRuntime<S> {
     fn request_stop_active_contest(&self) {
+        self.runs.request_stop();
         if let RootLocation::Contest(session) = &self.location {
             session.request_stop();
         }
     }
 
     fn shutdown_active_contest(&mut self) -> io::Result<()> {
-        match std::mem::replace(&mut self.location, RootLocation::WorkspaceHome) {
-            RootLocation::Contest(session) => session.shutdown(),
-            RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
-        }
+        self.request_stop_active_contest();
+        shutdown_workspace_contest(&mut self.runs, &mut self.location)
     }
+}
+
+fn shutdown_workspace_contest(
+    runs: &mut WorkspaceRuns,
+    location: &mut RootLocation,
+) -> io::Result<()> {
+    let execution = runs.shutdown();
+    let view = match std::mem::replace(location, RootLocation::WorkspaceHome) {
+        RootLocation::Contest(session) => session.shutdown(),
+        RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
+    };
+    combine_primary_and_cleanup_results(execution, [("contest view shutdown", view)])
 }
 
 trait WorkspaceSubmissionLifetime {
@@ -775,8 +845,13 @@ fn take_prepared_open(
         .ok_or_else(|| "contest open did not retain its validated prepared contest".to_string())
 }
 
-fn run_root_tui(app_context: AppContext, location: RootLocation) -> Result<(), AppError> {
+fn run_root_tui(
+    app_context: AppContext,
+    location: RootLocation,
+    runs: WorkspaceRuns,
+) -> Result<(), AppError> {
     let mut runtime = WorkspaceRuntime::from_location(app_context, location);
+    runtime.runs = runs;
     let mut preferences = crate::tui::FrontendPreferences::default();
     run_root_application(
         &mut runtime,
@@ -850,6 +925,7 @@ where
             let WorkspaceRuntime {
                 submissions,
                 location,
+                runs,
                 ..
             } = runtime;
             let mut root_lifetime = LiveRootLifetime {
@@ -857,10 +933,7 @@ where
                 terminal: &mut terminal,
             };
             let cleanup = run_tui_cleanup(&mut root_lifetime, || {
-                match std::mem::replace(location, RootLocation::WorkspaceHome) {
-                    RootLocation::Contest(session) => session.shutdown(),
-                    RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
-                }
+                shutdown_workspace_contest(runs, location)
             });
             drop(root_lifetime);
             combine_primary_and_cleanup_results(
@@ -1191,6 +1264,7 @@ where
     let WorkspaceRuntime {
         submissions,
         location,
+        runs,
         ..
     } = runtime;
     let mut root_lifetime = LiveRootLifetime {
@@ -1198,10 +1272,7 @@ where
         terminal: &mut terminal,
     };
     let cleanup = run_tui_cleanup(&mut root_lifetime, || {
-        match std::mem::replace(location, RootLocation::WorkspaceHome) {
-            RootLocation::Contest(session) => session.shutdown(),
-            RootLocation::WorkspaceHome | RootLocation::ContestShutdown => Ok(()),
-        }
+        shutdown_workspace_contest(runs, location)
     });
     drop(root_lifetime);
     // Explicit restore is followed by Drop so the original platform mode/code page is restored.
@@ -1237,6 +1308,7 @@ where
     let app_context = &runtime.app_context;
     let submissions = &mut runtime.submissions;
     let location = &mut runtime.location;
+    let runs = &runtime.runs;
     let prepared_switch = Arc::new(Mutex::new(None));
     let prepared_home_open = Arc::new(Mutex::new(None));
     let prepared_refresh = Arc::new(Mutex::new(None));
@@ -1265,7 +1337,7 @@ where
                 Arc::clone(&home_open_task),
                 || {
                     let prepared = take_prepared_open(&start_prepared)?;
-                    start_prepared_contest_entry(prepared, app_context)
+                    start_prepared_contest_entry(prepared, app_context, runs)
                         .map_err(|error| error.to_string())
                 },
                 || first_home_draw.take().and_then(|record| record()),
@@ -1333,7 +1405,7 @@ where
                 location,
                 &mut refresh_frontend_state,
                 &mut root_lifetime,
-                ContestSession::shutdown,
+                |session| runs.retire_contest(session),
             ) {
                 Ok(root_exit) => root_exit,
                 Err(error) => break Err(error),
@@ -1366,7 +1438,7 @@ where
                     else {
                         unreachable!("contest switch requires the active contest session")
                     };
-                    match switch_to_prepared_contest(old_session, prepared, app_context) {
+                    match switch_to_prepared_contest(old_session, prepared, app_context, runs) {
                         Ok(new_session) => {
                             *location = RootLocation::Contest(new_session);
                             refresh_frontend_state = None;
@@ -1393,8 +1465,13 @@ where
                     else {
                         unreachable!("contest refresh requires the active contest session")
                     };
-                    let rebuilt =
-                        rebuild_active_contest_session_after_refresh(old_session, prepared, resume);
+                    let rebuilt = rebuild_active_contest_session_after_refresh(
+                        old_session,
+                        prepared,
+                        resume,
+                        app_context,
+                        runs,
+                    );
                     match rebuilt {
                         Ok(rebuilt) => {
                             *location = RootLocation::Contest(rebuilt.session);
@@ -1412,26 +1489,32 @@ fn switch_to_prepared_contest(
     old_session: ContestSession,
     prepared: PreparedContestEntry,
     app_context: &AppContext,
+    runs: &WorkspaceRuns,
 ) -> io::Result<ContestSession> {
     let finalized = match finalize_prepared_contest_entry(prepared, app_context) {
         Ok(finalized) => finalized,
         Err(error) => {
             let error = combine_primary_and_cleanup_results(
                 Err(error),
-                [("old contest session shutdown", old_session.shutdown())],
+                [(
+                    "old contest session shutdown",
+                    runs.retire_contest(old_session),
+                )],
             )
             .expect_err("a failed final workspace validation must remain an error");
             return Err(error);
         }
     };
-    old_session.shutdown()?;
-    ContestSession::start_finalized_entry(finalized)
+    runs.retire_contest(old_session)?;
+    ContestSession::start_finalized_entry(finalized, app_context, runs)
 }
 
 fn rebuild_active_contest_session_after_refresh(
     old_session: ContestSession,
     prepared: PreparedRefresh,
     resume: crate::tui::RefreshResumeState,
+    app_context: &AppContext,
+    runs: &WorkspaceRuns,
 ) -> io::Result<RefreshRebuild<ContestSession>> {
     let refresh_destination = prepared.destination().to_path_buf();
     let refresh_contest_id = prepared.contest_id().to_string();
@@ -1452,13 +1535,19 @@ fn rebuild_active_contest_session_after_refresh(
         &refresh_contest_id,
         resume,
         RefreshRebuildHooks {
-            shutdown: ContestSession::shutdown,
+            shutdown: |session| runs.retire_contest(session),
             apply: |prepared| {
                 let mut reporter = RefreshApplyReporter;
                 super::refresh::apply_refresh(prepared, &mut reporter)
             },
             load: |destination, contest_id| PreparedWatchInput::load(destination, Some(contest_id)),
-            start: |input| ContestSession::start_entry(PreparedContestEntry { input, environment }),
+            start: |input| {
+                ContestSession::start_entry(
+                    PreparedContestEntry { input, environment },
+                    app_context,
+                    runs,
+                )
+            },
         },
     )
 }
@@ -1533,8 +1622,13 @@ fn finalize_prepared_contest_entry_with_hook(
 fn start_prepared_contest_entry(
     entry: PreparedContestEntry,
     app_context: &AppContext,
+    runs: &WorkspaceRuns,
 ) -> io::Result<ContestSession> {
-    ContestSession::start_finalized_entry(finalize_prepared_contest_entry(entry, app_context)?)
+    ContestSession::start_finalized_entry(
+        finalize_prepared_contest_entry(entry, app_context)?,
+        app_context,
+        runs,
+    )
 }
 
 #[derive(Debug)]
@@ -2027,12 +2121,11 @@ fn repair_and_prepare_contest_switch_with_final_hook(
 }
 
 struct ContestSession {
-    // After Drop::drop requests stop, field destruction joins these worker owners before the
-    // session communication endpoints below are discarded.
-    run_worker: Option<RunWorker>,
+    // The workspace owns the run worker. Only view-owned workers are joined here.
     watcher_thread: Option<WatcherThread>,
     detail_analysis_worker: Option<DetailAnalysisWorker>,
-    run_scope: RunScope,
+    run_generation: RunGeneration,
+    results: RunResults,
     environment: ContestEnvironment,
     input: PreparedWatchInput,
     message_rx: mpsc::Receiver<Message>,
@@ -2050,27 +2143,44 @@ enum SessionStartStage {
 }
 
 impl ContestSession {
-    fn start_finalized_entry(entry: FinalizedContestEntry) -> io::Result<Self> {
-        Self::start_finalized_entry_with_hook(entry, |_| Ok(()))
+    fn start_finalized_entry(
+        entry: FinalizedContestEntry,
+        app_context: &AppContext,
+        runs: &WorkspaceRuns,
+    ) -> io::Result<Self> {
+        Self::start_finalized_entry_with_hook(entry, app_context, runs, |_| Ok(()))
     }
 
     fn start_finalized_entry_with_hook(
         entry: FinalizedContestEntry,
+        app_context: &AppContext,
+        runs: &WorkspaceRuns,
         after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
-        Self::start_entry_with_hook(entry.0, after_stage)
+        Self::start_entry_with_hook(entry.0, app_context, runs, after_stage)
     }
 
-    fn start_entry(entry: PreparedContestEntry) -> io::Result<Self> {
-        Self::start_entry_with_hook(entry, |_| Ok(()))
+    fn start_entry(
+        entry: PreparedContestEntry,
+        app_context: &AppContext,
+        runs: &WorkspaceRuns,
+    ) -> io::Result<Self> {
+        Self::start_entry_with_hook(entry, app_context, runs, |_| Ok(()))
     }
 
     fn start_entry_with_hook(
         entry: PreparedContestEntry,
+        app_context: &AppContext,
+        runs: &WorkspaceRuns,
         mut after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
         let PreparedContestEntry { input, environment } = entry;
-        let run_scope = RunScope::new(&input.contest.contest_id);
+        let context = RunContext::new(
+            input.destination.clone(),
+            &input.contest,
+            environment.config.runner.clone(),
+            app_context.workspace_root(),
+        )?;
         let (message_tx, message_rx) = mpsc::channel();
         let watcher_thread = start_watcher(&input.destination, &input.contest, message_tx.clone())?;
         if let Err(error) = after_stage(SessionStartStage::WatcherStarted) {
@@ -2082,17 +2192,14 @@ impl ContestSession {
             )
             .expect_err("injected startup failure must remain an error"));
         }
-        let run_worker = match RunWorker::start(
-            input.destination.clone(),
-            run_scope.clone(),
-            input.contest.problems.clone(),
-            environment.config.runner.clone(),
-            message_tx.clone(),
-        ) {
-            Ok(worker) => worker,
+        let results = RunResults::from(message_tx);
+        let registration = runs.worker().and_then(|worker| {
+            let run_generation = worker.register(context, results.clone())?;
+            Ok((worker, run_generation))
+        });
+        let (run_worker, run_generation) = match registration {
+            Ok(registered) => registered,
             Err(error) => {
-                drop(message_rx);
-                drop(message_tx);
                 return Err(combine_primary_and_cleanup_results(
                     Err(error),
                     [("filesystem watcher shutdown", watcher_thread.stop())],
@@ -2101,32 +2208,19 @@ impl ContestSession {
             }
         };
         let run_tx = run_worker.sender();
-        if let Err(error) = after_stage(SessionStartStage::RunWorkerStarted) {
-            drop(message_rx);
-            drop(message_tx);
-            run_worker.request_stop();
-            watcher_thread.request_stop();
-            return Err(combine_primary_and_cleanup_results(
-                Err(error),
-                [
-                    ("run worker shutdown", run_worker.stop_and_join()),
-                    ("filesystem watcher shutdown", watcher_thread.stop()),
-                ],
-            )
-            .expect_err("injected startup failure must remain an error"));
-        }
-
-        let mut detail_analysis_worker = match DetailAnalysisWorker::start() {
+        let mut detail_analysis_worker = match after_stage(SessionStartStage::RunWorkerStarted)
+            .and_then(|()| DetailAnalysisWorker::start())
+        {
             Ok(worker) => worker,
             Err(error) => {
-                drop(message_rx);
-                drop(message_tx);
-                run_worker.request_stop();
                 watcher_thread.request_stop();
                 return Err(combine_primary_and_cleanup_results(
                     Err(error),
                     [
-                        ("run worker shutdown", run_worker.stop_and_join()),
+                        (
+                            "run scope retirement",
+                            run_worker.invalidate_and_join(run_generation.scope()),
+                        ),
                         ("filesystem watcher shutdown", watcher_thread.stop()),
                     ],
                 )
@@ -2135,13 +2229,11 @@ impl ContestSession {
         };
         let detail_analysis_tx = detail_analysis_worker.request_sender();
         let detail_analysis_rx = detail_analysis_worker.take_result_receiver();
-        drop(message_tx);
-
         Ok(Self {
-            run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
-            run_scope,
+            run_generation,
+            results,
             environment,
             input,
             message_rx,
@@ -2154,32 +2246,53 @@ impl ContestSession {
     }
 
     #[cfg(test)]
-    fn start(input: PreparedWatchInput, runner_config: &RunnerConfig) -> io::Result<Self> {
+    fn start(
+        input: PreparedWatchInput,
+        runner_config: &RunnerConfig,
+        runs: &WorkspaceRuns,
+    ) -> io::Result<Self> {
         let config = Config {
             runner: runner_config.clone(),
             ..Config::default()
         };
-        Self::start_entry(PreparedContestEntry {
-            input,
-            environment: ContestEnvironment::new(config),
-        })
+        Self::start_entry_for_test(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::new(config),
+            },
+            runs,
+        )
+    }
+
+    #[cfg(test)]
+    fn start_entry_for_test(entry: PreparedContestEntry, runs: &WorkspaceRuns) -> io::Result<Self> {
+        let app_context = AppContext::Standalone {
+            launch_root: entry.input.destination.clone(),
+        };
+        Self::start_entry(entry, &app_context, runs)
     }
 
     #[cfg(test)]
     fn start_with_hook(
         input: PreparedWatchInput,
         runner_config: &RunnerConfig,
+        runs: &WorkspaceRuns,
         after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
         let config = Config {
             runner: runner_config.clone(),
             ..Config::default()
         };
+        let app_context = AppContext::Standalone {
+            launch_root: input.destination.clone(),
+        };
         Self::start_entry_with_hook(
             PreparedContestEntry {
                 input,
                 environment: ContestEnvironment::new(config),
             },
+            &app_context,
+            runs,
             after_stage,
         )
     }
@@ -2218,15 +2331,12 @@ impl ContestSession {
             stress_cases,
             stress_load_errors,
             user_inputs,
-            crate::tui::SessionExecution::new(channels, submissions, self.run_scope.clone()),
+            crate::tui::SessionExecution::new(channels, submissions, self.run_generation.clone()),
         );
         crate::tui::run(terminal, app_context, preferences, runtime, frontend)
     }
 
     fn request_stop(&self) {
-        if let Some(worker) = self.run_worker.as_ref() {
-            worker.request_stop();
-        }
         if let Some(watcher) = self.watcher_thread.as_ref() {
             watcher.request_stop();
         }
@@ -2246,16 +2356,11 @@ impl ContestSession {
             probe.fetch_add(1, Ordering::Relaxed);
         }
         self.request_stop();
-        // `self` retains every channel endpoint until all three joins below have completed.
+        self.results.detach();
+        // Keep the view's channel endpoints until both view-owned workers have joined.
         combine_primary_and_cleanup_results(
             Ok(()),
             [
-                (
-                    "run worker shutdown",
-                    self.run_worker
-                        .take()
-                        .map_or(Ok(()), RunWorker::stop_and_join),
-                ),
                 (
                     "filesystem watcher shutdown",
                     self.watcher_thread
@@ -2275,6 +2380,7 @@ impl ContestSession {
 
 impl Drop for ContestSession {
     fn drop(&mut self) {
+        self.results.detach();
         self.request_stop();
     }
 }
@@ -3932,6 +4038,7 @@ mod tests {
                 app_context,
                 submissions,
                 location,
+                runs,
             } = runtime;
             drop(submissions);
             let mut runtime = WorkspaceRuntime {
@@ -3941,6 +4048,7 @@ mod tests {
                     probe: probe.clone(),
                 },
                 location,
+                runs,
             };
             let mut preferences = crate::tui::FrontendPreferences::default();
 
@@ -3976,15 +4084,17 @@ mod tests {
 
     #[test]
     fn workspace_runtime_constructor_accepts_standalone_direct_contest() {
+        let runs = WorkspaceRuns::default();
         let destination = tempfile::tempdir().unwrap();
         save_healthy_contest(destination.path(), "abc123");
         let input = PreparedWatchInput::load(destination.path(), Some("abc123")).unwrap();
-        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default(), &runs).unwrap();
         let context = AppContext::Standalone {
             launch_root: destination.path().to_path_buf(),
         };
         let mut runtime =
             WorkspaceRuntime::from_location(context.clone(), RootLocation::Contest(session));
+        runtime.runs = runs;
 
         assert_eq!(runtime.app_context, context);
         assert!(matches!(runtime.location, RootLocation::Contest(_)));
@@ -3994,10 +4104,11 @@ mod tests {
 
     #[test]
     fn workspace_runtime_keeps_standalone_direct_contest_compatibility() {
+        let runs = WorkspaceRuns::default();
         let destination = tempfile::tempdir().unwrap();
         save_healthy_contest(destination.path(), "abc123");
         let input = PreparedWatchInput::load(destination.path(), Some("abc123")).unwrap();
-        let mut session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let mut session = ContestSession::start(input, &RunnerConfig::default(), &runs).unwrap();
         let contest_shutdowns = Arc::new(AtomicUsize::new(0));
         session.set_shutdown_probe(Arc::clone(&contest_shutdowns));
         let context = AppContext::Standalone {
@@ -4011,6 +4122,7 @@ mod tests {
                 probe: probe.clone(),
             },
             location: RootLocation::Contest(session),
+            runs,
         };
         let mut preferences = crate::tui::FrontendPreferences::default();
 
@@ -4095,6 +4207,7 @@ mod tests {
 
     #[test]
     fn malformed_marker_is_repaired_from_home_and_contest_starts_without_restart() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let marker = crate::workspace::workspace_config_path(root.path());
         std::fs::write(&marker, "version = [\n").unwrap();
@@ -4153,7 +4266,7 @@ mod tests {
             task,
             || {
                 let prepared = take_prepared_open(&retained)?;
-                start_prepared_contest_entry(prepared, &app_context)
+                start_prepared_contest_entry(prepared, &app_context, &runs)
                     .map_err(|error| error.to_string())
             },
             &paths,
@@ -4175,12 +4288,13 @@ mod tests {
             session.environment.config.runner.python,
             "python-home-repair"
         );
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
         submissions.shutdown().unwrap();
     }
 
     #[test]
     fn contest_entry_loads_one_config_and_auth_generation_before_creation_and_retains_them() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let config_path = root.path().join("global-config.toml");
@@ -4247,7 +4361,7 @@ mod tests {
         assert_eq!(disk.runner.python, "python-b");
 
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let session = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        let session = start_prepared_contest_entry(prepared, &app_context, &runs).unwrap();
         assert_eq!(
             session.environment.config.defaults.language,
             Language::Python
@@ -4259,7 +4373,7 @@ mod tests {
                 .auth
                 .credential_matches_for_test("REVEL_SESSION=entry-auth-a")
         );
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
 
         let next_destination = root.path().join("abc503");
         save_healthy_contest(&next_destination, "abc503");
@@ -4298,6 +4412,7 @@ mod tests {
 
     #[test]
     fn reopening_from_home_after_settings_save_loads_a_fresh_config_snapshot() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let destination = root.path().join("abc504");
@@ -4325,7 +4440,7 @@ mod tests {
         )
         .unwrap();
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let first = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        let first = start_prepared_contest_entry(prepared, &app_context, &runs).unwrap();
         assert_eq!(first.environment.config.defaults.language, Language::Python);
 
         let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
@@ -4345,7 +4460,7 @@ mod tests {
             Language::Python,
             "an open contest keeps its original Settings snapshot"
         );
-        first.shutdown().unwrap();
+        runs.retire_contest(first).unwrap();
 
         let reopened = prepare_workspace_contest_entry_with(
             root.path(),
@@ -4357,13 +4472,14 @@ mod tests {
             |_, _, _, _| panic!("the test contest is healthy"),
         )
         .unwrap();
-        let reopened = start_prepared_contest_entry(reopened, &app_context).unwrap();
+        let reopened = start_prepared_contest_entry(reopened, &app_context, &runs).unwrap();
         assert_eq!(reopened.environment.config.defaults.language, Language::Cpp);
-        reopened.shutdown().unwrap();
+        runs.retire_contest(reopened).unwrap();
     }
 
     #[test]
     fn contest_creation_rotation_is_retained_by_the_started_session() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let destination = root.path().join("abc509");
@@ -4403,18 +4519,19 @@ mod tests {
                 .credential_matches_for_test("REVEL_SESSION=creation-b")
         );
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let session = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        let session = start_prepared_contest_entry(prepared, &app_context, &runs).unwrap();
         assert!(
             session
                 .environment
                 .auth
                 .credential_matches_for_test("REVEL_SESSION=creation-b")
         );
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
     }
 
     #[test]
     fn production_refresh_rebuild_preserves_the_active_contest_environment_snapshot() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("abc466");
         save_healthy_contest(&destination, "abc466");
@@ -4438,10 +4555,13 @@ mod tests {
             state_dir: auth_state,
             file: auth_file.clone(),
         });
-        let session = ContestSession::start_entry(PreparedContestEntry {
-            input,
-            environment: ContestEnvironment::from_snapshots(config_a, Arc::clone(&auth_b)),
-        })
+        let session = ContestSession::start_entry_for_test(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::from_snapshots(config_a, Arc::clone(&auth_b)),
+            },
+            &runs,
+        )
         .unwrap();
         let mut settings = crate::settings_store::SettingsStore::load(&config_path).unwrap();
         settings
@@ -4509,6 +4629,10 @@ mod tests {
             session,
             prepared,
             crate::tui::RefreshResumeState::default(),
+            &AppContext::Standalone {
+                launch_root: root.path().to_path_buf(),
+            },
+            &runs,
         )
         .unwrap();
 
@@ -4542,11 +4666,12 @@ mod tests {
             disk.editor.as_ref().map(|editor| editor.command.as_str()),
             Some("editor-b")
         );
-        rebuilt.session.shutdown().unwrap();
+        runs.retire_contest(rebuilt.session).unwrap();
     }
 
     #[test]
     fn contest_template_activation_resolves_the_session_editor_snapshot_after_disk_changes() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("abc466");
         save_healthy_contest(&destination, "abc466");
@@ -4560,10 +4685,13 @@ mod tests {
             Config::parse("[defaults]\nlanguage = \"python\"\n[editor]\ncommand = \"editor-a\"\n")
                 .unwrap();
         let input = PreparedWatchInput::load(&destination, Some("abc466")).unwrap();
-        let session = ContestSession::start_entry(PreparedContestEntry {
-            input,
-            environment: ContestEnvironment::new(config_a),
-        })
+        let session = ContestSession::start_entry_for_test(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::new(config_a),
+            },
+            &runs,
+        )
         .unwrap();
 
         std::fs::write(
@@ -4600,11 +4728,12 @@ mod tests {
             disk.editor.as_ref().map(|editor| editor.command.as_str()),
             Some("editor-b")
         );
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
     }
 
     #[test]
     fn production_switch_starts_fresh_config_auth_and_workspace_routing_generations() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let old_destination = root.path().join("abc500");
@@ -4621,10 +4750,13 @@ mod tests {
         .unwrap();
         let auth_a = SessionAuth::configured_for_test("REVEL_SESSION=switch-auth-a");
         let old_auth = Arc::clone(&auth_a);
-        let old_session = ContestSession::start_entry(PreparedContestEntry {
-            input: old_input,
-            environment: ContestEnvironment::from_snapshots(config_a, auth_a),
-        })
+        let old_session = ContestSession::start_entry_for_test(
+            PreparedContestEntry {
+                input: old_input,
+                environment: ContestEnvironment::from_snapshots(config_a, auth_a),
+            },
+            &runs,
+        )
         .unwrap();
         let old_rotation = [reqwest::header::HeaderValue::from_static(
             "REVEL_SESSION=switch-auth-c; Path=/",
@@ -4692,7 +4824,8 @@ mod tests {
         .unwrap();
 
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let new_session = switch_to_prepared_contest(old_session, prepared, &app_context).unwrap();
+        let new_session =
+            switch_to_prepared_contest(old_session, prepared, &app_context, &runs).unwrap();
 
         assert_eq!(new_session.input.destination, new_destination);
         assert_eq!(
@@ -4716,11 +4849,12 @@ mod tests {
                 .map(|editor| editor.command.as_str()),
             Some("editor-b")
         );
-        new_session.shutdown().unwrap();
+        runs.retire_contest(new_session).unwrap();
     }
 
     #[test]
     fn direct_workspace_entry_revalidates_marker_after_input_preparation_before_workers_start() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let marker = crate::workspace::workspace_config_path(root.path());
@@ -4734,8 +4868,11 @@ mod tests {
             &destination,
             Some("abc504"),
             &app_context,
-            Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
-            configured_auth(),
+            ContestEnvironment::from_snapshots(
+                Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
+                configured_auth(),
+            ),
+            &runs,
             || std::fs::remove_file(&marker).unwrap(),
             |_| {
                 start_stages.set(start_stages.get() + 1);
@@ -4743,7 +4880,7 @@ mod tests {
             },
         ) {
             Ok(session) => {
-                session.shutdown().unwrap();
+                runs.retire_contest(session).unwrap();
                 panic!("a deleted active marker must block the direct ContestSession start")
             }
             Err(error) => error,
@@ -4763,6 +4900,7 @@ mod tests {
 
     #[test]
     fn direct_workspace_entry_rejects_routing_change_after_input_preparation() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let marker = crate::workspace::workspace_config_path(root.path());
         std::fs::write(
@@ -4780,8 +4918,11 @@ mod tests {
             &destination,
             Some("abc505"),
             &app_context,
-            Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
-            configured_auth(),
+            ContestEnvironment::from_snapshots(
+                Config::parse("[defaults]\nlanguage = \"python\"\n").unwrap(),
+                configured_auth(),
+            ),
+            &runs,
             || {
                 std::fs::write(
                     &marker,
@@ -4795,7 +4936,7 @@ mod tests {
             },
         ) {
             Ok(session) => {
-                session.shutdown().unwrap();
+                runs.retire_contest(session).unwrap();
                 panic!("a changed active routing generation must block direct session start")
             }
             Err(error) => error,
@@ -4814,6 +4955,7 @@ mod tests {
 
     #[test]
     fn direct_standalone_entry_keeps_missing_marker_compatibility() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("abc506");
         save_healthy_contest(&destination, "abc506");
@@ -4826,8 +4968,8 @@ mod tests {
             &destination,
             Some("abc506"),
             &app_context,
-            Config::default(),
-            Arc::clone(&auth),
+            ContestEnvironment::from_snapshots(Config::default(), Arc::clone(&auth)),
+            &runs,
             || {},
             |_| {
                 start_stages.set(start_stages.get() + 1);
@@ -4838,11 +4980,12 @@ mod tests {
 
         assert_eq!(start_stages.get(), 2);
         assert!(Arc::ptr_eq(&session.environment.auth, &auth));
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
     }
 
     #[test]
     fn missing_and_invalid_auth_do_not_block_direct_contest_session_start() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("abc507");
         save_healthy_contest(&destination, "abc507");
@@ -4860,14 +5003,14 @@ mod tests {
                 &destination,
                 Some("abc507"),
                 &app_context,
-                Config::default(),
-                Arc::clone(&auth),
+                ContestEnvironment::from_snapshots(Config::default(), Arc::clone(&auth)),
+                &runs,
                 || {},
                 |_| Ok(()),
             )
             .unwrap();
             assert!(Arc::ptr_eq(&session.environment.auth, &auth));
-            session.shutdown().unwrap();
+            runs.retire_contest(session).unwrap();
         }
     }
 
@@ -5164,6 +5307,7 @@ mod tests {
 
     #[test]
     fn loading_tui_contest_keeps_another_problems_staging_error_local() {
+        let runs = WorkspaceRuns::default();
         for partial_metadata in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let contest = Contest {
@@ -5184,9 +5328,10 @@ mod tests {
             let session = ContestSession::start(
                 PreparedWatchInput::load(temp.path(), Some("contest")).unwrap(),
                 &RunnerConfig::default(),
+                &runs,
             )
             .unwrap();
-            drop(session);
+            runs.retire_contest(session).unwrap();
             assert_eq!(prepared.sample_counts, [0, 0]);
             assert_eq!(prepared.stress_cases, [None, None]);
             assert_eq!(prepared.stress_load_errors[0], None);
@@ -6149,20 +6294,52 @@ mod tests {
 
     #[test]
     fn complete_contest_session_stops_and_joins_all_idle_workers() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         save_healthy_contest(root.path(), "abc123");
         let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
-        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default(), &runs).unwrap();
+
+        runs.retire_contest(session).unwrap();
+    }
+
+    #[test]
+    fn closing_contest_view_preserves_registration_until_retirement() {
+        let mut runs = WorkspaceRuns::default();
+        let root = tempfile::tempdir().unwrap();
+        save_healthy_contest(root.path(), "abc123");
+        let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
+        let contest = input.contest.clone();
+        let config = RunnerConfig::default();
+        let session = ContestSession::start(input, &config, &runs).unwrap();
+        let scope = session.run_generation.scope().clone();
+        let context =
+            || RunContext::new(root.path().to_path_buf(), &contest, config.clone(), None).unwrap();
 
         session.shutdown().unwrap();
+        let worker = runs.worker().unwrap();
+        assert_eq!(
+            worker
+                .register(context(), RunResults::default())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        worker.invalidate_and_join(&scope).unwrap();
+        let fresh = worker.register(context(), RunResults::default()).unwrap();
+        assert_ne!(*fresh.scope(), scope);
+
+        runs.shutdown().unwrap();
+        assert!(matches!(runs.worker(), Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
     }
 
     #[test]
     fn production_return_home_orchestration_shuts_down_once_without_root_lifetime_cleanup() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         save_healthy_contest(root.path(), "abc123");
         let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
-        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default(), &runs).unwrap();
         let shutdown_calls = std::cell::Cell::new(0);
         let mut location = RootLocation::Contest(session);
         let mut lifetime = RootLifetimeSpy::default();
@@ -6177,7 +6354,7 @@ mod tests {
             &mut lifetime,
             |session| {
                 shutdown_calls.set(shutdown_calls.get() + 1);
-                session.shutdown()
+                runs.retire_contest(session)
             },
         )
         .unwrap();
@@ -6190,22 +6367,27 @@ mod tests {
         assert_eq!(lifetime.submission_shutdown, 0);
         assert_eq!(lifetime.terminal_restore, 0);
         let reopened_input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
-        let reopened = ContestSession::start(reopened_input, &RunnerConfig::default()).unwrap();
-        reopened.shutdown().unwrap();
+        let reopened =
+            ContestSession::start(reopened_input, &RunnerConfig::default(), &runs).unwrap();
+        runs.retire_contest(reopened).unwrap();
     }
 
     #[test]
     fn production_back_home_then_contest_entry_uses_fresh_auth() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         write_empty_workspace(root.path());
         let destination = root.path().join("abc508");
         save_healthy_contest(&destination, "abc508");
         let input = PreparedWatchInput::load(&destination, Some("abc508")).unwrap();
         let old_auth = SessionAuth::configured_for_test("REVEL_SESSION=back-home-auth-a");
-        let session = ContestSession::start_entry(PreparedContestEntry {
-            input,
-            environment: ContestEnvironment::from_snapshots(Config::default(), old_auth),
-        })
+        let session = ContestSession::start_entry_for_test(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::from_snapshots(Config::default(), old_auth),
+            },
+            &runs,
+        )
         .unwrap();
         let mut location = RootLocation::Contest(session);
         let mut lifetime = RootLifetimeSpy::default();
@@ -6217,7 +6399,7 @@ mod tests {
                 &mut location,
                 &mut refresh_frontend_state,
                 &mut lifetime,
-                ContestSession::shutdown,
+                |session| runs.retire_contest(session),
             )
             .unwrap()
             .is_none()
@@ -6241,7 +6423,7 @@ mod tests {
         )
         .unwrap();
         let app_context = AppContext::from_launch_root(root.path()).unwrap();
-        let reopened = start_prepared_contest_entry(prepared, &app_context).unwrap();
+        let reopened = start_prepared_contest_entry(prepared, &app_context, &runs).unwrap();
 
         assert!(
             reopened
@@ -6249,15 +6431,16 @@ mod tests {
                 .auth
                 .credential_matches_for_test("REVEL_SESSION=back-home-auth-b")
         );
-        reopened.shutdown().unwrap();
+        runs.retire_contest(reopened).unwrap();
     }
 
     #[test]
     fn production_return_home_orchestration_does_not_commit_home_on_shutdown_failure() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         save_healthy_contest(root.path(), "abc123");
         let input = PreparedWatchInput::load(root.path(), Some("abc123")).unwrap();
-        let session = ContestSession::start(input, &RunnerConfig::default()).unwrap();
+        let session = ContestSession::start(input, &RunnerConfig::default(), &runs).unwrap();
         let mut location = RootLocation::Contest(session);
         let lifecycle_calls = Arc::new(Mutex::new(Vec::new()));
         let shutdown_calls = Arc::clone(&lifecycle_calls);
@@ -6273,7 +6456,7 @@ mod tests {
             &mut lifetime,
             move |session| {
                 shutdown_calls.lock().unwrap().push("contest shutdown");
-                session.shutdown()?;
+                runs.retire_contest(session)?;
                 Err(io::Error::other("injected contest shutdown failure"))
             },
         )
@@ -6558,6 +6741,7 @@ mod tests {
 
     #[test]
     fn frontend_channel_borrow_survives_active_worker_shutdown_and_precedes_discard() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let old_destination = root.path().join("abc123");
         save_healthy_contest(&old_destination, "abc123");
@@ -6569,10 +6753,12 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (published_tx, published_rx) = mpsc::channel();
         let attempt_messages = message_tx.clone();
-        let run_scope = RunScope::new(&input.contest.contest_id);
-        let target = run_scope.target(&input.contest.problems[0].task_id);
+        let run_generation = RunGeneration::new(&input.contest.contest_id);
+        let target = run_generation
+            .scope()
+            .target(&input.contest.problems[0].task_id);
         let run_worker = RunWorker::start_with_test_attempt(
-            run_scope.clone(),
+            run_generation.scope().clone(),
             message_tx.clone(),
             move |request, completion_tx| {
                 let started_tx = started_tx.clone();
@@ -6612,11 +6798,12 @@ mod tests {
         let old_probe_tx = message_tx.clone();
         drop(message_tx);
 
+        assert!(runs.worker.set(run_worker).is_ok());
         let session = ContestSession {
-            run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
-            run_scope,
+            run_generation,
+            results: RunResults::from(old_probe_tx.clone()),
             environment: ContestEnvironment::new(Config::default()),
             input,
             message_rx,
@@ -6643,13 +6830,14 @@ mod tests {
             let _frontend_channels = session.channels();
         }
 
-        session.shutdown().unwrap();
+        runs.retire_contest(session).unwrap();
         assert!(published_rx.recv_timeout(Duration::from_secs(1)).unwrap());
 
         let fresh_destination = root.path().join("abc467");
         save_healthy_contest(&fresh_destination, "abc467");
         let fresh_input = PreparedWatchInput::load(&fresh_destination, Some("abc467")).unwrap();
-        let fresh_session = ContestSession::start(fresh_input, &RunnerConfig::default()).unwrap();
+        let fresh_session =
+            ContestSession::start(fresh_input, &RunnerConfig::default(), &runs).unwrap();
 
         assert!(
             old_probe_tx
@@ -6670,13 +6858,14 @@ mod tests {
 
     #[test]
     fn partial_new_session_startup_failure_cleans_started_workers() {
+        let runs = WorkspaceRuns::default();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("abc123");
         save_healthy_contest(&destination, "abc123");
         let input = PreparedWatchInput::load(&destination, Some("abc123")).unwrap();
 
         let error =
-            match ContestSession::start_with_hook(input, &RunnerConfig::default(), |stage| {
+            match ContestSession::start_with_hook(input, &RunnerConfig::default(), &runs, |stage| {
                 if stage == SessionStartStage::RunWorkerStarted {
                     Err(io::Error::other("injected detail startup failure"))
                 } else {

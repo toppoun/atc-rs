@@ -97,9 +97,10 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 ### Plain Watch と TUI Watch
 
 - `atc watch --plain` → `commands/watch.rs`。`FileWatcher::next_batch` で変更を集め、対応するソースを選び、その問題・言語で `test_problem` を同期実行する。
-- `atc watch` → `watch_tui_at` → `ContestSession`。ファイル監視の通知を `tui/mod.rs` が受け、ソース変更時に `WatchApp` を更新して Sample Test をキューに入れる。`watch_worker.rs` と `run_scheduler.rs` が実行順と中断を扱い、`attempt_executor.rs` が Sample Test・User Input・Stress に振り分ける。結果は `Message` として TUI に戻る。
-- `ContestSession` が Contest ID と新しいセッション世代を持つ `RunScope` を作り、`WatchApp` と `RunWorker` に渡す。Refresh 後にも新しい世代を作る。`WatchApp` はこの世代内で全実行種別に共通の `RunId` を 1 から採番し、task ID と `RunScope` を含む `RunTarget` を要求へ付ける。論理要求の照合には `RunTarget` と `RunId` の組を使う。
-- `RunScheduler` は `RunTarget` ごとに最新要求と User Input のソースリビジョンの下限を管理する。`AttemptExecutor` はセッションのメタデータから task ID で問題を引き、実行イベント・完了・再キューに元の対象と ID を付ける。TUI は対象の世代を照合してから task ID を現在の表示位置に解決し、その問題の実行状態に適用する。
+- `atc watch` → `watch_tui_at` → `ContestSession`。ファイル監視の通知を `tui/mod.rs` が受け、ソース変更時に `WatchApp` を更新して Sample Test をキューに入れる。`ContestSession` がファイル監視と詳細解析を管理し、`WorkspaceRuntime` が `WorkspaceRuns` を通じて 1 つの `RunWorker` を管理する。単体起動も同じ実行経路を使う。
+- `RunContext::new` は Contest ID・ディレクトリ・メタデータ・Runner 設定を結び付け、新しい `RunScope` を作る。`RunWorker` は実行対象を `RunScope` で登録し、1 つの `RunScheduler` と最大 1 件の物理 attempt を持つ。実行直前に `AttemptExecutor` が対象の task ID を解決し、メタデータ・物理ディレクトリ・Workspace の振り分け先を確認してから Sample Test・User Input・Stress を実行する。
+- `RunScope` は Contest ID と登録したメタデータの実行世代を表す。`WatchApp` は実行コンテキストと共有する `RunGeneration` から全実行種別に共通の `RunId` を取得する。同じ世代で画面を再構築しても採番が続き、User Input のリビジョンと起動ガードも task ID ごとに引き継ぐ。要求・イベント・完了・再キューは `RunTarget`（`RunScope` と task ID）と `RunId` で照合する。
+- `RunResults` は登録済み世代から現在の受信先への配送を扱う。画面終了で受信先を切り離せる。表示中の TUI は世代と `RunId` を照合し、task ID を表示位置へ解決して適用する。受信先がない間のイベントは破棄する。現在の手動切り替え、Workspace Home への復帰、Refresh は旧 Contest の実行世代を明示的に失効させる。
 
 ### AtCoder への提出と結果追跡
 

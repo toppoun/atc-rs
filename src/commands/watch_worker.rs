@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -9,13 +11,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::attempt::AttemptOutcome;
-use crate::config::RunnerConfig;
-use crate::model::Problem;
 use crate::tui::message::{
-    Message, RunId, RunKind, RunRequest, RunScope, RunTarget, RunWorkerCommand,
+    Message, RunGeneration, RunId, RunKind, RunRequest, RunResults, RunScope, RunTarget,
+    RunWorkerCommand,
 };
+#[cfg(test)]
+use crate::{config::RunnerConfig, model::Problem};
 
-use super::attempt_executor::{ActiveAttempt, AttemptCompletion, AttemptExecutor};
+use super::attempt_executor::{ActiveAttempt, AttemptCompletion, AttemptExecutor, RunContext};
 use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler, StressCancellation};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -23,47 +26,60 @@ const MAX_RUN_COMMANDS_PER_TICK: usize = 64;
 
 pub(super) struct RunWorker {
     command_tx: Sender<RunWorkerCommand>,
+    retire_tx: Sender<ScopeRetirement>,
     control: Arc<WorkerControl>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
 
-#[derive(Debug)]
-struct WorkerControl {
+struct RegisteredRun {
+    context: Arc<RunContext>,
+    results: RunResults,
+}
+
+type RunContexts = HashMap<RunScope, RegisteredRun>;
+
+struct ScopeRetirement {
     scope: RunScope,
+    joined: Sender<()>,
+}
+
+struct WorkerControl {
     stopping: AtomicBool,
-    lifecycle_gate: Mutex<()>,
+    lifecycle_gate: Mutex<RunContexts>,
 }
 
 impl WorkerControl {
-    fn new(scope: RunScope) -> Self {
+    fn new(contexts: RunContexts) -> Self {
         Self {
-            scope,
             stopping: AtomicBool::new(false),
-            lifecycle_gate: Mutex::new(()),
+            lifecycle_gate: Mutex::new(contexts),
         }
     }
 
     fn begin_shutdown(&self) {
-        let _gate = self
+        let contexts = self
             .lifecycle_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stopping.store(true, Ordering::Release);
+        for entry in contexts.values() {
+            entry.results.detach();
+        }
     }
 
     fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
 
-    fn while_running<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
-        let _gate = self
+    fn while_running<T>(&self, action: impl FnOnce(&mut RunContexts) -> T) -> Option<T> {
+        let mut contexts = self
             .lifecycle_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.is_stopping() {
             return None;
         }
-        Some(action())
+        Some(action(&mut contexts))
     }
 }
 
@@ -75,6 +91,18 @@ enum RequestDrain {
 }
 
 impl RunWorker {
+    pub(super) fn start_workspace() -> io::Result<Self> {
+        Self::launch(RunContexts::new(), |entry, request, completion| {
+            AttemptExecutor::spawn(
+                entry.context.clone(),
+                entry.results.clone(),
+                request,
+                completion,
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub fn start(
         destination: PathBuf,
         scope: RunScope,
@@ -82,19 +110,13 @@ impl RunWorker {
         runner_config: RunnerConfig,
         message_tx: Sender<Message>,
     ) -> io::Result<Self> {
-        let executor = AttemptExecutor::new(
-            destination,
-            scope.clone(),
-            problems,
-            runner_config,
-            message_tx.clone(),
-        );
-
-        Self::start_with(scope, message_tx, move |request, completion_tx| {
-            executor.spawn(request, completion_tx)
-        })
+        let worker = Self::start_workspace()?;
+        let context = RunContext::fixture(destination, scope, problems, runner_config);
+        worker.register(context, message_tx.into())?;
+        Ok(worker)
     }
 
+    #[cfg(test)]
     fn start_with(
         scope: RunScope,
         message_tx: Sender<Message>,
@@ -102,11 +124,44 @@ impl RunWorker {
         + Send
         + 'static,
     ) -> io::Result<Self> {
+        let mut spawn_attempt = spawn_attempt;
+        Self::launch(
+            Self::fixture_contexts(scope, message_tx),
+            move |_, request, completion| spawn_attempt(request, completion),
+        )
+    }
+
+    #[cfg(test)]
+    fn fixture_contexts(scope: RunScope, message_tx: Sender<Message>) -> RunContexts {
+        HashMap::from([(
+            scope.clone(),
+            RegisteredRun {
+                context: Arc::new(RunContext::fixture(
+                    PathBuf::new(),
+                    scope,
+                    Vec::new(),
+                    RunnerConfig::default(),
+                )),
+                results: message_tx.into(),
+            },
+        )])
+    }
+
+    fn launch(
+        contexts: RunContexts,
+        spawn_attempt: impl FnMut(
+            &RegisteredRun,
+            RunRequest,
+            Sender<AttemptCompletion>,
+        ) -> io::Result<ActiveAttempt>
+        + Send
+        + 'static,
+    ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
-        let control = Arc::new(WorkerControl::new(scope));
+        let (retire_tx, retire_rx) = mpsc::channel();
+        let control = Arc::new(WorkerControl::new(contexts));
         let thread_control = Arc::clone(&control);
-        let failure_tx = message_tx.clone();
 
         let handle = thread::Builder::new()
             .name("atc-watch-run".to_string())
@@ -116,8 +171,8 @@ impl RunWorker {
                         command_rx,
                         completion_rx,
                         completion_tx,
-                        thread_control,
-                        message_tx,
+                        Arc::clone(&thread_control),
+                        retire_rx,
                         spawn_attempt,
                     )
                 }));
@@ -125,12 +180,12 @@ impl RunWorker {
                 match result {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => {
-                        report_worker_failure(&failure_tx, &error);
+                        report_worker_failure(&thread_control, &error);
                         Err(error)
                     }
                     Err(_) => {
                         let error = io::Error::other("run worker thread panicked");
-                        report_worker_failure(&failure_tx, &error);
+                        report_worker_failure(&thread_control, &error);
                         Err(error)
                     }
                 }
@@ -138,6 +193,7 @@ impl RunWorker {
 
         Ok(Self {
             command_tx,
+            retire_tx,
             control,
             handle: Some(handle),
         })
@@ -156,6 +212,54 @@ impl RunWorker {
 
     pub fn sender(&self) -> Sender<RunWorkerCommand> {
         self.command_tx.clone()
+    }
+
+    pub(super) fn register(
+        &self,
+        context: RunContext,
+        results: RunResults,
+    ) -> io::Result<RunGeneration> {
+        self.control
+            .while_running(|contexts| {
+                let generation = context.generation.clone();
+                let scope = generation.scope();
+                if contexts
+                    .keys()
+                    .any(|registered| registered.contest_id() == scope.contest_id())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "contest has a registered execution generation",
+                    ));
+                }
+                contexts.insert(
+                    scope.clone(),
+                    RegisteredRun {
+                        context: Arc::new(context),
+                        results,
+                    },
+                );
+                Ok(generation)
+            })
+            .ok_or_else(stopped_worker)?
+    }
+
+    pub(super) fn invalidate_and_join(&self, scope: &RunScope) -> io::Result<()> {
+        let (done, joined) = mpsc::channel();
+        self.control
+            .while_running(|contexts| {
+                if let Some(entry) = contexts.remove(scope) {
+                    entry.results.detach();
+                }
+                self.retire_tx
+                    .send(ScopeRetirement {
+                        scope: scope.clone(),
+                        joined: done,
+                    })
+                    .map_err(|_| stopped_worker())
+            })
+            .ok_or_else(stopped_worker)??;
+        joined.recv().map_err(|_| stopped_worker())
     }
 
     pub fn request_stop(&self) {
@@ -179,6 +283,10 @@ impl RunWorker {
     }
 }
 
+fn stopped_worker() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "workspace run worker is stopped")
+}
+
 impl Drop for RunWorker {
     fn drop(&mut self) {
         self.request_stop();
@@ -191,8 +299,12 @@ fn scheduler_loop(
     completion_rx: Receiver<AttemptCompletion>,
     completion_tx: Sender<AttemptCompletion>,
     control: Arc<WorkerControl>,
-    message_tx: Sender<Message>,
-    mut spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>,
+    retire_rx: Receiver<ScopeRetirement>,
+    mut spawn_attempt: impl FnMut(
+        &RegisteredRun,
+        RunRequest,
+        Sender<AttemptCompletion>,
+    ) -> io::Result<ActiveAttempt>,
 ) -> io::Result<()> {
     let mut scheduler = RunScheduler::default();
     let mut active = None;
@@ -203,7 +315,7 @@ fn scheduler_loop(
             &completion_rx,
             &completion_tx,
             &control,
-            &message_tx,
+            &retire_rx,
             &mut spawn_attempt,
             &mut scheduler,
             &mut active,
@@ -221,8 +333,12 @@ fn scheduler_loop_inner(
     completion_rx: &Receiver<AttemptCompletion>,
     completion_tx: &Sender<AttemptCompletion>,
     control: &WorkerControl,
-    message_tx: &Sender<Message>,
-    spawn_attempt: &mut impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>,
+    retire_rx: &Receiver<ScopeRetirement>,
+    spawn_attempt: &mut impl FnMut(
+        &RegisteredRun,
+        RunRequest,
+        Sender<AttemptCompletion>,
+    ) -> io::Result<ActiveAttempt>,
     scheduler: &mut RunScheduler,
     active: &mut Option<ActiveAttempt>,
 ) -> io::Result<()> {
@@ -231,7 +347,18 @@ fn scheduler_loop_inner(
             return Ok(());
         }
 
-        if process_ready_completion(completion_rx, scheduler, active, message_tx, control)? {
+        for retirement in retire_rx.try_iter() {
+            if scheduler
+                .active_request()
+                .is_some_and(|request| request.target.scope == retirement.scope)
+            {
+                cleanup_active(scheduler, active.take())?;
+            }
+            scheduler.discard_scope(&retirement.scope);
+            let _ = retirement.joined.send(());
+        }
+
+        if process_ready_completion(completion_rx, scheduler, active, control)? {
             continue;
         }
 
@@ -242,7 +369,7 @@ fn scheduler_loop_inner(
 
         // Requests are bounded above, and completion is checked both before and after the
         // batch. A request flood therefore cannot starve an already-finished attempt.
-        if process_ready_completion(completion_rx, scheduler, active, message_tx, control)? {
+        if process_ready_completion(completion_rx, scheduler, active, control)? {
             continue;
         }
 
@@ -251,15 +378,18 @@ fn scheduler_loop_inner(
         }
 
         if active.is_none() {
-            let spawned = control.while_running(|| {
+            let spawned = control.while_running(|contexts| {
                 scheduler.start_next().map(|request| {
-                    let mut spawn = || spawn_attempt(request.clone(), completion_tx.clone());
-                    let attempt = match &request.kind {
-                        RunKind::UserInput(snapshot) => snapshot
-                            .start_gate
-                            .start_if_current(snapshot.source_revision, spawn),
-                        _ => Some(spawn()),
-                    };
+                    let attempt = contexts.get(&request.target.scope).and_then(|entry| {
+                        let mut spawn =
+                            || spawn_attempt(entry, request.clone(), completion_tx.clone());
+                        match &request.kind {
+                            RunKind::UserInput(snapshot) => snapshot
+                                .start_gate
+                                .start_if_current(snapshot.source_revision, spawn),
+                            _ => Some(spawn()),
+                        }
+                    });
                     (request, attempt)
                 })
             });
@@ -300,8 +430,8 @@ fn scheduler_loop_inner(
 
         match command_rx.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(command) => {
-                let Some(result) = control.while_running(|| {
-                    process_command(&control.scope, scheduler, active.as_ref(), command)
+                let Some(result) = control.while_running(|contexts| {
+                    process_command(contexts, scheduler, active.as_ref(), command)
                 }) else {
                     return Ok(());
                 };
@@ -322,9 +452,9 @@ fn drain_commands(
     for _ in 0..MAX_RUN_COMMANDS_PER_TICK {
         match command_rx.try_recv() {
             Ok(command) => {
-                let Some(result) = control
-                    .while_running(|| process_command(&control.scope, scheduler, active, command))
-                else {
+                let Some(result) = control.while_running(|contexts| {
+                    process_command(contexts, scheduler, active, command)
+                }) else {
                     return Ok(RequestDrain::Shutdown);
                 };
                 result?;
@@ -338,12 +468,23 @@ fn drain_commands(
 }
 
 fn process_command(
-    scope: &RunScope,
+    contexts: &RunContexts,
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
     command: RunWorkerCommand,
 ) -> io::Result<()> {
-    if command.target().scope != *scope {
+    let Some(entry) = contexts.get(&command.target().scope) else {
+        return Ok(());
+    };
+    if entry.context.is_stale() {
+        if let RunWorkerCommand::Run(request) = command {
+            entry.results.send(Message::RunFailed {
+                run_id: request.run_id,
+                target: request.target,
+                error: "contest data or Workspace route changed; reopen the contest and retry"
+                    .into(),
+            })?;
+        }
         return Ok(());
     }
 
@@ -415,13 +556,15 @@ fn process_ready_completion(
     completion_rx: &Receiver<AttemptCompletion>,
     scheduler: &mut RunScheduler,
     active: &mut Option<ActiveAttempt>,
-    message_tx: &Sender<Message>,
     control: &WorkerControl,
 ) -> io::Result<bool> {
     match completion_rx.try_recv() {
-        Ok(completion) if completion.target.scope != control.scope => Ok(true),
         Ok(completion) => {
-            complete_attempt(completion, scheduler, active, message_tx, control)?;
+            if control.while_running(|contexts| contexts.contains_key(&completion.target.scope))
+                == Some(true)
+            {
+                complete_attempt(completion, scheduler, active, control)?;
+            }
             Ok(true)
         }
         Err(TryRecvError::Disconnected) => {
@@ -442,7 +585,6 @@ fn complete_attempt(
     completion: AttemptCompletion,
     scheduler: &mut RunScheduler,
     active: &mut Option<ActiveAttempt>,
-    message_tx: &Sender<Message>,
     control: &WorkerControl,
 ) -> io::Result<()> {
     let physical = active.as_ref().ok_or_else(|| {
@@ -459,14 +601,13 @@ fn complete_attempt(
     // spawn are deliberately impossible before this call returns.
     let physical = active.take().expect("active was checked above");
     let outcome = physical.join()?;
-    finish_joined_attempt(request, outcome, scheduler, message_tx, control)
+    finish_joined_attempt(request, outcome, scheduler, control)
 }
 
 fn finish_joined_attempt(
     request: RunRequest,
     outcome: AttemptOutcome,
     scheduler: &mut RunScheduler,
-    message_tx: &Sender<Message>,
     control: &WorkerControl,
 ) -> io::Result<()> {
     let retired = retire_matching(scheduler, request.clone())?;
@@ -474,35 +615,47 @@ fn finish_joined_attempt(
     // Shutdown and logical outcome publication are serialized by the same lifecycle gate.
     // Whichever obtains it first is the linearization point. Once shutdown wins, no terminal
     // message or requeue can be published and no next attempt can be spawned.
-    let Some(result) = control.while_running(|| match outcome {
-        AttemptOutcome::Completed if retired.is_latest() => send_message(
-            message_tx,
-            Message::RunCompleted {
-                run_id: request.run_id,
-                target: request.target,
-            },
-        ),
-        AttemptOutcome::Failed(error) if retired.is_latest() => send_message(
-            message_tx,
-            Message::RunFailed {
-                run_id: request.run_id,
-                target: request.target,
-                error: error.to_string(),
-            },
-        ),
-        AttemptOutcome::Cancelled => {
-            if scheduler.requeue_retired(retired) {
-                send_message(
-                    message_tx,
-                    Message::RunRequeued {
+    let Some(result) = control.while_running(|contexts| {
+        let Some(entry) = contexts.get(&request.target.scope) else {
+            return Ok(());
+        };
+        if entry.context.is_stale() {
+            for discarded in scheduler.discard_scope(&request.target.scope) {
+                entry.results.send(Message::RunFailed {
+                    run_id: discarded.run_id,
+                    target: discarded.target,
+                    error: "contest data or Workspace route changed; reopen the contest and retry"
+                        .into(),
+                })?;
+            }
+        }
+        match outcome {
+            AttemptOutcome::Completed if retired.is_latest() => {
+                entry.results.send(Message::RunCompleted {
+                    run_id: request.run_id,
+                    target: request.target,
+                })
+            }
+            AttemptOutcome::Failed(error) if retired.is_latest() => {
+                entry.results.send(Message::RunFailed {
+                    run_id: request.run_id,
+                    target: request.target,
+                    error: error.to_string(),
+                })
+            }
+            AttemptOutcome::Cancelled if !entry.context.is_stale() => {
+                if scheduler.requeue_retired(retired) {
+                    entry.results.send(Message::RunRequeued {
                         run_id: request.run_id,
                         target: request.target,
-                    },
-                )?;
+                    })?;
+                }
+                Ok(())
             }
-            Ok(())
+            AttemptOutcome::Completed | AttemptOutcome::Failed(_) | AttemptOutcome::Cancelled => {
+                Ok(())
+            }
         }
-        AttemptOutcome::Completed | AttemptOutcome::Failed(_) => Ok(()),
     }) else {
         return Ok(());
     };
@@ -582,20 +735,17 @@ fn retire_matching(scheduler: &mut RunScheduler, request: RunRequest) -> io::Res
     Ok(retired)
 }
 
-fn send_message(message_tx: &Sender<Message>, message: Message) -> io::Result<()> {
-    message_tx.send(message).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "TUI message receiver disconnected from run worker",
-        )
-    })
-}
-
-fn report_worker_failure(message_tx: &Sender<Message>, error: &io::Error) {
-    let _ = message_tx.send(Message::WorkerFailed(io::Error::new(
-        error.kind(),
-        error.to_string(),
-    )));
+fn report_worker_failure(control: &WorkerControl, error: &io::Error) {
+    control.while_running(|contexts| {
+        control.stopping.store(true, Ordering::Release);
+        for entry in contexts.values() {
+            let _ = entry.results.send(Message::WorkerFailed(io::Error::new(
+                error.kind(),
+                error.to_string(),
+            )));
+            entry.results.detach();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -640,15 +790,21 @@ mod tests {
     impl FakeWorker {
         fn start() -> Self {
             let (message_tx, message_rx) = mpsc::channel();
+            Self::launch(
+                RunWorker::fixture_contexts(RunScope::fixture(), message_tx),
+                message_rx,
+            )
+        }
+
+        fn launch(contexts: RunContexts, message_rx: Receiver<Message>) -> Self {
             let (spawned_tx, spawned_rx) = mpsc::channel();
             let active_count = Arc::new(AtomicUsize::new(0));
             let max_active = Arc::new(AtomicUsize::new(0));
-            let closure_messages = message_tx.clone();
             let closure_active = Arc::clone(&active_count);
             let closure_max = Arc::clone(&max_active);
 
-            let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
-                let messages = closure_messages.clone();
+            let worker = RunWorker::launch(contexts, move |entry, request, completion_tx| {
+                let messages = entry.results.clone();
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
                 let max_active = Arc::clone(&closure_max);
@@ -739,6 +895,340 @@ mod tests {
             debug: false,
             kind: crate::tui::message::RunKind::Samples,
         }
+    }
+
+    fn scoped_sample(scope: &RunScope, task: &str, run_id: u64) -> RunRequest {
+        RunRequest {
+            target: scope.target(task),
+            ..request(0, run_id)
+        }
+    }
+
+    fn register_fake(worker: &RunWorker, scope: &RunScope, results: RunResults) {
+        let context = RunContext::fixture(
+            PathBuf::new(),
+            scope.clone(),
+            Vec::new(),
+            RunnerConfig::default(),
+        );
+        assert_eq!(worker.register(context, results).unwrap().scope(), scope);
+    }
+
+    #[test]
+    fn workspace_executor_uses_each_registered_contest_and_rejects_changed_metadata() {
+        use crate::{
+            model::{Contest, Sample},
+            workspace,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\npaths = []\n",
+        )
+        .unwrap();
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|name| {
+                std::process::Command::new(name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("runner integration tests require Python");
+        let config = RunnerConfig {
+            python: python.into(),
+            ..RunnerConfig::default()
+        };
+        let worker = RunWorker::start_workspace().unwrap();
+        let sender = worker.sender();
+        let register = |contest_id: &str| {
+            let destination = root.path().join(contest_id);
+            let task_id = format!("{contest_id}_a");
+            let contest = Contest {
+                contest_id: contest_id.into(),
+                problems: vec![Problem {
+                    index: "A".into(),
+                    title: "Problem A".into(),
+                    url: format!("https://atcoder.jp/contests/{contest_id}/tasks/{task_id}"),
+                    task_id,
+                    sample_count: 1,
+                }],
+            };
+            workspace::save_metadata(&destination, &contest).unwrap();
+            workspace::save_samples(
+                &destination,
+                &contest.problems[0],
+                &[Sample {
+                    input: String::new(),
+                    output: format!("{contest_id}\n"),
+                }],
+            )
+            .unwrap();
+            std::fs::write(destination.join("A.py"), format!("print('{contest_id}')\n")).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let generation = worker
+                .register(
+                    RunContext::new(
+                        destination.clone(),
+                        &contest,
+                        config.clone(),
+                        Some(root.path()),
+                    )
+                    .unwrap(),
+                    tx.into(),
+                )
+                .unwrap();
+            let request = RunRequest {
+                language: Language::Python,
+                debug: true,
+                ..scoped_sample(generation.scope(), &contest.problems[0].task_id, 1)
+            };
+            (request, rx, contest, destination)
+        };
+
+        let (a, a_rx, mut contest, destination) = register("abc483");
+        let (b, b_rx, _, b_destination) = register("abc480");
+        let assert_correct_output = |request: &RunRequest, rx: &Receiver<Message>| {
+            send_run(&sender, request.clone());
+            let events = messages_until(rx, |message| match message {
+                Message::RunCompleted { target, run_id } => request.matches(target, *run_id),
+                Message::RunFailed { error, .. } => panic!("registered contest failed: {error}"),
+                _ => false,
+            });
+            assert!(events.iter().any(|message| matches!(message,
+                Message::RunEvent { target, run_id, event: TestEvent::TestCaseComparison { actual, .. } }
+                if request.matches(target, *run_id) && actual.trim() == request.target.scope.contest_id()
+            )));
+        };
+        assert_correct_output(&a, &a_rx);
+        assert_correct_output(&b, &b_rx);
+
+        // An unrelated mapping must leave both effective routes intact.
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\n[[paths]]\npattern = '^arc'\npath = 'arc'\n",
+        )
+        .unwrap();
+        assert_correct_output(
+            &RunRequest {
+                run_id: 2,
+                ..b.clone()
+            },
+            &b_rx,
+        );
+
+        contest.problems[0].title = "Replaced metadata".into();
+        workspace::save_metadata(&destination, &contest).unwrap();
+        std::fs::write(
+            destination.join("A.py"),
+            "open('unexpected.txt', 'w').close()\n",
+        )
+        .unwrap();
+        for run_id in 2..=3 {
+            let stale = RunRequest {
+                run_id,
+                ..a.clone()
+            };
+            send_run(&sender, stale.clone());
+            let events = messages_until(&a_rx, |message| {
+                matches!(message,
+                    Message::RunFailed { target, run_id, .. } if stale.matches(target, *run_id)
+                )
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|message| matches!(message, Message::RunEvent { .. }))
+            );
+        }
+        assert!(!destination.join("unexpected.txt").exists());
+        assert_correct_output(
+            &RunRequest {
+                run_id: 3,
+                ..b.clone()
+            },
+            &b_rx,
+        );
+
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::rename(&b_destination, moved.join("abc480")).unwrap();
+        std::fs::write(
+            root.path().join(".atc-workspace.toml"),
+            "version = 1\n[[paths]]\npattern = '^abc480$'\npath = 'moved'\n",
+        )
+        .unwrap();
+        send_run(&sender, RunRequest { run_id: 4, ..b });
+        messages_until(&b_rx, |message| {
+            matches!(message,
+                Message::RunFailed { run_id: 4, error, .. } if error.contains("Workspace ownership changed")
+            )
+        });
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn workspace_prefers_latest_then_fifo_and_requeues_after_view_detaches() {
+        let (a_tx, a_rx) = mpsc::channel();
+        let a_results = RunResults::from(a_tx);
+        let fake = FakeWorker::launch(RunContexts::new(), a_rx);
+        let (other_tx, other_rx) = mpsc::channel();
+        let a_scope = RunScope::new("abc483");
+        let b_scope = RunScope::new("abc480");
+        let c_scope = RunScope::new("abc478");
+        register_fake(&fake.worker, &a_scope, a_results.clone());
+        register_fake(&fake.worker, &b_scope, other_tx.clone().into());
+        register_fake(&fake.worker, &c_scope, other_tx.into());
+        let a = scoped_sample(&a_scope, "a", 1);
+        let b = scoped_sample(&b_scope, "a", 1);
+        let c = scoped_sample(&c_scope, "a", 1);
+
+        send_run(&fake.request_tx, a.clone());
+        let active = fake.spawned();
+        assert_eq!(active.request, a);
+        assert!(
+            matches!(fake.message_rx.recv().unwrap(), Message::RunStarted { target, .. } if target == a.target)
+        );
+        a_results.detach();
+        send_run(&fake.request_tx, b.clone());
+        wait_cancel_requested(&active.cancellation);
+        send_run(&fake.request_tx, c.clone());
+        active.finish(Finish::Cancelled);
+
+        for expected in [&c, &b, &a] {
+            let spawn = fake.spawned();
+            let actual = spawn.request.clone();
+            spawn.finish(Finish::Completed);
+            assert_eq!(&actual, expected);
+        }
+        assert!(fake.message_rx.try_recv().is_err());
+        let delivered = messages_until(
+            &other_rx,
+            |message| matches!(message, Message::RunCompleted { target, .. } if *target == b.target),
+        );
+        assert!(delivered.iter().any(|message| {
+            matches!(message, Message::RunCompleted { target, .. } if *target == c.target)
+        }));
+        assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
+        fake.stop();
+    }
+
+    #[test]
+    fn scope_retirement_joins_matching_attempt_and_rejects_old_commands_and_completion() {
+        let fake = FakeWorker::start();
+        let old_scope = RunScope::fixture();
+        let other_scope = RunScope::new("abc480");
+        let (other_tx, other_rx) = mpsc::channel();
+        register_fake(&fake.worker, &other_scope, other_tx.into());
+        fake.send(0, 1);
+        let active = fake.spawned();
+        let cancellation = Arc::clone(&active.cancellation);
+        // Hold the physical attempt while retirement runs. Its completion will arrive after removal.
+        let (joined_tx, joined_rx) = mpsc::channel();
+        thread::scope(|threads| {
+            let worker = &fake.worker;
+            let old_scope = &old_scope;
+            threads.spawn(move || {
+                joined_tx
+                    .send(worker.invalidate_and_join(old_scope))
+                    .unwrap()
+            });
+            wait_cancel_requested(&cancellation);
+            let early_ack = joined_rx.try_recv();
+            send_run(&fake.request_tx, request(1, 2));
+            send_run(&fake.request_tx, scoped_sample(&other_scope, "a", 1));
+            active.finish(Finish::Cancelled);
+            assert!(matches!(early_ack, Err(TryRecvError::Empty)));
+            joined_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        });
+
+        let other = fake.spawned();
+        let actual = other.request.clone();
+        other.finish(Finish::Completed);
+        assert_eq!(actual, scoped_sample(&other_scope, "a", 1));
+        messages_until(&other_rx, |message| {
+            matches!(message, Message::RunCompleted { .. })
+        });
+        assert_no_logical_message(&fake.message_rx, 1);
+        assert_no_logical_message(&fake.message_rx, 2);
+
+        let new_scope = RunScope::new(old_scope.contest_id());
+        let (new_tx, new_rx) = mpsc::channel();
+        register_fake(&fake.worker, &new_scope, new_tx.into());
+        let fresh = RunRequest {
+            target: new_scope.target("abc123_0"),
+            ..stress_request(0, 1)
+        };
+        send_run(&fake.request_tx, fresh.clone());
+        let fresh_attempt = fake.spawned();
+        fake.request_tx
+            .send(RunWorkerCommand::CancelStress {
+                target: request(0, 1).target,
+                run_id: 1,
+            })
+            .unwrap();
+        let actual = fresh_attempt.request.clone();
+        let cancellation = fresh_attempt.cancellation.clone();
+        fresh_attempt.finish(Finish::Completed);
+        assert_eq!(actual, fresh);
+        messages_until(
+            &new_rx,
+            |message| matches!(message, Message::RunCompleted { target, run_id: 1 } if *target == fresh.target),
+        );
+        assert!(!cancellation.is_requested());
+        assert!(fake.spawned_rx.try_recv().is_err());
+        fake.stop();
+    }
+
+    #[test]
+    fn workspace_shutdown_joins_active_and_drops_other_contests_work() {
+        let fake = FakeWorker::start();
+        let other_scope = RunScope::new("abc480");
+        let (other_tx, other_rx) = mpsc::channel();
+        register_fake(&fake.worker, &other_scope, other_tx.into());
+        fake.send(0, 1);
+        let active = fake.spawned();
+        send_run(&fake.request_tx, scoped_sample(&other_scope, "a", 1));
+        wait_cancel_requested(&active.cancellation);
+
+        fake.worker.request_stop();
+        let new_scope = RunScope::new("abc478");
+        let new_context = RunContext::fixture(
+            PathBuf::new(),
+            new_scope,
+            Vec::new(),
+            RunnerConfig::default(),
+        );
+        assert_eq!(
+            fake.worker
+                .register(new_context, RunResults::default())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        active.finish(Finish::Cancelled);
+        let FakeWorker {
+            worker,
+            request_tx,
+            spawned_rx,
+            message_rx,
+            active_count,
+            ..
+        } = fake;
+        worker.stop_and_join().unwrap();
+        assert_eq!(active_count.load(Ordering::Acquire), 0);
+        assert!(spawned_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        assert_no_logical_message(&message_rx, 1);
+        assert!(
+            request_tx
+                .send(RunWorkerCommand::Run(request(0, 2)))
+                .is_err()
+        );
     }
 
     fn start_fixture_worker(
@@ -941,7 +1431,11 @@ mod tests {
         let (completion_tx, completion_rx) = mpsc::channel();
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
-        let control = Arc::new(WorkerControl::new(RunScope::fixture()));
+        let (_retire_tx, retire_rx) = mpsc::channel();
+        let control = Arc::new(WorkerControl::new(RunWorker::fixture_contexts(
+            RunScope::fixture(),
+            message_tx,
+        )));
         let thread_control = Arc::clone(&control);
         let old = user_input_request(0, 1, 1);
         let RunKind::UserInput(snapshot) = &old.kind else {
@@ -967,8 +1461,8 @@ mod tests {
                 completion_rx,
                 completion_tx,
                 thread_control,
-                message_tx,
-                move |request, completion| {
+                retire_rx,
+                move |_, request, completion| {
                     spawned_tx.send(request.clone()).unwrap();
                     spawn_with(request, completion, |cancellation| {
                         run_attempt(&cancellation, |_| Ok(()))
@@ -1153,7 +1647,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         let (command_tx, command_rx) = mpsc::channel();
-        let control = WorkerControl::new(scope);
+        let (message_tx, message_rx) = mpsc::channel();
+        let control = WorkerControl::new(RunWorker::fixture_contexts(scope, message_tx));
         command_tx
             .send(RunWorkerCommand::CancelStress {
                 target: old_target.clone(),
@@ -1178,16 +1673,9 @@ mod tests {
         };
         assert!(validate_completion(&old_completion, &active_request).is_err());
         completion_tx.send(old_completion).unwrap();
-        let (message_tx, message_rx) = mpsc::channel();
         assert!(
-            process_ready_completion(
-                &completion_rx,
-                &mut scheduler,
-                &mut active,
-                &message_tx,
-                &control,
-            )
-            .unwrap()
+            process_ready_completion(&completion_rx, &mut scheduler, &mut active, &control,)
+                .unwrap()
         );
         assert!(message_rx.try_recv().is_err());
         assert_eq!(active.as_ref().unwrap().request(), active_request);
@@ -1494,7 +1982,10 @@ mod tests {
             send_run(&tx, request(run_id as usize, run_id));
         }
         let mut scheduler = RunScheduler::default();
-        let control = WorkerControl::new(RunScope::fixture());
+        let control = WorkerControl::new(RunWorker::fixture_contexts(
+            RunScope::fixture(),
+            mpsc::channel().0,
+        ));
 
         assert_eq!(
             drain_commands(&rx, &mut scheduler, None, &control).unwrap(),
@@ -1634,14 +2125,17 @@ mod tests {
 
     #[test]
     fn shutdown_gate_rejects_requests_spawns_and_outcomes_after_linearization() {
-        let control = WorkerControl::new(RunScope::fixture());
+        let control = WorkerControl::new(RunWorker::fixture_contexts(
+            RunScope::fixture(),
+            mpsc::channel().0,
+        ));
         let called = AtomicBool::new(false);
 
         control.begin_shutdown();
 
         assert!(
             control
-                .while_running(|| called.store(true, Ordering::Release))
+                .while_running(|_| called.store(true, Ordering::Release))
                 .is_none()
         );
         assert!(!called.load(Ordering::Acquire));
@@ -1728,7 +2222,11 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut release_rx = Some(release_rx);
-        let control = Arc::new(WorkerControl::new(RunScope::fixture()));
+        let (_retire_tx, retire_rx) = mpsc::channel();
+        let control = Arc::new(WorkerControl::new(RunWorker::fixture_contexts(
+            RunScope::fixture(),
+            message_tx,
+        )));
 
         let handle = thread::spawn({
             let control = Arc::clone(&control);
@@ -1738,8 +2236,8 @@ mod tests {
                     completion_rx,
                     completion_tx,
                     control,
-                    message_tx,
-                    move |request, completion_tx| {
+                    retire_rx,
+                    move |_, request, completion_tx| {
                         let spawned_tx = spawned_tx.clone();
                         let finished_tx = finished_tx.clone();
                         let release_rx = release_rx.take().unwrap();
@@ -1897,8 +2395,7 @@ mod tests {
         })
         .unwrap();
         let mut active = Some(physical);
-        let (message_tx, _message_rx) = mpsc::channel();
-        let control = WorkerControl::new(RunScope::fixture());
+        let control = WorkerControl::new(RunContexts::new());
 
         let error = complete_attempt(
             AttemptCompletion {
@@ -1907,7 +2404,6 @@ mod tests {
             },
             &mut scheduler,
             &mut active,
-            &message_tx,
             &control,
         )
         .unwrap_err();
@@ -1924,7 +2420,6 @@ mod tests {
             },
             &mut scheduler,
             &mut no_active,
-            &message_tx,
             &control,
         )
         .unwrap_err();
@@ -1953,17 +2448,11 @@ mod tests {
         let mut active = Some(physical);
         let (disconnected_tx, disconnected_rx) = mpsc::channel();
         drop(disconnected_tx);
-        let (message_tx, _message_rx) = mpsc::channel();
-        let control = WorkerControl::new(RunScope::fixture());
+        let control = WorkerControl::new(RunContexts::new());
 
-        let error = process_ready_completion(
-            &disconnected_rx,
-            &mut scheduler,
-            &mut active,
-            &message_tx,
-            &control,
-        )
-        .unwrap_err();
+        let error =
+            process_ready_completion(&disconnected_rx, &mut scheduler, &mut active, &control)
+                .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         cleanup_active(&mut scheduler, active.take()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1971,6 +2460,19 @@ mod tests {
 
     #[test]
     fn thousand_rapid_requests_keep_one_physical_attempt_and_only_complete_latest_runs() {
+        verify_request_flood(&[RunScope::fixture()]);
+    }
+
+    #[test]
+    fn workspace_request_flood_keeps_one_physical_attempt() {
+        verify_request_flood(&[
+            RunScope::fixture(),
+            RunScope::new("abc480"),
+            RunScope::new("abc478"),
+        ]);
+    }
+
+    fn verify_request_flood(scopes: &[RunScope]) {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let allow_completion = Arc::new(AtomicBool::new(false));
@@ -1981,7 +2483,11 @@ mod tests {
         let closure_max = Arc::clone(&max_active);
         let attempt_messages = message_tx.clone();
 
-        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
+        let contexts = scopes
+            .iter()
+            .flat_map(|scope| RunWorker::fixture_contexts(scope.clone(), message_tx.clone()))
+            .collect();
+        let worker = RunWorker::launch(contexts, move |_, request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let allow_completion = Arc::clone(&closure_allow);
             let active_count = Arc::clone(&closure_active);
@@ -2015,7 +2521,7 @@ mod tests {
         })
         .unwrap();
         let request_tx = worker.sender();
-        send_run(&request_tx, request(0, 1));
+        send_run(&request_tx, scoped_sample(&scopes[0], "task_0", 1));
         spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let mut latest = std::collections::HashMap::new();
@@ -2023,7 +2529,8 @@ mod tests {
             let problem = (run_id as usize) % 3;
             let request = RunRequest {
                 run_id,
-                target: RunTarget::fixture(problem),
+                target: scopes[((run_id as usize) / 3) % scopes.len()]
+                    .target(&format!("task_{problem}")),
                 language: if run_id % 5 == 0 {
                     Language::Python
                 } else {
@@ -2032,7 +2539,7 @@ mod tests {
                 debug: run_id % 2 == 0 && run_id % 5 != 0,
                 kind: crate::tui::message::RunKind::Samples,
             };
-            latest.insert(problem, request.clone());
+            latest.insert(request.target.clone(), request.clone());
             send_run(&request_tx, request);
         }
         let sentinel = RunRequest {
@@ -2042,7 +2549,7 @@ mod tests {
             debug: true,
             kind: crate::tui::message::RunKind::Samples,
         };
-        latest.insert(sentinel.target.fixture_index(), sentinel.clone());
+        latest.insert(sentinel.target.clone(), sentinel.clone());
         send_run(&request_tx, sentinel.clone());
 
         loop {

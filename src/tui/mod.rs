@@ -53,7 +53,7 @@ pub(crate) use global_home::{
 #[cfg(test)]
 pub(crate) use home::run_with_terminal_and_paths as run_home_with_terminal_and_paths;
 pub(crate) use home::{HomeExit, HomeTerminal, run_with_terminal as run_home_with_terminal};
-use message::{Message, RunRequest, RunScope, RunWorkerCommand};
+use message::{Message, RunGeneration, RunRequest, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
@@ -2612,19 +2612,19 @@ pub(crate) struct SessionRuntime<'a> {
 pub(crate) struct SessionExecution<'a> {
     channels: SessionChannels<'a>,
     submissions: &'a mut SubmissionHub,
-    run_scope: RunScope,
+    run_generation: RunGeneration,
 }
 
 impl<'a> SessionExecution<'a> {
     pub(crate) fn new(
         channels: SessionChannels<'a>,
         submissions: &'a mut SubmissionHub,
-        run_scope: RunScope,
+        run_generation: RunGeneration,
     ) -> Self {
         Self {
             channels,
             submissions,
-            run_scope,
+            run_generation,
         }
     }
 }
@@ -3361,12 +3361,12 @@ where
                         detail_analysis_rx,
                     },
                 submissions,
-                run_scope,
+                run_generation,
             },
     } = runtime;
-    let mut app = WatchApp::new_with_run_scope(
+    let mut app = WatchApp::new_with_run_generation(
         stress_setup.contest,
-        run_scope,
+        run_generation,
         sample_counts,
         stress_cases,
         user_inputs,
