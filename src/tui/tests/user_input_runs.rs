@@ -30,6 +30,44 @@ fn run_without_selected_source_reports_failure_on_the_input_without_storage_or_s
 }
 
 #[test]
+fn old_session_user_input_result_with_the_same_run_id_and_revision_is_ignored() {
+    let mut old_app = user_input_app("input");
+    let mut current_app = user_input_app("input");
+    for app in [&mut old_app, &mut current_app] {
+        assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        app.begin_selected_user_input_edit().unwrap();
+        assert!(run_selected_user_input(app, None));
+    }
+    let old = take_run(&mut old_app);
+    let current = take_run(&mut current_app);
+    assert_eq!(old.run_id, current.run_id);
+    assert_eq!(snapshot(&old), snapshot(&current));
+    let (tx, rx) = mpsc::channel();
+    let (run_tx, _run_rx) = mpsc::channel();
+    tx.send(Message::RunStarted {
+        target: current.target.clone(),
+        run_id: current.run_id,
+    })
+    .unwrap();
+    assert!(handle_messages(&mut current_app, &rx, &run_tx).unwrap());
+
+    for (request, output) in [(&old, "stale"), (&current, "current")] {
+        tx.send(Message::UserInputRunEvent {
+            target: request.target.clone(),
+            run_id: request.run_id,
+            snapshot: Arc::clone(snapshot(request)),
+            event: result_event(output),
+        })
+        .unwrap();
+        assert_eq!(
+            handle_messages(&mut current_app, &rx, &run_tx).unwrap(),
+            output == "current"
+        );
+    }
+    assert_eq!(last(&current_app, 3).unwrap().stdout, "current");
+}
+
+#[test]
 fn source_change_is_problem_local_and_clears_draft_result_without_changing_its_buffer() {
     let (_temp, destination) = user_input_workspace();
     write_sync_inputs(&destination, "A", &[(7, "seven")]);
@@ -97,7 +135,10 @@ fn result_event(output: &str) -> UserInputRunEvent {
 }
 
 fn complete(app: &mut WatchApp, request: &RunRequest, output: &str) {
-    assert!(app.run_started(request.problem, request.run_id));
+    assert!(app.run_started(
+        app.problem_for_run_target(&request.target).unwrap(),
+        request.run_id
+    ));
     assert!(apply_event(app, request, result_event(output)));
 }
 
@@ -109,7 +150,12 @@ fn snapshot(request: &RunRequest) -> &Arc<message::UserInputRunSnapshot> {
 }
 
 fn apply_event(app: &mut WatchApp, request: &RunRequest, event: UserInputRunEvent) -> bool {
-    app.user_input_run_event(request.problem, request.run_id, snapshot(request), event)
+    app.user_input_run_event(
+        app.problem_for_run_target(&request.target).unwrap(),
+        request.run_id,
+        snapshot(request),
+        event,
+    )
 }
 
 fn last(app: &WatchApp, id: u64) -> Option<&app::UserInputRunState> {
@@ -273,7 +319,7 @@ fn output_stderr_elapsed_and_execution_status_have_no_judgement_or_expected() {
         let (tx, rx) = mpsc::channel();
         let (run_tx, run_rx) = mpsc::channel();
         tx.send(Message::UserInputRunEvent {
-            problem: 0,
+            target: request.target.clone(),
             run_id: request.run_id,
             snapshot: Arc::clone(snapshot(&request)),
             event: UserInputRunEvent::Finished(UserInputRunResult {

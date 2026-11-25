@@ -208,7 +208,7 @@ impl WatchApp {
             );
         self.pending_user_input_runs.push_back(RunRequest {
             run_id,
-            problem,
+            target: self.run_target(problem),
             language,
             debug: self.debug && language == Language::Cpp,
             kind: RunKind::UserInput(snapshot),

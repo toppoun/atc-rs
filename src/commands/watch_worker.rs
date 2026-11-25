@@ -11,7 +11,9 @@ use std::time::Duration;
 use crate::attempt::AttemptOutcome;
 use crate::config::RunnerConfig;
 use crate::model::Problem;
-use crate::tui::message::{Message, RunKind, RunRequest, RunWorkerCommand};
+use crate::tui::message::{
+    Message, RunId, RunKind, RunRequest, RunScope, RunTarget, RunWorkerCommand,
+};
 
 use super::attempt_executor::{ActiveAttempt, AttemptCompletion, AttemptExecutor};
 use super::run_scheduler::{RequestArrival, RetiredActive, RunScheduler, StressCancellation};
@@ -25,13 +27,22 @@ pub(super) struct RunWorker {
     handle: Option<JoinHandle<io::Result<()>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WorkerControl {
+    scope: RunScope,
     stopping: AtomicBool,
     lifecycle_gate: Mutex<()>,
 }
 
 impl WorkerControl {
+    fn new(scope: RunScope) -> Self {
+        Self {
+            scope,
+            stopping: AtomicBool::new(false),
+            lifecycle_gate: Mutex::new(()),
+        }
+    }
+
     fn begin_shutdown(&self) {
         let _gate = self
             .lifecycle_gate
@@ -66,25 +77,26 @@ enum RequestDrain {
 impl RunWorker {
     pub fn start(
         destination: PathBuf,
-        contest_id: String,
+        scope: RunScope,
         problems: Vec<Problem>,
         runner_config: RunnerConfig,
         message_tx: Sender<Message>,
     ) -> io::Result<Self> {
         let executor = AttemptExecutor::new(
             destination,
-            contest_id,
+            scope.clone(),
             problems,
             runner_config,
             message_tx.clone(),
         );
 
-        Self::start_with(message_tx, move |request, completion_tx| {
+        Self::start_with(scope, message_tx, move |request, completion_tx| {
             executor.spawn(request, completion_tx)
         })
     }
 
     fn start_with(
+        scope: RunScope,
         message_tx: Sender<Message>,
         spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>
         + Send
@@ -92,7 +104,7 @@ impl RunWorker {
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
-        let control = Arc::new(WorkerControl::default());
+        let control = Arc::new(WorkerControl::new(scope));
         let thread_control = Arc::clone(&control);
         let failure_tx = message_tx.clone();
 
@@ -133,12 +145,13 @@ impl RunWorker {
 
     #[cfg(test)]
     pub(super) fn start_with_test_attempt(
+        scope: RunScope,
         message_tx: Sender<Message>,
         spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>
         + Send
         + 'static,
     ) -> io::Result<Self> {
-        Self::start_with(message_tx, spawn_attempt)
+        Self::start_with(scope, message_tx, spawn_attempt)
     }
 
     pub fn sender(&self) -> Sender<RunWorkerCommand> {
@@ -277,8 +290,8 @@ fn scheduler_loop_inner(
                     return Err(io::Error::new(
                         error.kind(),
                         format!(
-                            "failed to spawn physical attempt {}/{}: {error}",
-                            request.problem, request.run_id
+                            "failed to spawn physical attempt {:?}/{}: {error}",
+                            request.target, request.run_id
                         ),
                     ));
                 }
@@ -287,9 +300,9 @@ fn scheduler_loop_inner(
 
         match command_rx.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(command) => {
-                let Some(result) =
-                    control.while_running(|| process_command(scheduler, active.as_ref(), command))
-                else {
+                let Some(result) = control.while_running(|| {
+                    process_command(&control.scope, scheduler, active.as_ref(), command)
+                }) else {
                     return Ok(());
                 };
                 result?;
@@ -309,8 +322,8 @@ fn drain_commands(
     for _ in 0..MAX_RUN_COMMANDS_PER_TICK {
         match command_rx.try_recv() {
             Ok(command) => {
-                let Some(result) =
-                    control.while_running(|| process_command(scheduler, active, command))
+                let Some(result) = control
+                    .while_running(|| process_command(&control.scope, scheduler, active, command))
                 else {
                     return Ok(RequestDrain::Shutdown);
                 };
@@ -325,20 +338,25 @@ fn drain_commands(
 }
 
 fn process_command(
+    scope: &RunScope,
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
     command: RunWorkerCommand,
 ) -> io::Result<()> {
+    if command.target().scope != *scope {
+        return Ok(());
+    }
+
     match command {
         RunWorkerCommand::Run(request) => process_run_request(scheduler, active, request),
-        RunWorkerCommand::CancelStress { problem, run_id } => {
-            process_stress_cancellation(scheduler, active, problem, run_id)
+        RunWorkerCommand::CancelStress { target, run_id } => {
+            process_stress_cancellation(scheduler, active, &target, run_id)
         }
         RunWorkerCommand::RetireUserInputRuns {
-            problem,
+            target,
             before_source_revision,
         } => {
-            scheduler.retire_user_input_runs(problem, before_source_revision);
+            scheduler.retire_user_input_runs(&target, before_source_revision);
             Ok(())
         }
     }
@@ -370,10 +388,10 @@ fn process_run_request(
 fn process_stress_cancellation(
     scheduler: &mut RunScheduler,
     active: Option<&ActiveAttempt>,
-    problem: usize,
-    run_id: crate::tui::message::RunId,
+    target: &RunTarget,
+    run_id: RunId,
 ) -> io::Result<()> {
-    match scheduler.cancel_stress(problem, run_id) {
+    match scheduler.cancel_stress(target, run_id) {
         StressCancellation::Ignored
         | StressCancellation::Accepted {
             cancel_active: false,
@@ -401,6 +419,7 @@ fn process_ready_completion(
     control: &WorkerControl,
 ) -> io::Result<bool> {
     match completion_rx.try_recv() {
+        Ok(completion) if completion.target.scope != control.scope => Ok(true),
         Ok(completion) => {
             complete_attempt(completion, scheduler, active, message_tx, control)?;
             Ok(true)
@@ -428,12 +447,12 @@ fn complete_attempt(
 ) -> io::Result<()> {
     let physical = active.as_ref().ok_or_else(|| {
         io::Error::other(format!(
-            "completion arrived without a physical attempt: {}/{}",
-            completion.problem, completion.run_id
+            "completion arrived without a physical attempt: {:?}/{}",
+            completion.target, completion.run_id
         ))
     })?;
     let request = physical.request();
-    validate_completion(completion, request.clone())?;
+    validate_completion(&completion, &request)?;
     ensure_identity(scheduler, physical)?;
 
     // Join is authoritative and is the no-late-event boundary. Logical messages and the next
@@ -460,14 +479,14 @@ fn finish_joined_attempt(
             message_tx,
             Message::RunCompleted {
                 run_id: request.run_id,
-                problem: request.problem,
+                target: request.target,
             },
         ),
         AttemptOutcome::Failed(error) if retired.is_latest() => send_message(
             message_tx,
             Message::RunFailed {
                 run_id: request.run_id,
-                problem: request.problem,
+                target: request.target,
                 error: error.to_string(),
             },
         ),
@@ -477,7 +496,7 @@ fn finish_joined_attempt(
                     message_tx,
                     Message::RunRequeued {
                         run_id: request.run_id,
-                        problem: request.problem,
+                        target: request.target,
                     },
                 )?;
             }
@@ -526,22 +545,22 @@ fn ensure_identity(scheduler: &RunScheduler, active: &ActiveAttempt) -> io::Resu
 
     if logical != physical {
         return Err(io::Error::other(format!(
-            "logical/physical attempt identity mismatch: logical={}/{}, physical={}/{}",
-            logical.problem, logical.run_id, physical.problem, physical.run_id
+            "logical/physical attempt identity mismatch: logical={:?}/{}, physical={:?}/{}",
+            logical.target, logical.run_id, physical.target, physical.run_id
         )));
     }
 
     Ok(())
 }
 
-fn validate_completion(completion: AttemptCompletion, request: RunRequest) -> io::Result<()> {
-    if completion.problem == request.problem && completion.run_id == request.run_id {
+fn validate_completion(completion: &AttemptCompletion, request: &RunRequest) -> io::Result<()> {
+    if request.matches(&completion.target, completion.run_id) {
         return Ok(());
     }
 
     Err(io::Error::other(format!(
-        "attempt completion identity mismatch: completion={}/{}, physical={}/{}",
-        completion.problem, completion.run_id, request.problem, request.run_id
+        "attempt completion identity mismatch: completion={:?}/{}, physical={:?}/{}",
+        completion.target, completion.run_id, request.target, request.run_id
     )))
 }
 
@@ -552,10 +571,10 @@ fn retire_matching(scheduler: &mut RunScheduler, request: RunRequest) -> io::Res
 
     if retired.request() != request {
         return Err(io::Error::other(format!(
-            "retired/physical attempt identity mismatch: retired={}/{}, physical={}/{}",
-            retired.request().problem,
+            "retired/physical attempt identity mismatch: retired={:?}/{}, physical={:?}/{}",
+            retired.request().target,
             retired.request().run_id,
-            request.problem,
+            request.target,
             request.run_id
         )));
     }
@@ -628,7 +647,7 @@ mod tests {
             let closure_active = Arc::clone(&active_count);
             let closure_max = Arc::clone(&max_active);
 
-            let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+            let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
                 let messages = closure_messages.clone();
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
@@ -643,7 +662,7 @@ mod tests {
                     messages
                         .send(Message::RunStarted {
                             run_id: request.run_id,
-                            problem: request.problem,
+                            target: request.target.clone(),
                         })
                         .unwrap();
                     spawned_tx
@@ -658,7 +677,7 @@ mod tests {
                     messages
                         .send(Message::RunEvent {
                             run_id: request.run_id,
-                            problem: request.problem,
+                            target: request.target.clone(),
                             event: TestEvent::NoSamples,
                         })
                         .unwrap();
@@ -715,11 +734,20 @@ mod tests {
     fn request(problem: usize, run_id: u64) -> RunRequest {
         RunRequest {
             run_id,
-            problem,
+            target: RunTarget::fixture(problem),
             language: Language::Cpp,
             debug: false,
             kind: crate::tui::message::RunKind::Samples,
         }
+    }
+
+    fn start_fixture_worker(
+        message_tx: Sender<Message>,
+        spawn_attempt: impl FnMut(RunRequest, Sender<AttemptCompletion>) -> io::Result<ActiveAttempt>
+        + Send
+        + 'static,
+    ) -> io::Result<RunWorker> {
+        RunWorker::start_with(RunScope::fixture(), message_tx, spawn_attempt)
     }
 
     fn stress_request(problem: usize, run_id: u64) -> RunRequest {
@@ -753,7 +781,7 @@ mod tests {
     ) {
         sender
             .send(RunWorkerCommand::RetireUserInputRuns {
-                problem,
+                target: RunTarget::fixture(problem),
                 before_source_revision,
             })
             .unwrap();
@@ -778,10 +806,7 @@ mod tests {
         messages_until(&fake.message_rx, |message| {
             matches!(
                 message,
-                Message::RunCompleted {
-                    problem: 1,
-                    run_id: 1
-                }
+                Message::RunCompleted { target, run_id: 1 } if target == &RunTarget::fixture(1)
             )
         });
         assert!(fake.spawned_rx.try_recv().is_err());
@@ -814,10 +839,7 @@ mod tests {
         messages_until(&fake.message_rx, |message| {
             matches!(
                 message,
-                Message::RunCompleted {
-                    problem: 1,
-                    run_id: 1
-                }
+                Message::RunCompleted { target, run_id: 1 } if target == &RunTarget::fixture(1)
             )
         });
         retire_user_inputs(&fake.request_tx, 0, 2);
@@ -851,10 +873,7 @@ mod tests {
             messages_until(&fake.message_rx, |message| {
                 matches!(
                     message,
-                    Message::RunCompleted {
-                        problem: 2,
-                        run_id: 1
-                    }
+                    Message::RunCompleted { target, run_id: 1 } if target == &RunTarget::fixture(2)
                 )
             });
             assert!(fake.spawned_rx.try_recv().is_err());
@@ -885,10 +904,7 @@ mod tests {
         messages_until(&fake.message_rx, |message| {
             matches!(
                 message,
-                Message::RunCompleted {
-                    problem: 2,
-                    run_id: 1
-                }
+                Message::RunCompleted { target, run_id: 1 } if target == &RunTarget::fixture(2)
             )
         });
         assert!(fake.spawned_rx.try_recv().is_err());
@@ -925,7 +941,7 @@ mod tests {
         let (completion_tx, completion_rx) = mpsc::channel();
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
-        let control = Arc::new(WorkerControl::default());
+        let control = Arc::new(WorkerControl::new(RunScope::fixture()));
         let thread_control = Arc::clone(&control);
         let old = user_input_request(0, 1, 1);
         let RunKind::UserInput(snapshot) = &old.kind else {
@@ -936,7 +952,7 @@ mod tests {
         for _ in 1..MAX_RUN_COMMANDS_PER_TICK {
             command_tx
                 .send(RunWorkerCommand::CancelStress {
-                    problem: 9,
+                    target: RunTarget::fixture(9),
                     run_id: 0,
                 })
                 .unwrap();
@@ -1088,7 +1104,10 @@ mod tests {
             .unwrap();
         let requeued = before_b
             .iter()
-            .position(|message| matches!(message, Message::RunRequeued { run_id: 5, .. }))
+            .position(|message| {
+                matches!(message, Message::RunRequeued { run_id: 5, target }
+                    if target == &RunTarget::fixture(0))
+            })
             .unwrap();
         let b_started = before_b
             .iter()
@@ -1105,6 +1124,89 @@ mod tests {
         });
         assert_eq!(fake.max_active.load(Ordering::Acquire), 1);
         fake.stop();
+    }
+
+    #[test]
+    fn old_session_commands_cannot_preempt_or_cancel_a_reused_run_id() {
+        let active_request = stress_request(0, 1);
+        let scope = active_request.target.scope.clone();
+        let old_target = RunScope::new(scope.contest_id()).target(&active_request.target.task_id);
+        let mut scheduler = RunScheduler::default();
+        scheduler.request_arrived(active_request.clone());
+        assert_eq!(scheduler.start_next(), Some(active_request.clone()));
+
+        let (cancellation_tx, cancellation_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let active = spawn_with(
+            active_request.clone(),
+            completion_tx.clone(),
+            move |cancellation| {
+                cancellation_tx.send(cancellation).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                AttemptOutcome::Completed
+            },
+        )
+        .unwrap();
+        let mut active = Some(active);
+        let cancellation = cancellation_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel();
+        let control = WorkerControl::new(scope);
+        command_tx
+            .send(RunWorkerCommand::CancelStress {
+                target: old_target.clone(),
+                run_id: active_request.run_id,
+            })
+            .unwrap();
+        command_tx
+            .send(RunWorkerCommand::Run(RunRequest {
+                target: old_target.clone(),
+                ..request(0, 2)
+            }))
+            .unwrap();
+        assert_eq!(
+            drain_commands(&command_rx, &mut scheduler, active.as_ref(), &control).unwrap(),
+            RequestDrain::Open
+        );
+        assert!(!cancellation.is_requested());
+        assert_eq!(scheduler.active_request(), Some(active_request.clone()));
+        let old_completion = AttemptCompletion {
+            target: old_target,
+            run_id: active_request.run_id,
+        };
+        assert!(validate_completion(&old_completion, &active_request).is_err());
+        completion_tx.send(old_completion).unwrap();
+        let (message_tx, message_rx) = mpsc::channel();
+        assert!(
+            process_ready_completion(
+                &completion_rx,
+                &mut scheduler,
+                &mut active,
+                &message_tx,
+                &control,
+            )
+            .unwrap()
+        );
+        assert!(message_rx.try_recv().is_err());
+        assert_eq!(active.as_ref().unwrap().request(), active_request);
+        assert!(!cancellation.is_requested());
+
+        command_tx
+            .send(RunWorkerCommand::CancelStress {
+                target: active_request.target.clone(),
+                run_id: active_request.run_id,
+            })
+            .unwrap();
+        drain_commands(&command_rx, &mut scheduler, active.as_ref(), &control).unwrap();
+        assert!(cancellation.is_requested());
+        release_tx.send(()).unwrap();
+        let completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        validate_completion(&completion, &active_request).unwrap();
+        active.unwrap().join().unwrap();
+        assert!(!scheduler.retire_active().unwrap().is_latest());
+        assert!(scheduler.start_next().is_none());
     }
 
     #[test]
@@ -1192,7 +1294,7 @@ mod tests {
 
         fake.request_tx
             .send(RunWorkerCommand::CancelStress {
-                problem: 0,
+                target: RunTarget::fixture(0),
                 run_id: 10,
             })
             .unwrap();
@@ -1232,7 +1334,7 @@ mod tests {
         wait_cancel_requested(&old.cancellation);
         fake.request_tx
             .send(RunWorkerCommand::CancelStress {
-                problem: old_request.problem,
+                target: old_request.target.clone(),
                 run_id: old_request.run_id,
             })
             .unwrap();
@@ -1266,7 +1368,8 @@ mod tests {
         .unwrap();
         let cancellation = cancellation_rx.recv().unwrap();
 
-        process_stress_cancellation(&mut scheduler, Some(&active), 0, 10).unwrap();
+        process_stress_cancellation(&mut scheduler, Some(&active), &RunTarget::fixture(0), 10)
+            .unwrap();
         assert!(!cancellation.is_requested());
 
         release_tx.send(()).unwrap();
@@ -1391,7 +1494,7 @@ mod tests {
             send_run(&tx, request(run_id as usize, run_id));
         }
         let mut scheduler = RunScheduler::default();
-        let control = WorkerControl::default();
+        let control = WorkerControl::new(RunScope::fixture());
 
         assert_eq!(
             drain_commands(&rx, &mut scheduler, None, &control).unwrap(),
@@ -1412,7 +1515,7 @@ mod tests {
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut release_rx = Some(release_rx);
-        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let release_rx = release_rx.take().unwrap();
             spawn_with(request.clone(), completion_tx, move |cancellation| {
@@ -1467,7 +1570,7 @@ mod tests {
         let attempt_messages = message_tx.clone();
         let mut first = true;
 
-        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             let is_first = std::mem::replace(&mut first, false);
             let release_rx = is_first.then(|| first_release.take().unwrap());
             let spawned_tx = spawned_tx.clone();
@@ -1482,7 +1585,7 @@ mod tests {
                 attempt_messages
                     .send(Message::RunStarted {
                         run_id: request.run_id,
-                        problem: request.problem,
+                        target: request.target.clone(),
                     })
                     .unwrap();
                 spawned_tx
@@ -1531,7 +1634,7 @@ mod tests {
 
     #[test]
     fn shutdown_gate_rejects_requests_spawns_and_outcomes_after_linearization() {
-        let control = WorkerControl::default();
+        let control = WorkerControl::new(RunScope::fixture());
         let called = AtomicBool::new(false);
 
         control.begin_shutdown();
@@ -1549,7 +1652,7 @@ mod tests {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut first = true;
-        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             spawned_tx.send(request.clone()).unwrap();
             if first {
                 first = false;
@@ -1585,7 +1688,7 @@ mod tests {
         let (message_tx, message_rx) = mpsc::channel();
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let mut fail_first = true;
-        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             if fail_first {
                 fail_first = false;
                 return Err(io::Error::other("fake spawn failure"));
@@ -1625,7 +1728,7 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut release_rx = Some(release_rx);
-        let control = Arc::new(WorkerControl::default());
+        let control = Arc::new(WorkerControl::new(RunScope::fixture()));
 
         let handle = thread::spawn({
             let control = Arc::clone(&control);
@@ -1686,7 +1789,7 @@ mod tests {
         drop(message_rx);
         let (finished_tx, finished_rx) = mpsc::channel();
         let attempt_messages = message_tx.clone();
-        let mut worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let mut worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             let attempt_messages = attempt_messages.clone();
             let finished_tx = finished_tx.clone();
             spawn_with(request.clone(), completion_tx, move |cancellation| {
@@ -1694,7 +1797,7 @@ mod tests {
                     attempt_messages
                         .send(Message::RunStarted {
                             run_id: request.run_id,
-                            problem: request.problem,
+                            target: request.target.clone(),
                         })
                         .map_err(|_| {
                             AppError::from(io::Error::new(
@@ -1719,8 +1822,7 @@ mod tests {
     fn scheduler_helper_panic_is_reported_and_stops_without_next_spawn() {
         let (message_tx, message_rx) = mpsc::channel();
         let worker =
-            RunWorker::start_with(message_tx, |_, _| panic!("fake scheduler helper panic"))
-                .unwrap();
+            start_fixture_worker(message_tx, |_, _| panic!("fake scheduler helper panic")).unwrap();
         let request_tx = worker.sender();
         send_run(&request_tx, request(0, 1));
         let _ = request_tx.send(RunWorkerCommand::Run(request(1, 2)));
@@ -1743,7 +1845,7 @@ mod tests {
     fn spawned_identity_mismatch_explicitly_cancels_and_joins_attempt() {
         let (message_tx, message_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
-        let worker = RunWorker::start_with(message_tx, move |_, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |_, completion_tx| {
             let physical = request(1, 99);
             let finished_tx = finished_tx.clone();
             spawn_with(physical, completion_tx, move |cancellation| {
@@ -1796,11 +1898,11 @@ mod tests {
         .unwrap();
         let mut active = Some(physical);
         let (message_tx, _message_rx) = mpsc::channel();
-        let control = WorkerControl::default();
+        let control = WorkerControl::new(RunScope::fixture());
 
         let error = complete_attempt(
             AttemptCompletion {
-                problem: 7,
+                target: RunTarget::fixture(7),
                 run_id: 8,
             },
             &mut scheduler,
@@ -1817,7 +1919,7 @@ mod tests {
         let mut no_active = None;
         let error = complete_attempt(
             AttemptCompletion {
-                problem: 0,
+                target: RunTarget::fixture(0),
                 run_id: 1,
             },
             &mut scheduler,
@@ -1852,7 +1954,7 @@ mod tests {
         let (disconnected_tx, disconnected_rx) = mpsc::channel();
         drop(disconnected_tx);
         let (message_tx, _message_rx) = mpsc::channel();
-        let control = WorkerControl::default();
+        let control = WorkerControl::new(RunScope::fixture());
 
         let error = process_ready_completion(
             &disconnected_rx,
@@ -1879,7 +1981,7 @@ mod tests {
         let closure_max = Arc::clone(&max_active);
         let attempt_messages = message_tx.clone();
 
-        let worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+        let worker = start_fixture_worker(message_tx, move |request, completion_tx| {
             let spawned_tx = spawned_tx.clone();
             let allow_completion = Arc::clone(&closure_allow);
             let active_count = Arc::clone(&closure_active);
@@ -1892,7 +1994,7 @@ mod tests {
                 attempt_messages
                     .send(Message::RunStarted {
                         run_id: request.run_id,
-                        problem: request.problem,
+                        target: request.target.clone(),
                     })
                     .unwrap();
                 spawned_tx.send(request.clone()).unwrap();
@@ -1921,7 +2023,7 @@ mod tests {
             let problem = (run_id as usize) % 3;
             let request = RunRequest {
                 run_id,
-                problem,
+                target: RunTarget::fixture(problem),
                 language: if run_id % 5 == 0 {
                     Language::Python
                 } else {
@@ -1935,12 +2037,12 @@ mod tests {
         }
         let sentinel = RunRequest {
             run_id: 1_002,
-            problem: 3,
+            target: RunTarget::fixture(3),
             language: Language::Cpp,
             debug: true,
             kind: crate::tui::message::RunKind::Samples,
         };
-        latest.insert(sentinel.problem, sentinel.clone());
+        latest.insert(sentinel.target.fixture_index(), sentinel.clone());
         send_run(&request_tx, sentinel.clone());
 
         loop {
@@ -2032,7 +2134,7 @@ mod tests {
             let release_cancelled_attempt = Arc::new(AtomicBool::new(false));
             let closure_active = Arc::clone(&active_count);
             let closure_release = Arc::clone(&release_cancelled_attempt);
-            let mut worker = RunWorker::start_with(message_tx, move |request, completion_tx| {
+            let mut worker = start_fixture_worker(message_tx, move |request, completion_tx| {
                 let spawned_tx = spawned_tx.clone();
                 let active_count = Arc::clone(&closure_active);
                 let release_cancelled_attempt = Arc::clone(&closure_release);

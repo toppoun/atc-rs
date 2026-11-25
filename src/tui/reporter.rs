@@ -3,20 +3,20 @@ use std::sync::mpsc::Sender;
 
 use crate::ui::{Event, Reporter};
 
-use super::message::{Message, RunId, StressEvent, TestEvent};
+use super::message::{Message, RunId, RunTarget, StressEvent, TestEvent};
 
 pub struct ChannelReporter {
     run_id: RunId,
-    problem: usize,
+    target: RunTarget,
     tx: Sender<Message>,
     send_error: Option<io::Error>,
 }
 
 impl ChannelReporter {
-    pub fn new(run_id: RunId, problem: usize, tx: Sender<Message>) -> Self {
+    pub fn new(run_id: RunId, target: RunTarget, tx: Sender<Message>) -> Self {
         Self {
             run_id,
-            problem,
+            target,
             tx,
             send_error: None,
         }
@@ -38,7 +38,7 @@ impl ChannelReporter {
     fn send(&mut self, event: TestEvent) {
         self.send_message(Message::RunEvent {
             run_id: self.run_id,
-            problem: self.problem,
+            target: self.target.clone(),
             event,
         });
     }
@@ -46,7 +46,7 @@ impl ChannelReporter {
     fn send_stress(&mut self, event: StressEvent) {
         self.send_message(Message::StressEvent {
             run_id: self.run_id,
-            problem: self.problem,
+            target: self.target.clone(),
             event,
         });
     }
@@ -75,7 +75,7 @@ impl Reporter for ChannelReporter {
             Event::CompileDiagnostics { stderr, .. } => {
                 self.send_message(Message::CompileDiagnostics {
                     run_id: self.run_id,
-                    problem: self.problem,
+                    target: self.target.clone(),
                     stderr: stderr.to_owned(),
                 });
             }
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn forwards_skipped_legacy_case_as_a_distinct_test_notice() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ChannelReporter::new(7, 2, tx);
+        let mut reporter = ChannelReporter::new(7, RunTarget::fixture(2), tx);
         reporter.report(Event::SavedStressCaseSkipped {
             problem_index: "A",
             reason: "legacy v1 timed-out has no expected.out",
@@ -255,9 +255,9 @@ mod tests {
         match rx.recv().unwrap() {
             Message::RunEvent {
                 run_id: 7,
-                problem: 2,
+                target,
                 event: TestEvent::SavedStressCaseSkipped { reason },
-            } => assert!(reason.contains("expected.out")),
+            } if target == RunTarget::fixture(2) => assert!(reason.contains("expected.out")),
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -266,7 +266,7 @@ mod tests {
     fn converts_accepted_event_to_owned_run_message() {
         let (tx, rx) = mpsc::channel();
 
-        let mut reporter = ChannelReporter::new(7, 2, tx);
+        let mut reporter = ChannelReporter::new(7, RunTarget::fixture(2), tx);
 
         reporter.report(Event::TestCaseAccepted {
             number: 1,
@@ -278,11 +278,11 @@ mod tests {
         match message {
             Message::RunEvent {
                 run_id,
-                problem,
+                target,
                 event: TestEvent::TestCaseAccepted { number, elapsed },
             } => {
                 assert_eq!(run_id, 7);
-                assert_eq!(problem, 2);
+                assert_eq!(target, RunTarget::fixture(2));
                 assert_eq!(number, 1);
                 assert_eq!(elapsed, Duration::from_millis(12));
             }
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn ignores_cli_only_initialization_events() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ChannelReporter::new(1, 0, tx);
+        let mut reporter = ChannelReporter::new(1, RunTarget::fixture(0), tx);
         let path = std::path::Path::new("templates/cpp.cpp");
 
         reporter.report(Event::TemplateFileCreated { path });
@@ -310,7 +310,7 @@ mod tests {
     fn owns_wrong_answer_text() {
         let (tx, rx) = mpsc::channel();
 
-        let mut reporter = ChannelReporter::new(3, 0, tx);
+        let mut reporter = ChannelReporter::new(3, RunTarget::fixture(0), tx);
 
         let input = String::from("1\n");
         let expected = String::from("Yes\n");
@@ -372,7 +372,7 @@ mod tests {
     fn converts_stderr_event() {
         let (tx, rx) = mpsc::channel();
 
-        let mut reporter = ChannelReporter::new(4, 1, tx);
+        let mut reporter = ChannelReporter::new(4, RunTarget::fixture(1), tx);
 
         reporter.report(Event::TestCaseStderr {
             number: 1,
@@ -382,9 +382,9 @@ mod tests {
         match rx.recv().unwrap() {
             Message::RunEvent {
                 run_id: 4,
-                problem: 1,
+                target,
                 event: TestEvent::TestCaseStderr { number: 1, stderr },
-            } => {
+            } if target == RunTarget::fixture(1) => {
                 assert_eq!(stderr, "debug output\n");
             }
 
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn converts_run_boundaries_and_recoverable_terminal_events() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ChannelReporter::new(9, 1, tx);
+        let mut reporter = ChannelReporter::new(9, RunTarget::fixture(1), tx);
 
         reporter.report(Event::TestRunStarted {
             problem_index: "B",
@@ -414,23 +414,23 @@ mod tests {
 
         let messages: Vec<_> = rx.try_iter().collect();
         assert!(matches!(
-            messages[0],
+            &messages[0],
             Message::RunEvent {
                 run_id: 9,
-                problem: 1,
+                target,
                 event: TestEvent::TestRunStarted { total_cases: 2 },
-            }
+            } if target == &RunTarget::fixture(1)
         ));
         assert!(matches!(
-            messages[1],
+            &messages[1],
             Message::RunEvent {
                 run_id: 9,
-                problem: 1,
+                target,
                 event: TestEvent::TestRunFinished {
                     accepted: 1,
                     total_cases: 2,
                 },
-            }
+            } if target == &RunTarget::fixture(1)
         ));
         assert!(matches!(
             messages[2],
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn converts_stress_failure_to_owned_message() {
         let (tx, rx) = mpsc::channel();
-        let mut reporter = ChannelReporter::new(11, 0, tx);
+        let mut reporter = ChannelReporter::new(11, RunTarget::fixture(0), tx);
         let failure = crate::stress::StressFailure {
             kind: crate::stress::CandidateFailureKind::WrongAnswer,
             case_number: 14,
@@ -484,7 +484,7 @@ mod tests {
         match rx.recv().unwrap() {
             Message::StressEvent {
                 run_id: 11,
-                problem: 0,
+                target,
                 event:
                     StressEvent::Failed {
                         kind: crate::stress::CandidateFailureKind::WrongAnswer,
@@ -497,7 +497,7 @@ mod tests {
                         saved_to,
                         ..
                     },
-            } => {
+            } if target == RunTarget::fixture(0) => {
                 assert_eq!(input, "2\n1 2\n");
                 assert_eq!(expected, "No\n");
                 assert_eq!(actual, "Yes\n");
@@ -512,7 +512,7 @@ mod tests {
     fn disconnected_channel_can_be_normalized_as_an_attempt_failure() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        let mut reporter = ChannelReporter::new(1, 0, tx);
+        let mut reporter = ChannelReporter::new(1, RunTarget::fixture(0), tx);
         let cancellation = AttemptCancellation::new();
 
         let outcome = run_attempt(&cancellation, |_| {

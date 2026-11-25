@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::tui::message::{RunId, RunKind, RunRequest};
+use crate::tui::message::{RunId, RunKind, RunRequest, RunTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestArrival {
@@ -50,8 +50,8 @@ pub(super) struct RunScheduler {
     active: Option<ActiveRequest>,
     foreground: Option<RunRequest>,
     pending: VecDeque<RunRequest>,
-    latest_seen: HashMap<usize, RunId>,
-    retired_user_input_revisions: HashMap<usize, u64>,
+    latest_seen: HashMap<RunTarget, RunId>,
+    retired_user_input_revisions: HashMap<RunTarget, u64>,
 }
 
 impl RunScheduler {
@@ -63,24 +63,25 @@ impl RunScheduler {
         if self.user_input_request_retired(&request)
             || self
                 .latest_seen
-                .get(&request.problem)
+                .get(&request.target)
                 .is_some_and(|latest| request.run_id <= *latest)
         {
             return RequestArrival::IgnoredStale;
         }
 
-        self.latest_seen.insert(request.problem, request.run_id);
-        self.remove_pending_problem(request.problem);
+        self.latest_seen
+            .insert(request.target.clone(), request.run_id);
+        self.remove_pending_problem(&request.target);
 
         if let Some(previous_foreground) = self.foreground.take()
-            && previous_foreground.problem != request.problem
+            && previous_foreground.target != request.target
             && previous_foreground.kind.preserve_on_preemption()
         {
             self.push_pending_latest(previous_foreground);
         }
 
         let cancel_active = if let Some(active) = self.active.as_mut() {
-            if active.request.problem == request.problem {
+            if active.request.target == request.target {
                 active.logical_state = ActiveLogicalState::Obsolete;
             }
 
@@ -100,14 +101,18 @@ impl RunScheduler {
         RequestArrival::Accepted { cancel_active }
     }
 
-    pub(super) fn retire_user_input_runs(&mut self, problem: usize, before_source_revision: u64) {
+    pub(super) fn retire_user_input_runs(
+        &mut self,
+        target: &RunTarget,
+        before_source_revision: u64,
+    ) {
         let minimum = self
             .retired_user_input_revisions
-            .entry(problem)
+            .entry(target.clone())
             .or_default();
         *minimum = (*minimum).max(before_source_revision);
         let matches_retired = |request: &RunRequest| {
-            request.problem == problem
+            request.target == *target
                 && matches!(&request.kind, RunKind::UserInput(snapshot)
                     if snapshot.source_revision < *minimum)
         };
@@ -123,15 +128,17 @@ impl RunScheduler {
     fn user_input_request_retired(&self, request: &RunRequest) -> bool {
         matches!(&request.kind, RunKind::UserInput(snapshot)
             if snapshot.start_gate.is_retired(snapshot.source_revision)
-                || self.retired_user_input_revisions.get(&request.problem)
+                || self.retired_user_input_revisions.get(&request.target)
                     .is_some_and(|minimum| snapshot.source_revision < *minimum))
     }
 
-    pub(super) fn cancel_stress(&mut self, problem: usize, run_id: RunId) -> StressCancellation {
+    pub(super) fn cancel_stress(
+        &mut self,
+        target: &RunTarget,
+        run_id: RunId,
+    ) -> StressCancellation {
         let matches_stress = |request: &RunRequest| {
-            request.problem == problem
-                && request.run_id == run_id
-                && matches!(request.kind, RunKind::Stress { .. })
+            request.matches(target, run_id) && matches!(request.kind, RunKind::Stress { .. })
         };
 
         if self.foreground.as_ref().is_some_and(matches_stress) {
@@ -181,10 +188,7 @@ impl RunScheduler {
             }
         };
 
-        debug_assert_eq!(
-            self.latest_seen.get(&request.problem),
-            Some(&request.run_id)
-        );
+        debug_assert_eq!(self.latest_seen.get(&request.target), Some(&request.run_id));
 
         self.active = Some(ActiveRequest {
             request: request.clone(),
@@ -199,8 +203,8 @@ impl RunScheduler {
     pub(super) fn retire_active(&mut self) -> Option<RetiredActive> {
         let active = self.active.take()?;
         let is_latest = active.logical_state == ActiveLogicalState::Latest
-            && self.latest_seen.get(&active.request.problem) == Some(&active.request.run_id)
-            && !self.has_logical_request_for(active.request.problem);
+            && self.latest_seen.get(&active.request.target) == Some(&active.request.run_id)
+            && !self.has_logical_request_for(&active.request.target);
         let requeue_eligible = is_latest && active.request.kind.preserve_on_preemption();
 
         debug_assert!(self.invariants_hold());
@@ -216,8 +220,8 @@ impl RunScheduler {
         let request = retired.request;
 
         if !retired.requeue_eligible
-            || self.latest_seen.get(&request.problem) != Some(&request.run_id)
-            || self.has_logical_request_for(request.problem)
+            || self.latest_seen.get(&request.target) != Some(&request.run_id)
+            || self.has_logical_request_for(&request.target)
         {
             debug_assert!(self.invariants_hold());
             return false;
@@ -228,42 +232,39 @@ impl RunScheduler {
         true
     }
 
-    fn remove_pending_problem(&mut self, problem: usize) -> Option<RunRequest> {
+    fn remove_pending_problem(&mut self, target: &RunTarget) -> Option<RunRequest> {
         let position = self
             .pending
             .iter()
-            .position(|request| request.problem == problem)?;
+            .position(|request| request.target == *target)?;
         self.pending.remove(position)
     }
 
     fn push_pending_latest(&mut self, request: RunRequest) {
-        self.remove_pending_problem(request.problem);
+        self.remove_pending_problem(&request.target);
         self.pending.push_back(request);
     }
 
-    fn has_logical_request_for(&self, problem: usize) -> bool {
+    fn has_logical_request_for(&self, target: &RunTarget) -> bool {
         self.foreground
             .as_ref()
-            .is_some_and(|request| request.problem == problem)
-            || self
-                .pending
-                .iter()
-                .any(|request| request.problem == problem)
+            .is_some_and(|request| request.target == *target)
+            || self.pending.iter().any(|request| request.target == *target)
     }
 
     fn invariants_hold(&self) -> bool {
         let mut logical_problems = HashSet::new();
 
         if let Some(foreground) = &self.foreground
-            && (!logical_problems.insert(foreground.problem)
-                || self.latest_seen.get(&foreground.problem) != Some(&foreground.run_id))
+            && (!logical_problems.insert(&foreground.target)
+                || self.latest_seen.get(&foreground.target) != Some(&foreground.run_id))
         {
             return false;
         }
 
         for pending in &self.pending {
-            if !logical_problems.insert(pending.problem)
-                || self.latest_seen.get(&pending.problem) != Some(&pending.run_id)
+            if !logical_problems.insert(&pending.target)
+                || self.latest_seen.get(&pending.target) != Some(&pending.run_id)
             {
                 return false;
             }
@@ -272,8 +273,8 @@ impl RunScheduler {
         if let Some(active) = &self.active {
             match active.logical_state {
                 ActiveLogicalState::Latest => {
-                    if !logical_problems.insert(active.request.problem)
-                        || self.latest_seen.get(&active.request.problem)
+                    if !logical_problems.insert(&active.request.target)
+                        || self.latest_seen.get(&active.request.target)
                             != Some(&active.request.run_id)
                     {
                         return false;
@@ -285,7 +286,7 @@ impl RunScheduler {
                     // replacement remains.
                     if self
                         .latest_seen
-                        .get(&active.request.problem)
+                        .get(&active.request.target)
                         .is_none_or(|latest| *latest <= active.request.run_id)
                     {
                         return false;
@@ -295,7 +296,7 @@ impl RunScheduler {
                     if !matches!(active.request.kind, RunKind::Stress { .. })
                         || self
                             .latest_seen
-                            .get(&active.request.problem)
+                            .get(&active.request.target)
                             .is_none_or(|latest| *latest < active.request.run_id)
                     {
                         return false;
@@ -317,7 +318,7 @@ mod tests {
     fn request(problem: usize, run_id: RunId) -> RunRequest {
         RunRequest {
             run_id,
-            problem,
+            target: RunTarget::fixture(problem),
             language: Language::Cpp,
             debug: false,
             kind: RunKind::Samples,
@@ -327,7 +328,7 @@ mod tests {
     fn ids(requests: impl IntoIterator<Item = RunRequest>) -> Vec<(usize, RunId)> {
         requests
             .into_iter()
-            .map(|request| (request.problem, request.run_id))
+            .map(|request| (request.target.fixture_index(), request.run_id))
             .collect()
     }
 
@@ -339,7 +340,7 @@ mod tests {
         scheduler
             .foreground
             .as_ref()
-            .map(|request| (request.problem, request.run_id))
+            .map(|request| (request.target.fixture_index(), request.run_id))
     }
 
     fn assert_invariants(scheduler: &RunScheduler) {
@@ -348,12 +349,12 @@ mod tests {
         let pending_problems = scheduler
             .pending
             .iter()
-            .map(|request| request.problem)
+            .map(|request| request.target.fixture_index())
             .collect::<HashSet<_>>();
         assert_eq!(pending_problems.len(), scheduler.pending.len());
 
         if let Some(foreground) = &scheduler.foreground {
-            assert!(!pending_problems.contains(&foreground.problem));
+            assert!(!pending_problems.contains(&foreground.target.fixture_index()));
         }
     }
 
@@ -611,7 +612,7 @@ mod tests {
 
         let mut order = Vec::new();
         while let Some(next) = scheduler.start_next() {
-            order.push((next.problem, next.run_id));
+            order.push((next.target.fixture_index(), next.run_id));
             assert!(scheduler.retire_active().is_some());
         }
 
@@ -634,7 +635,7 @@ mod tests {
 
         let mut order = Vec::new();
         while let Some(next) = scheduler.start_next() {
-            order.push((next.problem, next.run_id));
+            order.push((next.target.fixture_index(), next.run_id));
             assert!(scheduler.retire_active().is_some());
         }
         assert_eq!(order, [(3, 4), (1, 2), (2, 3), (0, 1)]);
@@ -663,7 +664,7 @@ mod tests {
 
         let duplicate = RunRequest {
             run_id: 3,
-            problem: 0,
+            target: RunTarget::fixture(0),
             language: Language::Python,
             debug: true,
             kind: RunKind::Samples,
@@ -747,7 +748,7 @@ mod tests {
         );
 
         assert_eq!(
-            scheduler.cancel_stress(stress.problem, stress.run_id),
+            scheduler.cancel_stress(&stress.target, stress.run_id),
             StressCancellation::Accepted {
                 cancel_active: false
             }
@@ -780,7 +781,7 @@ mod tests {
         );
 
         assert_eq!(
-            scheduler.cancel_stress(stress.problem, stress.run_id),
+            scheduler.cancel_stress(&stress.target, stress.run_id),
             StressCancellation::Accepted {
                 cancel_active: false
             }
@@ -804,16 +805,22 @@ mod tests {
         };
         start(&mut scheduler, stress);
 
-        assert_eq!(scheduler.cancel_stress(0, 9), StressCancellation::Ignored);
-        assert_eq!(scheduler.cancel_stress(1, 10), StressCancellation::Ignored);
         assert_eq!(
-            scheduler.cancel_stress(0, 10),
+            scheduler.cancel_stress(&RunTarget::fixture(0), 9),
+            StressCancellation::Ignored
+        );
+        assert_eq!(
+            scheduler.cancel_stress(&RunTarget::fixture(1), 10),
+            StressCancellation::Ignored
+        );
+        assert_eq!(
+            scheduler.cancel_stress(&RunTarget::fixture(0), 10),
             StressCancellation::Accepted {
                 cancel_active: true
             }
         );
         assert_eq!(
-            scheduler.cancel_stress(0, 10),
+            scheduler.cancel_stress(&RunTarget::fixture(0), 10),
             StressCancellation::Accepted {
                 cancel_active: false
             }
@@ -847,7 +854,7 @@ mod tests {
         scheduler.request_arrived(new.clone());
 
         assert_eq!(
-            scheduler.cancel_stress(old.problem, old.run_id),
+            scheduler.cancel_stress(&old.target, old.run_id),
             StressCancellation::Ignored
         );
         assert_eq!(scheduler.start_next(), Some(new));
@@ -874,7 +881,7 @@ mod tests {
         start(&mut scheduler, old.clone());
 
         assert_eq!(
-            scheduler.cancel_stress(old.problem, old.run_id),
+            scheduler.cancel_stress(&old.target, old.run_id),
             StressCancellation::Accepted {
                 cancel_active: true
             }
@@ -919,7 +926,7 @@ mod tests {
         );
 
         assert_eq!(
-            scheduler.cancel_stress(old.problem, old.run_id),
+            scheduler.cancel_stress(&old.target, old.run_id),
             StressCancellation::Accepted {
                 cancel_active: false
             }
@@ -936,7 +943,7 @@ mod tests {
         let mut scheduler = RunScheduler::default();
         let python_debug = RunRequest {
             run_id: 1,
-            problem: 0,
+            target: RunTarget::fixture(0),
             language: Language::Python,
             debug: true,
             kind: RunKind::Samples,
@@ -959,6 +966,58 @@ mod tests {
                 start_gate: Default::default(),
             })),
             ..request(problem, run_id)
+        }
+    }
+
+    #[test]
+    fn equal_task_and_run_ids_in_different_contests_keep_distinct_requests() {
+        use crate::tui::message::RunScope;
+
+        let mut scheduler = RunScheduler::default();
+        let first = request(0, 7);
+        let second = RunRequest {
+            target: RunScope::new("abc456").target(&first.target.task_id),
+            ..first.clone()
+        };
+        start(&mut scheduler, first.clone());
+        assert_eq!(
+            scheduler.request_arrived(second.clone()),
+            RequestArrival::Accepted {
+                cancel_active: true
+            }
+        );
+        let retired = scheduler.retire_active().unwrap();
+        assert!(scheduler.requeue_retired(retired));
+        assert_eq!(scheduler.start_next(), Some(second));
+        let finished = scheduler.retire_active().unwrap();
+        assert!(finished.is_latest());
+        assert_eq!(scheduler.start_next(), Some(first));
+    }
+
+    #[test]
+    fn source_retirement_compares_revisions_only_within_the_target_and_generation() {
+        use crate::tui::message::RunScope;
+
+        let old = user_input_request(0, 1);
+        let current = RunRequest {
+            target: RunScope::new(old.target.scope.contest_id()).target(&old.target.task_id),
+            ..user_input_request(0, 1)
+        };
+        let other_problem = user_input_request(1, 1);
+        let mut scheduler = RunScheduler::default();
+        scheduler.retire_user_input_runs(&old.target, 99);
+        assert_eq!(scheduler.request_arrived(old), RequestArrival::IgnoredStale);
+
+        for unaffected in [current, other_problem] {
+            assert_eq!(
+                scheduler.request_arrived(unaffected.clone()),
+                RequestArrival::Accepted {
+                    cancel_active: false
+                }
+            );
+            assert_eq!(scheduler.start_next(), Some(unaffected));
+            let finished = scheduler.retire_active().unwrap();
+            assert!(finished.is_latest());
         }
     }
 
@@ -1015,7 +1074,7 @@ mod tests {
         let mut scheduler = RunScheduler::default();
         start(&mut scheduler, request(0, 1));
         scheduler.request_arrived(user_input_request(0, 2));
-        scheduler.retire_user_input_runs(0, 4);
+        scheduler.retire_user_input_runs(&RunTarget::fixture(0), 4);
         let retired = scheduler.retire_active().unwrap();
         assert!(!retired.is_latest());
         assert!(!scheduler.requeue_retired(retired));
@@ -1035,15 +1094,15 @@ mod tests {
     fn user_input_removal_boundary_is_monotonic_and_preserves_recreated_generation() {
         let mut scheduler = RunScheduler::default();
         scheduler.request_arrived(user_input_request(0, 1));
-        scheduler.retire_user_input_runs(0, 4);
+        scheduler.retire_user_input_runs(&RunTarget::fixture(0), 4);
         let mut fresh = user_input_request(0, 2);
         let RunKind::UserInput(snapshot) = &mut fresh.kind else {
             unreachable!()
         };
         std::sync::Arc::make_mut(snapshot).source_revision = 5;
         scheduler.request_arrived(fresh.clone());
-        scheduler.retire_user_input_runs(0, 4); // Delayed/repeated removal must not kill fresh work.
-        scheduler.retire_user_input_runs(0, 2);
+        scheduler.retire_user_input_runs(&RunTarget::fixture(0), 4); // Delayed/repeated removal must not kill fresh work.
+        scheduler.retire_user_input_runs(&RunTarget::fixture(0), 2);
         assert_eq!(scheduler.start_next(), Some(fresh));
         let retired = scheduler.retire_active().unwrap();
         assert!(!scheduler.requeue_retired(retired));
@@ -1060,7 +1119,7 @@ mod tests {
         let mut with_pending = scheduler_with_three_pending();
         let pending_before = pending_ids(&with_pending);
         let active_before = with_pending.active_request();
-        with_pending.retire_user_input_runs(0, 4);
+        with_pending.retire_user_input_runs(&RunTarget::fixture(0), 4);
         assert_eq!(pending_ids(&with_pending), pending_before);
         assert_eq!(with_pending.active_request(), active_before);
         assert_invariants(&with_pending);
@@ -1078,7 +1137,7 @@ mod tests {
             let mut scheduler = RunScheduler::default();
             start(&mut scheduler, request(9, 1));
             scheduler.request_arrived(foreground.clone());
-            scheduler.retire_user_input_runs(0, 4);
+            scheduler.retire_user_input_runs(&RunTarget::fixture(0), 4);
             let retired = scheduler.retire_active().unwrap();
             assert!(scheduler.requeue_retired(retired));
             assert_eq!(scheduler.start_next(), Some(foreground));
@@ -1095,7 +1154,7 @@ mod tests {
         let mut scheduler = RunScheduler::default();
         let old = user_input_request(0, 1);
         start(&mut scheduler, old.clone());
-        scheduler.retire_user_input_runs(0, 4);
+        scheduler.retire_user_input_runs(&RunTarget::fixture(0), 4);
         assert_eq!(scheduler.active_request(), Some(old));
         assert!(scheduler.start_next().is_none());
         let retired = scheduler.retire_active().unwrap();

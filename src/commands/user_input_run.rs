@@ -6,6 +6,7 @@ use std::sync::mpsc::Sender;
 use crate::config::RunnerConfig;
 use crate::error::AppError;
 use crate::language::Language;
+use crate::model::Problem;
 use crate::runner::{self, ExecutionOutcome, ExecutionResult};
 use crate::tui::message::{
     Message, RunKind, RunRequest, UserInputRunEvent, UserInputRunResult, UserInputRunStatus,
@@ -16,6 +17,7 @@ use super::test::duration_from_seconds;
 // A one-shot execution, with no Sample, comparator, saved-case load, or storage write.
 pub(super) fn run(
     destination: &Path,
+    problem: &Problem,
     request: &RunRequest,
     config: &RunnerConfig,
     messages: &Sender<Message>,
@@ -26,11 +28,7 @@ pub(super) fn run(
     };
     // Match the normal sample runner's live source path and execution semantics.
     // Only stdin is captured by the request; the compiler/interpreter reads the source.
-    let source = destination.join(format!(
-        "{}.{}",
-        snapshot.problem_index,
-        request.language.extension()
-    ));
+    let source = crate::workspace::source_file_path(destination, &problem.index, request.language)?;
     if !source.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -47,7 +45,7 @@ pub(super) fn run(
         messages
             .send(Message::UserInputRunEvent {
                 run_id: request.run_id,
-                problem: request.problem,
+                target: request.target.clone(),
                 snapshot: Arc::clone(snapshot),
                 event,
             })
@@ -68,11 +66,10 @@ pub(super) fn run(
         Language::Cpp => {
             // The sample runner also builds once per attempt into a private temporary directory.
             let build = tempfile::tempdir()?;
-            let output = build.path().join(format!(
-                "{}{}",
-                snapshot.problem_index,
-                std::env::consts::EXE_SUFFIX
-            ));
+            let output =
+                build
+                    .path()
+                    .join(format!("{}{}", problem.index, std::env::consts::EXE_SUFFIX));
             let options = runner::BuildOptions {
                 debug_include_dir: if request.debug {
                     Some(crate::debug::materialize_debug_header()?)
@@ -131,18 +128,17 @@ pub(crate) fn execute_user_input_for_test(
     request: RunRequest,
     config: RunnerConfig,
 ) -> Vec<Message> {
-    use crate::model::Problem;
     use crate::tui::message::RunWorkerCommand;
     use std::sync::mpsc;
     use std::time::Duration;
     let (tx, rx) = mpsc::channel();
     let worker = super::watch_worker::RunWorker::start(
         destination.to_path_buf(),
-        "abc123".into(),
+        request.target.scope.clone(),
         vec![Problem {
             index: "A".into(),
             title: "A".into(),
-            task_id: "abc123_a".into(),
+            task_id: request.target.task_id.to_string(),
             url: "https://example.invalid/a".into(),
             sample_count: 42,
         }],
@@ -176,8 +172,7 @@ mod tests {
     use super::super::attempt_executor::AttemptExecutor;
     use super::*;
     use crate::attempt::AttemptOutcome;
-    use crate::model::Problem;
-    use crate::tui::message::{UserInputRunSnapshot, UserInputRunTarget};
+    use crate::tui::message::{RunScope, UserInputRunSnapshot, UserInputRunTarget};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
@@ -203,7 +198,7 @@ mod tests {
 
     fn request(language: Language, input: &str) -> RunRequest {
         RunRequest {
-            problem: 0,
+            target: RunScope::fixture().target("abc123_a"),
             run_id: 17,
             language,
             debug: false,
@@ -220,7 +215,7 @@ mod tests {
     fn executor(path: &Path, config: RunnerConfig, tx: Sender<Message>) -> AttemptExecutor {
         AttemptExecutor::new(
             path.to_path_buf(),
-            "abc123".to_string(),
+            RunScope::fixture(),
             vec![Problem {
                 index: "A".to_string(),
                 title: "A".to_string(),
@@ -257,8 +252,8 @@ mod tests {
             messages.first(),
             Some(Message::RunStarted {
                 run_id: 17,
-                problem: 0
-            })
+                target,
+            }) if target == &RunScope::fixture().target("abc123_a")
         ));
         assert!(!messages.iter().any(|message| matches!(
             message,
@@ -442,34 +437,38 @@ mod tests {
         let (waiting_tx, waiting_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut first_release = Some(release_rx);
-        let worker = RunWorker::start_with_test_attempt(tx, move |request, completion| {
-            spawned_tx.send(request.clone()).unwrap();
-            if matches!(request.kind, RunKind::Samples) {
-                let release = first_release.take();
-                let waiting_tx = waiting_tx.clone();
-                return spawn_with(request, completion, move |cancellation| {
-                    run_attempt(&cancellation, |is_cancelled| {
-                        if let Some(release) = release {
-                            let deadline = Instant::now() + Duration::from_secs(5);
-                            while !is_cancelled() {
-                                assert!(Instant::now() < deadline);
-                                std::thread::yield_now();
+        let worker = RunWorker::start_with_test_attempt(
+            RunScope::fixture(),
+            tx,
+            move |request, completion| {
+                spawned_tx.send(request.clone()).unwrap();
+                if matches!(request.kind, RunKind::Samples) {
+                    let release = first_release.take();
+                    let waiting_tx = waiting_tx.clone();
+                    return spawn_with(request, completion, move |cancellation| {
+                        run_attempt(&cancellation, |is_cancelled| {
+                            if let Some(release) = release {
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                while !is_cancelled() {
+                                    assert!(Instant::now() < deadline);
+                                    std::thread::yield_now();
+                                }
+                                waiting_tx.send(()).unwrap();
+                                release.recv_timeout(Duration::from_secs(5)).unwrap();
+                                Err(clean_cancellation_io_error().into())
+                            } else {
+                                Ok(())
                             }
-                            waiting_tx.send(()).unwrap();
-                            release.recv_timeout(Duration::from_secs(5)).unwrap();
-                            Err(clean_cancellation_io_error().into())
-                        } else {
-                            Ok(())
-                        }
-                    })
-                });
-            }
-            executor.spawn(request, completion)
-        })
+                        })
+                    });
+                }
+                executor.spawn(request, completion)
+            },
+        )
         .unwrap();
         let sender = worker.sender();
         let x = RunRequest {
-            problem: 1,
+            target: RunScope::fixture().target("abc123_b"),
             run_id: 1,
             language: Language::Python,
             debug: false,
@@ -489,7 +488,7 @@ mod tests {
             .start_gate
             .retire_before(before_source_revision);
         let retirement = RunWorkerCommand::RetireUserInputRuns {
-            problem: 0,
+            target: old.target.clone(),
             before_source_revision,
         };
         sender.send(retirement.clone()).unwrap();
@@ -547,9 +546,11 @@ mod tests {
             "import sys,time,pathlib\ndata=sys.stdin.buffer.read()\nif data == b'block':\n pathlib.Path('started').write_text('ready')\n time.sleep(30)\nsys.stdout.buffer.write(data)\n").unwrap();
         let (tx, rx) = mpsc::channel();
         let executor = executor(temp.path(), python_config(), tx.clone());
-        let worker = RunWorker::start_with_test_attempt(tx, move |request, completion| {
-            executor.spawn(request, completion)
-        })
+        let worker = RunWorker::start_with_test_attempt(
+            RunScope::fixture(),
+            tx,
+            move |request, completion| executor.spawn(request, completion),
+        )
         .unwrap();
         worker
             .sender()

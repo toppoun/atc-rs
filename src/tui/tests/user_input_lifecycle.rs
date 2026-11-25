@@ -271,10 +271,10 @@ fn background_tick_waits_for_all_delivered_terminal_events_not_only_q() {
     assert!(matches!(
         run_rx.try_recv().unwrap(),
         RunWorkerCommand::Run(RunRequest {
-            problem: 1,
+            target,
             kind: RunKind::Samples,
             ..
-        })
+        }) if target == app.run_target(1)
     ));
     assert!(app.user_input_editor_active());
 }
@@ -331,7 +331,7 @@ fn source_removal_invalidates_old_runs_preserves_edits_and_allows_recreation() {
     assert_eq!(
         run_rx.try_recv().unwrap(),
         RunWorkerCommand::RetireUserInputRuns {
-            problem: 0,
+            target: app.run_target(0),
             before_source_revision: snapshot.source_revision + 1,
         }
     );
@@ -349,12 +349,12 @@ fn source_removal_invalidates_old_runs_preserves_edits_and_allows_recreation() {
     assert_eq!(app.case_selection(), selection);
     assert_eq!(format!("{:?}", app.problems()[1]), unrelated);
     tx.send(Message::RunStarted {
-        problem: 0,
+        target: request.target.clone(),
         run_id: request.run_id,
     })
     .unwrap();
     tx.send(Message::UserInputRunEvent {
-        problem: 0,
+        target: request.target.clone(),
         run_id: request.run_id,
         snapshot: Arc::clone(snapshot),
         event: UserInputRunEvent::Finished(UserInputRunResult {
@@ -366,13 +366,13 @@ fn source_removal_invalidates_old_runs_preserves_edits_and_allows_recreation() {
     })
     .unwrap();
     tx.send(Message::RunFailed {
-        problem: 0,
+        target: request.target.clone(),
         run_id: request.run_id,
         error: "stale failure".into(),
     })
     .unwrap();
     tx.send(Message::RunCompleted {
-        problem: 0,
+        target: request.target.clone(),
         run_id: request.run_id,
     })
     .unwrap();
@@ -488,7 +488,7 @@ fn source_notifications_clear_finished_input_results_only_for_the_changed_proble
         if removed {
             assert!(matches!(
                 requests.as_slice(),
-                [RunWorkerCommand::RetireUserInputRuns { problem: 0, .. }]
+                [RunWorkerCommand::RetireUserInputRuns { target, .. }] if target == &app.run_target(0)
             ));
         } else {
             assert!(matches!(
@@ -521,7 +521,7 @@ fn source_removal_discards_input_requests_that_have_not_reached_the_worker() {
     assert!(app.take_user_input_run_request().is_none());
     assert!(matches!(
         run_rx.try_recv().unwrap(),
-        RunWorkerCommand::RetireUserInputRuns { problem: 0, .. }
+        RunWorkerCommand::RetireUserInputRuns { target, .. } if target == app.run_target(0)
     ));
     assert!(run_rx.try_recv().is_err());
     assert_eq!(app.selected_user_input_edit(), Some(&editor));
@@ -560,7 +560,7 @@ fn source_removal_revokes_sent_requests_even_after_their_ui_result_was_cleared()
     assert_eq!(
         run_rx.try_recv().unwrap(),
         RunWorkerCommand::RetireUserInputRuns {
-            problem: 0,
+            target: app.run_target(0),
             before_source_revision: old.source_revision + 1
         }
     );
@@ -606,12 +606,12 @@ fn removing_an_active_stress_source_sends_the_existing_cancel_command() {
     handle_messages_with_destination(&mut app, &rx, &run_tx, Some(&destination)).unwrap();
     assert!(matches!(
         run_rx.try_recv().unwrap(),
-        RunWorkerCommand::RetireUserInputRuns { problem: 0, .. }
+        RunWorkerCommand::RetireUserInputRuns { target, .. } if target == app.run_target(0)
     ));
     assert_eq!(
         run_rx.try_recv().unwrap(),
         RunWorkerCommand::CancelStress {
-            problem: 0,
+            target: app.run_target(0),
             run_id: request.run_id
         }
     );

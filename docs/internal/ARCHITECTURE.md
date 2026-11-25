@@ -98,6 +98,8 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 
 - `atc watch --plain` → `commands/watch.rs`。`FileWatcher::next_batch` で変更を集め、対応するソースを選び、その問題・言語で `test_problem` を同期実行する。
 - `atc watch` → `watch_tui_at` → `ContestSession`。ファイル監視の通知を `tui/mod.rs` が受け、ソース変更時に `WatchApp` を更新して Sample Test をキューに入れる。`watch_worker.rs` と `run_scheduler.rs` が実行順と中断を扱い、`attempt_executor.rs` が Sample Test・User Input・Stress に振り分ける。結果は `Message` として TUI に戻る。
+- `ContestSession` が Contest ID と新しいセッション世代を持つ `RunScope` を作り、`WatchApp` と `RunWorker` に渡す。Refresh 後にも新しい世代を作る。`WatchApp` はこの世代内で全実行種別に共通の `RunId` を 1 から採番し、task ID と `RunScope` を含む `RunTarget` を要求へ付ける。論理要求の照合には `RunTarget` と `RunId` の組を使う。
+- `RunScheduler` は `RunTarget` ごとに最新要求と User Input のソースリビジョンの下限を管理する。`AttemptExecutor` はセッションのメタデータから task ID で問題を引き、実行イベント・完了・再キューに元の対象と ID を付ける。TUI は対象の世代を照合してから task ID を現在の表示位置に解決し、その問題の実行状態に適用する。
 
 ### AtCoder への提出と結果追跡
 

@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -9,6 +10,80 @@ use crate::model::Sample;
 use crate::stress::CandidateFailureKind;
 
 pub type RunId = u64;
+
+// A fresh token for each ContestSession, including a rebuild after Refresh.
+// In-flight requests hold a clone, so a live generation cannot be reused.
+#[derive(Debug, Clone)]
+struct SessionGeneration(Arc<()>);
+
+impl PartialEq for SessionGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionGeneration {}
+
+impl Hash for SessionGeneration {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RunScope {
+    contest_id: Arc<str>,
+    generation: SessionGeneration,
+}
+
+impl RunScope {
+    pub(crate) fn new(contest_id: &str) -> Self {
+        Self {
+            contest_id: Arc::from(contest_id),
+            generation: SessionGeneration(Arc::new(())),
+        }
+    }
+
+    pub(crate) fn contest_id(&self) -> &str {
+        &self.contest_id
+    }
+
+    pub(crate) fn target(&self, task_id: &str) -> RunTarget {
+        RunTarget {
+            scope: self.clone(),
+            task_id: Arc::from(task_id),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        static SCOPE: std::sync::OnceLock<RunScope> = std::sync::OnceLock::new();
+        SCOPE.get_or_init(|| Self::new("abc123")).clone()
+    }
+}
+
+// The logical problem is (contest_id, task_id). The scope ties its queued work,
+// source revisions and events to a particular session's metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RunTarget {
+    pub(crate) scope: RunScope,
+    pub(crate) task_id: Arc<str>,
+}
+
+#[cfg(test)]
+impl RunTarget {
+    pub(crate) fn fixture(problem: usize) -> Self {
+        RunScope::fixture().target(&format!("abc123_{problem}"))
+    }
+
+    pub(crate) fn fixture_index(&self) -> usize {
+        self.task_id
+            .strip_prefix("abc123_")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunKind {
@@ -29,23 +104,38 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
     pub run_id: RunId,
-    pub problem: usize,
+    pub target: RunTarget,
     pub language: Language,
     pub debug: bool,
     pub kind: RunKind,
+}
+
+impl RunRequest {
+    pub(crate) fn matches(&self, target: &RunTarget, run_id: RunId) -> bool {
+        self.target == *target && self.run_id == run_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunWorkerCommand {
     Run(RunRequest),
     CancelStress {
-        problem: usize,
+        target: RunTarget,
         run_id: RunId,
     },
     RetireUserInputRuns {
-        problem: usize,
+        target: RunTarget,
         before_source_revision: u64,
     },
+}
+
+impl RunWorkerCommand {
+    pub(crate) fn target(&self) -> &RunTarget {
+        match self {
+            Self::Run(request) => &request.target,
+            Self::CancelStress { target, .. } | Self::RetireUserInputRuns { target, .. } => target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -303,7 +393,7 @@ pub enum StressEvent {
 pub enum Message {
     UserInputRunEvent {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
         snapshot: Arc<UserInputRunSnapshot>,
         event: UserInputRunEvent,
     },
@@ -324,42 +414,42 @@ pub enum Message {
 
     RunStarted {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
     },
 
     // The sender must emit this only after the old physical attempt has stopped sending events
     // and its thread has been joined. The same logical run_id is then safe to start again.
     RunRequeued {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
     },
 
     CompileDiagnostics {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
         stderr: String,
     },
 
     RunEvent {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
         event: TestEvent,
     },
 
     StressEvent {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
         event: StressEvent,
     },
 
     RunCompleted {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
     },
 
     RunFailed {
         run_id: RunId,
-        problem: usize,
+        target: RunTarget,
         error: String,
     },
 }

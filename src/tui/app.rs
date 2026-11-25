@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::detail::DetailSectionKind;
-use super::message::{RunId, RunKind, RunRequest, StressEvent, TestEvent};
+use super::message::{RunId, RunKind, RunRequest, RunScope, RunTarget, StressEvent, TestEvent};
 use super::message::{
     UserInputRunEvent, UserInputRunSnapshot, UserInputRunStartGate, UserInputRunStatus,
     UserInputRunTarget,
@@ -661,7 +661,7 @@ pub struct WatchApp {
     side_pane: SidePaneState,
     shortcut_help_visible: bool,
 
-    contest_id: String,
+    run_scope: RunScope,
     problems: Vec<ProblemState>,
 
     selected_problem: usize,
@@ -671,6 +671,7 @@ pub struct WatchApp {
     detail_revision: u64,
     detail_folds: DetailFoldState,
 
+    // Monotonic across all run kinds in this WatchApp's session generation.
     next_run_id: RunId,
     pending_user_input_runs: VecDeque<RunRequest>,
 }
@@ -955,6 +956,28 @@ impl WatchApp {
         stress_cases: Vec<Option<Sample>>,
         user_inputs: Vec<UserInputState>,
     ) -> io::Result<Self> {
+        Self::new_with_run_scope(
+            contest,
+            RunScope::new(&contest.contest_id),
+            sample_counts,
+            stress_cases,
+            user_inputs,
+        )
+    }
+
+    pub(crate) fn new_with_run_scope(
+        contest: &Contest,
+        run_scope: RunScope,
+        sample_counts: Vec<usize>,
+        stress_cases: Vec<Option<Sample>>,
+        user_inputs: Vec<UserInputState>,
+    ) -> io::Result<Self> {
+        if run_scope.contest_id() != contest.contest_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "run scope does not match the contest",
+            ));
+        }
         if contest.problems.len() != sample_counts.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1024,7 +1047,7 @@ impl WatchApp {
             debug: false,
             side_pane: SidePaneState::default(),
             shortcut_help_visible: false,
-            contest_id: contest.contest_id.clone(),
+            run_scope,
             problems,
             selected_problem: 0,
             case_selection,
@@ -1101,7 +1124,20 @@ impl WatchApp {
     }
 
     pub fn contest_id(&self) -> &str {
-        &self.contest_id
+        self.run_scope.contest_id()
+    }
+
+    pub(super) fn run_target(&self, problem: usize) -> RunTarget {
+        self.run_scope.target(&self.problems[problem].task_id)
+    }
+
+    pub(super) fn problem_for_run_target(&self, target: &RunTarget) -> Option<usize> {
+        if target.scope != self.run_scope {
+            return None;
+        }
+        self.problems
+            .iter()
+            .position(|problem| problem.task_id == target.task_id.as_ref())
     }
 
     pub fn current_problem(&self) -> Option<&ProblemState> {
@@ -2047,7 +2083,7 @@ impl WatchApp {
         problem: usize,
         path: &std::path::Path,
         language: Language,
-    ) -> Option<u64> {
+    ) -> Option<(RunTarget, u64)> {
         let state = self.problems.get_mut(problem)?;
         // A problem can have both C++ and Python files. Removing the other source must not
         // invalidate the one currently selected for execution.
@@ -2068,8 +2104,9 @@ impl WatchApp {
         if let Some(ready) = state.user_inputs.ready_mut() {
             ready.runs.clear();
         }
+        let target = self.run_scope.target(&state.task_id);
         self.pending_user_input_runs
-            .retain(|request| request.problem != problem);
+            .retain(|request| request.target != target);
         state.run = RunState {
             total_cases: state.total_cases,
             cases: vec![CaseState::default(); state.total_cases],
@@ -2084,7 +2121,7 @@ impl WatchApp {
         }
         // Removal invalidates results, but is not a navigation action or an editor action.
         self.invalidate_detail();
-        Some(before_source_revision)
+        Some((target, before_source_revision))
     }
 
     pub fn select_source(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
@@ -2256,7 +2293,7 @@ impl WatchApp {
 
         Some(RunRequest {
             run_id,
-            problem,
+            target: self.run_target(problem),
             language,
             debug,
             kind: RunKind::Samples,
@@ -2309,7 +2346,7 @@ impl WatchApp {
 
         Some(RunRequest {
             run_id,
-            problem,
+            target: self.run_target(problem),
             language,
             debug,
             kind: RunKind::Stress {
@@ -4823,7 +4860,7 @@ mod tests {
         let request = app.queue_run(0).unwrap();
 
         assert_eq!(request.run_id, 1);
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(!request.debug);
 
@@ -5811,7 +5848,7 @@ mod tests {
 
         let request = app.queue_stress(0, 1234).unwrap();
 
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(matches!(
             request.kind,

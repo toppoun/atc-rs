@@ -1608,7 +1608,7 @@ mod tests {
 
         let (mut app, run_id) = running_cpp_app(true);
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut reporter = ChannelReporter::new(run_id, 0, tx);
+        let mut reporter = ChannelReporter::new(run_id, app.run_target(0), tx);
         let stderr = "index = 42\nAssertion '__n < this->size()' failed.\n";
         reporter.report(Event::TestCaseRuntimeError {
             number: 1,
@@ -1624,13 +1624,14 @@ mod tests {
 
         for message in rx.try_iter() {
             let Message::RunEvent {
-                problem,
+                target,
                 run_id,
                 event,
             } = message
             else {
                 panic!("expected a test case event");
             };
+            let problem = app.problem_for_run_target(&target).unwrap();
             assert!(app.run_event(problem, run_id, event));
         }
 

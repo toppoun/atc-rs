@@ -49,6 +49,7 @@ impl WatchApp {
         let state = &mut self.problems[problem];
         match result {
             Ok(()) => {
+                let target = self.run_scope.target(&state.task_id);
                 let ready = state
                     .user_inputs
                     .ready_mut()
@@ -57,7 +58,7 @@ impl WatchApp {
                 ready.persisted.retain(|input| input.id != id);
                 ready.runs.remove(&UserInputRunTarget::Persisted(id));
                 self.pending_user_input_runs.retain(|request| {
-                    request.problem != problem || !matches!(
+                    request.target != target || !matches!(
                         &request.kind,
                         RunKind::UserInput(snapshot) if snapshot.target == UserInputRunTarget::Persisted(id)
                     )

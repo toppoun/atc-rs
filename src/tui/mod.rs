@@ -53,7 +53,7 @@ pub(crate) use global_home::{
 #[cfg(test)]
 pub(crate) use home::run_with_terminal_and_paths as run_home_with_terminal_and_paths;
 pub(crate) use home::{HomeExit, HomeTerminal, run_with_terminal as run_home_with_terminal};
-use message::{Message, RunRequest, RunWorkerCommand};
+use message::{Message, RunRequest, RunScope, RunWorkerCommand};
 use mouse::{
     MouseMode, TerminalPixelMetrics, normalize_absolute_pixels, project_absolute_pixels_to_cells,
 };
@@ -2612,13 +2612,19 @@ pub(crate) struct SessionRuntime<'a> {
 pub(crate) struct SessionExecution<'a> {
     channels: SessionChannels<'a>,
     submissions: &'a mut SubmissionHub,
+    run_scope: RunScope,
 }
 
 impl<'a> SessionExecution<'a> {
-    pub(crate) fn new(channels: SessionChannels<'a>, submissions: &'a mut SubmissionHub) -> Self {
+    pub(crate) fn new(
+        channels: SessionChannels<'a>,
+        submissions: &'a mut SubmissionHub,
+        run_scope: RunScope,
+    ) -> Self {
         Self {
             channels,
             submissions,
+            run_scope,
         }
     }
 }
@@ -3083,12 +3089,14 @@ fn handle_messages_with_destination(
     for _ in 0..MAX_MESSAGES_PER_TICK {
         match message_rx.try_recv() {
             Ok(Message::UserInputRunEvent {
-                problem,
+                target,
                 run_id,
                 snapshot,
                 event,
             }) => {
-                changed |= app.user_input_run_event(problem, run_id, &snapshot, event);
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.user_input_run_event(problem, run_id, &snapshot, event);
+                }
             }
             Ok(Message::SourceChanged {
                 problem,
@@ -3115,19 +3123,21 @@ fn handle_messages_with_destination(
                 let stress = app
                     .active_stress_identity()
                     .filter(|(active, _)| *active == problem);
-                if let Some(before_source_revision) = app.source_removed(problem, &path, language) {
+                if let Some((target, before_source_revision)) =
+                    app.source_removed(problem, &path, language)
+                {
                     changed = true;
                     send_run_worker_command(
                         run_tx,
                         RunWorkerCommand::RetireUserInputRuns {
-                            problem,
+                            target: target.clone(),
                             before_source_revision,
                         },
                     )?;
-                    if let Some((problem, run_id)) = stress {
+                    if let Some((_, run_id)) = stress {
                         send_run_worker_command(
                             run_tx,
-                            RunWorkerCommand::CancelStress { problem, run_id },
+                            RunWorkerCommand::CancelStress { target, run_id },
                         )?;
                     }
                 }
@@ -3147,59 +3157,61 @@ fn handle_messages_with_destination(
                     "background message channel disconnected",
                 ));
             }
-            Ok(Message::RunStarted { run_id, problem }) => {
-                if app.run_started(problem, run_id) {
-                    changed = true;
+            Ok(Message::RunStarted { run_id, target }) => {
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.run_started(problem, run_id);
                 }
             }
 
-            Ok(Message::RunRequeued { run_id, problem }) => {
-                if app.run_requeued(problem, run_id) {
-                    changed = true;
+            Ok(Message::RunRequeued { run_id, target }) => {
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.run_requeued(problem, run_id);
                 }
             }
 
             Ok(Message::CompileDiagnostics {
                 run_id,
-                problem,
+                target,
                 stderr,
             }) => {
-                changed |= app.compile_diagnostics(problem, run_id, stderr);
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.compile_diagnostics(problem, run_id, stderr);
+                }
             }
 
             Ok(Message::RunEvent {
                 run_id,
-                problem,
+                target,
                 event,
             }) => {
-                if app.run_event(problem, run_id, event) {
-                    changed = true;
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.run_event(problem, run_id, event);
                 }
             }
 
             Ok(Message::StressEvent {
                 run_id,
-                problem,
+                target,
                 event,
             }) => {
-                if app.stress_event(problem, run_id, event) {
-                    changed = true;
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.stress_event(problem, run_id, event);
                 }
             }
 
-            Ok(Message::RunCompleted { run_id, problem }) => {
-                if app.run_completed(problem, run_id) {
-                    changed = true;
+            Ok(Message::RunCompleted { run_id, target }) => {
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.run_completed(problem, run_id);
                 }
             }
 
             Ok(Message::RunFailed {
                 run_id,
-                problem,
+                target,
                 error,
             }) => {
-                if app.run_failed(problem, run_id, error) {
-                    changed = true;
+                if let Some(problem) = app.problem_for_run_target(&target) {
+                    changed |= app.run_failed(problem, run_id, error);
                 }
             }
         }
@@ -3349,10 +3361,12 @@ where
                         detail_analysis_rx,
                     },
                 submissions,
+                run_scope,
             },
     } = runtime;
-    let mut app = WatchApp::new_with_session_data(
+    let mut app = WatchApp::new_with_run_scope(
         stress_setup.contest,
+        run_scope,
         sample_counts,
         stress_cases,
         user_inputs,
@@ -4984,7 +4998,10 @@ fn execute_frontend_action(
             };
             send_run_worker_command(
                 input.run_tx,
-                RunWorkerCommand::CancelStress { problem, run_id },
+                RunWorkerCommand::CancelStress {
+                    target: app.run_target(problem),
+                    run_id,
+                },
             )?;
             Ok(app.cancel_stress(problem, run_id))
         }
@@ -5524,8 +5541,8 @@ mod tests {
     fn run_request(command: RunWorkerCommand) -> RunRequest {
         match command {
             RunWorkerCommand::Run(request) => request,
-            RunWorkerCommand::CancelStress { problem, run_id } => {
-                panic!("expected run command, got stress cancellation {problem}/{run_id}")
+            RunWorkerCommand::CancelStress { target, run_id } => {
+                panic!("expected run command, got stress cancellation {target:?}/{run_id}")
             }
             RunWorkerCommand::RetireUserInputRuns { .. } => {
                 panic!("expected run command, got User Input retirement")
@@ -8460,7 +8477,7 @@ mod tests {
         assert_eq!(
             run_rx.try_recv().unwrap(),
             RunWorkerCommand::CancelStress {
-                problem: 0,
+                target: stress.target.clone(),
                 run_id: stress.run_id,
             }
         );
@@ -8534,7 +8551,7 @@ mod tests {
             .unwrap()
         );
         assert!(!palette.is_active());
-        assert_eq!(received_run(&run_rx).problem, 1);
+        assert_eq!(received_run(&run_rx).target, app.run_target(1));
     }
 
     #[test]
@@ -10907,6 +10924,96 @@ mod tests {
     }
 
     #[test]
+    fn run_targets_distinguish_contests_with_the_same_problem_label_and_position() {
+        let mut contest = Contest {
+            contest_id: "abc123".into(),
+            problems: vec![crate::model::Problem {
+                index: "A".into(),
+                title: "A".into(),
+                task_id: "shared_task".into(),
+                url: "https://atcoder.jp/contests/abc123/tasks/shared_task".into(),
+                sample_count: 0,
+            }],
+        };
+        let mut first_app = WatchApp::new(&contest, vec![0]).unwrap();
+        contest.contest_id = "abc456".into();
+        contest.problems[0].url = "https://atcoder.jp/contests/abc456/tasks/shared_task".into();
+        let mut second_app = WatchApp::new(&contest, vec![0]).unwrap();
+        for app in [&mut first_app, &mut second_app] {
+            assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        }
+        let first = first_app.queue_run(0).unwrap();
+        let second = second_app.queue_run(0).unwrap();
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first.target.task_id, second.target.task_id);
+        assert_ne!(first.target, second.target);
+        assert_eq!(first_app.problem_for_run_target(&first.target), Some(0));
+        assert_eq!(second_app.problem_for_run_target(&second.target), Some(0));
+        assert_eq!(first_app.problem_for_run_target(&second.target), None);
+        assert_eq!(second_app.problem_for_run_target(&first.target), None);
+    }
+
+    #[test]
+    fn old_session_run_messages_with_the_current_run_id_are_ignored() {
+        let mut old_app = app_with_problems(&[1]);
+        let mut current_app = app_with_problems(&[1]);
+        for app in [&mut old_app, &mut current_app] {
+            assert!(app.source_changed(0, PathBuf::from("A.py"), Language::Python));
+        }
+        let old = old_app.queue_run(0).unwrap();
+        let current = current_app.queue_run(0).unwrap();
+        assert_eq!(old.run_id, current.run_id);
+        assert_eq!(
+            old.target.scope.contest_id(),
+            current.target.scope.contest_id()
+        );
+        assert_eq!(old.target.task_id, current.target.task_id);
+        assert_ne!(old.target.scope, current.target.scope);
+        let run_id = current.run_id;
+        let (tx, rx) = mpsc::channel();
+        let (run_tx, _run_rx) = mpsc::channel();
+
+        tx.send(Message::RunStarted {
+            run_id,
+            target: current.target.clone(),
+        })
+        .unwrap();
+        assert!(handle_messages(&mut current_app, &rx, &run_tx).unwrap());
+        for message in [
+            Message::RunRequeued {
+                run_id,
+                target: old.target.clone(),
+            },
+            Message::RunEvent {
+                run_id,
+                target: old.target.clone(),
+                event: message::TestEvent::TestRunStarted { total_cases: 99 },
+            },
+            Message::RunFailed {
+                run_id,
+                target: old.target,
+                error: "stale failure".into(),
+            },
+        ] {
+            tx.send(message).unwrap();
+        }
+        assert!(!handle_messages(&mut current_app, &rx, &run_tx).unwrap());
+        let run = &current_app.current_problem().unwrap().run;
+        assert_eq!(run.id, Some(run_id));
+        assert_eq!(run.phase, app::RunPhase::Running);
+        assert_eq!(run.total_cases, 1);
+        assert!(run.error.is_none());
+
+        tx.send(Message::RunEvent {
+            run_id,
+            target: current.target,
+            event: message::TestEvent::TestRunStarted { total_cases: 1 },
+        })
+        .unwrap();
+        assert!(handle_messages(&mut current_app, &rx, &run_tx).unwrap());
+    }
+
+    #[test]
     fn press_and_repeat_are_handled_but_release_is_ignored() {
         let mut app = app();
 
@@ -11206,7 +11313,7 @@ mod tests {
 
         assert_eq!(second_requests.len(), 1);
         assert_eq!(second_requests[0].run_id, MAX_MESSAGES_PER_TICK as u64 + 1);
-        assert_eq!(second_requests[0].problem, 0);
+        assert_eq!(second_requests[0].target, app.run_target(0));
         assert_eq!(second_requests[0].language, Language::Python);
     }
 
@@ -11460,7 +11567,7 @@ mod tests {
         let request = received_run(&run_rx);
 
         assert_eq!(request.run_id, 1);
-        assert_eq!(request.problem, 1);
+        assert_eq!(request.target, app.run_target(1));
         assert_eq!(request.language, Language::Python);
         assert!(!request.debug);
 
@@ -11483,10 +11590,11 @@ mod tests {
         let first = received_run(&run_rx);
         tx.send(Message::RunStarted {
             run_id: first.run_id,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
-        let mut reporter = reporter::ChannelReporter::new(first.run_id, 0, tx.clone());
+        let mut reporter =
+            reporter::ChannelReporter::new(first.run_id, first.target.clone(), tx.clone());
         let diagnostics = "  A.cpp:2: warning: comparison [-Wsign-compare]\r\n  ^\r\n\r\n";
         reporter.report(Event::CompileDiagnostics {
             problem_index: "A",
@@ -11541,7 +11649,7 @@ mod tests {
 
         tx.send(Message::RunStarted {
             run_id: second.run_id,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
         assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
@@ -11551,7 +11659,8 @@ mod tests {
         });
         assert!(!handle_messages(&mut app, &rx, &run_tx).unwrap());
 
-        let mut reporter = reporter::ChannelReporter::new(second.run_id, 0, tx.clone());
+        let mut reporter =
+            reporter::ChannelReporter::new(second.run_id, second.target.clone(), tx.clone());
         reporter.report(Event::CompileDiagnostics {
             problem_index: "A",
             stderr: "new warning\n",
@@ -11568,7 +11677,7 @@ mod tests {
 
         tx.send(Message::RunRequeued {
             run_id: second.run_id,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
         assert!(handle_messages(&mut app, &rx, &run_tx).unwrap());
@@ -11593,7 +11702,7 @@ mod tests {
         .unwrap();
         tx.send(Message::RunStarted {
             run_id: 1,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
         tx.send(Message::SourceChanged {
@@ -11604,7 +11713,7 @@ mod tests {
         .unwrap();
         tx.send(Message::RunEvent {
             run_id: 1,
-            problem: 0,
+            target: app.run_target(0),
             event: message::TestEvent::TestRunFinished {
                 accepted: 3,
                 total_cases: 3,
@@ -11613,7 +11722,7 @@ mod tests {
         .unwrap();
         tx.send(Message::RunCompleted {
             run_id: 1,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
 
@@ -11643,7 +11752,7 @@ mod tests {
         let (run_tx, _run_rx) = mpsc::channel();
         tx.send(Message::RunRequeued {
             run_id: request.run_id,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
 
@@ -11656,7 +11765,7 @@ mod tests {
         let current = app.queue_run(0).unwrap();
         tx.send(Message::RunRequeued {
             run_id: request.run_id,
-            problem: 0,
+            target: app.run_target(0),
         })
         .unwrap();
 
@@ -16020,7 +16129,7 @@ mod tests {
 
         let request = received_run(&run_rx);
 
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(!request.debug);
     }
@@ -16068,7 +16177,7 @@ mod tests {
         assert_eq!(seed_calls.get(), 1);
         let request = received_run(&run_rx);
         assert_eq!(request.run_id, 1);
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(request.debug);
         assert!(matches!(
@@ -16099,7 +16208,7 @@ mod tests {
         );
 
         let request = received_run(&run_rx);
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(matches!(
             request.kind,
@@ -16462,7 +16571,7 @@ mod tests {
         );
 
         let request = received_run(&run_rx);
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
     }
 
@@ -16587,7 +16696,7 @@ mod tests {
 
         let request = received_run(&run_rx);
 
-        assert_eq!(request.problem, 0);
+        assert_eq!(request.target, app.run_target(0));
         assert_eq!(request.language, Language::Cpp);
         assert!(request.debug);
         for kind in [
@@ -16757,11 +16866,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             (1..=300).collect::<Vec<_>>()
         );
-        assert!(
-            requests
-                .iter()
-                .all(|request| { request.problem == 0 && request.language == Language::Cpp })
-        );
+        assert!(requests.iter().all(|request| {
+            request.target == app.run_target(0) && request.language == Language::Cpp
+        }));
 
         let latest = requests.last().unwrap();
         let run = &app.current_problem().unwrap().run;

@@ -94,11 +94,19 @@ fn run(app: &mut WatchApp, id: u64, output: &str) -> message::RunRequest {
     app.select_case(selection(id));
     assert!(app.enqueue_selected_user_input());
     let request = app.take_user_input_run_request().unwrap();
-    assert!(app.run_started(request.problem, request.run_id));
+    assert!(app.run_started(
+        app.problem_for_run_target(&request.target).unwrap(),
+        request.run_id
+    ));
     let RunKind::UserInput(snapshot) = &request.kind else {
         panic!("User Input run")
     };
-    assert!(app.user_input_run_event(request.problem, request.run_id, snapshot, result(output)));
+    assert!(app.user_input_run_event(
+        app.problem_for_run_target(&request.target).unwrap(),
+        request.run_id,
+        snapshot,
+        result(output)
+    ));
     request
 }
 

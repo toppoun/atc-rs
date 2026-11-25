@@ -8,21 +8,21 @@ use crate::attempt::{AttemptCancellation, AttemptOutcome, run_attempt};
 use crate::config::RunnerConfig;
 use crate::error::AppError;
 use crate::model::Problem;
-use crate::tui::message::{Message, RunId, RunKind, RunRequest};
+use crate::tui::message::{Message, RunId, RunKind, RunRequest, RunScope, RunTarget};
 use crate::tui::reporter::ChannelReporter;
 
 use super::stress::build_request as build_stress_request;
 use super::test::test_problem_with_cancel;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AttemptCompletion {
     pub(super) run_id: RunId,
-    pub(super) problem: usize,
+    pub(super) target: RunTarget,
 }
 
 pub(super) struct AttemptExecutor {
     destination: Arc<PathBuf>,
-    contest_id: Arc<String>,
+    scope: RunScope,
     problems: Arc<Vec<Problem>>,
     runner_config: Arc<RunnerConfig>,
     message_tx: Sender<Message>,
@@ -31,14 +31,14 @@ pub(super) struct AttemptExecutor {
 impl AttemptExecutor {
     pub(super) fn new(
         destination: PathBuf,
-        contest_id: String,
+        scope: RunScope,
         problems: Vec<Problem>,
         runner_config: RunnerConfig,
         message_tx: Sender<Message>,
     ) -> Self {
         Self {
             destination: Arc::new(destination),
-            contest_id: Arc::new(contest_id),
+            scope,
             problems: Arc::new(problems),
             runner_config: Arc::new(runner_config),
             message_tx,
@@ -51,7 +51,7 @@ impl AttemptExecutor {
         completion_tx: Sender<AttemptCompletion>,
     ) -> io::Result<ActiveAttempt> {
         let destination = Arc::clone(&self.destination);
-        let contest_id = Arc::clone(&self.contest_id);
+        let scope = self.scope.clone();
         let problems = Arc::clone(&self.problems);
         let runner_config = Arc::clone(&self.runner_config);
         let message_tx = self.message_tx.clone();
@@ -62,12 +62,22 @@ impl AttemptExecutor {
                 message_tx.clone(),
                 &cancellation,
                 |reporter, is_cancelled| {
-                    let problem = problems.get(request.problem).ok_or_else(|| {
-                        io::Error::new(
+                    if request.target.scope != scope {
+                        return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("invalid problem index: {}", request.problem),
+                            "run request does not match the executor's contest session",
                         )
-                    })?;
+                        .into());
+                    }
+                    let problem = problems
+                        .iter()
+                        .find(|problem| problem.task_id == request.target.task_id.as_ref())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("unknown task ID: {}", request.target.task_id),
+                            )
+                        })?;
 
                     match &request.kind {
                         RunKind::UserInput(snapshot) => {
@@ -79,6 +89,7 @@ impl AttemptExecutor {
                             }
                             super::user_input_run::run(
                                 &destination,
+                                problem,
                                 &request,
                                 &runner_config,
                                 &message_tx,
@@ -87,7 +98,7 @@ impl AttemptExecutor {
                         }
                         RunKind::Samples => test_problem_with_cancel(
                             &destination,
-                            contest_id.as_str(),
+                            scope.contest_id(),
                             problem,
                             request.language,
                             &runner_config,
@@ -98,7 +109,7 @@ impl AttemptExecutor {
                         RunKind::Stress { base_seed, count } => {
                             let stress_request = build_stress_request(
                                 &destination,
-                                contest_id.as_str(),
+                                scope.contest_id(),
                                 problem,
                                 request.language,
                                 &runner_config,
@@ -171,7 +182,7 @@ pub(super) fn spawn_with(
     let thread_cancellation = Arc::clone(&cancellation);
     let completion = AttemptCompletion {
         run_id: request.run_id,
-        problem: request.problem,
+        target: request.target.clone(),
     };
 
     let handle = thread::Builder::new()
@@ -210,7 +221,7 @@ fn run_reported_attempt(
         message_tx
             .send(Message::RunStarted {
                 run_id: request.run_id,
-                problem: request.problem,
+                target: request.target.clone(),
             })
             .map_err(|_| {
                 io::Error::new(
@@ -219,8 +230,7 @@ fn run_reported_attempt(
                 )
             })?;
 
-        let mut reporter =
-            ChannelReporter::new(request.run_id, request.problem, message_tx.clone());
+        let mut reporter = ChannelReporter::new(request.run_id, request.target, message_tx.clone());
         let run_result = run(&mut reporter, is_cancelled);
         let reporter_result = reporter.finish().map_err(AppError::from);
 
@@ -259,7 +269,7 @@ mod tests {
     fn request() -> RunRequest {
         RunRequest {
             run_id: 7,
-            problem: 0,
+            target: RunScope::fixture().target("abc123_a"),
             language: Language::Python,
             debug: false,
             kind: RunKind::Samples,
@@ -291,7 +301,7 @@ mod tests {
         .unwrap();
         let executor = AttemptExecutor::new(
             temp.path().to_path_buf(),
-            "abc123".to_string(),
+            RunScope::fixture(),
             vec![problem()],
             RunnerConfig::default(),
             message_tx,
@@ -311,7 +321,7 @@ mod tests {
             completion_rx.recv().unwrap(),
             AttemptCompletion {
                 run_id: 7,
-                problem: 0,
+                target: request().target,
             }
         );
         assert!(matches!(active.join().unwrap(), AttemptOutcome::Completed));
@@ -322,16 +332,91 @@ mod tests {
             [
                 Message::RunStarted {
                     run_id: 7,
-                    problem: 0
+                    target: started,
                 },
                 Message::RunEvent {
                     run_id: 7,
-                    problem: 0,
+                    target: reported,
                     event: TestEvent::NoSamples
                 }
-            ]
+            ] if started == &request().target && reported == started
         ));
         assert!(message_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reordered_metadata_still_runs_the_source_for_the_requested_task() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (temp, _) = executor_with_no_samples(message_tx.clone());
+        let contest = crate::model::Contest {
+            contest_id: "abc123".into(),
+            problems: vec![
+                Problem {
+                    index: "B".into(),
+                    task_id: "abc123_b".into(),
+                    url: "https://atcoder.jp/contests/abc123/tasks/abc123_b".into(),
+                    ..problem()
+                },
+                problem(),
+            ],
+        };
+        crate::workspace::save_metadata(temp.path(), &contest).unwrap();
+        let executor = AttemptExecutor::new(
+            temp.path().to_path_buf(),
+            RunScope::fixture(),
+            contest.problems,
+            RunnerConfig::default(),
+            message_tx,
+        );
+        let (completion_tx, _completion_rx) = mpsc::channel();
+        let requested = request();
+        let outcome = executor
+            .spawn(requested.clone(), completion_tx)
+            .unwrap()
+            .join()
+            .unwrap();
+
+        // Only A.py exists, even though A is the second item in the metadata.
+        assert!(matches!(outcome, AttemptOutcome::Completed));
+        assert!(matches!(
+            message_rx.try_iter().collect::<Vec<_>>().as_slice(),
+            [Message::RunStarted { .. }, Message::RunEvent { target, event: TestEvent::NoSamples, .. }]
+                if target == &requested.target
+        ));
+    }
+
+    #[test]
+    fn unknown_task_and_other_session_are_rejected_before_source_execution() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (_temp, executor) = executor_with_no_samples(message_tx);
+        for (target, reason) in [
+            (
+                RunScope::fixture().target("abc123_missing"),
+                "unknown task ID",
+            ),
+            (RunScope::new("abc123").target("abc123_a"), "does not match"),
+            (RunScope::new("abc456").target("abc123_a"), "does not match"),
+        ] {
+            let (completion_tx, completion_rx) = mpsc::channel();
+            let requested = RunRequest {
+                target,
+                ..request()
+            };
+            let outcome = executor
+                .spawn(requested.clone(), completion_tx)
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(
+                matches!(outcome, AttemptOutcome::Failed(error) if error.to_string().contains(reason))
+            );
+            let completion = completion_rx.recv().unwrap();
+            assert!(requested.matches(&completion.target, completion.run_id));
+            assert!(matches!(
+                message_rx.try_iter().collect::<Vec<_>>().as_slice(),
+                [Message::RunStarted { target, .. }] if target == &requested.target
+            ));
+        }
     }
 
     #[test]

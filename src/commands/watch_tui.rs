@@ -27,7 +27,7 @@ use super::refresh::PreparedRefresh;
 use super::watch_worker::RunWorker;
 use crate::tui::app::{PersistedUserInputState, UserInputState};
 use crate::tui::detail_analysis::DetailAnalysisWorker;
-use crate::tui::message::Message;
+use crate::tui::message::{Message, RunScope};
 use crate::ui::Reporter;
 use crate::watcher;
 
@@ -2032,6 +2032,7 @@ struct ContestSession {
     run_worker: Option<RunWorker>,
     watcher_thread: Option<WatcherThread>,
     detail_analysis_worker: Option<DetailAnalysisWorker>,
+    run_scope: RunScope,
     environment: ContestEnvironment,
     input: PreparedWatchInput,
     message_rx: mpsc::Receiver<Message>,
@@ -2069,6 +2070,7 @@ impl ContestSession {
         mut after_stage: impl FnMut(SessionStartStage) -> io::Result<()>,
     ) -> io::Result<Self> {
         let PreparedContestEntry { input, environment } = entry;
+        let run_scope = RunScope::new(&input.contest.contest_id);
         let (message_tx, message_rx) = mpsc::channel();
         let watcher_thread = start_watcher(&input.destination, &input.contest, message_tx.clone())?;
         if let Err(error) = after_stage(SessionStartStage::WatcherStarted) {
@@ -2082,7 +2084,7 @@ impl ContestSession {
         }
         let run_worker = match RunWorker::start(
             input.destination.clone(),
-            input.contest.contest_id.clone(),
+            run_scope.clone(),
             input.contest.problems.clone(),
             environment.config.runner.clone(),
             message_tx.clone(),
@@ -2139,6 +2141,7 @@ impl ContestSession {
             run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
+            run_scope,
             environment,
             input,
             message_rx,
@@ -2215,7 +2218,7 @@ impl ContestSession {
             stress_cases,
             stress_load_errors,
             user_inputs,
-            crate::tui::SessionExecution::new(channels, submissions),
+            crate::tui::SessionExecution::new(channels, submissions, self.run_scope.clone()),
         );
         crate::tui::run(terminal, app_context, preferences, runtime, frontend)
     }
@@ -6566,7 +6569,10 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (published_tx, published_rx) = mpsc::channel();
         let attempt_messages = message_tx.clone();
+        let run_scope = RunScope::new(&input.contest.contest_id);
+        let target = run_scope.target(&input.contest.problems[0].task_id);
         let run_worker = RunWorker::start_with_test_attempt(
+            run_scope.clone(),
             message_tx.clone(),
             move |request, completion_tx| {
                 let started_tx = started_tx.clone();
@@ -6584,7 +6590,7 @@ mod tests {
                         let published = attempt_messages
                             .send(Message::RunEvent {
                                 run_id: request.run_id,
-                                problem: request.problem,
+                                target: request.target,
                                 event: TestEvent::NoSamples,
                             })
                             .is_ok();
@@ -6610,6 +6616,7 @@ mod tests {
             run_worker: Some(run_worker),
             watcher_thread: Some(watcher_thread),
             detail_analysis_worker: Some(detail_analysis_worker),
+            run_scope,
             environment: ContestEnvironment::new(Config::default()),
             input,
             message_rx,
@@ -6622,7 +6629,7 @@ mod tests {
             .run_tx
             .send(RunWorkerCommand::Run(RunRequest {
                 run_id: 1,
-                problem: 0,
+                target,
                 language: Language::Cpp,
                 debug: false,
                 kind: RunKind::Samples,
