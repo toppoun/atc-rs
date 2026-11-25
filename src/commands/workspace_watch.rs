@@ -31,7 +31,6 @@ pub(super) struct WorkspaceWatcher {
     stop: Arc<AtomicBool>,
     commands: mpsc::SyncSender<Command>,
     handle: Option<JoinHandle<io::Result<()>>>,
-    #[cfg(test)]
     status: Arc<Mutex<WatchStatus>>,
 }
 
@@ -42,16 +41,76 @@ pub(super) struct WatchStatus {
     pub(super) peak_paths: usize,
     pub(super) accepted: u64,
     pub(super) latest_save: Option<SaveReceipt>,
+    latest_notification: Option<SaveReceipt>,
+    pending_notification: Option<SaveReceipt>,
     pub(super) warning: Option<String>,
 }
 
 /// Save order is independent of attempt admission, cancellation and requeue.
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // Phase 5 consumes the last accepted save rather than attempt events.
 pub(super) struct SaveReceipt {
     pub(super) sequence: u64,
     pub(super) target: RunTarget,
     pub(super) language: Language,
+    pub(super) path: PathBuf,
+    pub(super) origin: SaveOrigin,
+    pub(super) context: Arc<RunContext>,
+    pub(super) results: RunResults,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SaveOrigin {
+    Notification,
+    Reconciliation,
+}
+
+#[derive(Clone)]
+pub(super) struct SaveReceipts(Arc<Mutex<WatchStatus>>);
+
+impl SaveReceipts {
+    pub(super) fn accepted_sequence(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepted
+    }
+
+    // The pending notification also makes an earlier prepared view ineligible while a batch
+    // is still being admitted. A manual switch can still fence every accepted sequence.
+    pub(super) fn latest_after(&self, sequence: u64) -> (Option<SaveReceipt>, bool) {
+        let status = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if status
+            .pending_notification
+            .as_ref()
+            .is_some_and(|save| save.sequence > sequence)
+        {
+            (None, true)
+        } else {
+            (
+                status
+                    .latest_notification
+                    .as_ref()
+                    .filter(|save| save.sequence > sequence)
+                    .cloned(),
+                false,
+            )
+        }
+    }
+
+    pub(super) fn is_current(&self, sequence: u64) -> bool {
+        let status = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.pending_notification.is_none()
+            && status
+                .latest_notification
+                .as_ref()
+                .is_some_and(|save| save.sequence == sequence)
+    }
 }
 
 type RunRegistration = (RunGeneration, RunResults);
@@ -77,6 +136,8 @@ enum Command {
     },
     #[cfg(test)]
     DropNotifications(mpsc::Sender<io::Result<()>>),
+    #[cfg(test)]
+    SourceBatch(Vec<PathBuf>, mpsc::Sender<io::Result<()>>),
 }
 
 impl WorkspaceWatcher {
@@ -128,7 +189,6 @@ impl WorkspaceWatcher {
             stop,
             commands,
             handle: Some(handle),
-            #[cfg(test)]
             status,
         };
         if let Err(error) = started.recv().map_err(|_| closed())? {
@@ -136,6 +196,10 @@ impl WorkspaceWatcher {
             return Err(error);
         }
         Ok(watcher)
+    }
+
+    pub(super) fn saves(&self) -> SaveReceipts {
+        SaveReceipts(self.status.clone())
     }
 
     pub(super) fn attach_registration(
@@ -307,6 +371,23 @@ impl WatchIndex {
                 self.file_watcher.set_interests(WatchInterests::default());
                 let _ = reply.send(Ok(()));
             }
+            #[cfg(test)]
+            Command::SourceBatch(paths, reply) => {
+                let paths = paths
+                    .into_iter()
+                    .map(|path| {
+                        let epoch = self.sources[&path].epoch;
+                        (path, epoch)
+                    })
+                    .collect();
+                let _ = reply.send(self.process(WorkspaceBatch {
+                    paths,
+                    reconcile: false,
+                    rescan: false,
+                    error: None,
+                    peak_paths: 0,
+                }));
+            }
         }
     }
 
@@ -345,6 +426,15 @@ impl WatchIndex {
         for (path, epoch) in batch.paths {
             if self.source_event(&path, epoch, true, &mut verified)? {
                 delivered.insert(path);
+            }
+        }
+        {
+            let mut status = self
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(save) = status.pending_notification.take() {
+                status.latest_notification = Some(save);
             }
         }
         if reconcile {
@@ -438,19 +528,36 @@ impl WatchIndex {
                 revision,
                 source: Some((source.path.clone(), source.language)),
             })?;
-            sender
-                .send(RunWorkerCommand::Run(request))
-                .map_err(|_| closed())?;
             let mut status = self
                 .status
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sender
+                .send(RunWorkerCommand::Run(request))
+                .map_err(|_| closed())?;
             status.accepted += 1;
-            status.latest_save = Some(SaveReceipt {
+            let origin = if notified {
+                SaveOrigin::Notification
+            } else {
+                SaveOrigin::Reconciliation
+            };
+            let save = SaveReceipt {
                 sequence: status.accepted,
                 target: source.target.clone(),
                 language: source.language,
-            });
+                path: source.path.clone(),
+                origin,
+                context: contest.context.clone(),
+                results: contest.results.clone(),
+            };
+            if origin == SaveOrigin::Notification
+                && path
+                    .parent()
+                    .is_some_and(|parent| self.installed.contains_key(parent))
+            {
+                status.pending_notification = Some(save.clone());
+            }
+            status.latest_save = Some(save);
         } else if let Some(revision) = gate.remove_source(source.language) {
             contest.results.send(Message::WorkspaceSource {
                 target: source.target.clone(),
@@ -1061,8 +1168,57 @@ mod tests {
         let recovered = watcher.status().latest_save.unwrap();
         assert_eq!(recovered.target.scope.contest_id(), "abc480");
         assert_eq!(recovered.sequence, 1);
+        assert_eq!(recovered.origin, SaveOrigin::Reconciliation);
+        assert!(watcher.saves().latest_after(0).0.is_none());
         watcher.reconcile(true).unwrap();
         assert_eq!(watcher.status().accepted, 1);
+        stop(worker, watcher);
+    }
+
+    #[test]
+    fn a_batch_publishes_only_its_latest_save_and_rescan_does_not_replace_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        fixture(root, "abc483", false);
+        fixture(root, "abc480", false);
+        fixture(root, "abc478", false);
+        let (worker, watcher) = start(root, RunnerConfig::default());
+        watcher.request(Command::DropNotifications).unwrap();
+        let first = root.join("abc483/A.py");
+        let last = root.join("abc480/A.cpp");
+        fs::write(&first, "pass\n").unwrap();
+        fs::write(&last, "int main() {}\n").unwrap();
+        let observed = |path: &Path| {
+            watcher::watch_directory(path.parent().unwrap())
+                .unwrap()
+                .join(path.file_name().unwrap())
+        };
+        watcher
+            .request(|reply| Command::SourceBatch(vec![observed(&first), observed(&last)], reply))
+            .unwrap();
+        assert_eq!(watcher.status().accepted, 2);
+        let saves = watcher.saves();
+        let displayed = saves.latest_after(0).0.unwrap();
+        assert_eq!(displayed.sequence, 2);
+        assert_eq!(displayed.target.scope.contest_id(), "abc480");
+        assert_eq!(displayed.language, Language::Cpp);
+        assert_eq!(displayed.path, last);
+        assert!(!saves.is_current(1));
+
+        fs::write(root.join("abc478/A.py"), "pass\n").unwrap();
+        thread::sleep(Duration::from_millis(350));
+        watcher.reconcile(true).unwrap();
+        assert_eq!(
+            watcher.status().latest_save.unwrap().origin,
+            SaveOrigin::Reconciliation
+        );
+        assert_eq!(saves.accepted_sequence(), 3);
+        assert_eq!(
+            saves.latest_after(0).0.unwrap().sequence,
+            displayed.sequence
+        );
+        assert!(saves.latest_after(displayed.sequence).0.is_none());
         stop(worker, watcher);
     }
 
@@ -1109,6 +1265,14 @@ mod tests {
                 && b_run.phase == RunPhase::Running)
                 .then_some(())
         });
+        let receipts = watcher.saves();
+        let latest = wait_for(|| receipts.latest_after(0).0.filter(|save| save.sequence == 2));
+        assert_eq!(latest.target.scope.contest_id(), "abc480");
+        assert_eq!(latest.sequence, 2);
+        assert!(
+            receipts.latest_after(latest.sequence).0.is_none(),
+            "the requeue creates no display candidate"
+        );
         let stopped_at = Instant::now();
         stop(worker, watcher);
         assert!(stopped_at.elapsed() < Duration::from_secs(5));

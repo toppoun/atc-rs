@@ -601,6 +601,30 @@ pub(crate) fn watched_source_fingerprint(
     path: &Path,
     expected_directory: &PhysicalDirectoryIdentity,
 ) -> io::Result<Option<safe_file::FileFingerprint>> {
+    let Some((directory, name)) = open_watched_source_parent(path, expected_directory)? else {
+        return Ok(None);
+    };
+    match safe_file::read_regular_file_fingerprint_at(&directory, name, path) {
+        Ok(stamp) => Ok(Some(stamp)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn watched_source_exists(
+    path: &Path,
+    expected_directory: &PhysicalDirectoryIdentity,
+) -> io::Result<bool> {
+    let Some((directory, name)) = open_watched_source_parent(path, expected_directory)? else {
+        return Ok(false);
+    };
+    safe_file::regular_file_exists_at(&directory, name, path)
+}
+
+fn open_watched_source_parent<'a>(
+    path: &'a Path,
+    expected_directory: &PhysicalDirectoryIdentity,
+) -> io::Result<Option<(CapDir, &'a OsStr)>> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -620,11 +644,7 @@ pub(crate) fn watched_source_fingerprint(
     }
     for entry in directory.entries()? {
         if entry?.file_name() == name {
-            return match safe_file::read_regular_file_fingerprint_at(&directory, name, path) {
-                Ok(stamp) => Ok(Some(stamp)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error),
-            };
+            return Ok(Some((directory, name)));
         }
     }
     Ok(None)

@@ -1018,6 +1018,8 @@ fn render_footer(
             workspace_available,
             content_width,
         ))
+    } else if let Some(status) = &app.saved_view_status {
+        Line::raw(fit_command_palette_row(status, content_width))
     } else if let Some(warning) = &app.workspace_watch_warning {
         Line::styled(
             fit_command_palette_row(warning, content_width),
@@ -1123,11 +1125,7 @@ pub(super) fn render_frontend_with_pointer(
         .map(|source| language_label(source.language))
         .unwrap_or("-");
 
-    let debug = if app.debug_enabled() {
-        "DEBUG ON"
-    } else {
-        "DEBUG OFF"
-    };
+    let debug = debug_status(app);
 
     let summary = current_problem
         .map(run_summary)
@@ -2407,6 +2405,23 @@ fn problem_status_line(
     match app.side_pane_mode() {
         SidePaneMode::Samples => sample_problem_status_line(app),
         SidePaneMode::Submissions => submission_problem_status_line(app, submission_view),
+    }
+}
+
+fn debug_status(app: &WatchApp) -> &'static str {
+    let next = app.debug_enabled();
+    if !app.saved_view_enabled {
+        return if next { "DEBUG ON" } else { "DEBUG OFF" };
+    }
+    let last = app.current_problem().and_then(|problem| {
+        (problem.run.id.is_some() && problem.run.language == Some(Language::Cpp))
+            .then_some(problem.run.debug)
+    });
+    match (next, last) {
+        (true, Some(false)) => "DEBUG next ON / run OFF",
+        (false, Some(true)) => "DEBUG next OFF / run ON",
+        (true, _) => "DEBUG next ON",
+        (false, _) => "DEBUG next OFF",
     }
 }
 

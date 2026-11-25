@@ -688,6 +688,8 @@ pub struct WatchApp {
     run_generation: RunGeneration,
     run_view: Option<super::run_results::RunView>,
     pub(super) workspace_watch_warning: Option<String>,
+    pub(super) saved_view_enabled: bool,
+    pub(super) saved_view_status: Option<Arc<str>>,
     watch_generation_invalid: bool,
     problems: Vec<ProblemState>,
 
@@ -1206,6 +1208,8 @@ impl WatchApp {
             run_generation,
             run_view: None,
             workspace_watch_warning: None,
+            saved_view_enabled: false,
+            saved_view_status: None,
             watch_generation_invalid: false,
             problems,
             selected_problem: 0,
@@ -2329,6 +2333,62 @@ impl WatchApp {
 
     pub fn select_source(&mut self, problem: usize, path: PathBuf, language: Language) -> bool {
         self.set_source(problem, path, language, false)
+    }
+
+    pub(super) fn select_saved_source(
+        &mut self,
+        saved: super::SavedSource,
+        destination: &std::path::Path,
+    ) -> bool {
+        if self.watch_generation_invalid {
+            return false;
+        }
+        let Some(problem) = self.problem_for_run_target(&saved.target) else {
+            return false;
+        };
+        let Ok(path) = crate::workspace::source_file_path(
+            destination,
+            &self.problems[problem].index,
+            saved.language,
+        ) else {
+            return false;
+        };
+        if path.file_name() != saved.path.file_name() {
+            return false;
+        }
+        let previous = self.displayed_detail_case();
+        self.disarm_user_input_delete();
+        let state = &mut self.problems[problem];
+        let source_changed = !state
+            .source
+            .as_ref()
+            .is_some_and(|source| source.path == path && source.language == saved.language);
+        let selection_changed =
+            self.selected_problem != problem || state.detail_mode != DetailMode::Samples;
+        state.detail_mode = DetailMode::Samples;
+        if source_changed {
+            let revision = state.user_input_start_gate.display_source(saved.language);
+            state.source = Some(SourceState {
+                path,
+                language: saved.language,
+            });
+            state.source_revision = revision;
+            if let Some(ready) = state.user_inputs.ready_mut() {
+                ready.runs.retain(|_, run| {
+                    run.snapshot.source_revision == revision && run.language == Some(saved.language)
+                });
+            }
+        }
+        self.selected_problem = problem;
+        if selection_changed {
+            self.case_selection = self.problems[problem].first_case_selection();
+            self.reset_folds_if_displayed_case_changed(previous);
+            self.reset_detail_scroll();
+        }
+        if selection_changed || source_changed {
+            self.invalidate_detail();
+        }
+        selection_changed || source_changed
     }
 
     fn set_source(

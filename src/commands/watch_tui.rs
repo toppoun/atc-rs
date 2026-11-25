@@ -1,3 +1,6 @@
+#[path = "watch_tui/saved_view.rs"]
+mod saved_view;
+
 use crate::app_context::AppContext;
 use crate::auth::{AuthSnapshot, SessionAuth};
 use crate::config::{Config, RunnerConfig};
@@ -13,6 +16,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -639,8 +643,7 @@ impl WorkspaceRuns {
         )
     }
 
-    // Current manual navigation retires the old scope. Dropping a view alone only
-    // detaches its result route and leaves registered work available to the worker.
+    // Workspace-watched views detach from a live generation. Legacy navigation retires it.
     fn retire_contest(&self, session: ContestSession) -> io::Result<()> {
         session.request_stop();
         if session.workspace_watched {
@@ -841,6 +844,7 @@ where
 enum ContestRootExit {
     Quit,
     SwitchContest,
+    DisplaySavedContest,
     RefreshContest(crate::tui::RefreshResumeState),
 }
 
@@ -867,6 +871,9 @@ fn orchestrate_contest_frontend_exit(
         }
         crate::tui::SessionExit::Quit => Ok(Some(ContestRootExit::Quit)),
         crate::tui::SessionExit::SwitchContest => Ok(Some(ContestRootExit::SwitchContest)),
+        crate::tui::SessionExit::DisplaySavedContest => {
+            Ok(Some(ContestRootExit::DisplaySavedContest))
+        }
         crate::tui::SessionExit::RefreshContest(resume) => {
             Ok(Some(ContestRootExit::RefreshContest(resume)))
         }
@@ -1381,8 +1388,12 @@ where
     let home_open_task = contest_open_task(app_context, Arc::clone(&prepared_home_open));
     let mut refresh_frontend_state = None;
     let mut first_home_draw = Some(first_home_draw);
+    let mut saved_switch = None;
+    let mut initial_saved_source = None;
     loop {
         if matches!(&*location, RootLocation::WorkspaceHome) {
+            saved_switch = None;
+            initial_saved_source = None;
             match prepared_home_open.lock() {
                 Ok(mut pending) => *pending = None,
                 Err(_) => {
@@ -1441,13 +1452,41 @@ where
             Arc::clone(&prepared_refresh),
         );
         let refresh_check = prepared_refresh_check(Arc::clone(&prepared_refresh));
+        let saved_frontend = if active_session.workspace_watched {
+            let coordinator = saved_switch
+                .get_or_insert_with(|| {
+                    let watcher = runs.workspace_watcher.borrow();
+                    let root = app_context
+                        .workspace_root()
+                        .expect("Workspace view has a root");
+                    Rc::new(RefCell::new(saved_view::SavedViewSwitch::new(
+                        root.to_path_buf(),
+                        watcher
+                            .as_ref()
+                            .expect("Workspace view has a watcher")
+                            .saves(),
+                    )))
+                })
+                .clone();
+            let visible = active_session.run_generation.scope().clone();
+            let run_tx = active_session.run_tx.clone();
+            Some(crate::tui::SavedViewFrontend {
+                initial_source: initial_saved_source.take(),
+                update: Box::new(move |event| {
+                    coordinator.borrow_mut().update(event, &visible, &run_tx)
+                }),
+            })
+        } else {
+            None
+        };
         let frontend = crate::tui::SessionFrontend::new(
             refresh_frontend_state.take(),
             |contest_id: &str| resolve_contest_open(app_context, contest_id),
             Arc::clone(&switch_task),
             refresh_task,
             refresh_check,
-        );
+        )
+        .with_saved_view(saved_frontend);
         let frontend_result = terminal.run_contest_frontend(
             active_session,
             app_context,
@@ -1460,6 +1499,9 @@ where
             Err(error) => break Err(error),
             Ok(exit) => exit,
         };
+        if frontend_exit == crate::tui::SessionExit::ReturnToWorkspaceHome {
+            saved_switch = None;
+        }
         let root_exit = {
             let mut root_lifetime = LiveRootLifetime {
                 submissions: &mut *submissions,
@@ -1482,6 +1524,24 @@ where
         if let Some(root_exit) = root_exit {
             match root_exit {
                 ContestRootExit::Quit => break Ok(WorkspaceExit::Quit),
+                ContestRootExit::DisplaySavedContest => {
+                    let Some((session, source)) = saved_switch
+                        .as_ref()
+                        .and_then(|switch| switch.borrow_mut().take_next())
+                    else {
+                        break Err(io::Error::other("saved source switch has no prepared view"));
+                    };
+                    let RootLocation::Contest(old_session) =
+                        std::mem::replace(location, RootLocation::Contest(session))
+                    else {
+                        unreachable!("saved source switch requires an active contest session")
+                    };
+                    if let Err(error) = runs.retire_contest(old_session) {
+                        break Err(error);
+                    }
+                    initial_saved_source = Some(source);
+                    refresh_frontend_state = None;
+                }
                 ContestRootExit::SwitchContest => {
                     let prepared = match prepared_switch.lock() {
                         Ok(mut pending) => match pending.take() {
@@ -1609,7 +1669,7 @@ fn rebuild_active_contest_session_after_refresh(
                 runs.retire_contest(session)
             },
             apply: |prepared| {
-                let mut reporter = RefreshApplyReporter;
+                let mut reporter = SilentContestReporter;
                 super::refresh::apply_refresh(prepared, &mut reporter)
             },
             load: |destination, contest_id| {
@@ -2043,9 +2103,9 @@ fn prepared_refresh_check(
     })
 }
 
-struct RefreshApplyReporter;
+struct SilentContestReporter;
 
-impl Reporter for RefreshApplyReporter {
+impl Reporter for SilentContestReporter {
     fn report(&mut self, _event: crate::ui::Event<'_>) {}
 }
 
@@ -2205,6 +2265,7 @@ struct ContestSession {
     detail_analysis_worker: Option<DetailAnalysisWorker>,
     run_generation: RunGeneration,
     results: RunResults,
+    initial_run_view: Option<crate::tui::run_results::RunView>,
     message_tx: mpsc::Sender<Message>,
     environment: ContestEnvironment,
     input: PreparedWatchInput,
@@ -2321,7 +2382,7 @@ impl ContestSession {
         };
         let run_worker = run_worker.expect("registration requires a worker");
         let run_tx = run_worker.sender();
-        let mut detail_analysis_worker = match after_stage(SessionStartStage::RunWorkerStarted)
+        let detail_analysis_worker = match after_stage(SessionStartStage::RunWorkerStarted)
             .and_then(|()| DetailAnalysisWorker::start())
         {
             Ok(worker) => worker,
@@ -2344,24 +2405,63 @@ impl ContestSession {
                 .expect_err("detail worker startup failure must remain an error"));
             }
         };
+        Ok(Self::with_view_workers(
+            PreparedContestEntry { input, environment },
+            watcher_thread,
+            (run_generation, results),
+            run_tx,
+            (message_tx, message_rx),
+            detail_analysis_worker,
+        ))
+    }
+
+    fn start_saved_view(
+        entry: FinalizedContestEntry,
+        generation: RunGeneration,
+        results: RunResults,
+        run_tx: mpsc::Sender<crate::tui::message::RunWorkerCommand>,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let view = results.attach(tx.clone())?;
+        let mut session = Self::with_view_workers(
+            entry.0,
+            None,
+            (generation, results),
+            run_tx,
+            (tx, rx),
+            DetailAnalysisWorker::start()?,
+        );
+        session.initial_run_view = Some(view);
+        Ok(session)
+    }
+
+    fn with_view_workers(
+        entry: PreparedContestEntry,
+        watcher_thread: Option<WatcherThread>,
+        (run_generation, results): (RunGeneration, RunResults),
+        run_tx: mpsc::Sender<crate::tui::message::RunWorkerCommand>,
+        (message_tx, message_rx): (mpsc::Sender<Message>, mpsc::Receiver<Message>),
+        mut detail_analysis_worker: DetailAnalysisWorker,
+    ) -> Self {
         let detail_analysis_tx = detail_analysis_worker.request_sender();
         let detail_analysis_rx = detail_analysis_worker.take_result_receiver();
-        Ok(Self {
+        Self {
+            workspace_watched: watcher_thread.is_none(),
             watcher_thread,
-            workspace_watched: workspace_root.is_some(),
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results,
+            initial_run_view: None,
             message_tx,
-            environment,
-            input,
+            environment: entry.environment,
+            input: entry.input,
             message_rx,
             run_tx,
             detail_analysis_tx,
             detail_analysis_rx,
             #[cfg(test)]
             shutdown_probe: None,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -2436,7 +2536,10 @@ impl ContestSession {
     where
         R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
     {
-        let view = self.results.attach(self.message_tx.clone())?;
+        let view = match self.initial_run_view.take() {
+            Some(view) => view,
+            None => self.results.attach(self.message_tx.clone())?,
+        };
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
         let stress_load_errors = std::mem::take(&mut self.input.stress_load_errors);
@@ -3164,6 +3267,262 @@ mod tests {
                 .set(self.probe.contest_frontend_dispatches.get() + 1);
             Ok(crate::tui::SessionExit::Quit)
         }
+    }
+
+    struct SavedViewTerminal {
+        root: PathBuf,
+        receipts: crate::commands::workspace_watch::SaveReceipts,
+        visits: Vec<crate::tui::message::RunScope>,
+    }
+
+    impl SavedViewTerminal {
+        fn wait<T>(mut read: impl FnMut() -> Option<T>) -> T {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Some(value) = read() {
+                    return value;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "saved Workspace view did not settle"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn save(&self, relative: &str) {
+            let before = self.receipts.accepted_sequence();
+            std::fs::write(self.root.join(relative), "/* saved source */\n").unwrap();
+            Self::wait(|| self.receipts.latest_after(before).0);
+        }
+    }
+
+    impl RootTerminalLifetime for SavedViewTerminal {
+        fn mouse_mode_label(&self) -> &'static str {
+            "test"
+        }
+        fn mouse_trace_line(&self) -> Option<String> {
+            None
+        }
+        fn restore(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::tui::HomeTerminal for SavedViewTerminal {
+        fn draw_home(
+            &mut self,
+            _render: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> io::Result<()> {
+            panic!("the saved view must not return to Workspace Home")
+        }
+        fn finish_home_redraw(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn note_home_resize(&mut self) {}
+        fn poll_home(&mut self, _wait: Duration) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn read_home(&mut self) -> io::Result<crate::tui::TerminalEvent> {
+            panic!("unexpected Home input")
+        }
+    }
+
+    impl WorkspaceTerminal for SavedViewTerminal {
+        fn run_contest_frontend<R>(
+            &mut self,
+            session: &mut ContestSession,
+            _app_context: &AppContext,
+            _preferences: &mut crate::tui::FrontendPreferences,
+            _submissions: &mut crate::tui::SubmissionHub,
+            mut frontend: crate::tui::SessionFrontend<R>,
+        ) -> io::Result<crate::tui::SessionExit>
+        where
+            R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
+        {
+            use crate::tui::app::{RunPhase, WatchApp};
+            use crate::tui::poll_saved_view;
+            let mut view = frontend
+                .take_saved_view()
+                .expect("enabled Workspace has saved navigation");
+            let mut app = WatchApp::new_with_run_generation(
+                &session.input.contest,
+                session.run_generation.clone(),
+                session.input.sample_counts.clone(),
+                session.input.stress_cases.clone(),
+                session.input.user_inputs.clone(),
+            )?;
+            app.attach_run_view(match session.initial_run_view.take() {
+                Some(view) => view,
+                None => session.results.attach(session.message_tx.clone())?,
+            })?;
+            view.initialize(&mut app, &session.input.destination);
+            self.visits.push(session.run_generation.scope().clone());
+
+            let events = std::collections::VecDeque::new();
+            match self.visits.len() {
+                1 => {
+                    assert_eq!(app.contest_id(), "abc481");
+                    self.save("abc481/B.py");
+                    Self::wait(|| {
+                        let (_, switching) = poll_saved_view(
+                            &mut view,
+                            &mut app,
+                            &session.input.destination,
+                            &events,
+                            false,
+                        );
+                        assert!(
+                            !switching,
+                            "a save in the current generation only selects its problem"
+                        );
+                        (app.current_problem().unwrap().index == "B").then_some(())
+                    });
+                    assert_eq!(app.current_source_language(), Some(Language::Python));
+
+                    self.save("abc482/D.py");
+                    self.save("abc483/C.cpp");
+                    assert!(
+                        !poll_saved_view(
+                            &mut view,
+                            &mut app,
+                            &session.input.destination,
+                            &events,
+                            true
+                        )
+                        .1
+                    );
+                    assert_eq!(app.contest_id(), "abc481");
+                }
+                2 => {
+                    assert_eq!(app.contest_id(), "abc483");
+                    assert_eq!(app.current_problem().unwrap().index, "C");
+                    assert_eq!(app.current_source_language(), Some(Language::Cpp));
+                    Self::wait(|| {
+                        app.apply_execution_updates();
+                        (app.current_problem().unwrap().run.phase == RunPhase::NoSamples)
+                            .then_some(())
+                    });
+                    app.toggle_debug();
+                    assert!(app.debug_enabled());
+                    assert!(!app.current_problem().unwrap().run.debug);
+                    assert_eq!(app.current_problem().unwrap().run.id, Some(1));
+                    self.save("abc481/A.py");
+                }
+                3 => {
+                    assert_eq!(app.contest_id(), "abc481");
+                    assert_eq!(self.visits[0], self.visits[2]);
+                    assert_eq!(app.current_problem().unwrap().index, "A");
+                    assert_eq!(
+                        app.problems()[1].run.id,
+                        Some(1),
+                        "earlier result was restored"
+                    );
+                    assert_eq!(app.problems()[1].run.phase, RunPhase::NoSamples);
+                    assert!(
+                        !poll_saved_view(
+                            &mut view,
+                            &mut app,
+                            &session.input.destination,
+                            &events,
+                            false
+                        )
+                        .1
+                    );
+                    return Ok(crate::tui::SessionExit::Quit);
+                }
+                _ => panic!("an extra view was opened"),
+            }
+            Self::wait(|| {
+                poll_saved_view(
+                    &mut view,
+                    &mut app,
+                    &session.input.destination,
+                    &events,
+                    false,
+                )
+                .1
+                .then_some(())
+            });
+            Ok(crate::tui::SessionExit::DisplaySavedContest)
+        }
+    }
+
+    #[test]
+    fn actual_saves_drive_workspace_view_transitions_and_restore_the_original_generation() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_workspace(root.path());
+        let context = AppContext::from_launch_root(root.path()).unwrap();
+        for (id, index) in [("abc481", "B"), ("abc482", "D"), ("abc483", "C")] {
+            workspace::save_metadata(
+                &root.path().join(id),
+                &Contest {
+                    contest_id: id.into(),
+                    problems: vec![problem_for(id, "A"), problem_for(id, index)],
+                },
+            )
+            .unwrap();
+        }
+        let runs = if std::env::var_os("ATC_INTERNAL_CROSS_CONTEST_WATCH").is_some() {
+            let runs = WorkspaceRuns::with_internal_watch();
+            assert!(runs.cross_contest);
+            runs
+        } else {
+            WorkspaceRuns {
+                cross_contest: true,
+                ..WorkspaceRuns::default()
+            }
+        };
+        let input = PreparedWatchInput::load(&root.path().join("abc481"), Some("abc481")).unwrap();
+        let session = ContestSession::start_entry(
+            PreparedContestEntry {
+                input,
+                environment: ContestEnvironment::new(Config::default()),
+            },
+            &context,
+            &runs,
+        )
+        .unwrap();
+        let receipts = runs.workspace_watcher.borrow().as_ref().unwrap().saves();
+        let worker = runs.worker().unwrap().clone();
+        let mut terminal = SavedViewTerminal {
+            root: root.path().to_path_buf(),
+            receipts: receipts.clone(),
+            visits: Vec::new(),
+        };
+        let mut runtime = WorkspaceRuntime::from_location(context, RootLocation::Contest(session));
+        runtime.runs = runs;
+        let exit = run_workspace_runtime(
+            &mut runtime,
+            &mut terminal,
+            &mut crate::tui::FrontendPreferences::default(),
+            || None,
+        )
+        .unwrap();
+        assert!(matches!(exit, WorkspaceExit::Quit));
+        assert_eq!(
+            terminal
+                .visits
+                .iter()
+                .map(|scope| scope.contest_id())
+                .collect::<Vec<_>>(),
+            ["abc481", "abc483", "abc481"]
+        );
+        assert!(Arc::ptr_eq(&worker, runtime.runs.worker().unwrap()));
+        assert_eq!(receipts.accepted_sequence(), 4);
+        assert_eq!(
+            runtime
+                .runs
+                .workspace_watcher
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .status()
+                .indexed,
+            3
+        );
+        drop(worker);
+        runtime.shutdown_active_contest().unwrap();
     }
 
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
@@ -6981,6 +7340,7 @@ mod tests {
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results: RunResults::from(old_probe_tx.clone()),
+            initial_run_view: None,
             message_tx: old_probe_tx.clone(),
             environment: ContestEnvironment::new(Config::default()),
             input,

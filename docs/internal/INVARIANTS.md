@@ -99,6 +99,8 @@
 - 画面の購読開始と初回更新対象の確定は同じ同期境界で行う。画面は task ごとの最新状態を取得し、別世代や新しい要求より古い反映を拒否する。完了状態は Workspace 全体の件数・推計バイト数の上限に従い、実行中と待機中の状態を保持する。世代失効で正本から対象を削除し、遅延イベントからの再作成を拒否する。
 - 内部の Workspace 監視は正規のソースパスと通知受付時の登録世代を照合する。Refresh の適用前に対象世代を停止して join する。対象の移動・削除やメタデータ更新で失効した世代の保存通知は破棄し、他 Contest の有効な状態を保持する。Workspace Home に戻ると監視を終了し、登録した全世代を失効させる。
 - 通知の集約は 150 ms、最大 4,096 パス。通知の欠落が疑われる場合は残った通知順を維持し、正規ソースの最終状態の差分をパス順で回収する。欠落した通知の順序と中間状態は復元できない。新世代で最初に観測した既存ファイルは比較の基準とする。ファイルシステムの通知から Git 操作とエディタ保存を区別する契約はない。
+- 自動表示は最新の通常保存通知だけを候補にする。再照合で回収した変更、実行の開始・完了・再キューでは表示を切り替えない。手動切り替えの確定時点までの候補は失効する。準備が失敗した場合は現在の画面を維持し、古い候補へ戻らない。自動表示によって実行要求を追加しない。
+- 内部経路が有効なときの通常の表示切り替えでは、表示の購読と詳細解析を終了してから新しい画面を開始する。既存の実行世代・キュー・結果は保持する。同じ有効世代へ戻った場合は最新の結果を取得する。編集やモーダルを保護するため、入力バッチを消化し、操作が完了した時点でのみ自動表示を確定する。
 - 対象世代の失効は新規受付と結果配送を止め、該当する active attempt を中断して join し、該当する foreground・pending・履歴を取り除く。他の世代のキューを保持する。Refresh は適用データを先に準備し、旧世代の join と監視・詳細解析の停止を終えてから、適用 → ディスクから再読込 → 新世代の登録と画面開始の順に進める。Workspace 終了は全対象の受付と再キューを止め、実行と画面のワーカーを join してから端末を復元する。
 - **拒否・失敗・中断時の動作** — Plain Watch は一時的にメタデータを読めない場合も最後に確認できた対応を保持し、個別 Test の読込エラーを報告して監視を続ける。TUI は準備データと現在の Contest が異なる場合や旧セッションの停止に失敗した場合に適用を拒む。適用失敗時もディスクからの再構築を試み、成功すれば失敗表示を引き継ぐ。再読込・起動も失敗すればエラーで終了する。
 - **保証しない範囲と例外** — TUI は Contest を新規に開く・切り替える際に設定・認証を読み込む。Refresh の再構築は直前の設定と同じ `SessionAuth` を使うため、外部の設定・認証ファイルを読み直す契機にはならない。HTTP 応答による認証更新は[契約 8](#8-credential-secrecy)の経路で起こる。提出ワーカーはワークスペース側が管理し、Contest セッションの停止対象から外れる。外部プロセスからの Migrate・削除・所有権変更は、次の物理実行前の検証で検出する。
@@ -108,6 +110,7 @@
 - Workspace の実行は [src/commands/watch_worker.rs](../../src/commands/watch_worker.rs) の `workspace_executor_uses_each_registered_contest_and_rejects_changed_metadata`、`workspace_prefers_latest_then_fifo_and_requeues_after_view_detaches`、`scope_retirement_joins_matching_attempt_and_rejects_old_commands_and_completion`、`workspace_request_flood_keeps_one_physical_attempt`、`workspace_shutdown_joins_active_and_drops_other_contests_work` で検証する。画面の再構築後の採番とリビジョンは [src/tui/app.rs](../../src/tui/app.rs) の `rebuilt_watch_model_keeps_scope_ids_and_task_source_revision_monotonic` で検証する。
 - 非表示状態の復元と先取りは [src/commands/watch_worker.rs](../../src/commands/watch_worker.rs) の `hidden_contest_restores_queued_running_progress_and_completed_results`、`hidden_one_shot_attempts_are_cancelled_by_cross_contest_preemption` で検証する。購読競合、失効、保持上限は [src/tui/run_results.rs](../../src/tui/run_results.rs) のテストで検証する。
 - Workspace の実ファイル監視、動的登録、Refresh の停止境界と再照合は [src/commands/workspace_watch.rs](../../src/commands/workspace_watch.rs) のテストで検証する。集約順序と登録の部分失敗は [src/watcher.rs](../../src/watcher.rs) の Workspace 監視テストで検証する。
+- 自動表示の競合と失効は [src/commands/watch_tui/saved_view.rs](../../src/commands/watch_tui/saved_view.rs) のテストで検証する。実ファイル保存からの表示遷移と元の世代の復元は [src/commands/watch_tui.rs](../../src/commands/watch_tui.rs) の `actual_saves_drive_workspace_view_transitions_and_restore_the_original_generation` を参照。
 - **未検証事項・プラットフォーム依存事項** — すべてのエディタの保存方式で全通知が届くかは未確認。監視パスの対応は[契約 9](#9-windows--macos-filesystem-differences)を参照。
 
 ## 6. User file preservation

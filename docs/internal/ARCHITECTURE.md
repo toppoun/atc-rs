@@ -109,7 +109,9 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - デバッグビルドで内部フラグ `ATC_INTERNAL_CROSS_CONTEST_WATCH=1` を指定すると、`WorkspaceRuns` が最初の Contest 表示時に `WorkspaceWatcher` を開始する。既存の単一 Contest Watcher をこの経路では生成しない。表示を開き直しても同じ Watcher を使用し、Workspace Home 復帰・Workspace 終了で停止する。Standalone と Plain Watch は従来の経路を使う。
 - `BatchWorkspace::scan_watch` が優先する配置ルールと管理対象の所有権を照合する。Workspace 用の診断でマニフェストとサンプル構造・UTF-8 を確認し、サンプル本文を常駐させずに `RunContext` を登録する。索引は正規ソースのパスを task ID・言語・登録世代へ対応付ける。既存の `RunContext` と `RunResultStore` を切替後も共有する。
 - `WorkspaceFileWatcher` は単一の notify Watcher に Workspace の配置先と Contest 直下を非再帰登録する。150 ms の固定窓で対象パスを最後の通知順に集約し、4,096 パスまで保持する。エラー・Rescan・上限超過・登録差分では照合後に正規ソースの指紋を確認し、検出済みの順序を処理したあと、欠落分をパス順で回収する。`.atc` 内には監視ハンドルを置かず、マニフェストの属性を 1 秒ごとに、全体を 15 秒ごとに再照合する。
-- 保存通知は登録世代と現行の所有権を照合して `RunWorker` へ送る。ワーカーは実行直前にメタデータと正規ソースを再検証する。受付順と対象は物理 attempt から独立した `SaveReceipt` に記録し、表示中の選択は変更しない。保存先の言語を使い、C++ の Debug は当該 Contest の購読中の値を使う。非表示の Debug は無効。
+- 保存通知は登録世代と現行の所有権を照合して `RunWorker` へ送る。ワーカーは実行直前にメタデータと正規ソースを再検証する。受付順と対象は物理 attempt から独立した `SaveReceipt` に記録する。保存先の言語を使い、C++ の Debug は当該 Contest の購読中の値を使う。非表示の Debug は無効。
+- `SavedViewSwitch` は固定窓ごとに公開される最新の通常通知を読む。準備は 1 件ずつバックグラウンドで行い、端末入力バッチを処理し終えた安全な時点で受付順・所有権・ソース・世代を再検証する。同じ世代なら task ID と言語で表示を選び、別世代なら読み取り専用で準備した `ContestSession` に移る。すでに受理した実行の状態は `RunResultStore` から復元する。Debug の現在値は次回実行用として表示し、保存時に確定した実行の Debug と区別する。
+- User Input の編集を開いている間、提出・切替・Refresh・ソース操作などのモーダル、コマンドパレットと詳細スクロールのドラッグ中は、自動切り替えを保留する。手動切り替えが確定した時点までの受付を表示候補から除外する。保留や候補失効の間も実行と提出追跡を続ける。
 - Refresh は対象を一時停止し、旧世代の取消・join を終えてから適用する。再開時に新しい世代を登録する。外部操作による所有経路・メタデータの失効も同じ選択的な取消経路を使う。部分的な登録エラーはほかの登録を保ちながら状態行に表示する。
 
 ### AtCoder への提出と結果追跡

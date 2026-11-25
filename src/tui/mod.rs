@@ -1434,6 +1434,7 @@ impl CommandPalette {
 pub(crate) enum SessionExit {
     Quit,
     SwitchContest,
+    DisplaySavedContest,
     RefreshContest(RefreshResumeState),
     ReturnToWorkspaceHome,
 }
@@ -2639,6 +2640,39 @@ pub(crate) struct SessionFrontend<R> {
     contest_switch_task: ContestSwitchTask,
     refresh_task: RefreshContestTask,
     refresh_prepared_check: RefreshPreparedCheck,
+    saved_view: Option<SavedViewFrontend>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SavedSource {
+    pub(crate) target: message::RunTarget,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) language: Language,
+}
+
+pub(crate) enum SavedViewEvent {
+    Poll { blocked: bool },
+    ManualCommit,
+}
+
+pub(crate) enum SavedViewUpdate {
+    Status(Option<Arc<str>>),
+    Select(SavedSource),
+    Switch,
+}
+
+pub(crate) struct SavedViewFrontend {
+    pub(crate) initial_source: Option<SavedSource>,
+    pub(crate) update: Box<dyn FnMut(SavedViewEvent) -> SavedViewUpdate>,
+}
+
+impl SavedViewFrontend {
+    pub(crate) fn initialize(&mut self, app: &mut WatchApp, destination: &Path) {
+        app.saved_view_enabled = true;
+        if let Some(source) = self.initial_source.take() {
+            app.select_saved_source(source, destination);
+        }
+    }
 }
 
 impl<R> SessionFrontend<R> {
@@ -2655,7 +2689,18 @@ impl<R> SessionFrontend<R> {
             contest_switch_task,
             refresh_task,
             refresh_prepared_check,
+            saved_view: None,
         }
+    }
+
+    pub(crate) fn with_saved_view(mut self, saved_view: Option<SavedViewFrontend>) -> Self {
+        self.saved_view = saved_view;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_saved_view(&mut self) -> Option<SavedViewFrontend> {
+        self.saved_view.take()
     }
 }
 
@@ -3346,6 +3391,37 @@ fn handle_background_events(
     Ok(changed)
 }
 
+pub(crate) fn poll_saved_view(
+    view: &mut SavedViewFrontend,
+    app: &mut WatchApp,
+    destination: &Path,
+    terminal_events: &VecDeque<TerminalEvent>,
+    modal_or_drag_active: bool,
+) -> (bool, bool) {
+    // A partially handled input batch still belongs to the view that received it.
+    if !terminal_events.is_empty() {
+        return (false, false);
+    }
+    let blocked = modal_or_drag_active || app.has_user_input_edits();
+    match (view.update)(SavedViewEvent::Poll { blocked }) {
+        SavedViewUpdate::Status(status) => {
+            let changed = app.saved_view_status != status;
+            app.saved_view_status = status;
+            (changed, false)
+        }
+        SavedViewUpdate::Select(source) => {
+            let previous = app.selected_problem();
+            let mut changed = app.saved_view_status.take().is_some();
+            if app.select_saved_source(source, destination) {
+                sync_user_inputs_on_problem_entry(app, previous, Some(destination));
+                changed = true;
+            }
+            (changed, false)
+        }
+        SavedViewUpdate::Switch => (false, true),
+    }
+}
+
 pub(crate) fn run<R>(
     terminal: &mut TerminaSession,
     app_context: &AppContext,
@@ -3362,6 +3438,7 @@ where
         contest_switch_task,
         refresh_task,
         refresh_prepared_check,
+        mut saved_view,
     } = frontend;
     let SessionRuntime {
         current_destination,
@@ -3406,6 +3483,9 @@ where
     if let Some(state) = refresh_frontend_state.as_ref() {
         state.resume.apply(&mut app, current_destination);
     }
+    if let Some(view) = &mut saved_view {
+        view.initialize(&mut app, current_destination);
+    }
     let mut contest_switch = ContestSwitchController::new(
         app_context,
         current_destination,
@@ -3441,6 +3521,7 @@ where
     let mut detail_layout = detail_layout::DetailLayout::default();
     let mut detail_scrollbar_drag = DetailScrollbarDragState::default();
     let mut terminal_events = VecDeque::new();
+    let mut display_saved_contest = false;
 
     while !app.should_quit() {
         if detail_scrollbar_drag.advance_fold_animation(&mut app, Instant::now()) {
@@ -3511,6 +3592,28 @@ where
             discard_stale_pixel_events(&mut terminal_events);
             terminal.note_resize_dispatched();
             dirty = true;
+        }
+
+        if let Some(view) = &mut saved_view {
+            let modal_active = contest_switch.modal_active()
+                || contest_refresh.modal_active()
+                || submit.modal_active()
+                || open_source.modal_active()
+                || editor_targets.modal_active()
+                || command_palette.is_active()
+                || detail_scrollbar_drag.active.is_some();
+            let (changed, switching) = poll_saved_view(
+                view,
+                &mut app,
+                current_destination,
+                &terminal_events,
+                modal_active,
+            );
+            dirty |= changed;
+            if switching {
+                display_saved_contest = true;
+                break;
+            }
         }
 
         let submission_animation_phase = view::SubmissionAnimationPhase::from_elapsed(
@@ -3672,7 +3775,12 @@ where
             current_destination,
         )))
     } else if contest_switch.switch_requested {
+        if let Some(view) = &mut saved_view {
+            (view.update)(SavedViewEvent::ManualCommit);
+        }
         Ok(SessionExit::SwitchContest)
+    } else if display_saved_contest {
+        Ok(SessionExit::DisplaySavedContest)
     } else {
         Ok(SessionExit::Quit)
     }
@@ -5425,6 +5533,124 @@ mod tests {
 
     fn app() -> WatchApp {
         app_with_problems(&[3])
+    }
+
+    fn select_on_unblocked_save(target: SavedSource) -> SavedViewFrontend {
+        SavedViewFrontend {
+            initial_source: None,
+            update: Box::new(move |event| match event {
+                SavedViewEvent::Poll { blocked: true } => {
+                    SavedViewUpdate::Status(Some("hold".into()))
+                }
+                SavedViewEvent::Poll { blocked: false } => SavedViewUpdate::Select(target.clone()),
+                SavedViewEvent::ManualCommit => panic!("test does not commit a manual switch"),
+            }),
+        }
+    }
+
+    #[test]
+    fn saved_selection_waits_for_input_batch_and_preserves_an_unsaved_user_input() {
+        let destination = Path::new("workspace/abc123");
+        let mut app = app_with_problems(&[1, 1]);
+        let mut view = select_on_unblocked_save(SavedSource {
+            target: app.run_target(1),
+            path: destination.join("B.py"),
+            language: Language::Python,
+        });
+        assert!(app.begin_new_user_input().unwrap());
+        assert!(app.edit_user_input_insert("pending draft"));
+        let events = VecDeque::from([test_key_press('j')]);
+        assert_eq!(
+            poll_saved_view(&mut view, &mut app, destination, &events, false),
+            (false, false)
+        );
+        assert!(
+            app.saved_view_status.is_none(),
+            "the delivered input batch owns routing"
+        );
+
+        let events = VecDeque::new();
+        assert_eq!(
+            poll_saved_view(&mut view, &mut app, destination, &events, false),
+            (true, false)
+        );
+        assert_eq!(app.selected_problem(), Some(0));
+        assert_eq!(
+            app.selected_user_input_edit().unwrap().buffer(),
+            "pending draft"
+        );
+        assert!(app.cancel_user_input_edit());
+        assert_eq!(
+            poll_saved_view(&mut view, &mut app, destination, &events, false),
+            (true, false)
+        );
+        assert_eq!(app.selected_problem(), Some(1));
+        assert_eq!(app.current_source_language(), Some(Language::Python));
+        assert!(app.current_problem().unwrap().run.id.is_none());
+    }
+
+    #[test]
+    fn saved_selection_waits_for_submit_without_changing_the_confirmed_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path();
+        write_valid_submit_metadata(destination);
+        fs::write(destination.join("A.cpp"), "exact confirmed source\n").unwrap();
+        let mut app = app_with_problems(&[1, 1]);
+        let mut view = select_on_unblocked_save(SavedSource {
+            target: app.run_target(1),
+            path: destination.join("B.py"),
+            language: Language::Python,
+        });
+        let hub = SubmissionHub::new();
+        let mut submit = SubmitController::new(
+            destination,
+            Language::Cpp,
+            PythonRuntime::CPython,
+            configured_auth(),
+        );
+        assert!(submit.open(&app, &hub));
+        let events = VecDeque::new();
+        poll_saved_view(
+            &mut view,
+            &mut app,
+            destination,
+            &events,
+            submit.modal_active(),
+        );
+        assert_eq!(app.selected_problem(), Some(0));
+        assert!(submit.handle_key_with_start(
+            key(KeyCode::Enter, KeyEventKind::Press),
+            &app,
+            |key, problem, _, plan| {
+                assert_eq!(key.contest_id, "abc123");
+                assert_eq!(problem, "A");
+                assert_eq!(
+                    crate::commands::submit::prepare_submit(plan)
+                        .unwrap()
+                        .test_source_snapshot(),
+                    "exact confirmed source\n"
+                );
+                Ok(1)
+            }
+        ));
+        assert!(submit.modal().unwrap().is_starting());
+        poll_saved_view(
+            &mut view,
+            &mut app,
+            destination,
+            &events,
+            submit.modal_active(),
+        );
+        assert_eq!(app.selected_problem(), Some(0));
+        submit.close();
+        poll_saved_view(
+            &mut view,
+            &mut app,
+            destination,
+            &events,
+            submit.modal_active(),
+        );
+        assert_eq!(app.selected_problem(), Some(1));
     }
 
     fn app_with_problems(sample_counts: &[usize]) -> WatchApp {

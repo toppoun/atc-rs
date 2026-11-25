@@ -98,6 +98,12 @@ impl RunResultStore {
 }
 
 impl RunResults {
+    pub(crate) fn is_registered(&self) -> bool {
+        let mut registered = false;
+        self.with_store(|store, scope| registered = store.scopes.contains_key(scope));
+        registered
+    }
+
     pub(crate) fn attach(&self, sender: Sender<Message>) -> io::Result<RunView> {
         match self {
             Self::Tracked { store, scope } => {

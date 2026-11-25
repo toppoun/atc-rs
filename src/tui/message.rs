@@ -215,6 +215,15 @@ struct SourceRevisions {
 }
 
 impl UserInputRunStartGate {
+    pub(super) fn display_source(&self, language: Language) -> u64 {
+        let mut revisions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        revisions.language = Some(language);
+        revisions.current
+    }
+
     pub(super) fn current(&self) -> u64 {
         self.0
             .lock()

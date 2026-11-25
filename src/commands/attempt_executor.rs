@@ -163,13 +163,20 @@ impl RunContext {
         &self,
         path: &Path,
     ) -> io::Result<Option<crate::safe_file::FileFingerprint>> {
-        let route = self
-            .binding
+        workspace::watched_source_fingerprint(path, self.watched_directory_identity())
+    }
+
+    pub(super) fn watched_source_exists(&self, path: &Path) -> io::Result<bool> {
+        workspace::watched_source_exists(path, self.watched_directory_identity())
+    }
+
+    fn watched_directory_identity(&self) -> &workspace::PhysicalDirectoryIdentity {
+        self.binding
             .as_ref()
             .and_then(|binding| binding.route.as_ref())
             .map(|(_, route)| route)
-            .expect("Workspace watch source has a validated route");
-        workspace::watched_source_fingerprint(path, route.destination_identity())
+            .expect("Workspace watch source has a validated route")
+            .destination_identity()
     }
 
     pub(super) fn sample_count(&self, task_id: &str) -> Option<usize> {
