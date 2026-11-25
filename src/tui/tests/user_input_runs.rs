@@ -64,7 +64,7 @@ fn old_session_user_input_result_with_the_same_run_id_and_revision_is_ignored() 
             output == "current"
         );
     }
-    assert_eq!(last(&current_app, 3).unwrap().stdout, "current");
+    assert_eq!(last(&current_app, 3).unwrap().stdout.as_str(), "current");
 }
 
 #[test]
@@ -105,7 +105,8 @@ fn source_change_is_problem_local_and_clears_draft_result_without_changing_its_b
             .unwrap()
             .last_run(app::UserInputSelection::Persisted(7))
             .unwrap()
-            .stdout,
+            .stdout
+            .as_str(),
         "B"
     );
     assert!(app.take_user_input_run_request().is_none());
@@ -433,7 +434,10 @@ fn each_stable_input_retains_its_own_result_across_selection_and_renumbering() {
     sync_user_inputs_for_problem(&mut app, Some(&destination), 0);
     for id in [7, 9, 7] {
         select_sync_input(&mut app, id);
-        assert_eq!(last(&app, id).unwrap().stdout, format!("output {id}"));
+        assert_eq!(
+            last(&app, id).unwrap().stdout.as_str(),
+            format!("output {id}")
+        );
         assert!(text(&app).contains(&format!("output {id}")));
     }
 }
@@ -643,7 +647,7 @@ fn cursor_moves_and_noop_mutation_keep_result() {
         KeyCode::End,
     ] {
         handle_user_input_editor_key(&mut app, key(code, KeyEventKind::Press), None);
-        assert_eq!(last(&app, 7).unwrap().stdout, "kept");
+        assert_eq!(last(&app, 7).unwrap().stdout.as_str(), "kept");
     }
     assert!(!app.edit_user_input_insert(""));
     assert!(!app.edit_user_input_delete());
@@ -785,7 +789,7 @@ fn repeated_run_latest_wins_even_if_old_started_and_completed_messages_arrive_la
     complete(&mut app, &second, "latest");
     assert!(!apply_event(&mut app, &first, result_event("old")));
     assert!(!app.run_started(0, first.run_id));
-    assert_eq!(last(&app, 7).unwrap().stdout, "latest");
+    assert_eq!(last(&app, 7).unwrap().stdout.as_str(), "latest");
 }
 
 #[test]
@@ -1516,7 +1520,7 @@ fn readonly_target_refresh_changes_only_target_and_preserves_other_editor_baseli
         Some(&destination),
         0
     ));
-    assert_eq!(last(&app, 9).unwrap().stdout, "old target output");
+    assert_eq!(last(&app, 9).unwrap().stdout.as_str(), "old target output");
     run_selected_user_input(&mut app, Some(&destination));
     let request = take_run(&mut app);
     assert_eq!(stdin(&request), "latest\r\n\t界\n");
@@ -1677,7 +1681,7 @@ fn real_program_stderr_is_rendered_for_success_and_runtime_error() {
                 Status::RuntimeError
             }
         );
-        assert_eq!(run.stderr, "program stderr");
+        assert_eq!(run.stderr.as_str(), "program stderr");
         assert!(run.diagnostic.is_none());
         assert!(text(&app).contains("▼ Stderr\nprogram stderr"));
         assert!(!text(&app).contains("Error: "));

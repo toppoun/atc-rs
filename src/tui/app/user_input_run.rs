@@ -1,5 +1,53 @@
 use super::*;
 
+impl UserInputRunState {
+    pub(crate) fn queued(
+        run_id: RunId,
+        snapshot: Arc<UserInputRunSnapshot>,
+        language: Language,
+    ) -> Self {
+        Self {
+            run_id,
+            snapshot,
+            language: Some(language),
+            status: UserInputRunStatus::Queued,
+            stdout: Arc::default(),
+            stderr: Arc::default(),
+            diagnostic: None,
+            elapsed: None,
+        }
+    }
+
+    pub(crate) fn started(&mut self) -> bool {
+        if self.status != UserInputRunStatus::Queued {
+            return false;
+        }
+        self.status = if self.language == Some(Language::Cpp) {
+            UserInputRunStatus::Compiling
+        } else {
+            UserInputRunStatus::Running
+        };
+        true
+    }
+
+    pub(crate) fn failed(&mut self, error: &str) {
+        self.status = UserInputRunStatus::Failed;
+        self.diagnostic = Some(Arc::new(error.to_owned()));
+    }
+
+    pub(crate) fn apply_event(&mut self, event: UserInputRunEvent) {
+        match event {
+            UserInputRunEvent::Running => self.status = UserInputRunStatus::Running,
+            UserInputRunEvent::Finished(result) => {
+                self.status = result.status;
+                self.stdout = Arc::new(result.stdout);
+                self.stderr = Arc::new(result.stderr);
+                self.elapsed = Some(result.elapsed);
+            }
+        }
+    }
+}
+
 impl UserInputReadyState {
     pub(super) fn discard_draft_run(&mut self) {
         self.runs
@@ -41,6 +89,55 @@ impl UserInputReadyState {
                 .map(|input| input.content.as_str()),
             UserInputRunTarget::Draft(_) => None,
         }
+    }
+}
+
+impl ProblemState {
+    pub(super) fn apply_user_input_results(
+        &mut self,
+        latest: RunId,
+        runs: HashMap<UserInputRunTarget, UserInputRunState>,
+    ) -> bool {
+        let Some(ready) = self.user_inputs.ready_mut() else {
+            return false;
+        };
+        let before = ready.runs.len();
+        ready.runs.retain(|target, local| {
+            local.run_id > latest
+                || local.language.is_none()
+                || runs
+                    .get(target)
+                    .is_some_and(|stored| stored.run_id == local.run_id)
+        });
+        let mut changed = ready.runs.len() != before;
+        for run in runs.into_values() {
+            changed |= self.apply_user_input_projection(run);
+        }
+        changed
+    }
+
+    fn apply_user_input_projection(&mut self, run: UserInputRunState) -> bool {
+        let Some(ready) = self.user_inputs.ready_mut() else {
+            return false;
+        };
+        let target = run.snapshot.target;
+        let local = ready.runs.get(&target);
+        let requires_local = self.own_request_id.is_some_and(|own| run.run_id <= own)
+            || matches!(target, UserInputRunTarget::Draft(_));
+        if run.snapshot.source_revision != self.source_revision
+            || run.snapshot.problem_index != self.index
+            || self
+                .source
+                .as_ref()
+                .is_some_and(|source| Some(source.language) != run.language)
+            || ready.run_content(target) != Some(run.snapshot.input.as_ref())
+            || requires_local && !local.is_some_and(|local| local.run_id == run.run_id)
+            || local == Some(&run)
+        {
+            return false;
+        }
+        ready.runs.insert(target, run);
+        true
     }
 }
 
@@ -154,8 +251,8 @@ impl WatchApp {
                         snapshot,
                         language: None,
                         status: UserInputRunStatus::Failed,
-                        stdout: String::new(),
-                        stderr: String::new(),
+                        stdout: Arc::default(),
+                        stderr: Arc::default(),
                         diagnostic: Some(Arc::new(
                             "No source is selected. Open or save a source file before running User Input."
                                 .to_string(),
@@ -171,21 +268,9 @@ impl WatchApp {
         // different-problem sample work remains eligible for the scheduler's normal requeue.
         self.retire_other_stress_requests(problem);
         let state = &mut self.problems[problem];
-        if matches!(
-            state.run.phase,
-            RunPhase::Queued | RunPhase::Compiling | RunPhase::Running
-        ) {
-            state.run.id = None;
-            state.run.phase = RunPhase::Cancelled;
-        }
-        if matches!(
-            state.stress.phase,
-            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-        ) {
-            state.stress.id = None;
-            state.stress.phase = StressPhase::Cancelled;
-        }
+        state.execution.queue_user_input();
         let run_id = self.run_generation.next_run_id();
+        state.stage_execution(run_id);
         state
             .user_inputs
             .ready_mut()
@@ -193,16 +278,7 @@ impl WatchApp {
             .runs
             .insert(
                 target,
-                UserInputRunState {
-                    run_id,
-                    snapshot: Arc::clone(&snapshot),
-                    language: Some(language),
-                    status: UserInputRunStatus::Queued,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    diagnostic: None,
-                    elapsed: None,
-                },
+                UserInputRunState::queued(run_id, Arc::clone(&snapshot), language),
             );
         self.pending_user_input_runs.push_back(RunRequest {
             run_id,
@@ -268,14 +344,9 @@ impl WatchApp {
         let Some(run) = self.current_user_input_run_mut(problem, run_id) else {
             return false;
         };
-        if run.status != UserInputRunStatus::Queued {
+        if !run.started() {
             return false;
         }
-        run.status = if run.language == Some(Language::Cpp) {
-            UserInputRunStatus::Compiling
-        } else {
-            UserInputRunStatus::Running
-        };
         self.invalidate_detail();
         true
     }
@@ -289,8 +360,7 @@ impl WatchApp {
         let Some(run) = self.current_user_input_run_mut(problem, run_id) else {
             return false;
         };
-        run.status = UserInputRunStatus::Failed;
-        run.diagnostic = Some(Arc::new(error.to_string()));
+        run.failed(error);
         self.invalidate_detail();
         true
     }
@@ -308,15 +378,7 @@ impl WatchApp {
         if run.snapshot.as_ref() != snapshot {
             return false;
         }
-        match event {
-            UserInputRunEvent::Running => run.status = UserInputRunStatus::Running,
-            UserInputRunEvent::Finished(result) => {
-                run.status = result.status;
-                run.stdout = result.stdout;
-                run.stderr = result.stderr;
-                run.elapsed = Some(result.elapsed);
-            }
-        }
+        run.apply_event(event);
         self.invalidate_detail();
         true
     }

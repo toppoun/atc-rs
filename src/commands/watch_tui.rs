@@ -2126,6 +2126,7 @@ struct ContestSession {
     detail_analysis_worker: Option<DetailAnalysisWorker>,
     run_generation: RunGeneration,
     results: RunResults,
+    message_tx: mpsc::Sender<Message>,
     environment: ContestEnvironment,
     input: PreparedWatchInput,
     message_rx: mpsc::Receiver<Message>,
@@ -2192,12 +2193,11 @@ impl ContestSession {
             )
             .expect_err("injected startup failure must remain an error"));
         }
-        let results = RunResults::from(message_tx);
         let registration = runs.worker().and_then(|worker| {
-            let run_generation = worker.register(context, results.clone())?;
-            Ok((worker, run_generation))
+            let (run_generation, results) = worker.register_retained(context)?;
+            Ok((worker, run_generation, results))
         });
-        let (run_worker, run_generation) = match registration {
+        let (run_worker, run_generation, results) = match registration {
             Ok(registered) => registered,
             Err(error) => {
                 return Err(combine_primary_and_cleanup_results(
@@ -2234,6 +2234,7 @@ impl ContestSession {
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results,
+            message_tx,
             environment,
             input,
             message_rx,
@@ -2317,6 +2318,7 @@ impl ContestSession {
     where
         R: FnMut(&str) -> crate::tui::ContestSwitchResolution,
     {
+        let view = self.results.attach(self.message_tx.clone())?;
         let sample_counts = std::mem::take(&mut self.input.sample_counts);
         let stress_cases = std::mem::take(&mut self.input.stress_cases);
         let stress_load_errors = std::mem::take(&mut self.input.stress_load_errors);
@@ -2331,7 +2333,12 @@ impl ContestSession {
             stress_cases,
             stress_load_errors,
             user_inputs,
-            crate::tui::SessionExecution::new(channels, submissions, self.run_generation.clone()),
+            crate::tui::SessionExecution::new(
+                channels,
+                submissions,
+                self.run_generation.clone(),
+                view,
+            ),
         );
         crate::tui::run(terminal, app_context, preferences, runtime, frontend)
     }
@@ -2356,7 +2363,6 @@ impl ContestSession {
             probe.fetch_add(1, Ordering::Relaxed);
         }
         self.request_stop();
-        self.results.detach();
         // Keep the view's channel endpoints until both view-owned workers have joined.
         combine_primary_and_cleanup_results(
             Ok(()),
@@ -2380,7 +2386,6 @@ impl ContestSession {
 
 impl Drop for ContestSession {
     fn drop(&mut self) {
-        self.results.detach();
         self.request_stop();
     }
 }
@@ -6804,6 +6809,7 @@ mod tests {
             detail_analysis_worker: Some(detail_analysis_worker),
             run_generation,
             results: RunResults::from(old_probe_tx.clone()),
+            message_tx: old_probe_tx.clone(),
             environment: ContestEnvironment::new(Config::default()),
             input,
             message_rx,

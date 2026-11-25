@@ -105,6 +105,20 @@ impl RunContext {
     pub(super) fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Acquire)
     }
+
+    pub(super) fn sample_count(&self, task_id: &str) -> Option<usize> {
+        #[cfg(test)]
+        if self.binding.is_none() && self.problems.is_empty() {
+            return Some(0);
+        }
+        self.problem(task_id).map(|problem| problem.sample_count)
+    }
+
+    fn problem(&self, task_id: &str) -> Option<&Problem> {
+        self.problems
+            .iter()
+            .find(|problem| problem.task_id == task_id)
+    }
 }
 
 pub(super) struct AttemptExecutor;
@@ -129,16 +143,12 @@ impl AttemptExecutor {
                         )
                         .into());
                     }
-                    let problem = context
-                        .problems
-                        .iter()
-                        .find(|problem| problem.task_id == request.target.task_id.as_ref())
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unknown task ID: {}", request.target.task_id),
-                            )
-                        })?;
+                    let problem = context.problem(&request.target.task_id).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("unknown task ID: {}", request.target.task_id),
+                        )
+                    })?;
                     if let Err(error) = context.revalidate() {
                         context.stale.store(true, Ordering::Release);
                         return Err(error.into());

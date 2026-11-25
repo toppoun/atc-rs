@@ -59,6 +59,10 @@ impl RunScheduler {
         self.active.as_ref().map(|active| active.request.clone())
     }
 
+    pub(super) fn foreground_request(&self) -> Option<&RunRequest> {
+        self.foreground.as_ref()
+    }
+
     /// The worker has already joined and retired any active attempt in this scope.
     pub(super) fn discard_scope(&mut self, scope: &RunScope) -> Vec<RunRequest> {
         debug_assert!(
@@ -203,7 +207,15 @@ impl RunScheduler {
         StressCancellation::Accepted { cancel_active }
     }
 
+    #[cfg(test)]
     pub(super) fn start_next(&mut self) -> Option<RunRequest> {
+        self.start_next_with_retirement(|_| {})
+    }
+
+    pub(super) fn start_next_with_retirement(
+        &mut self,
+        mut retired: impl FnMut(&RunRequest),
+    ) -> Option<RunRequest> {
         if self.active.is_some() {
             return None;
         }
@@ -216,6 +228,7 @@ impl RunScheduler {
             if !self.user_input_request_retired(&request) {
                 break request;
             }
+            retired(&request);
         };
 
         debug_assert_eq!(self.latest_seen.get(&request.target), Some(&request.run_id));

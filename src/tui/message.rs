@@ -4,7 +4,6 @@ use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -195,41 +194,7 @@ impl RunWorkerCommand {
     }
 }
 
-/// One execution scope's result route. With no view attached, events can be discarded.
-#[derive(Clone, Default)]
-pub(crate) struct RunResults(Arc<Mutex<Option<Sender<Message>>>>);
-
-impl From<Sender<Message>> for RunResults {
-    fn from(sender: Sender<Message>) -> Self {
-        Self(Arc::new(Mutex::new(Some(sender))))
-    }
-}
-
-impl RunResults {
-    pub(crate) fn detach(&self) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    }
-
-    pub(crate) fn send(&self, message: Message) -> io::Result<()> {
-        if let Some(sender) = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            sender.send(message).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "TUI message receiver disconnected from run worker",
-                )
-            })?;
-        }
-        Ok(())
-    }
-}
+pub(crate) use super::run_results::RunResults;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UserInputRunTarget {
@@ -249,6 +214,13 @@ struct SourceRevisions {
 }
 
 impl UserInputRunStartGate {
+    pub(super) fn current(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
+    }
+
     pub(super) fn advance(&self, removed: bool) -> u64 {
         let mut revisions = self
             .0
@@ -508,6 +480,7 @@ pub enum StressEvent {
 
 #[derive(Debug)]
 pub enum Message {
+    ExecutionChanged,
     UserInputRunEvent {
         run_id: RunId,
         target: RunTarget,
@@ -557,6 +530,11 @@ pub enum Message {
         run_id: RunId,
         target: RunTarget,
         event: StressEvent,
+    },
+
+    RunCancelled {
+        run_id: RunId,
+        target: RunTarget,
     },
 
     RunCompleted {

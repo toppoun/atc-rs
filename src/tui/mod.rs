@@ -13,6 +13,7 @@ mod home;
 pub mod message;
 mod mouse;
 pub mod reporter;
+pub(crate) mod run_results;
 mod settings_screen;
 mod submission;
 mod template_modal;
@@ -2613,6 +2614,7 @@ pub(crate) struct SessionExecution<'a> {
     channels: SessionChannels<'a>,
     submissions: &'a mut SubmissionHub,
     run_generation: RunGeneration,
+    run_view: run_results::RunView,
 }
 
 impl<'a> SessionExecution<'a> {
@@ -2620,11 +2622,13 @@ impl<'a> SessionExecution<'a> {
         channels: SessionChannels<'a>,
         submissions: &'a mut SubmissionHub,
         run_generation: RunGeneration,
+        run_view: run_results::RunView,
     ) -> Self {
         Self {
             channels,
             submissions,
             run_generation,
+            run_view,
         }
     }
 }
@@ -3088,6 +3092,8 @@ fn handle_messages_with_destination(
 
     for _ in 0..MAX_MESSAGES_PER_TICK {
         match message_rx.try_recv() {
+            Ok(Message::ExecutionChanged) => changed |= app.apply_execution_updates(),
+            Ok(Message::RunCancelled { .. }) => {}
             Ok(Message::UserInputRunEvent {
                 target,
                 run_id,
@@ -3362,6 +3368,7 @@ where
                     },
                 submissions,
                 run_generation,
+                run_view,
             },
     } = runtime;
     let mut app = WatchApp::new_with_run_generation(
@@ -3376,6 +3383,7 @@ where
             app.set_saved_stress_load_error(problem, error);
         }
     }
+    app.attach_run_view(run_view)?;
     preferences.apply(&mut app);
     let initial_refresh_error = refresh_frontend_state
         .as_ref()

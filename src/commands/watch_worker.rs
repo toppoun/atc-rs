@@ -15,6 +15,7 @@ use crate::tui::message::{
     Message, RunGeneration, RunId, RunKind, RunRequest, RunResults, RunScope, RunTarget,
     RunWorkerCommand,
 };
+use crate::tui::run_results::RunResultStore;
 #[cfg(test)]
 use crate::{config::RunnerConfig, model::Problem};
 
@@ -29,6 +30,7 @@ pub(super) struct RunWorker {
     retire_tx: Sender<ScopeRetirement>,
     control: Arc<WorkerControl>,
     handle: Option<JoinHandle<io::Result<()>>>,
+    results: RunResultStore,
 }
 
 struct RegisteredRun {
@@ -63,7 +65,7 @@ impl WorkerControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stopping.store(true, Ordering::Release);
         for entry in contexts.values() {
-            entry.results.detach();
+            entry.results.invalidate();
         }
     }
 
@@ -196,6 +198,7 @@ impl RunWorker {
             retire_tx,
             control,
             handle: Some(handle),
+            results: RunResultStore::default(),
         })
     }
 
@@ -214,11 +217,28 @@ impl RunWorker {
         self.command_tx.clone()
     }
 
+    pub(super) fn register_retained(
+        &self,
+        context: RunContext,
+    ) -> io::Result<(RunGeneration, RunResults)> {
+        self.register_with(context, |scope| self.results.register(scope))
+    }
+
+    #[cfg(test)]
     pub(super) fn register(
         &self,
         context: RunContext,
         results: RunResults,
     ) -> io::Result<RunGeneration> {
+        self.register_with(context, |_| results)
+            .map(|(generation, _)| generation)
+    }
+
+    fn register_with(
+        &self,
+        context: RunContext,
+        make_results: impl FnOnce(&RunScope) -> RunResults,
+    ) -> io::Result<(RunGeneration, RunResults)> {
         self.control
             .while_running(|contexts| {
                 let generation = context.generation.clone();
@@ -232,14 +252,15 @@ impl RunWorker {
                         "contest has a registered execution generation",
                     ));
                 }
+                let results = make_results(scope);
                 contexts.insert(
                     scope.clone(),
                     RegisteredRun {
                         context: Arc::new(context),
-                        results,
+                        results: results.clone(),
                     },
                 );
-                Ok(generation)
+                Ok((generation, results))
             })
             .ok_or_else(stopped_worker)?
     }
@@ -249,7 +270,7 @@ impl RunWorker {
         self.control
             .while_running(|contexts| {
                 if let Some(entry) = contexts.remove(scope) {
-                    entry.results.detach();
+                    entry.results.invalidate();
                 }
                 self.retire_tx
                     .send(ScopeRetirement {
@@ -379,7 +400,9 @@ fn scheduler_loop_inner(
 
         if active.is_none() {
             let spawned = control.while_running(|contexts| {
-                scheduler.start_next().map(|request| {
+                let next = scheduler
+                    .start_next_with_retirement(|request| cancel_result(contexts, request));
+                next.map(|request| {
                     let attempt = contexts.get(&request.target.scope).and_then(|entry| {
                         let mut spawn =
                             || spawn_attempt(entry, request.clone(), completion_tx.clone());
@@ -399,7 +422,8 @@ fn scheduler_loop_inner(
                 Some(None) => {}
                 Some(Some((request, None))) => {
                     // Removal won after start_next selected this logical request, but before
-                    // any physical attempt was spawned. Retire it without publishing a run.
+                    // any physical attempt was spawned. Retire its admitted state as well.
+                    control.while_running(|contexts| cancel_result(contexts, &request));
                     let _retired = retire_matching(scheduler, request)?;
                     continue;
                 }
@@ -476,53 +500,77 @@ fn process_command(
     let Some(entry) = contexts.get(&command.target().scope) else {
         return Ok(());
     };
-    if entry.context.is_stale() {
-        if let RunWorkerCommand::Run(request) = command {
-            entry.results.send(Message::RunFailed {
-                run_id: request.run_id,
-                target: request.target,
-                error: "contest data or Workspace route changed; reopen the contest and retry"
-                    .into(),
-            })?;
-        }
-        return Ok(());
-    }
-
     match command {
-        RunWorkerCommand::Run(request) => process_run_request(scheduler, active, request),
+        RunWorkerCommand::Run(request) => {
+            let Some(sample_count) = entry.context.sample_count(&request.target.task_id) else {
+                return Ok(());
+            };
+            if entry.context.is_stale() {
+                entry.results.admitted(&request, sample_count);
+                return entry.results.send(Message::RunFailed {
+                    run_id: request.run_id,
+                    target: request.target,
+                    error: "contest data or Workspace route changed; reopen the contest and retry"
+                        .into(),
+                });
+            }
+
+            let previous_foreground = scheduler
+                .foreground_request()
+                .filter(|request| !request.kind.preserve_on_preemption())
+                .cloned();
+            let previous_active = scheduler
+                .active_request()
+                .filter(|request| !request.kind.preserve_on_preemption());
+            let RequestArrival::Accepted { cancel_active } =
+                scheduler.request_arrived(request.clone())
+            else {
+                return Ok(());
+            };
+            for displaced in [previous_foreground, previous_active].iter().flatten() {
+                cancel_result(contexts, displaced);
+            }
+            entry.results.admitted(&request, sample_count);
+            if cancel_active {
+                let active = active.ok_or_else(|| {
+                    io::Error::other("scheduler requested cancellation without a physical attempt")
+                })?;
+                ensure_identity(scheduler, active)?;
+                active.request_cancel();
+            }
+            Ok(())
+        }
         RunWorkerCommand::CancelStress { target, run_id } => {
-            process_stress_cancellation(scheduler, active, &target, run_id)
+            if process_stress_cancellation(scheduler, active, &target, run_id)? {
+                entry.results.cancel(&target, run_id);
+            }
+            Ok(())
         }
         RunWorkerCommand::RetireUserInputRuns {
             target,
             before_source_revision,
         } => {
+            let waiting = scheduler
+                .foreground_request()
+                .filter(|request| {
+                    request.target == target
+                        && matches!(&request.kind, RunKind::UserInput(snapshot)
+                    if snapshot.source_revision < before_source_revision)
+                })
+                .cloned();
             scheduler.retire_user_input_runs(&target, before_source_revision);
+            entry.results.source_removed(&target);
+            if let Some(waiting) = waiting {
+                entry.results.cancelled(&waiting);
+            }
             Ok(())
         }
     }
 }
 
-fn process_run_request(
-    scheduler: &mut RunScheduler,
-    active: Option<&ActiveAttempt>,
-    request: RunRequest,
-) -> io::Result<()> {
-    match scheduler.request_arrived(request) {
-        RequestArrival::IgnoredStale => Ok(()),
-        RequestArrival::Accepted {
-            cancel_active: false,
-        } => Ok(()),
-        RequestArrival::Accepted {
-            cancel_active: true,
-        } => {
-            let active = active.ok_or_else(|| {
-                io::Error::other("scheduler requested cancellation without a physical attempt")
-            })?;
-            ensure_identity(scheduler, active)?;
-            active.request_cancel();
-            Ok(())
-        }
+fn cancel_result(contexts: &RunContexts, request: &RunRequest) {
+    if let Some(entry) = contexts.get(&request.target.scope) {
+        entry.results.cancelled(request);
     }
 }
 
@@ -531,12 +579,12 @@ fn process_stress_cancellation(
     active: Option<&ActiveAttempt>,
     target: &RunTarget,
     run_id: RunId,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     match scheduler.cancel_stress(target, run_id) {
-        StressCancellation::Ignored
-        | StressCancellation::Accepted {
+        StressCancellation::Ignored => Ok(false),
+        StressCancellation::Accepted {
             cancel_active: false,
-        } => Ok(()),
+        } => Ok(true),
         StressCancellation::Accepted {
             cancel_active: true,
         } => {
@@ -547,7 +595,7 @@ fn process_stress_cancellation(
             })?;
             ensure_identity(scheduler, active)?;
             active.request_cancel();
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -620,6 +668,7 @@ fn finish_joined_attempt(
             return Ok(());
         };
         if entry.context.is_stale() {
+            entry.results.discard_completed();
             for discarded in scheduler.discard_scope(&request.target.scope) {
                 entry.results.send(Message::RunFailed {
                     run_id: discarded.run_id,
@@ -649,6 +698,8 @@ fn finish_joined_attempt(
                         run_id: request.run_id,
                         target: request.target,
                     })?;
+                } else {
+                    entry.results.cancelled(&request);
                 }
                 Ok(())
             }
@@ -743,7 +794,7 @@ fn report_worker_failure(control: &WorkerControl, error: &io::Error) {
                 error.kind(),
                 error.to_string(),
             )));
-            entry.results.detach();
+            entry.results.invalidate();
         }
     });
 }
@@ -912,6 +963,197 @@ mod tests {
             RunnerConfig::default(),
         );
         assert_eq!(worker.register(context, results).unwrap().scope(), scope);
+    }
+
+    fn register_retained_fixture(
+        worker: &RunWorker,
+        contest_id: &str,
+    ) -> (crate::model::Contest, RunGeneration, RunResults) {
+        let contest = crate::model::Contest {
+            contest_id: contest_id.to_owned(),
+            problems: vec![Problem {
+                index: "A".into(),
+                title: "A".into(),
+                task_id: "same_task".into(),
+                url: String::new(),
+                sample_count: 1,
+            }],
+        };
+        let context = RunContext::fixture(
+            PathBuf::new(),
+            RunScope::new(contest_id),
+            contest.problems.clone(),
+            RunnerConfig::default(),
+        );
+        let (generation, results) = worker.register_retained(context).unwrap();
+        (contest, generation, results)
+    }
+
+    fn retained_view(
+        fixture: &(crate::model::Contest, RunGeneration, RunResults),
+    ) -> (crate::tui::app::WatchApp, Receiver<Message>) {
+        use crate::tui::app::{PersistedUserInputState, UserInputState, WatchApp};
+        let (contest, generation, results) = fixture;
+        let (tx, rx) = mpsc::channel();
+        let mut app = WatchApp::new_with_run_generation(
+            contest,
+            generation.clone(),
+            vec![1],
+            vec![None],
+            vec![UserInputState::loaded(vec![PersistedUserInputState {
+                id: 7,
+                content: "old stdin".into(),
+            }])],
+        )
+        .unwrap();
+        app.attach_run_view(results.attach(tx).unwrap()).unwrap();
+        (app, rx)
+    }
+
+    #[test]
+    fn hidden_contest_restores_queued_running_progress_and_completed_results() {
+        use crate::tui::app::{CaseVerdict, RunPhase};
+        let (_tx, rx) = mpsc::channel();
+        let fake = FakeWorker::launch(RunContexts::new(), rx);
+        let a = register_retained_fixture(&fake.worker, "abc483");
+        let b = register_retained_fixture(&fake.worker, "abc480");
+        let first = scoped_sample(a.1.scope(), "same_task", 1);
+        let hidden = RunRequest {
+            language: Language::Python,
+            ..scoped_sample(b.1.scope(), "same_task", 1)
+        };
+        send_run(&fake.request_tx, first.clone());
+        let active = fake.spawned();
+        send_run(&fake.request_tx, hidden.clone());
+        wait_cancel_requested(&active.cancellation);
+        let (queued, _) = retained_view(&b);
+        assert_eq!(
+            queued.current_problem().unwrap().run.phase,
+            RunPhase::Queued
+        );
+        drop(queued);
+        active.finish(Finish::Cancelled);
+
+        let active = fake.spawned();
+        assert_eq!(active.request, hidden);
+        let (requeued, _) = retained_view(&a);
+        assert_eq!(
+            requeued.current_problem().unwrap().run.phase,
+            RunPhase::Queued
+        );
+        assert_eq!(
+            requeued.current_problem().unwrap().run.id,
+            Some(first.run_id)
+        );
+        drop(requeued);
+        let (running, _) = retained_view(&b);
+        assert_eq!(
+            running.current_problem().unwrap().run.phase,
+            RunPhase::Running
+        );
+        drop(running);
+
+        let event = |event| {
+            b.2.send(Message::RunEvent {
+                target: hidden.target.clone(),
+                run_id: hidden.run_id,
+                event,
+            })
+            .unwrap()
+        };
+        event(TestEvent::TestCaseLayout {
+            sample_cases: 1,
+            stress_case: None,
+        });
+        event(TestEvent::TestRunStarted { total_cases: 1 });
+        event(TestEvent::TestCaseAccepted {
+            number: 1,
+            elapsed: Duration::from_millis(4),
+        });
+        event(TestEvent::TestCaseComparison {
+            number: 1,
+            input: "stdin".into(),
+            expected: "abc480".into(),
+            actual: "abc480".into(),
+        });
+        let (progress, _) = retained_view(&b);
+        assert_eq!(
+            progress.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::Accepted
+        );
+        drop(progress);
+        event(TestEvent::TestRunFinished {
+            accepted: 1,
+            total_cases: 1,
+        });
+        active.finish(Finish::Completed);
+
+        let reattempt = fake.spawned();
+        let actual = reattempt.request.clone();
+        reattempt.finish(Finish::Completed);
+        assert_eq!(actual, first);
+        let (mut restored, _) = retained_view(&b);
+        let result = &restored.current_problem().unwrap().run;
+        assert_eq!(result.phase, RunPhase::Finished);
+        assert_eq!(result.accepted, 1);
+        assert_eq!(
+            result.cases[0].actual.as_deref().map(String::as_str),
+            Some("abc480")
+        );
+        assert!(!restored.apply_execution_updates());
+        fake.stop();
+    }
+
+    #[test]
+    fn hidden_one_shot_attempts_are_cancelled_by_cross_contest_preemption() {
+        use crate::tui::app::{StressPhase, UserInputSelection};
+        use crate::tui::message::UserInputRunStatus;
+        for kind in [stress_request(0, 1).kind, user_input_request(0, 1, 0).kind] {
+            let (_tx, rx) = mpsc::channel();
+            let fake = FakeWorker::launch(RunContexts::new(), rx);
+            let first = register_retained_fixture(&fake.worker, "abc483");
+            let other = register_retained_fixture(&fake.worker, "abc480");
+            let is_stress = matches!(kind, RunKind::Stress { .. });
+            let kind = match kind {
+                RunKind::UserInput(snapshot) => {
+                    RunKind::UserInput(Arc::new(crate::tui::message::UserInputRunSnapshot {
+                        problem_index: "A".into(),
+                        ..(*snapshot).clone()
+                    }))
+                }
+                kind => kind,
+            };
+            let request = RunRequest {
+                kind,
+                ..scoped_sample(first.1.scope(), "same_task", 1)
+            };
+            let next = scoped_sample(other.1.scope(), "same_task", 1);
+            send_run(&fake.request_tx, request);
+            let active = fake.spawned();
+            send_run(&fake.request_tx, next.clone());
+            wait_cancel_requested(&active.cancellation);
+            active.finish(Finish::Cancelled);
+            let active = fake.spawned();
+            let actual = active.request.clone();
+            active.finish(Finish::Completed);
+            assert_eq!(actual, next);
+
+            let (app, _) = retained_view(&first);
+            let problem = app.current_problem().unwrap();
+            if is_stress {
+                assert_eq!(problem.stress.phase, StressPhase::Cancelled);
+            } else {
+                let run = problem
+                    .user_inputs
+                    .ready()
+                    .unwrap()
+                    .last_run(UserInputSelection::Persisted(7))
+                    .unwrap();
+                assert_eq!(run.status, UserInputRunStatus::Cancelled);
+            }
+            assert!(fake.spawned_rx.try_recv().is_err());
+            fake.stop();
+        }
     }
 
     #[test]
@@ -1090,7 +1332,7 @@ mod tests {
         assert!(
             matches!(fake.message_rx.recv().unwrap(), Message::RunStarted { target, .. } if target == a.target)
         );
-        a_results.detach();
+        a_results.invalidate();
         send_run(&fake.request_tx, b.clone());
         wait_cancel_requested(&active.cancellation);
         send_run(&fake.request_tx, c.clone());

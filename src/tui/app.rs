@@ -24,7 +24,9 @@ pub struct SourceState {
     pub language: Language,
 }
 
+mod execution;
 mod user_input_delete;
+pub use execution::ExecutionState;
 mod user_input_run;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,13 +35,13 @@ pub struct UserInputRunState {
     pub snapshot: Arc<UserInputRunSnapshot>,
     pub language: Option<Language>,
     pub status: UserInputRunStatus,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Arc<String>,
+    pub stderr: Arc<String>,
     pub diagnostic: Option<Arc<String>>,
     pub elapsed: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SavedStressCaseState {
     pub input: Arc<String>,
     pub expected: Arc<String>,
@@ -548,14 +550,14 @@ pub struct ProblemState {
     pub index: String,
     pub title: String,
     pub task_id: String,
-    pub sample_cases: usize,
-    pub total_cases: usize,
-    pub saved_stress_case: Option<SavedStressCaseState>,
+    pub(super) execution: ExecutionState,
+    latest_execution_id: Option<RunId>,
+    own_request_id: Option<RunId>,
+    cleared_execution_id: Option<RunId>,
+    execution_requeues: u64,
     pub source: Option<SourceState>,
     source_revision: u64,
     user_input_start_gate: UserInputRunStartGate,
-    pub run: RunState,
-    pub stress: StressState,
     pub stress_setup: StressSetupState,
     #[cfg_attr(not(test), allow(dead_code))]
     pub user_inputs: UserInputState,
@@ -565,7 +567,27 @@ pub struct ProblemState {
     pub detail_mode: DetailMode,
 }
 
+impl std::ops::Deref for ProblemState {
+    type Target = ExecutionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.execution
+    }
+}
+
+impl std::ops::DerefMut for ProblemState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.execution
+    }
+}
+
 impl ProblemState {
+    fn stage_execution(&mut self, run_id: RunId) {
+        self.latest_execution_id = Some(run_id);
+        self.own_request_id = Some(run_id);
+        self.execution_requeues = 0;
+    }
+
     fn user_input_selections(&self) -> impl Iterator<Item = CaseSelection> + '_ {
         let ready = self.user_inputs.ready();
         let persisted = ready.into_iter().flat_map(|ready| {
@@ -664,6 +686,7 @@ pub struct WatchApp {
     shortcut_help_visible: bool,
 
     run_generation: RunGeneration,
+    run_view: Option<super::run_results::RunView>,
     problems: Vec<ProblemState>,
 
     selected_problem: usize,
@@ -785,7 +808,7 @@ pub enum StressSetupState {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StressFailureState {
     pub kind: CandidateFailureKind,
     pub case_number: u64,
@@ -798,7 +821,7 @@ pub struct StressFailureState {
     pub saved_to: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StressState {
     pub id: Option<RunId>,
     pub phase: StressPhase,
@@ -858,7 +881,7 @@ pub enum CaseVerdict {
     TimedOut,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaseState {
     pub verdict: CaseVerdict,
     pub elapsed: Option<Duration>,
@@ -881,7 +904,7 @@ impl Default for CaseState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     pub id: Option<RunId>,
     pub phase: RunPhase,
@@ -917,12 +940,141 @@ impl Default for RunState {
     }
 }
 
-fn case_mut(run: &mut RunState, number: usize) -> Option<&mut CaseState> {
-    let index = number.checked_sub(1)?;
-    run.cases.get_mut(index)
-}
-
 impl WatchApp {
+    pub(crate) fn attach_run_view(&mut self, view: super::run_results::RunView) -> io::Result<()> {
+        if view.scope() != self.run_generation.scope() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution view belongs to a different contest generation",
+            ));
+        }
+        self.run_view = Some(view);
+        self.apply_execution_updates();
+        Ok(())
+    }
+
+    pub(crate) fn apply_execution_updates(&mut self) -> bool {
+        let Some(view) = &self.run_view else {
+            return false;
+        };
+        let updates = view.take_updates();
+        let mut changed = false;
+        for update in updates {
+            changed |= self.apply_execution_update(update);
+        }
+        changed
+    }
+
+    fn apply_execution_update(&mut self, update: super::run_results::ExecutionUpdate) -> bool {
+        let Some(problem) = self
+            .problems
+            .iter()
+            .position(|state| state.task_id == *update.task_id)
+        else {
+            return false;
+        };
+        let previous_case = self.displayed_detail_case();
+        let selected_case = self.selected_test_detail_for(problem);
+        let displays_samples = self.displays_attempt_detail(problem, DetailMode::Samples);
+        let displays_stress = self.displays_attempt_detail(problem, DetailMode::Stress);
+        let state = &mut self.problems[problem];
+        let displays_saved_stress =
+            selected_case == Some(state.sample_cases) && state.saved_stress_case.is_some();
+        if state
+            .latest_execution_id
+            .is_some_and(|id| update.run_id < id)
+            || state
+                .cleared_execution_id
+                .is_some_and(|id| update.run_id <= id)
+        {
+            return false;
+        }
+        state.latest_execution_id = Some(update.run_id);
+        let Some(mut result) = update.result else {
+            state.execution.run = RunState::default();
+            state.execution.stress = StressState::default();
+            if let Some(ready) = state.user_inputs.ready_mut() {
+                ready.runs.clear();
+            }
+            if self.selected_problem == problem {
+                self.invalidate_detail();
+            }
+            return true;
+        };
+
+        if !result.layout_known {
+            // The registered metadata supplies the base count. Until an attempt reads the
+            // layout, keep the selection and saved Stress case loaded by this view.
+            result.execution.sample_cases = state.sample_cases;
+            result.execution.total_cases = state.total_cases;
+            result.execution.saved_stress_case = state.saved_stress_case.clone();
+            if matches!(
+                result.execution.run.phase,
+                RunPhase::Queued | RunPhase::Compiling | RunPhase::Running
+            ) && !result.execution.run.test_run_started
+            {
+                result.execution.run.total_cases = state.total_cases;
+                result
+                    .execution
+                    .run
+                    .cases
+                    .resize_with(state.total_cases, CaseState::default);
+            }
+        }
+
+        let layout_changed = state.sample_cases != result.execution.sample_cases
+            || state.total_cases != result.execution.total_cases
+            || state.saved_stress_case != result.execution.saved_stress_case;
+        let requeued =
+            state.run.id == result.execution.run.id && state.execution_requeues < result.requeued;
+        let run_changed = state.run != result.execution.run;
+        let stress_changed = state.stress != result.execution.stress;
+        let detail_case_changed = selected_case
+            .is_some_and(|case| state.run.cases.get(case) != result.execution.run.cases.get(case));
+        let sample_detail_changed = layout_changed
+            || requeued
+            || detail_case_changed
+            || state.run.phase != result.execution.run.phase
+            || state.run.id != result.execution.run.id
+            || state.run.error != result.execution.run.error
+            || state.run.warning != result.execution.run.warning
+            || state.run.compile_diagnostics != result.execution.run.compile_diagnostics;
+        let new_stress_failure = state.stress.failure != result.execution.stress.failure
+            && result.execution.stress.failure.is_some();
+        state.execution = result.execution;
+        state.execution_requeues = result.requeued;
+        if stress_changed {
+            state.stress_setup = StressSetupState::None;
+        }
+        let user_input_changed = state.apply_user_input_results(update.run_id, result.user_inputs);
+
+        if layout_changed && self.selected_problem == problem {
+            self.reconcile_case_selection(problem);
+        }
+        if self.selected_problem == problem {
+            let selection_changed = self.displayed_detail_case() != previous_case;
+            if selection_changed || (displays_samples && (requeued || layout_changed)) {
+                self.reset_detail_scroll();
+            }
+            if requeued && displays_samples
+                || new_stress_failure
+                    && (displays_stress || displays_saved_stress || selection_changed)
+            {
+                self.reset_detail_folds();
+            } else {
+                self.reset_folds_if_displayed_case_changed(previous_case);
+            }
+            if selection_changed
+                || user_input_changed
+                || displays_stress && stress_changed
+                || displays_samples && sample_detail_changed
+            {
+                self.invalidate_detail();
+            }
+        }
+        run_changed || stress_changed || layout_changed || user_input_changed || requeued
+    }
+
     pub(crate) fn set_saved_stress_load_error(&mut self, problem: usize, error: String) {
         let Some(state) = self.problems.get_mut(problem) else {
             return;
@@ -1017,18 +1169,19 @@ impl WatchApp {
             .zip(user_inputs)
             .map(|(((problem, sample_cases), stress_case), user_inputs)| {
                 let saved_stress_case = stress_case.map(SavedStressCaseState::from);
+                let user_input_start_gate = run_generation.source_gate(&problem.task_id);
                 ProblemState {
                     index: problem.index.clone(),
                     title: problem.title.clone(),
                     task_id: problem.task_id.clone(),
-                    sample_cases,
-                    total_cases: sample_cases + if saved_stress_case.is_some() { 1 } else { 0 },
-                    saved_stress_case,
+                    execution: ExecutionState::new(sample_cases, saved_stress_case),
+                    latest_execution_id: None,
+                    own_request_id: None,
+                    cleared_execution_id: None,
+                    execution_requeues: 0,
                     source: None,
-                    source_revision: 0,
-                    user_input_start_gate: run_generation.source_gate(&problem.task_id),
-                    run: RunState::default(),
-                    stress: StressState::default(),
+                    source_revision: user_input_start_gate.current(),
+                    user_input_start_gate,
                     stress_setup: StressSetupState::None,
                     user_inputs,
                     user_input_sync_notice: None,
@@ -1048,6 +1201,7 @@ impl WatchApp {
             side_pane: SidePaneState::default(),
             shortcut_help_visible: false,
             run_generation,
+            run_view: None,
             problems,
             selected_problem: 0,
             case_selection,
@@ -2105,18 +2259,8 @@ impl WatchApp {
         let target = self.run_generation.scope().target(&state.task_id);
         self.pending_user_input_runs
             .retain(|request| request.target != target);
-        state.run = RunState {
-            total_cases: state.total_cases,
-            cases: vec![CaseState::default(); state.total_cases],
-            ..RunState::default()
-        };
-        state.stress.id = None;
-        if matches!(
-            state.stress.phase,
-            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-        ) {
-            state.stress.phase = StressPhase::Cancelled;
-        }
+        state.cleared_execution_id = state.latest_execution_id;
+        state.execution.reset_source();
         // Removal invalidates results, but is not a navigation action or an editor action.
         self.invalidate_detail();
         Some((target, before_source_revision))
@@ -2222,17 +2366,13 @@ impl WatchApp {
                 .problems
                 .get(problem)
                 .is_some_and(|problem| problem.detail_mode == DetailMode::Stress);
-        let Some(stress) = self.current_stress_mut(problem, run_id) else {
+        let Some(state) = self.problems.get_mut(problem) else {
             return false;
         };
-        if !matches!(
-            stress.phase,
-            StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-        ) {
+        if state.stress.id != Some(run_id) || !state.execution.cancel_stress() {
             return false;
         }
 
-        stress.phase = StressPhase::Cancelled;
         self.problems[problem].stress_setup = StressSetupState::None;
         if affects_current_detail {
             self.invalidate_detail();
@@ -2242,11 +2382,7 @@ impl WatchApp {
 
     pub fn queue_run(&mut self, problem: usize) -> Option<RunRequest> {
         self.disarm_user_input_delete();
-        let (language, total_cases) = {
-            let problem_state = self.problems.get(problem)?;
-            let source = problem_state.source.as_ref()?;
-            (source.language, problem_state.total_cases)
-        };
+        let language = self.problems.get(problem)?.source.as_ref()?.language;
         self.retire_user_input_runs();
         self.retire_other_stress_requests(problem);
         let debug = self.debug && language == Language::Cpp;
@@ -2255,28 +2391,10 @@ impl WatchApp {
 
         let previous_detail_case = self.displayed_detail_case();
         self.problems[problem].detail_mode = DetailMode::Samples;
-        if self.problems[problem].stress.id.is_some()
-            && matches!(
-                self.problems[problem].stress.phase,
-                StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-            )
-        {
-            self.problems[problem].stress.phase = StressPhase::Cancelled;
-        }
-        self.problems[problem].stress.id = None;
-        self.problems[problem].run = RunState {
-            id: Some(run_id),
-            phase: RunPhase::Queued,
-            language: Some(language),
-            debug,
-            test_run_started: false,
-            accepted: 0,
-            total_cases,
-            error: None,
-            warning: None,
-            compile_diagnostics: None,
-            cases: vec![CaseState::default(); total_cases],
-        };
+        self.problems[problem].stage_execution(run_id);
+        self.problems[problem]
+            .execution
+            .queue_samples(run_id, language, debug);
         if self.selected_problem == problem {
             let displayed_case_changed = self.displayed_detail_case() != previous_detail_case;
             if displayed_case_changed || self.selected_user_input().is_none() {
@@ -2308,32 +2426,10 @@ impl WatchApp {
         let run_id = self.run_generation.next_run_id();
 
         self.problems[problem].detail_mode = DetailMode::Stress;
-        if self.problems[problem].run.id.is_some()
-            && matches!(
-                self.problems[problem].run.phase,
-                RunPhase::Queued | RunPhase::Compiling | RunPhase::Running
-            )
-        {
-            self.problems[problem].run.id = None;
-            self.problems[problem].run.phase = RunPhase::Cancelled;
-        } else {
-            self.problems[problem].run.id = None;
-        }
-        self.problems[problem].stress = StressState {
-            id: Some(run_id),
-            phase: StressPhase::Queued,
-            language: Some(language),
-            base_seed: Some(base_seed),
-            case_limit: None,
-            case_number: 0,
-            seed: None,
-            passed: 0,
-            elapsed: Duration::ZERO,
-            cases_per_second: 0.0,
-            failure: None,
-            error: None,
-            compile_diagnostics: None,
-        };
+        self.problems[problem].stage_execution(run_id);
+        self.problems[problem]
+            .execution
+            .queue_stress(run_id, language, base_seed, None);
         self.problems[problem].stress_setup = StressSetupState::None;
         self.reset_detail_scroll();
         if self.selected_problem == problem {
@@ -2353,146 +2449,66 @@ impl WatchApp {
         })
     }
 
-    fn current_run_mut(&mut self, problem: usize, run_id: RunId) -> Option<&mut RunState> {
-        let run = &mut self.problems.get_mut(problem)?.run;
-
-        if run.id != Some(run_id) {
-            return None;
-        }
-
-        Some(run)
-    }
-
-    fn current_stress_mut(&mut self, problem: usize, run_id: RunId) -> Option<&mut StressState> {
-        let stress = &mut self.problems.get_mut(problem)?.stress;
-
-        if stress.id != Some(run_id) {
-            return None;
-        }
-
-        Some(stress)
-    }
-
-    fn attempt_mode(&self, problem: usize, run_id: RunId) -> Option<DetailMode> {
-        let problem = self.problems.get(problem)?;
-        if problem.run.id == Some(run_id) {
-            Some(DetailMode::Samples)
-        } else if problem.stress.id == Some(run_id) {
-            Some(DetailMode::Stress)
-        } else {
-            None
-        }
-    }
-
     pub(super) fn compile_diagnostics(
         &mut self,
         problem: usize,
         run_id: RunId,
         stderr: String,
     ) -> bool {
-        let Some(mode) = self.attempt_mode(problem, run_id) else {
+        self.apply_attempt_state(problem, run_id, |state| {
+            state.compile_diagnostics(run_id, stderr)
+        })
+    }
+
+    pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
+        self.user_input_run_started(problem, run_id)
+            || self.apply_attempt_state(problem, run_id, |state| state.started(run_id))
+    }
+
+    pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
+        self.apply_attempt_state(problem, run_id, |state| state.completed(run_id))
+    }
+
+    pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
+        self.user_input_run_failed(problem, run_id, &error)
+            || self.apply_attempt_state(problem, run_id, |state| state.failed(run_id, error))
+    }
+
+    fn apply_attempt_state(
+        &mut self,
+        problem: usize,
+        run_id: RunId,
+        apply: impl FnOnce(&mut ExecutionState) -> bool,
+    ) -> bool {
+        let Some(state) = self.problems.get_mut(problem) else {
             return false;
         };
-        let state = &mut self.problems[problem];
-        let diagnostics = match mode {
-            DetailMode::Samples if state.run.phase == RunPhase::Compiling => {
-                &mut state.run.compile_diagnostics
-            }
-            DetailMode::Stress if state.stress.phase == StressPhase::Compiling => {
-                &mut state.stress.compile_diagnostics
-            }
-            _ => return false,
+        let Some(mode) = state.execution.attempt_mode(run_id) else {
+            return false;
         };
-        *diagnostics = Some(Arc::new(stderr));
-
+        if !apply(&mut state.execution) {
+            return false;
+        }
+        if mode == DetailMode::Stress {
+            state.stress_setup = StressSetupState::None;
+        }
         if self.displays_attempt_detail(problem, mode) {
             self.invalidate_detail();
         }
         true
     }
 
-    pub fn run_started(&mut self, problem: usize, run_id: RunId) -> bool {
-        if self.user_input_run_started(problem, run_id) {
-            return true;
-        }
-        let Some(mode) = self.attempt_mode(problem, run_id) else {
-            return false;
-        };
-        let affects_current_detail = self.displays_attempt_detail(problem, mode);
-
-        let changed = match mode {
-            DetailMode::Samples => {
-                let run = self
-                    .current_run_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                if run.phase != RunPhase::Queued {
-                    false
-                } else {
-                    run.phase = match run.language {
-                        Some(Language::Cpp) => RunPhase::Compiling,
-                        _ => RunPhase::Running,
-                    };
-                    true
-                }
-            }
-            DetailMode::Stress => {
-                let stress = self
-                    .current_stress_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                if stress.phase != StressPhase::Queued {
-                    false
-                } else {
-                    stress.phase = match stress.language {
-                        Some(Language::Cpp) => StressPhase::Compiling,
-                        _ => StressPhase::Running,
-                    };
-                    true
-                }
-            }
-        };
-
-        if changed && mode == DetailMode::Stress {
-            self.problems[problem].stress_setup = StressSetupState::None;
-        }
-
-        if changed && affects_current_detail {
-            self.invalidate_detail();
-        }
-
-        changed
-    }
     pub fn run_requeued(&mut self, problem: usize, run_id: RunId) -> bool {
-        let affects_current_detail = self.displays_attempt_detail(problem, DetailMode::Samples);
-        let Some(total_cases) = self
-            .problems
-            .get(problem)
-            .map(|problem| problem.total_cases)
-        else {
+        let Some(state) = self.problems.get_mut(problem) else {
             return false;
         };
-        let Some(run) = self.current_run_mut(problem, run_id) else {
-            return false;
-        };
-
-        if !matches!(run.phase, RunPhase::Compiling | RunPhase::Running) {
+        if !state.execution.requeued(run_id) {
             return false;
         }
-
-        // run_id/language are logical-request state and survive preemption. Everything below is
-        // physical-attempt state and must be fresh before the same logical run starts again.
-        run.phase = RunPhase::Queued;
-        run.test_run_started = false;
-        run.accepted = 0;
-        run.total_cases = total_cases;
-        run.error = None;
-        run.warning = None;
-        run.compile_diagnostics = None;
-        run.cases = vec![CaseState::default(); total_cases];
-
         if self.selected_problem == problem {
             self.reconcile_case_selection(problem);
         }
-        if affects_current_detail {
+        if self.displays_attempt_detail(problem, DetailMode::Samples) {
             self.reset_detail_scroll();
             self.reset_detail_folds();
             self.invalidate_detail();
@@ -2500,63 +2516,8 @@ impl WatchApp {
 
         true
     }
-    fn apply_test_case_layout(
-        &mut self,
-        problem: usize,
-        run_id: RunId,
-        sample_cases: usize,
-        stress_case: Option<Sample>,
-    ) -> bool {
-        let previous_detail_case = self.displayed_detail_case();
-        let affects_current_detail = self.displays_attempt_detail(problem, DetailMode::Samples);
-        let Some(problem_state) = self.problems.get_mut(problem) else {
-            return false;
-        };
-        if problem_state.run.id != Some(run_id)
-            || problem_state.run.test_run_started
-            || !matches!(
-                problem_state.run.phase,
-                RunPhase::Compiling | RunPhase::Running
-            )
-        {
-            return false;
-        }
-
-        problem_state.sample_cases = sample_cases;
-        problem_state.saved_stress_case = stress_case.map(SavedStressCaseState::from);
-        let total_cases = sample_cases
-            + if problem_state.saved_stress_case.is_some() {
-                1
-            } else {
-                0
-            };
-        problem_state.total_cases = total_cases;
-        problem_state.run.total_cases = total_cases;
-        problem_state.run.cases = vec![CaseState::default(); total_cases];
-
-        if self.selected_problem == problem {
-            self.reconcile_case_selection(problem);
-        }
-        if affects_current_detail {
-            self.reset_detail_scroll();
-            self.reset_folds_if_displayed_case_changed(previous_detail_case);
-            self.invalidate_detail();
-        }
-
-        true
-    }
 
     pub fn run_event(&mut self, problem: usize, run_id: RunId, event: TestEvent) -> bool {
-        let event = match event {
-            TestEvent::TestCaseLayout {
-                sample_cases,
-                stress_case,
-            } => {
-                return self.apply_test_case_layout(problem, run_id, sample_cases, stress_case);
-            }
-            event => event,
-        };
-
         let affects_current_detail = match &event {
             TestEvent::TestCaseAccepted { number, .. }
             | TestEvent::TestCaseComparison { number, .. }
@@ -2569,216 +2530,42 @@ impl WatchApp {
             _ => self.displays_attempt_detail(problem, DetailMode::Samples),
         };
 
-        let updated_total_cases = match &event {
-            TestEvent::TestRunStarted { total_cases } => Some(*total_cases),
-            TestEvent::NoSamples => Some(0),
-            _ => None,
-        };
+        let layout_event = matches!(&event, TestEvent::TestCaseLayout { .. });
+        let case_count_event = matches!(
+            &event,
+            TestEvent::TestRunStarted { .. } | TestEvent::NoSamples
+        );
         let previous_detail_case = self.displayed_detail_case();
-
-        let Some(run) = self.current_run_mut(problem, run_id) else {
+        let Some(state) = self.problems.get_mut(problem) else {
             return false;
         };
-
-        let changed = match event {
-            TestEvent::SavedStressCaseSkipped { reason }
-                if !run.test_run_started
-                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
-            {
-                run.warning = Some(Arc::new(format!("Saved Stress case skipped: {reason}")));
-                true
-            }
-            TestEvent::NoSamples
-                if !run.test_run_started
-                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
-            {
-                run.phase = RunPhase::NoSamples;
-                run.accepted = 0;
-                run.total_cases = 0;
-                run.cases.clear();
-                true
-            }
-
-            TestEvent::CompileFailed { stderr } if run.phase == RunPhase::Compiling => {
-                run.phase = RunPhase::CompileError;
-                run.error = Some(Arc::new(stderr));
-                true
-            }
-
-            TestEvent::CompileTimedOut { .. } if run.phase == RunPhase::Compiling => {
-                run.phase = RunPhase::CompileTimedOut;
-                true
-            }
-
-            TestEvent::TestRunStarted { total_cases }
-                if !run.test_run_started
-                    && matches!(run.phase, RunPhase::Compiling | RunPhase::Running) =>
-            {
-                run.phase = RunPhase::Running;
-                run.test_run_started = true;
-                run.accepted = 0;
-                run.total_cases = total_cases;
-                run.cases = vec![CaseState::default(); total_cases];
-                true
-            }
-
-            TestEvent::TestRunFinished {
-                accepted,
-                total_cases,
-            } if run.phase == RunPhase::Running
-                && run.test_run_started
-                && total_cases == run.cases.len()
-                && accepted <= total_cases =>
-            {
-                run.phase = RunPhase::Finished;
-                run.accepted = accepted;
-                run.total_cases = total_cases;
-                true
-            }
-
-            TestEvent::TestCaseAccepted { number, elapsed }
-                if run.phase == RunPhase::Running && run.test_run_started =>
-            {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-                if case.verdict != CaseVerdict::Pending {
-                    return false;
-                }
-
-                case.verdict = CaseVerdict::Accepted;
-                case.elapsed = Some(elapsed);
-
-                true
-            }
-
-            TestEvent::TestCaseWrongAnswer { number, elapsed }
-                if run.phase == RunPhase::Running && run.test_run_started =>
-            {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-                if case.verdict != CaseVerdict::Pending {
-                    return false;
-                }
-
-                case.verdict = CaseVerdict::WrongAnswer;
-                case.elapsed = Some(elapsed);
-
-                true
-            }
-            TestEvent::TestCaseComparison {
-                number,
-                input,
-                expected,
-                actual,
-            } if run.phase == RunPhase::Running && run.test_run_started => {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-
-                if case.input.is_some() || case.expected.is_some() || case.actual.is_some() {
-                    return false;
-                }
-
-                case.input = Some(Arc::new(input));
-                case.expected = Some(Arc::new(expected));
-                case.actual = Some(Arc::new(actual));
-
-                true
-            }
-
-            TestEvent::TestCaseRuntimeError { number, elapsed }
-                if run.phase == RunPhase::Running && run.test_run_started =>
-            {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-                if case.verdict != CaseVerdict::Pending {
-                    return false;
-                }
-
-                case.verdict = CaseVerdict::RuntimeError;
-                case.elapsed = Some(elapsed);
-
-                true
-            }
-
-            TestEvent::TestCaseTimedOut { number, elapsed }
-                if run.phase == RunPhase::Running && run.test_run_started =>
-            {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-                if case.verdict != CaseVerdict::Pending {
-                    return false;
-                }
-
-                case.verdict = CaseVerdict::TimedOut;
-                case.elapsed = Some(elapsed);
-
-                true
-            }
-
-            TestEvent::TestCaseStderr { number, stderr }
-                if run.phase == RunPhase::Running && run.test_run_started =>
-            {
-                let Some(case) = case_mut(run, number) else {
-                    return false;
-                };
-                if case.stderr.is_some() {
-                    return false;
-                }
-
-                case.stderr = Some(Arc::new(stderr));
-
-                true
-            }
-
-            _ => false,
-        };
-
-        if changed && let Some(total_cases) = updated_total_cases {
-            self.problems[problem].total_cases = total_cases;
-            if total_cases == 0 {
-                self.problems[problem].sample_cases = 0;
-                self.problems[problem].saved_stress_case = None;
-            }
+        if !state.execution.run_event(run_id, event) {
+            return false;
+        }
+        if layout_event || case_count_event {
             if self.selected_problem == problem {
                 self.reconcile_case_selection(problem);
-                let displayed_case_changed = self.displayed_detail_case() != previous_detail_case;
-                if affects_current_detail || displayed_case_changed {
-                    self.reset_folds_if_displayed_case_changed(previous_detail_case);
-                    self.reset_detail_scroll();
-                }
+            }
+            if affects_current_detail
+                || (case_count_event && self.displayed_detail_case() != previous_detail_case)
+            {
+                self.reset_detail_scroll();
+                self.reset_folds_if_displayed_case_changed(previous_detail_case);
             }
         }
-
-        if changed
-            && (affects_current_detail || self.displayed_detail_case() != previous_detail_case)
+        if affects_current_detail
+            || (!layout_event && self.displayed_detail_case() != previous_detail_case)
         {
             self.invalidate_detail();
         }
-
-        changed
+        true
     }
-    #[allow(clippy::too_many_arguments)]
-    fn stress_failed(
-        &mut self,
-        problem: usize,
-        run_id: RunId,
-        kind: CandidateFailureKind,
-        case_number: u64,
-        base_seed: u64,
-        seed: u64,
-        input: String,
-        expected: String,
-        actual: String,
-        stderr: String,
-        candidate_elapsed: Duration,
-        elapsed: Duration,
-        saved_to: PathBuf,
-    ) -> bool {
+
+    pub fn stress_event(&mut self, problem: usize, run_id: RunId, event: StressEvent) -> bool {
+        if !matches!(&event, StressEvent::Failed { .. }) {
+            return self
+                .apply_attempt_state(problem, run_id, |state| state.stress_event(run_id, event));
+        }
         let previous_detail_case = self.displayed_detail_case();
         let affects_current_detail = self.selected_problem == problem
             && self.problems.get(problem).is_some_and(|state| {
@@ -2787,73 +2574,14 @@ impl WatchApp {
                         && state.saved_stress_case.is_some()
                         && self.selected_test_case() == Some(state.sample_cases))
             });
-        let Some(problem_state) = self.problems.get_mut(problem) else {
+
+        let Some(state) = self.problems.get_mut(problem) else {
             return false;
         };
-        if problem_state.stress.id != Some(run_id)
-            || !matches!(
-                problem_state.stress.phase,
-                StressPhase::Running | StressPhase::Compiling
-            )
-        {
+        if !state.execution.stress_event(run_id, event) {
             return false;
         }
-
-        let input = Arc::new(input);
-        let expected = Arc::new(expected);
-        let actual = Arc::new(actual);
-        let stderr = Arc::new(stderr);
-
-        problem_state.stress.phase = StressPhase::Failed;
-        problem_state.stress_setup = StressSetupState::None;
-        problem_state.stress.base_seed = Some(base_seed);
-        problem_state.stress.case_number = case_number;
-        problem_state.stress.seed = Some(seed);
-        problem_state.stress.elapsed = elapsed;
-        problem_state.stress.failure = Some(StressFailureState {
-            kind,
-            case_number,
-            seed,
-            input: Arc::clone(&input),
-            expected: Arc::clone(&expected),
-            actual: Arc::clone(&actual),
-            stderr: Arc::clone(&stderr),
-            candidate_elapsed,
-            saved_to,
-        });
-
-        problem_state.saved_stress_case = Some(SavedStressCaseState {
-            input,
-            expected: Arc::clone(&expected),
-        });
-        problem_state.total_cases = problem_state.sample_cases + 1;
-        problem_state.run.total_cases = problem_state.total_cases;
-        problem_state
-            .run
-            .cases
-            .resize_with(problem_state.total_cases, CaseState::default);
-
-        let stress_index = problem_state.sample_cases;
-        if problem_state
-            .run
-            .cases
-            .get(stress_index)
-            .is_some_and(|case| case.verdict == CaseVerdict::Accepted)
-        {
-            problem_state.run.accepted = problem_state.run.accepted.saturating_sub(1);
-        }
-        if let Some(case) = problem_state.run.cases.get_mut(stress_index) {
-            case.verdict = match kind {
-                CandidateFailureKind::WrongAnswer => CaseVerdict::WrongAnswer,
-                CandidateFailureKind::RuntimeError => CaseVerdict::RuntimeError,
-                CandidateFailureKind::TimedOut => CaseVerdict::TimedOut,
-            };
-            case.elapsed = Some(candidate_elapsed);
-            case.expected = Some(expected);
-            case.actual = Some(actual);
-            case.stderr = (!stderr.is_empty()).then_some(stderr);
-        }
-
+        state.stress_setup = StressSetupState::None;
         if self.selected_problem == problem {
             self.reconcile_case_selection(problem);
         }
@@ -2867,229 +2595,6 @@ impl WatchApp {
         }
 
         true
-    }
-
-    pub fn stress_event(&mut self, problem: usize, run_id: RunId, event: StressEvent) -> bool {
-        let event = match event {
-            StressEvent::Failed {
-                kind,
-                case_number,
-                base_seed,
-                seed,
-                input,
-                expected,
-                actual,
-                stderr,
-                candidate_elapsed,
-                elapsed,
-                saved_to,
-            } => {
-                return self.stress_failed(
-                    problem,
-                    run_id,
-                    kind,
-                    case_number,
-                    base_seed,
-                    seed,
-                    input,
-                    expected,
-                    actual,
-                    stderr,
-                    candidate_elapsed,
-                    elapsed,
-                    saved_to,
-                );
-            }
-            event => event,
-        };
-
-        let affects_current_detail = self.selected_problem == problem
-            && self
-                .problems
-                .get(problem)
-                .is_some_and(|problem| problem.detail_mode == DetailMode::Stress);
-
-        let Some(stress) = self.current_stress_mut(problem, run_id) else {
-            return false;
-        };
-
-        let changed = match event {
-            StressEvent::Started {
-                base_seed,
-                case_limit,
-            } if matches!(
-                stress.phase,
-                StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-            ) =>
-            {
-                stress.phase = StressPhase::Running;
-                stress.base_seed = Some(base_seed);
-                stress.case_limit = case_limit;
-                stress.case_number = 0;
-                stress.seed = None;
-                stress.passed = 0;
-                stress.elapsed = Duration::ZERO;
-                stress.cases_per_second = 0.0;
-                stress.failure = None;
-                stress.error = None;
-                true
-            }
-
-            StressEvent::Progress {
-                case_number,
-                seed,
-                passed,
-                elapsed,
-                cases_per_second,
-            } if stress.phase == StressPhase::Running => {
-                stress.case_number = case_number;
-                stress.seed = Some(seed);
-                stress.passed = passed;
-                stress.elapsed = elapsed;
-                stress.cases_per_second = cases_per_second;
-                true
-            }
-
-            StressEvent::Finished { cases, elapsed }
-                if matches!(stress.phase, StressPhase::Running | StressPhase::Compiling) =>
-            {
-                stress.phase = StressPhase::Finished;
-                stress.passed = cases;
-                stress.elapsed = elapsed;
-                true
-            }
-
-            StressEvent::Cancelled { cases, elapsed }
-                if matches!(
-                    stress.phase,
-                    StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-                ) =>
-            {
-                stress.phase = StressPhase::Cancelled;
-                stress.passed = cases;
-                stress.elapsed = elapsed;
-                true
-            }
-
-            _ => false,
-        };
-
-        if changed {
-            self.problems[problem].stress_setup = StressSetupState::None;
-        }
-
-        if changed && affects_current_detail {
-            self.invalidate_detail();
-        }
-
-        changed
-    }
-
-    pub fn run_completed(&mut self, problem: usize, run_id: RunId) -> bool {
-        let Some(mode) = self.attempt_mode(problem, run_id) else {
-            return false;
-        };
-        let affects_current_detail = self.displays_attempt_detail(problem, mode);
-
-        let changed = match mode {
-            DetailMode::Samples => {
-                let run = self
-                    .current_run_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                match run.phase {
-                    RunPhase::Queued | RunPhase::Compiling | RunPhase::Running => {
-                        run.phase = RunPhase::Finished;
-                        true
-                    }
-                    RunPhase::Idle
-                    | RunPhase::Finished
-                    | RunPhase::CompileError
-                    | RunPhase::CompileTimedOut
-                    | RunPhase::NoSamples
-                    | RunPhase::Cancelled
-                    | RunPhase::Failed => false,
-                }
-            }
-            DetailMode::Stress => {
-                let stress = self
-                    .current_stress_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                match stress.phase {
-                    StressPhase::Queued | StressPhase::Compiling | StressPhase::Running => {
-                        stress.phase = StressPhase::Finished;
-                        true
-                    }
-                    StressPhase::Idle
-                    | StressPhase::Failed
-                    | StressPhase::Finished
-                    | StressPhase::Cancelled
-                    | StressPhase::Error => false,
-                }
-            }
-        };
-
-        if changed && mode == DetailMode::Stress {
-            self.problems[problem].stress_setup = StressSetupState::None;
-        }
-
-        if changed && affects_current_detail {
-            self.invalidate_detail();
-        }
-
-        changed
-    }
-
-    pub fn run_failed(&mut self, problem: usize, run_id: RunId, error: String) -> bool {
-        if self.user_input_run_failed(problem, run_id, &error) {
-            return true;
-        }
-        let Some(mode) = self.attempt_mode(problem, run_id) else {
-            return false;
-        };
-        let affects_current_detail = self.displays_attempt_detail(problem, mode);
-
-        let changed = match mode {
-            DetailMode::Samples => {
-                let run = self
-                    .current_run_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                if !matches!(
-                    run.phase,
-                    RunPhase::Queued | RunPhase::Compiling | RunPhase::Running
-                ) {
-                    false
-                } else {
-                    run.phase = RunPhase::Failed;
-                    run.error = Some(Arc::new(error));
-                    true
-                }
-            }
-            DetailMode::Stress => {
-                let stress = self
-                    .current_stress_mut(problem, run_id)
-                    .expect("attempt mode was checked above");
-                if !matches!(
-                    stress.phase,
-                    StressPhase::Queued | StressPhase::Compiling | StressPhase::Running
-                ) {
-                    false
-                } else {
-                    stress.phase = StressPhase::Error;
-                    stress.error = Some(Arc::new(error));
-                    true
-                }
-            }
-        };
-
-        if changed && mode == DetailMode::Stress {
-            self.problems[problem].stress_setup = StressSetupState::None;
-        }
-
-        if changed && affects_current_detail {
-            self.invalidate_detail();
-        }
-
-        changed
     }
 
     pub fn problems(&self) -> &[ProblemState] {

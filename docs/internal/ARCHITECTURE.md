@@ -100,7 +100,9 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `atc watch` → `watch_tui_at` → `ContestSession`。ファイル監視の通知を `tui/mod.rs` が受け、ソース変更時に `WatchApp` を更新して Sample Test をキューに入れる。`ContestSession` がファイル監視と詳細解析を管理し、`WorkspaceRuntime` が `WorkspaceRuns` を通じて 1 つの `RunWorker` を管理する。単体起動も同じ実行経路を使う。
 - `RunContext::new` は Contest ID・ディレクトリ・メタデータ・Runner 設定を結び付け、新しい `RunScope` を作る。`RunWorker` は実行対象を `RunScope` で登録し、1 つの `RunScheduler` と最大 1 件の物理 attempt を持つ。実行直前に `AttemptExecutor` が対象の task ID を解決し、メタデータ・物理ディレクトリ・Workspace の振り分け先を確認してから Sample Test・User Input・Stress を実行する。
 - `RunScope` は Contest ID と登録したメタデータの実行世代を表す。`WatchApp` は実行コンテキストと共有する `RunGeneration` から全実行種別に共通の `RunId` を取得する。同じ世代で画面を再構築しても採番が続き、User Input のリビジョンと起動ガードも task ID ごとに引き継ぐ。要求・イベント・完了・再キューは `RunTarget`（`RunScope` と task ID）と `RunId` で照合する。
-- `RunResults` は登録済み世代から現在の受信先への配送を扱う。画面終了で受信先を切り離せる。表示中の TUI は世代と `RunId` を照合し、task ID を表示位置へ解決して適用する。受信先がない間のイベントは破棄する。現在の手動切り替え、Workspace Home への復帰、Refresh は旧 Contest の実行世代を明示的に失効させる。
+- `RunResultStore` は Workspace の実行状態の正本。`RunWorker` が受理・置換・取消・join 後の結果を反映し、`RunResults` が実行イベントを同じ世代の状態に適用する。`ExecutionState` と `UserInputRunState` が状態遷移を担い、`WatchApp` の即時の待機表示にも同じ遷移を使う。
+- 画面は `RunView` で同じ世代を購読する。購読の登録と初回更新対象の決定を同じロックで行い、通知が来たら変更された task の最新状態を取得する。`WatchApp` は表示位置への対応付けと、選択・スクロール・折りたたみ・編集中の内容を管理する。画面終了で購読が外れても正本への更新は続く。現行の手動切り替え、Workspace Home への復帰、Refresh では旧世代を明示的に失効させる。
+- 状態は実行要求を受理した task にだけ作る。Workspace 全体で完了済み 64 task・推計 64 MiB を上限とし、古い完了から取り除く。単体で上限を超えた結果はまず詳細テキストを外し、収まらなければ破棄する。実行中と待機中はこの上限から除外する。User Input は task ごとに最新 8 入力まで保持し、表示へ渡す出力文字列は共有する。
 
 ### AtCoder への提出と結果追跡
 

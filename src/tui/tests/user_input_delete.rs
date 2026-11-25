@@ -468,7 +468,10 @@ fn only_the_deleted_result_is_removed_and_unrelated_inflight_completion_still_ap
     };
     assert!(app.user_input_run_event(0, seven.run_id, snapshot, result("seven result")));
     assert_eq!(
-        last(&app, UserInputSelection::Persisted(7)).unwrap().stdout,
+        last(&app, UserInputSelection::Persisted(7))
+            .unwrap()
+            .stdout
+            .as_str(),
         "seven result"
     );
     assert_eq!(
