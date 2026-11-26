@@ -15,7 +15,7 @@ use crate::tui::message::{
     Message, RunGeneration, RunId, RunKind, RunRequest, RunResults, RunScope, RunTarget,
     RunWorkerCommand,
 };
-use crate::tui::run_results::RunResultStore;
+use crate::tui::run_results::{RunResultRetention, RunResultStore};
 #[cfg(test)]
 use crate::{config::RunnerConfig, model::Problem};
 
@@ -228,7 +228,12 @@ impl RunWorker {
         &self,
         context: Arc<RunContext>,
     ) -> io::Result<(RunGeneration, RunResults)> {
-        self.register_with(context, |scope| self.results.register(scope))
+        let retention = if context.is_workspace_watch() {
+            RunResultRetention::Workspace
+        } else {
+            RunResultRetention::Contest
+        };
+        self.register_with(context, |scope| self.results.register(scope, retention))
     }
 
     #[cfg(test)]

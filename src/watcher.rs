@@ -1,3 +1,4 @@
+use notify::event::{MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 #[cfg(test)]
@@ -71,6 +72,17 @@ impl WorkspaceInbox {
                     let Some(interest) = interest else {
                         continue;
                     };
+                    // FSEvents reports inode metadata separately from data changes. A generic
+                    // modify or a write-time change can be the only signal of a write.
+                    if interest.is_some()
+                        && matches!(
+                            event.kind,
+                            EventKind::Modify(ModifyKind::Metadata(kind))
+                                if kind != MetadataKind::WriteTime
+                        )
+                    {
+                        continue;
+                    }
                     self.deadline.get_or_insert(now + DEBOUNCE_DURATION);
                     if let Some(generation) = interest {
                         if self.paths.len() == MAX_WORKSPACE_PATHS_PER_BATCH
@@ -476,6 +488,52 @@ mod tests {
         assert_eq!(batch.paths.first(), Some(&(files[1].clone(), 7)));
         assert_eq!(batch.paths.last(), Some(&(files[0].clone(), 7)));
         assert!(batch.rescan);
+    }
+
+    #[test]
+    fn workspace_ignores_source_attributes_but_keeps_writes_and_management_events() {
+        use notify::event::{DataChange, Flag};
+        let mut inbox = WorkspaceInbox::default();
+        let start = Instant::now();
+        let source = Path::new("workspace/abc123/A.py");
+        let other = Path::new("workspace/abc124/A.py");
+        let marker = Path::new("workspace/.atc-workspace.toml");
+        inbox.interests.paths.insert(source.into(), Some(1));
+        inbox.interests.paths.insert(other.into(), Some(2));
+        inbox.interests.paths.insert(marker.into(), None);
+        let metadata = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any));
+        let data = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        inbox.record(event(metadata, source), start);
+        inbox.record(
+            event(
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+                source,
+            ),
+            start,
+        );
+        assert!(inbox.take_ready(start + DEBOUNCE_DURATION).is_none());
+
+        inbox.record(event(metadata, source), start);
+        inbox.record(event(data, source), start);
+        inbox.record(event(EventKind::Modify(ModifyKind::Any), other), start);
+        inbox.record(event(metadata, source), start);
+        inbox.record(event(metadata, marker), start);
+        inbox.record(
+            Ok(Event::new(metadata)
+                .add_path(source.into())
+                .set_flag(Flag::Rescan)),
+            start,
+        );
+        let batch = inbox.take_ready(start + DEBOUNCE_DURATION).unwrap();
+        assert_eq!(batch.paths, [(source.into(), 1), (other.into(), 2)]);
+        assert!(batch.reconcile);
+        assert!(batch.rescan);
+
+        let start = start + DEBOUNCE_DURATION;
+        let write_time = EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime));
+        inbox.record(event(write_time, source), start);
+        let batch = inbox.take_ready(start + DEBOUNCE_DURATION).unwrap();
+        assert_eq!(batch.paths, [(source.into(), 1)]);
     }
 
     #[test]

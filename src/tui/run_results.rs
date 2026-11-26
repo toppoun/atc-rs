@@ -17,6 +17,12 @@ const MAX_USER_INPUT_RESULTS_PER_TASK: usize = 8;
 #[derive(Clone, Default)]
 pub(crate) struct RunResultStore(Arc<Mutex<Store>>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunResultRetention {
+    Contest,
+    Workspace,
+}
+
 #[derive(Default)]
 struct Store {
     scopes: HashMap<RunScope, ScopeResults>,
@@ -24,8 +30,8 @@ struct Store {
     completed_bytes: usize,
 }
 
-#[derive(Default)]
 struct ScopeResults {
+    retention: RunResultRetention,
     tasks: HashMap<Arc<str>, TaskResult>,
     view: Option<Subscriber>,
     watch_warning: Option<String>,
@@ -58,6 +64,7 @@ pub(crate) struct RunView {
     store: RunResultStore,
     scope: RunScope,
     token: Arc<()>,
+    retention: RunResultRetention,
 }
 
 impl std::fmt::Debug for RunView {
@@ -79,7 +86,7 @@ pub(crate) enum RunResults {
 }
 
 impl RunResultStore {
-    pub(crate) fn register(&self, scope: &RunScope) -> RunResults {
+    pub(crate) fn register(&self, scope: &RunScope, retention: RunResultRetention) -> RunResults {
         let mut store = self
             .0
             .lock()
@@ -87,7 +94,15 @@ impl RunResultStore {
         assert!(
             store
                 .scopes
-                .insert(scope.clone(), ScopeResults::default())
+                .insert(
+                    scope.clone(),
+                    ScopeResults {
+                        retention,
+                        tasks: HashMap::new(),
+                        view: None,
+                        watch_warning: None,
+                    },
+                )
                 .is_none()
         );
         RunResults::Tracked {
@@ -147,6 +162,7 @@ impl RunResults {
                     store: store.clone(),
                     scope: scope.clone(),
                     token,
+                    retention: entry.retention,
                 })
             }
             #[cfg(test)]
@@ -164,15 +180,7 @@ impl RunResults {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.scopes.remove(scope);
-                let mut removed_bytes = 0;
-                state.completed.retain(|(target, bytes)| {
-                    if &target.scope != scope {
-                        return true;
-                    }
-                    removed_bytes += bytes;
-                    false
-                });
-                state.completed_bytes -= removed_bytes;
+                state.remove_completed_budget(scope);
             }
             #[cfg(test)]
             Self::Raw(sender) => {
@@ -199,18 +207,23 @@ impl RunResults {
 
     pub(crate) fn discard_completed(&self) {
         self.with_store(|state, scope| {
+            let Some(entry) = state.scopes.get_mut(scope) else {
+                return;
+            };
             let mut discarded = Vec::new();
-            state.completed.retain(|(target, bytes)| {
-                if &target.scope == scope {
-                    discarded.push((target.clone(), *bytes));
-                    false
-                } else {
+            entry.tasks.retain(|task_id, task| {
+                if task.in_flight {
                     true
+                } else {
+                    discarded.push((task_id.clone(), task.run_id));
+                    false
                 }
             });
-            for (target, size) in discarded {
-                state.evict(&target, size);
+            entry.tasks.shrink_to_fit();
+            for (task, run_id) in discarded {
+                entry.mark_dirty(&task, run_id);
             }
+            state.remove_completed_budget(scope);
         });
     }
 
@@ -358,6 +371,39 @@ impl RunView {
             })
             .collect()
     }
+
+    pub(super) fn discard_unprojected_user_inputs(
+        &self,
+        task_id: &str,
+        through: RunId,
+        visible: &HashMap<UserInputRunTarget, UserInputRunState>,
+    ) {
+        if self.retention == RunResultRetention::Workspace {
+            return;
+        }
+        let mut store = self
+            .store
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = store.scopes.get_mut(&self.scope)
+            && entry
+                .view
+                .as_ref()
+                .is_some_and(|view| Arc::ptr_eq(&self.token, &view.token))
+            && let Some(task) = entry.tasks.get_mut(task_id)
+        {
+            // The single view owns the input lifecycle. An edit or delete can retire its
+            // projection while the worker is still finishing that input.
+            task.user_inputs.retain(|target, run| {
+                run.run_id > through
+                    || run.status.is_active()
+                    || visible
+                        .get(target)
+                        .is_some_and(|current| current.run_id == run.run_id)
+            });
+        }
+    }
 }
 
 impl Drop for RunView {
@@ -379,6 +425,17 @@ impl Drop for RunView {
 }
 
 impl Store {
+    fn remove_completed_budget(&mut self, scope: &RunScope) {
+        self.completed.retain(|(target, bytes)| {
+            if &target.scope == scope {
+                self.completed_bytes -= bytes;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn admitted(&mut self, request: &RunRequest, sample_count: usize) {
         let Some(entry) = self.scopes.get_mut(&request.target.scope) else {
             return;
@@ -428,7 +485,9 @@ impl Store {
                     snapshot.target,
                     UserInputRunState::queued(request.run_id, snapshot.clone(), request.language),
                 );
-                if task.user_inputs.len() > MAX_USER_INPUT_RESULTS_PER_TASK {
+                if entry.retention == RunResultRetention::Workspace
+                    && task.user_inputs.len() > MAX_USER_INPUT_RESULTS_PER_TASK
+                {
                     let oldest = task
                         .user_inputs
                         .iter()
@@ -495,13 +554,17 @@ impl Store {
     }
 
     fn changed(&mut self, target: &RunTarget, run_id: RunId) {
-        if let Some(position) = self.completed.iter().position(|(key, _)| key == target) {
-            self.completed_bytes -= self.completed.remove(position).unwrap().1;
-        }
         let entry = self
             .scopes
             .get_mut(&target.scope)
             .expect("result scope is registered");
+        entry.mark_dirty(&target.task_id, run_id);
+        if entry.retention == RunResultRetention::Contest {
+            return;
+        }
+        if let Some(position) = self.completed.iter().position(|(key, _)| key == target) {
+            self.completed_bytes -= self.completed.remove(position).unwrap().1;
+        }
         let task = entry
             .tasks
             .get_mut(&target.task_id)
@@ -515,7 +578,6 @@ impl Store {
             self.completed_bytes += bytes;
             self.completed.push_back((target.clone(), bytes));
         }
-        entry.mark_dirty(&target.task_id, run_id);
         while self.completed.len() > MAX_COMPLETED_TASKS
             || self.completed_bytes > MAX_COMPLETED_BYTES
         {
@@ -745,7 +807,7 @@ mod tests {
     fn subscription_and_concurrent_publication_restore_latest_state_once() {
         let store = RunResultStore::default();
         let scope = RunScope::new("abc483");
-        let results = store.register(&scope);
+        let results = store.register(&scope, RunResultRetention::Workspace);
         let request = sample(&scope, "task", 1);
         results.admitted(&request, 0);
         start(&results, &request);
@@ -780,8 +842,8 @@ mod tests {
         let store = RunResultStore::default();
         let old_scope = RunScope::new("abc483");
         let other_scope = RunScope::new("abc480");
-        let old = store.register(&old_scope);
-        let other = store.register(&other_scope);
+        let old = store.register(&old_scope, RunResultRetention::Workspace);
+        let other = store.register(&other_scope, RunResultRetention::Workspace);
         let first = sample(&old_scope, "same", 1);
         let second = sample(&old_scope, "same", 2);
         let other_request = sample(&other_scope, "same", 1);
@@ -800,7 +862,7 @@ mod tests {
         old.invalidate();
 
         let new_scope = RunScope::new("abc483");
-        let new = store.register(&new_scope);
+        let new = store.register(&new_scope, RunResultRetention::Workspace);
         let replacement = sample(&new_scope, "same", 1);
         new.admitted(&replacement, 0);
         complete(&old, &second);
@@ -844,7 +906,7 @@ mod tests {
         };
         let generation = RunGeneration::new(&contest.contest_id);
         let store = RunResultStore::default();
-        let results = store.register(generation.scope());
+        let results = store.register(generation.scope(), RunResultRetention::Workspace);
         let mut app = WatchApp::new_with_run_generation(
             &contest,
             generation,
@@ -860,7 +922,7 @@ mod tests {
         complete(&results, &first);
 
         let old_scope = RunScope::new(&contest.contest_id);
-        let old = store.register(&old_scope);
+        let old = store.register(&old_scope, RunResultRetention::Workspace);
         let (tx, _rx) = mpsc::channel();
         assert!(app.attach_run_view(old.attach(tx).unwrap()).is_err());
         let (tx, _rx) = mpsc::channel();
@@ -885,7 +947,7 @@ mod tests {
         let scopes: Vec<_> = (0..1000)
             .map(|index| {
                 let scope = RunScope::new(&format!("abc{index}"));
-                let results = store.register(&scope);
+                let results = store.register(&scope, RunResultRetention::Workspace);
                 (scope, results)
             })
             .collect();
@@ -941,7 +1003,7 @@ mod tests {
     fn completed_outputs_obey_byte_budget_and_oversized_results_keep_verdicts() {
         let store = RunResultStore::default();
         let scope = RunScope::new("abc483");
-        let results = store.register(&scope);
+        let results = store.register(&scope, RunResultRetention::Workspace);
         let output = Arc::new("x".repeat(8 * 1024 * 1024));
         // The normal runner caps each stream at 8 MiB. Multiple completed runs still need a
         // Workspace-wide cap, and a single test can include much larger input/expected text.
@@ -1001,5 +1063,114 @@ mod tests {
         );
         assert!(result.execution.run.cases[0].input.is_none());
         assert!(state.completed_bytes <= MAX_COMPLETED_BYTES);
+    }
+
+    #[test]
+    fn contest_results_with_large_output_do_not_spend_the_workspace_budget() {
+        let store = RunResultStore::default();
+        let local_scope = RunScope::new("typical90");
+        let local = store.register(&local_scope, RunResultRetention::Contest);
+        let workspace_scope = RunScope::new("abc483");
+        let workspace = store.register(&workspace_scope, RunResultRetention::Workspace);
+        let request = sample(&workspace_scope, "other", 1);
+        workspace.admitted(&request, 1);
+        complete(&workspace, &request);
+
+        let request = sample(&local_scope, "large", 1);
+        local.admitted(&request, 1);
+        start(&local, &request);
+        for event in [
+            TestEvent::TestRunStarted { total_cases: 1 },
+            TestEvent::TestCaseComparison {
+                number: 1,
+                input: "x".repeat(MAX_COMPLETED_BYTES),
+                expected: "expected".into(),
+                actual: "actual".into(),
+            },
+        ] {
+            local
+                .send(Message::RunEvent {
+                    target: request.target.clone(),
+                    run_id: request.run_id,
+                    event,
+                })
+                .unwrap();
+        }
+        complete(&local, &request);
+        let pending = sample(&local_scope, "pending", 2);
+        local.admitted(&pending, 1);
+        {
+            let state = store.0.lock().unwrap();
+            assert_eq!(state.completed.len(), 1);
+            assert_eq!(state.completed[0].0.scope, workspace_scope);
+            let cases = &state.scopes[&local_scope].tasks["large"]
+                .execution
+                .run
+                .cases;
+            assert_eq!(cases[0].input.as_ref().unwrap().len(), MAX_COMPLETED_BYTES);
+        }
+
+        let (tx, _rx) = mpsc::channel();
+        let view = local.attach(tx).unwrap();
+        assert_eq!(view.take_updates().len(), 2);
+        local.discard_completed();
+        let updates = view.take_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].task_id.as_ref(), "large");
+        assert!(updates[0].result.is_none());
+        assert!(store.0.lock().unwrap().scopes[&local_scope].tasks["pending"].in_flight);
+        local.invalidate();
+        complete(&local, &pending);
+        assert!(view.take_updates().is_empty());
+        assert_eq!(store.0.lock().unwrap().completed.len(), 1);
+    }
+
+    #[test]
+    fn user_input_retention_matches_the_registered_scope() {
+        use super::super::message::UserInputRunSnapshot;
+        let store = RunResultStore::default();
+        for (retention, expected) in [
+            (RunResultRetention::Contest, 9),
+            (RunResultRetention::Workspace, 8),
+        ] {
+            let scope = RunScope::new("abc483");
+            let results = store.register(&scope, retention);
+            for id in 1..=10 {
+                let request = RunRequest {
+                    kind: RunKind::UserInput(Arc::new(UserInputRunSnapshot {
+                        problem_index: "A".into(),
+                        target: UserInputRunTarget::Persisted(id.min(9)),
+                        input: Arc::from(format!("input {id}")),
+                        source_revision: 0,
+                        start_gate: Default::default(),
+                    })),
+                    ..sample(&scope, "task", id)
+                };
+                results.admitted(&request, 0);
+                complete(&results, &request);
+            }
+            let (tx, _rx) = mpsc::channel();
+            let view = results.attach(tx).unwrap();
+            let task = view.take_updates().pop().unwrap().result.unwrap();
+            assert_eq!(task.user_inputs.len(), expected);
+            assert_eq!(
+                task.user_inputs[&UserInputRunTarget::Persisted(9)].run_id,
+                10
+            );
+            let mut visible = task.user_inputs;
+            visible.remove(&UserInputRunTarget::Persisted(2));
+            view.discard_unprojected_user_inputs("task", 10, &visible);
+            let state = store.0.lock().unwrap();
+            let runs = &state.scopes[&scope].tasks["task"].user_inputs;
+            assert_eq!(runs.len(), 8);
+            assert_eq!(
+                runs.contains_key(&UserInputRunTarget::Persisted(1)),
+                retention == RunResultRetention::Contest
+            );
+            assert_eq!(
+                runs.contains_key(&UserInputRunTarget::Persisted(2)),
+                retention == RunResultRetention::Workspace
+            );
+        }
     }
 }

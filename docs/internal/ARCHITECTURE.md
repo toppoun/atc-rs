@@ -102,13 +102,13 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `RunScope` は Contest ID と登録したメタデータの実行世代を表す。`WatchApp` は実行コンテキストと共有する `RunGeneration` から全実行種別に共通の `RunId` を取得する。同じ世代で画面を再構築しても採番が続き、User Input のリビジョンと起動ガードも task ID ごとに引き継ぐ。要求・イベント・完了・再キューは `RunTarget`（`RunScope` と task ID）と `RunId` で照合する。
 - `RunResultStore` は Workspace の実行状態の正本。`RunWorker` が受理・置換・取消・join 後の結果を反映し、`RunResults` が実行イベントを同じ世代の状態に適用する。`ExecutionState` と `UserInputRunState` が状態遷移を担い、`WatchApp` の即時の待機表示にも同じ遷移を使う。
 - 画面は `RunView` で同じ世代を購読する。購読の登録と初回更新対象の決定を同じロックで行い、通知が来たら変更された task の最新状態を取得する。`WatchApp` は表示位置への対応付けと、選択・スクロール・折りたたみ・編集中の内容を管理する。画面終了で購読が外れても正本への更新は続く。現行の手動切り替え、Workspace Home への復帰、Refresh では旧世代を明示的に失効させる。
-- 状態は実行要求を受理した task にだけ作る。Workspace 全体で完了済み 64 task・推計 64 MiB を上限とし、古い完了から取り除く。単体で上限を超えた結果はまず詳細テキストを外し、収まらなければ破棄する。実行中と待機中はこの上限から除外する。User Input は task ごとに最新 8 入力まで保持し、表示へ渡す出力文字列は共有する。
+- 状態は実行要求を受理した task にだけ作る。登録時の `RunResultRetention` が完了結果の保持を決める。Cross-Contest Watch は Workspace 全体で完了済み 64 task・推計 64 MiB を上限とし、古い完了から取り除く。単体で上限を超えた結果はまず詳細テキストを外し、収まらなければ破棄する。実行中と待機中はこの上限から除外する。User Input は task ごとに最新 8 入力まで保持する。無効時と Standalone は、各 task と各 User Input の最新結果を従来の単一 Contest のライフサイクルで保持する。どのモードでも表示へ渡す出力文字列は共有する。
 
 #### Workspace 監視の内部経路
 
 - Global Config の `watch.cross_contest` は既定値が `false`。Settings の `Watch` で編集し、Doctor で値と出所を確認できる。Workspace の最初の Contest を開く際に `WorkspaceRuns` がモードを確定し、有効なら `WorkspaceWatcher` を開始する。表示切り替え・Refresh では監視モードを維持する。Workspace Home 復帰時は監視と実行を join し、次回の Contest 起動時に新しい設定を採用する。無効時、Standalone、Plain Watch は単一 Contest の監視経路を使う。
 - `BatchWorkspace::scan_watch` が優先する配置ルールと管理対象の所有権を照合する。Workspace 用の診断でマニフェストとサンプル構造・UTF-8 を確認し、サンプル本文を常駐させずに `RunContext` を登録する。索引は正規ソースのパスを task ID・言語・登録世代へ対応付ける。既存の `RunContext` と `RunResultStore` を切替後も共有する。
-- `WorkspaceFileWatcher` は単一の notify Watcher に Workspace の配置先と Contest 直下を非再帰登録する。150 ms の固定窓で対象パスを最後の通知順に集約し、4,096 パスまで保持する。エラー・Rescan・上限超過・登録差分では照合後に正規ソースの指紋を確認し、検出済みの順序を処理したあと、欠落分をパス順で回収する。`.atc` 内には監視ハンドルを置かず、マニフェストの属性を 1 秒ごとに、全体を 15 秒ごとに再照合する。
+- `WorkspaceFileWatcher` は単一の notify Watcher に Workspace の配置先と Contest 直下を非再帰登録する。`WorkspaceInbox` は正規ソースへの属性通知を保存候補から外す。書込時刻の変更と種別が曖昧な更新通知は保存候補に含める。macOS では、複数種類の通知が届いても、指紋と書込時刻が同じで状態変更時刻（ctime）だけが変わったソースを除外する。管理パスの照合と Rescan は同じ受信処理で受け付ける。150 ms の固定窓で対象パスを最後の通知順に集約し、4,096 パスまで保持する。エラー・Rescan・上限超過・登録差分では照合後に正規ソースの指紋を確認し、検出済みの順序を処理したあと、欠落分をパス順で回収する。`.atc` 内には監視ハンドルを置かず、マニフェストの属性を 1 秒ごとに、全体を 15 秒ごとに再照合する。
 - 保存通知は登録世代と現行の所有権を照合して `RunWorker` へ送る。ワーカーは実行直前にメタデータと正規ソースを再検証する。受付順と対象は物理 attempt から独立した `SaveReceipt` に記録する。保存先の言語を使い、C++ の Debug は当該 Contest の購読中の値を使う。非表示の Debug は無効。
 - `SavedViewSwitch` は固定窓ごとに公開される最新の通常通知を読む。準備は 1 件ずつバックグラウンドで行い、端末入力バッチを処理し終えた安全な時点で受付順・所有権・ソース・世代を再検証する。同じ世代なら task ID と言語で表示を選び、別世代なら読み取り専用で準備した `ContestSession` に移る。すでに受理した実行の状態は `RunResultStore` から復元する。Debug の現在値は次回実行用として表示し、保存時に確定した実行の Debug と区別する。
 - User Input の編集を開いている間、提出・切替・Refresh・ソース操作などのモーダル、コマンドパレットと詳細スクロールのドラッグ中は、自動切り替えを保留する。手動切り替えが確定した時点までの受付を表示候補から除外する。保留や候補失効の間も実行と提出追跡を続ける。

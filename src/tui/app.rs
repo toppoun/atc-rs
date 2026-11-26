@@ -1051,7 +1051,13 @@ impl WatchApp {
         if stress_changed {
             state.stress_setup = StressSetupState::None;
         }
+        let has_user_input_results = !result.user_inputs.is_empty();
         let user_input_changed = state.apply_user_input_results(update.run_id, result.user_inputs);
+        if has_user_input_results
+            && let (Some(view), Some(ready)) = (&self.run_view, state.user_inputs.ready())
+        {
+            view.discard_unprojected_user_inputs(&state.task_id, update.run_id, &ready.runs);
+        }
 
         if layout_changed && self.selected_problem == problem {
             self.reconcile_case_selection(problem);

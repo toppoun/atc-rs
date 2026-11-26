@@ -3553,6 +3553,85 @@ mod tests {
         runtime.shutdown_active_contest().unwrap();
     }
 
+    #[test]
+    fn single_contest_sessions_keep_completed_results_for_large_contests() {
+        use crate::tui::app::{RunPhase, WatchApp};
+
+        for (contest_id, count, standalone) in
+            [("typical90", 90, false), ("tessoku-book", 100, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join(contest_id);
+            let app_context = if standalone {
+                AppContext::Standalone {
+                    launch_root: destination.clone(),
+                }
+            } else {
+                write_empty_workspace(root.path());
+                AppContext::from_launch_root(root.path()).unwrap()
+            };
+            let contest = Contest {
+                contest_id: contest_id.into(),
+                problems: (1..=count)
+                    .map(|number| problem_for(contest_id, &format!("P{number:03}")))
+                    .collect(),
+            };
+            workspace::save_metadata(&destination, &contest).unwrap();
+            for problem in &contest.problems {
+                std::fs::write(destination.join(format!("{}.py", problem.index)), "pass\n")
+                    .unwrap();
+            }
+            let mut runs = WorkspaceRuns::default();
+            let mut config = Config::default();
+            config.watch.cross_contest = standalone;
+            let input = PreparedWatchInput::load(&destination, Some(contest_id)).unwrap();
+            let session = ContestSession::start_entry(
+                PreparedContestEntry {
+                    input,
+                    environment: ContestEnvironment::new(config),
+                },
+                &app_context,
+                &runs,
+            )
+            .unwrap();
+            assert!(!session.workspace_watched);
+            let mut app = WatchApp::new_with_run_generation(
+                &session.input.contest,
+                session.run_generation.clone(),
+                session.input.sample_counts.clone(),
+                session.input.stress_cases.clone(),
+                session.input.user_inputs.clone(),
+            )
+            .unwrap();
+            app.attach_run_view(session.results.attach(session.message_tx.clone()).unwrap())
+                .unwrap();
+            for (index, problem) in contest.problems.iter().enumerate() {
+                app.select_source(
+                    index,
+                    destination.join(format!("{}.py", problem.index)),
+                    Language::Python,
+                );
+                session
+                    .run_tx
+                    .send(RunWorkerCommand::Run(app.queue_run(index).unwrap()))
+                    .unwrap();
+                SavedViewTerminal::wait(|| {
+                    app.apply_execution_updates();
+                    (app.problems()[index].run.phase == RunPhase::NoSamples).then_some(())
+                });
+            }
+            assert!(
+                app.problems()
+                    .iter()
+                    .all(|problem| problem.run.phase == RunPhase::NoSamples)
+            );
+            let results = session.results.clone();
+            runs.retire_contest(session).unwrap();
+            assert!(!results.is_registered());
+            runs.shutdown().unwrap();
+        }
+    }
+
     fn switch_error(root: &Path, contest_id: &str) -> SwitchPreparationError {
         match PreparedWatchInput::resolve_for_switch(root, contest_id) {
             Ok(_) => panic!("contest switch unexpectedly succeeded"),

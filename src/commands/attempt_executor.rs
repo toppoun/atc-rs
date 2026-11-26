@@ -159,11 +159,11 @@ impl RunContext {
         self.workspace_watch
     }
 
-    pub(super) fn source_fingerprint(
+    pub(super) fn source_stamp(
         &self,
         path: &Path,
-    ) -> io::Result<Option<crate::safe_file::FileFingerprint>> {
-        workspace::watched_source_fingerprint(path, self.watched_directory_identity())
+    ) -> io::Result<Option<crate::safe_file::WatchedFileStamp>> {
+        workspace::watched_source_stamp(path, self.watched_directory_identity())
     }
 
     pub(super) fn watched_source_exists(&self, path: &Path) -> io::Result<bool> {
@@ -232,7 +232,7 @@ impl AttemptExecutor {
                             &problem.index,
                             request.language,
                         )?;
-                        if context.source_fingerprint(&source)?.is_none() {
+                        if context.source_stamp(&source)?.is_none() {
                             return Err(io::Error::new(
                                 io::ErrorKind::NotFound,
                                 format!("source file not found: {}", source.display()),

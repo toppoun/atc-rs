@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::config::RunnerConfig;
 use crate::language::Language;
 use crate::model::Contest;
-use crate::safe_file::FileFingerprint;
+use crate::safe_file::WatchedFileStamp;
 use crate::tui::message::{
     Message, RunGeneration, RunKind, RunRequest, RunResults, RunTarget, RunWorkerCommand,
 };
@@ -307,7 +307,7 @@ struct SourceEntry {
     target: RunTarget,
     language: Language,
     epoch: u64,
-    stamp: Option<FileFingerprint>,
+    stamp: Option<WatchedFileStamp>,
 }
 
 impl WatchIndex {
@@ -490,7 +490,7 @@ impl WatchIndex {
         else {
             return Ok(false);
         };
-        let stamp = match contest.context.source_fingerprint(&source.path) {
+        let stamp = match contest.context.source_stamp(&source.path) {
             Ok(stamp) => stamp,
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => None,
             Err(_) => {
@@ -500,7 +500,19 @@ impl WatchIndex {
                 return Ok(false);
             }
         };
-        if stamp == source.stamp && (!notified || stamp.is_none()) {
+        // FSEvents can repeat creation/data flags on a chmod. A ctime-only change with
+        // the same fingerprint and mtime is not evidence of a save. Keep the baseline
+        // so repeated notifications for that metadata state are ignored too.
+        #[cfg(target_os = "macos")]
+        if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
+            && current.metadata_only_change_from(previous)
+        {
+            return Ok(false);
+        }
+        let fingerprint = stamp.as_ref().map(|stamp| &stamp.fingerprint);
+        let previous_fingerprint = source.stamp.as_ref().map(|stamp| &stamp.fingerprint);
+        if fingerprint == previous_fingerprint && (!notified || stamp.is_none()) {
+            source.stamp = stamp;
             return Ok(false);
         }
         let valid = *verified
@@ -783,7 +795,7 @@ impl WatchIndex {
             let Some(name) = source.path.file_name() else {
                 continue;
             };
-            let stamp = context.source_fingerprint(&source.path).unwrap_or(None);
+            let stamp = context.source_stamp(&source.path).unwrap_or(None);
             self.sources.insert(
                 observed.join(name),
                 SourceEntry {
@@ -1022,6 +1034,65 @@ mod tests {
         assert_eq!(watcher.status().accepted, 2);
         fs::write(&source, "print(2)\n").unwrap();
         wait_for(|| (watcher.status().accepted == 3).then_some(()));
+        stop(worker, watcher);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_chmod_does_not_run_or_offer_hidden_view_but_writes_do() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        let contest = fixture(root, "abc480", true);
+        fixture(root, "abc483", false);
+        let destination = root.join("abc480");
+        let source = destination.join("A.py");
+        let original = "print('expected-abc480')\n";
+        fs::write(&source, original).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+        let (worker, watcher) = start(root, python());
+        let (generation, results) = watcher.attach_registration(&destination, &contest).unwrap();
+        let saves = watcher.saves();
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        thread::sleep(Duration::from_millis(450));
+        watcher.reconcile(true).unwrap();
+        assert_eq!(saves.accepted_sequence(), 0);
+        assert!(saves.latest_after(0).0.is_none());
+        let (app, _inbox) = display(&contest, generation, &results);
+        assert_eq!(app.current_problem().unwrap().run.phase, RunPhase::Idle);
+        drop(app);
+
+        fs::write(&source, original).unwrap();
+        let same_content = wait_for(|| saves.latest_after(0).0);
+        assert_eq!(same_content.sequence, 1);
+        assert_eq!(same_content.origin, SaveOrigin::Notification);
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(&source, "print('new content')\n").unwrap();
+        let mixed = wait_for(|| saves.latest_after(same_content.sequence).0);
+        assert_eq!(mixed.sequence, 2);
+        let (generation, results) = watcher.attach_registration(&destination, &contest).unwrap();
+        let (mut app, _inbox) = display(&contest, generation, &results);
+        wait_for(|| {
+            app.apply_execution_updates();
+            (app.current_problem().unwrap().run.phase == RunPhase::Finished).then_some(())
+        });
+        assert_eq!(
+            app.current_problem().unwrap().run.cases[0]
+                .actual
+                .as_deref()
+                .unwrap()
+                .trim(),
+            "new content"
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        thread::sleep(Duration::from_millis(450));
+        assert_eq!(saves.accepted_sequence(), mixed.sequence);
         stop(worker, watcher);
     }
 

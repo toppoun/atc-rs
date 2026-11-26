@@ -597,14 +597,14 @@ pub(crate) fn watch_manifest_stamp(destination: &Path) -> Option<WatchManifestSt
     })
 }
 
-pub(crate) fn watched_source_fingerprint(
+pub(crate) fn watched_source_stamp(
     path: &Path,
     expected_directory: &PhysicalDirectoryIdentity,
-) -> io::Result<Option<safe_file::FileFingerprint>> {
+) -> io::Result<Option<safe_file::WatchedFileStamp>> {
     let Some((directory, name)) = open_watched_source_parent(path, expected_directory)? else {
         return Ok(None);
     };
-    match safe_file::read_regular_file_fingerprint_at(&directory, name, path) {
+    match safe_file::read_watched_file_stamp_at(&directory, name, path) {
         Ok(stamp) => Ok(Some(stamp)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),

@@ -217,6 +217,23 @@ pub(crate) struct FileFingerprint {
     sha256: [u8; SHA256_OUTPUT_LEN],
 }
 
+pub(crate) struct WatchedFileStamp {
+    pub(crate) fingerprint: FileFingerprint,
+    #[cfg(target_os = "macos")]
+    modified: std::time::SystemTime,
+    #[cfg(target_os = "macos")]
+    changed: (i64, i64),
+}
+
+impl WatchedFileStamp {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metadata_only_change_from(&self, previous: &Self) -> bool {
+        self.fingerprint == previous.fingerprint
+            && self.modified == previous.modified
+            && self.changed != previous.changed
+    }
+}
+
 impl FileSnapshot {
     pub(crate) fn fingerprint(&self) -> FileFingerprint {
         FileFingerprint {
@@ -279,6 +296,23 @@ pub(crate) fn read_regular_file_fingerprint_at(
     })
 }
 
+pub(crate) fn read_watched_file_stamp_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<WatchedFileStamp> {
+    let (file, hash) = read_stable_regular_file_at(directory, name, path, |file, limit| {
+        hash_reader(file.take(limit))
+    })?;
+    Ok(WatchedFileStamp {
+        #[cfg(target_os = "macos")]
+        modified: file.modified,
+        #[cfg(target_os = "macos")]
+        changed: file.changed,
+        fingerprint: file.into_fingerprint(hash),
+    })
+}
+
 fn read_tree_in<F>(
     directory: &Dir,
     root: &Path,
@@ -335,6 +369,16 @@ struct FileObservation {
     modified: std::time::SystemTime,
     #[cfg(unix)]
     changed: (i64, i64),
+}
+
+impl FileObservation {
+    fn into_fingerprint(self, hash: digest::Digest) -> FileFingerprint {
+        FileFingerprint {
+            identity: self.identity,
+            size: self.size,
+            sha256: sha256_bytes(hash),
+        }
+    }
 }
 
 fn observe_regular_file(file: &fs::File, path: &Path) -> io::Result<FileObservation> {
@@ -401,11 +445,7 @@ fn fingerprint_regular_file_at(
     read: impl FnOnce(&mut fs::File, u64) -> io::Result<(u64, digest::Digest)>,
 ) -> io::Result<FileFingerprint> {
     let (file, hash) = read_stable_regular_file_at(directory, name, path, read)?;
-    Ok(FileFingerprint {
-        identity: file.identity,
-        size: file.size,
-        sha256: sha256_bytes(hash),
-    })
+    Ok(file.into_fingerprint(hash))
 }
 
 fn read_stable_regular_file_at<T>(
