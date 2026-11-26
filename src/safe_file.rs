@@ -568,7 +568,7 @@ pub(crate) fn read_regular_file_snapshot(path: &Path) -> io::Result<FileSnapshot
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    snapshot_regular_file(options.open(path)?, path)
+    snapshot_regular_file(options.open(path)?, path).map(|(snapshot, _)| snapshot)
 }
 
 pub(crate) fn read_regular_file_snapshot_at(
@@ -576,6 +576,14 @@ pub(crate) fn read_regular_file_snapshot_at(
     name: &OsStr,
     path: &Path,
 ) -> io::Result<FileSnapshot> {
+    read_regular_file_snapshot_with_metadata_at(directory, name, path).map(|(snapshot, _)| snapshot)
+}
+
+pub(crate) fn read_regular_file_snapshot_with_metadata_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<(FileSnapshot, fs::Metadata)> {
     snapshot_regular_file(open_file_nofollow_at(directory, name)?, path)
 }
 
@@ -585,15 +593,19 @@ fn open_file_nofollow_at(directory: &Dir, name: &OsStr) -> io::Result<fs::File> 
     Ok(directory.open_with(name, &options)?.into_std())
 }
 
-fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnapshot> {
+fn snapshot_regular_file(
+    mut file: fs::File,
+    path: &Path,
+) -> io::Result<(FileSnapshot, fs::Metadata)> {
+    let metadata = file.metadata()?;
     require_regular_file(
-        &cap_std::fs::Metadata::from_just_metadata(file.metadata()?),
+        &cap_std::fs::Metadata::from_just_metadata(metadata.clone()),
         path,
     )?;
     let identity = file_identity(&file, path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok(FileSnapshot { bytes, identity })
+    Ok((FileSnapshot { bytes, identity }, metadata))
 }
 
 pub(crate) fn regular_file_exists_at(

@@ -18,7 +18,7 @@ use crate::watcher::{
     self, WatchInterests, WorkspaceBatch, WorkspaceFileWatcher, WorkspaceRegistration,
 };
 use crate::workspace::batch::BatchWorkspace;
-use crate::workspace::diagnosis::{ContestDiagnosis, diagnose_watch_contest};
+use crate::workspace::diagnosis::diagnose_watch_contest;
 use crate::workspace::update_cancellation::UpdateCancellation;
 use crate::workspace::{self, ExplicitContestRoute, PhysicalDirectoryIdentity, WatchManifestStamp};
 
@@ -360,6 +360,13 @@ impl WatchIndex {
     }
 
     fn initialize(&mut self) -> io::Result<()> {
+        self.initialize_after_registration(|| {})
+    }
+
+    fn initialize_after_registration(
+        &mut self,
+        after_registration: impl FnOnce(),
+    ) -> io::Result<()> {
         self.reconcile(None)?;
         #[cfg(target_os = "macos")]
         if self.installed.is_empty() {
@@ -371,6 +378,7 @@ impl WatchIndex {
                 || "No FSEvents registration could be started".into(),
             )));
         }
+        after_registration();
         // Keep the pre-Ready comparison on backends without deferred registration recovery.
         #[cfg(not(target_os = "macos"))]
         {
@@ -880,19 +888,19 @@ impl WatchIndex {
             Err(error) => diagnostics.report(format!("Workspace discovery: {error}")),
         }
 
-        let expired: Vec<_> = self
-            .contests
-            .iter()
-            .filter(|(id, current)| {
-                !routes
-                    .get(*id)
-                    .is_some_and(|route| current.context.matches_watch_route(route))
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut manifests = HashMap::new();
+        let mut expired = Vec::new();
+        for (id, current) in &self.contests {
+            if let Some(route) = routes.get(id)
+                && let Some(stamp) = current.context.reconcile_watch_route(route)
+            {
+                manifests.insert(route.destination.clone(), Some(stamp));
+            } else {
+                expired.push(id.clone());
+            }
+        }
         self.retire_many(expired)?;
 
-        let mut manifests = HashMap::new();
         for (id, route) in routes {
             if self.is_stopping() {
                 return Ok(());
@@ -901,6 +909,7 @@ impl WatchIndex {
             let observed = match watcher::watch_directory(&path) {
                 Ok(path) => path,
                 Err(error) => {
+                    manifests.remove(&path);
                     diagnostics.report(format!("{}: {error}", path.display()));
                     continue;
                 }
@@ -914,7 +923,9 @@ impl WatchIndex {
             interests.contests.insert(observed.clone());
             // Windows blocks rename of a directory with an open handle to a descendant,
             // even with FILE_SHARE_DELETE. Poll metadata without watching .atc itself.
-            manifests.insert(path.clone(), workspace::watch_manifest_stamp(&path));
+            manifests
+                .entry(path.clone())
+                .or_insert_with(|| workspace::watch_manifest_stamp(&path));
             if !self.contests.contains_key(&id)
                 && let Err(error) = self.add_contest(&id, route, &observed)
             {
@@ -995,19 +1006,15 @@ impl WatchIndex {
         observed: &Path,
     ) -> io::Result<()> {
         let destination = route.destination.clone();
-        let contest = match diagnose_watch_contest(&destination, id) {
-            ContestDiagnosis::Healthy { contest, .. } => contest,
-            ContestDiagnosis::Blocked(reason) => {
-                let (kind, message) = reason.error_details();
-                return Err(io::Error::new(kind, message));
-            }
-            _ => return Ok(()),
+        let Some((contest, metadata)) = diagnose_watch_contest(&route, id)? else {
+            return Ok(());
         };
         let sources = build_watched_sources(&destination, &contest)?;
         let context = Arc::new(RunContext::from_watch_route(
             &self.root,
             route,
             &contest,
+            metadata,
             self.config.clone(),
         )?);
         let (generation, results) = self.worker.register_shared(context.clone())?;
@@ -1207,6 +1214,158 @@ mod tests {
         watcher::watch_directory(path.parent().unwrap())
             .unwrap()
             .join(path.file_name().unwrap())
+    }
+
+    #[test]
+    fn startup_indexes_all_candidates_and_reuses_manifest_attributes_on_reconcile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        let contest = fixture(root, "abc483", true);
+        let destination = root.join("abc483");
+        let python = destination.join("A.py");
+        fs::write(&python, "print(42)\n").unwrap();
+        let mut index = stepped_index(root);
+        let (generation, _) = index.open(&destination, &contest).unwrap();
+        assert_eq!(index.sources.len(), 2);
+        for (path, language, exists) in [
+            (python, Language::Python, true),
+            (destination.join("A.cpp"), Language::Cpp, false),
+        ] {
+            let item = &index.sources[&observed(&path)];
+            assert_eq!(item.path, path);
+            assert_eq!(item.target, generation.scope().target("abc483_a"));
+            assert_eq!(item.language, language);
+            assert_eq!(item.stamp.is_some(), exists);
+        }
+        index.reconcile(None).unwrap();
+        assert!(index.manifests[&destination] == workspace::watch_manifest_stamp(&destination));
+        assert_eq!(
+            index.open(&destination, &contest).unwrap().0.scope(),
+            generation.scope()
+        );
+    }
+
+    #[test]
+    fn diagnosis_rejects_invalid_or_differently_owned_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        let healthy = fixture(root, "abc483", false);
+        fixture(root, "abc484", true);
+        let mut wrong_owner = fixture(root, "abc485", false);
+        wrong_owner.contest_id = "abc486".into();
+        wrong_owner.problems[0].task_id = "abc486_a".into();
+        wrong_owner.problems[0].url = "https://atcoder.jp/contests/abc486/tasks/abc486_a".into();
+        fs::write(root.join("abc484/.atc/contest.toml"), "version = [invalid").unwrap();
+        workspace::save_metadata(&root.join("abc485"), &wrong_owner).unwrap();
+
+        let index = stepped_index(root);
+        assert!(index.open(&root.join("abc483"), &healthy).is_ok());
+        assert_eq!(index.contests.len(), 1);
+        assert_eq!(index.sources.len(), 2);
+        assert!(index.status.lock().unwrap().warning.is_some());
+    }
+
+    #[test]
+    fn registration_rechecks_diagnosed_manifest_and_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        let contest = fixture(root, "abc483", false);
+        let destination = root.join("abc483");
+        let route = ExplicitContestRoute::resolve(root, "abc483").unwrap();
+        let (diagnosed, snapshot) = diagnose_watch_contest(&route, "abc483").unwrap().unwrap();
+        assert_eq!(diagnosed, contest);
+        let marker = destination.join(".atc/contest.toml");
+        let content = fs::read_to_string(&marker).unwrap();
+        fs::write(&marker, format!("{content}\n# updated after diagnosis\n")).unwrap();
+        let outcome = RunContext::from_watch_route(
+            root,
+            route,
+            &diagnosed,
+            snapshot,
+            RunnerConfig::default(),
+        );
+        assert!(matches!(outcome, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+
+        let route = ExplicitContestRoute::resolve(root, "abc483").unwrap();
+        let (diagnosed, snapshot) = diagnose_watch_contest(&route, "abc483").unwrap().unwrap();
+        let original = root.join("original");
+        fs::rename(&destination, &original).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::rename(original.join(".atc"), destination.join(".atc")).unwrap();
+        let outcome = RunContext::from_watch_route(
+            root,
+            route,
+            &diagnosed,
+            snapshot,
+            RunnerConfig::default(),
+        );
+        assert!(matches!(outcome, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn watch_diagnosis_rejects_redirected_manifest_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        fixture(root, "abc483", false);
+        let route = ExplicitContestRoute::resolve(root, "abc483").unwrap();
+        let marker = route.destination.join(".atc");
+        let moved = root.join("actual-marker");
+        fs::rename(&marker, &moved).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&moved, &marker).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+
+            let result = ProcessCommand::new("cmd")
+                .args(["/d", "/c"])
+                .raw_arg(r#"mklink /J "%ATC_TEST_JUNCTION%" "%ATC_TEST_JUNCTION_TARGET%""#)
+                .env("ATC_TEST_JUNCTION", &marker)
+                .env("ATC_TEST_JUNCTION_TARGET", &moved)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let outcome = diagnose_watch_contest(&route, "abc483");
+        assert!(matches!(outcome, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
+        assert!(moved.join("contest.toml").is_file());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn startup_recovers_a_save_between_registration_and_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        fixture(root, "abc483", false);
+        let path = root.join("abc483/A.py");
+        fs::write(&path, "print(41)\n").unwrap();
+        let mut index = WatchIndex::new(
+            std::path::absolute(root).unwrap(),
+            workspace::contest_directory_identity(root).unwrap(),
+            RunnerConfig::default(),
+            Arc::new(RunWorker::start_workspace().unwrap()),
+            WorkspaceFileWatcher::new().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(WatchStatus::default())),
+        );
+        index
+            .initialize_after_registration(|| fs::write(&path, "print(42)\n").unwrap())
+            .unwrap();
+        let status = index.status.lock().unwrap();
+        let saved = status.latest_save.as_ref().unwrap();
+        assert_eq!(saved.sequence, 1);
+        assert_eq!(saved.target.scope.contest_id(), "abc483");
+        assert_eq!(saved.origin, SaveOrigin::Reconciliation);
     }
 
     #[test]

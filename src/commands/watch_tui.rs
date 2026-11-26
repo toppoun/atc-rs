@@ -2044,41 +2044,38 @@ where
         }
     }
 
-    match inspect_contest_target(&destination, &request.contest_id)? {
-        ContestTargetHealth::Healthy => {}
-        ContestTargetHealth::MissingDirectory => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "contest preparation completed but the destination is missing: {}",
-                    destination.display()
-                ),
-            )
-            .into());
-        }
-        ContestTargetHealth::RepairRequired => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "contest preparation completed but contest data requires repair: {}",
-                    destination.display()
-                ),
-            )
-            .into());
-        }
-        ContestTargetHealth::UnsupportedVersion(version) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported contest metadata version: {version}"),
-            )
-            .into());
-        }
+    if !matches!(request.mutation, crate::tui::ContestSwitchMutation::Open) {
+        verify_mutated_contest_target(&destination, &request.contest_id)?;
     }
 
     Ok(PreparedContestEntry {
         input: PreparedWatchInput::load(&destination, Some(&request.contest_id))?,
         environment: ContestEnvironment::from_snapshots(config, auth),
     })
+}
+
+fn verify_mutated_contest_target(destination: &Path, contest_id: &str) -> io::Result<()> {
+    match inspect_contest_target(destination, contest_id)? {
+        ContestTargetHealth::Healthy => Ok(()),
+        ContestTargetHealth::MissingDirectory => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "contest preparation completed but the destination is missing: {}",
+                destination.display()
+            ),
+        )),
+        ContestTargetHealth::RepairRequired => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contest preparation completed but contest data requires repair: {}",
+                destination.display()
+            ),
+        )),
+        ContestTargetHealth::UnsupportedVersion(version) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported contest metadata version: {version}"),
+        )),
+    }
 }
 
 fn contest_refresh_task(

@@ -277,8 +277,13 @@ impl BatchWorkspace {
             return Ok(None);
         }
 
-        let child = open_managed_directory(directory, name, path, "contest directory")?
-            .ok_or_else(|| super::missing_contest_directory(path))?;
+        let child = super::open_managed_directory_with_metadata(
+            directory,
+            name,
+            path,
+            "contest directory",
+            metadata,
+        )?;
         if !super::entry_exists(&child, ".atc")?
             && !((standard_id || configured_id) && has_legacy_data(&child)?)
         {

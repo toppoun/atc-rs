@@ -15,7 +15,7 @@ use crate::tui::message::{
     Message, RunGeneration, RunId, RunKind, RunRequest, RunResults, RunTarget,
 };
 use crate::tui::reporter::ChannelReporter;
-use crate::workspace::{self, ContestTaskSnapshot, ExplicitContestRoute};
+use crate::workspace::{self, ContestTaskSnapshot, ExplicitContestRoute, WatchManifestStamp};
 
 use super::stress::build_request as build_stress_request;
 use super::test::test_problem_with_cancel;
@@ -81,16 +81,13 @@ impl RunContext {
         root: &Path,
         route: ExplicitContestRoute,
         contest: &Contest,
+        metadata: ContestTaskSnapshot,
         runner_config: RunnerConfig,
     ) -> io::Result<Self> {
         let destination = route.destination.clone();
-        if &workspace::contest_directory_identity(&destination)? != route.destination_identity() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "contest changed during Workspace discovery",
-            ));
-        }
-        let metadata = ContestTaskSnapshot::capture_contest(&destination, contest)?;
+        // Diagnosis has released its handles. Check the live destination before
+        // binding the observed task manifest to an execution generation.
+        metadata.revalidate(&destination)?;
         Ok(Self {
             destination,
             generation: RunGeneration::new(&contest.contest_id),
@@ -105,15 +102,16 @@ impl RunContext {
         })
     }
 
-    pub(super) fn matches_watch_route(&self, route: &ExplicitContestRoute) -> bool {
-        !self.is_stale()
-            && self.binding.as_ref().is_some_and(|binding| {
-                binding
-                    .route
-                    .as_ref()
-                    .is_some_and(|(_, current)| current.same_owner(route))
-                    && binding.metadata.revalidate(&self.destination).is_ok()
-            })
+    pub(super) fn reconcile_watch_route(
+        &self,
+        route: &ExplicitContestRoute,
+    ) -> Option<WatchManifestStamp> {
+        let binding = self.binding.as_ref()?;
+        let (_, current) = binding.route.as_ref()?;
+        if self.is_stale() || !current.same_owner(route) {
+            return None;
+        }
+        binding.metadata.revalidate_watch(&self.destination).ok()
     }
 
     pub(super) fn matches_view(&self, destination: &Path, contest: &Contest) -> io::Result<bool> {

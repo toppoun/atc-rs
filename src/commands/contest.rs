@@ -32,16 +32,9 @@ pub(super) fn inspect_contest_target(
     }
 
     let metadata_health = workspace::inspect_contest_metadata(destination)?;
-    if !matches!(
-        metadata_health,
-        ContestMetadataHealth::UnsupportedVersion(_)
-    ) {
-        workspace::validate_existing_contest_identity(destination, contest_id)?;
-    }
     match metadata_health {
         ContestMetadataHealth::Healthy(contest) => {
             workspace::validate_contest_identity(&contest, contest_id)?;
-            workspace::validate_contest_paths(&contest)?;
             match workspace::inspect_tests_health(destination, &contest)? {
                 TestsHealth::Healthy => Ok(ContestTargetHealth::Healthy),
                 TestsHealth::Broken => Ok(ContestTargetHealth::RepairRequired),
@@ -52,6 +45,7 @@ pub(super) fn inspect_contest_target(
             Ok(ContestTargetHealth::RepairRequired)
         }
         ContestMetadataHealth::Missing | ContestMetadataHealth::Invalid => {
+            workspace::validate_existing_contest_identity(destination, contest_id)?;
             Ok(ContestTargetHealth::RepairRequired)
         }
         ContestMetadataHealth::UnsupportedVersion(version) => {

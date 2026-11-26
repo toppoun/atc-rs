@@ -579,6 +579,16 @@ pub(crate) struct WatchManifestStamp {
     modified: Option<std::time::SystemTime>,
 }
 
+impl WatchManifestStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            size: metadata.len(),
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
 pub(crate) fn watch_manifest_stamp(destination: &Path) -> Option<WatchManifestStamp> {
     let marker = destination.join(".atc");
     let directory = fs::symlink_metadata(&marker).ok()?;
@@ -590,11 +600,7 @@ pub(crate) fn watch_manifest_stamp(destination: &Path) -> Option<WatchManifestSt
         return None;
     }
     // A discovery hint. RunContext verifies identity and metadata before admission.
-    Some(WatchManifestStamp {
-        size: manifest.len(),
-        created: manifest.created().ok(),
-        modified: manifest.modified().ok(),
-    })
+    Some(WatchManifestStamp::from_metadata(&manifest))
 }
 
 pub(crate) fn watched_source_stamp(
@@ -1423,23 +1429,20 @@ fn inspect_contest_metadata_unchecked(destination: &Path) -> io::Result<ContestM
 }
 
 fn inspect_contest_metadata_text(content: &str) -> io::Result<ContestMetadataHealth> {
-    let header: ContestMetadataHeader = match toml::from_str(content) {
-        Ok(header) => header,
-        Err(_) => {
-            return Ok(ContestMetadataHealth::Invalid);
-        }
-    };
-
-    if header.version != METADATA_VERSION {
-        return Ok(ContestMetadataHealth::UnsupportedVersion(header.version));
-    }
-
     let metadata: ContestMetadata = match toml::from_str(content) {
         Ok(metadata) => metadata,
         Err(_) => {
-            return Ok(ContestMetadataHealth::Invalid);
+            return Ok(match toml::from_str::<ContestMetadataHeader>(content) {
+                Ok(header) if header.version != METADATA_VERSION => {
+                    ContestMetadataHealth::UnsupportedVersion(header.version)
+                }
+                _ => ContestMetadataHealth::Invalid,
+            });
         }
     };
+    if metadata.version != METADATA_VERSION {
+        return Ok(ContestMetadataHealth::UnsupportedVersion(metadata.version));
+    }
 
     let contest = Contest {
         contest_id: metadata.contest_id,
@@ -1711,6 +1714,22 @@ fn open_managed_directory(
     path: &Path,
     kind: &str,
 ) -> io::Result<Option<CapDir>> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => {
+            open_managed_directory_with_metadata(parent, name, path, kind, metadata).map(Some)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_managed_directory_with_metadata(
+    parent: &CapDir,
+    name: &str,
+    path: &Path,
+    kind: &str,
+    metadata: cap_std::fs::Metadata,
+) -> io::Result<CapDir> {
     let validate = |metadata: cap_std::fs::Metadata| {
         if managed_metadata_is_reparse(&metadata) {
             return Err(io::Error::new(
@@ -1726,14 +1745,10 @@ fn open_managed_directory(
         }
         Ok(())
     };
-    match parent.symlink_metadata(name) {
-        Ok(metadata) => validate(metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    }
+    validate(metadata)?;
     let directory = parent.open_dir_nofollow(name)?;
     validate(directory.dir_metadata()?)?;
-    Ok(Some(directory))
+    Ok(directory)
 }
 
 #[cfg(windows)]
@@ -1936,11 +1951,24 @@ pub(crate) struct ContestTaskSnapshot {
 
 impl ContestTaskSnapshot {
     fn read(destination: &Path, directory: &CapDir) -> io::Result<Self> {
-        Ok(Self {
-            directory: opened_directory_identity(directory, destination)?,
-            recovery: contest_recovery_state(destination, directory)?,
-            manifest: test_manifest_snapshot(destination, directory)?,
-        })
+        Self::read_with_manifest_metadata(destination, directory).map(|(snapshot, _)| snapshot)
+    }
+
+    fn read_with_manifest_metadata(
+        destination: &Path,
+        directory: &CapDir,
+    ) -> io::Result<(Self, fs::Metadata)> {
+        let directory_identity = opened_directory_identity(directory, destination)?;
+        let recovery = contest_recovery_state(destination, directory)?;
+        let (manifest, attributes) = test_manifest_snapshot(destination, directory)?;
+        Ok((
+            Self {
+                directory: directory_identity,
+                recovery,
+                manifest,
+            },
+            attributes,
+        ))
     }
 
     pub(crate) fn capture(
@@ -1972,10 +2000,20 @@ impl ContestTaskSnapshot {
     }
 
     pub(crate) fn revalidate(&self, destination: &Path) -> io::Result<()> {
+        self.revalidate_with_manifest_metadata(destination)
+            .map(|_| ())
+    }
+
+    pub(crate) fn revalidate_watch(&self, destination: &Path) -> io::Result<WatchManifestStamp> {
+        self.revalidate_with_manifest_metadata(destination)
+            .map(|metadata| WatchManifestStamp::from_metadata(&metadata))
+    }
+
+    fn revalidate_with_manifest_metadata(&self, destination: &Path) -> io::Result<fs::Metadata> {
         let directory = open_contest_destination_nofollow(destination)?;
-        let current = Self::read(destination, &directory)?;
+        let (current, attributes) = Self::read_with_manifest_metadata(destination, &directory)?;
         if *self == current {
-            return Ok(());
+            return Ok(attributes);
         }
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -2009,7 +2047,7 @@ impl ContestTaskSnapshot {
 fn test_manifest_snapshot(
     destination: &Path,
     directory: &CapDir,
-) -> io::Result<safe_file::FileSnapshot> {
+) -> io::Result<(safe_file::FileSnapshot, fs::Metadata)> {
     let marker_path = destination.join(".atc");
     let marker = open_managed_directory(directory, ".atc", &marker_path, "workspace marker")?
         .ok_or_else(|| {
@@ -2018,7 +2056,7 @@ fn test_manifest_snapshot(
                 format!("workspace marker not found: {}", marker_path.display()),
             )
         })?;
-    safe_file::read_regular_file_snapshot_at(
+    safe_file::read_regular_file_snapshot_with_metadata_at(
         &marker,
         OsStr::new("contest.toml"),
         &marker_path.join("contest.toml"),
