@@ -2056,10 +2056,11 @@ fn test_manifest_snapshot(
                 format!("workspace marker not found: {}", marker_path.display()),
             )
         })?;
-    safe_file::read_regular_file_snapshot_with_metadata_at(
+    safe_file::read_bounded_regular_file_snapshot_with_metadata_at(
         &marker,
         OsStr::new("contest.toml"),
         &marker_path.join("contest.toml"),
+        MAX_CONTEST_METADATA_BYTES,
     )
 }
 
@@ -7383,5 +7384,32 @@ mod tests {
         );
         assert!(load_metadata(&destination).is_err());
         assert_eq!(load_metadata_unchecked(&destination).unwrap(), new_contest);
+    }
+
+    #[test]
+    fn task_manifest_snapshot_enforces_the_diagnostic_size_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("abc483");
+        let marker = destination.join(".atc");
+        fs::create_dir_all(&marker).unwrap();
+        let manifest = marker.join("contest.toml");
+        let directory = open_contest_destination_nofollow(&destination).unwrap();
+        let file = fs::File::create(&manifest).unwrap();
+
+        for size in [
+            MAX_CONTEST_METADATA_BYTES - 1,
+            MAX_CONTEST_METADATA_BYTES,
+            MAX_CONTEST_METADATA_BYTES + 1,
+        ] {
+            file.set_len(size).unwrap();
+            let snapshot = test_manifest_snapshot(&destination, &directory);
+            if size <= MAX_CONTEST_METADATA_BYTES {
+                let (snapshot, metadata) = snapshot.unwrap();
+                assert_eq!(snapshot.bytes.len() as u64, size);
+                assert_eq!(metadata.len(), size);
+            } else {
+                assert_eq!(snapshot.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 }

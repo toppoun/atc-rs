@@ -101,7 +101,7 @@ CLI の進捗と Test・Stress の実行結果は `ui::Event` / `Reporter` で�
 - `RunContext::new` は Contest ID・ディレクトリ・メタデータ・Runner 設定を結び付け、新しい `RunScope` を作る。`RunWorker` は実行対象を `RunScope` で登録し、1 つの `RunScheduler` と最大 1 件の物理 attempt を持つ。実行直前に `AttemptExecutor` が対象の task ID を解決し、メタデータ・物理ディレクトリ・Workspace の振り分け先を確認してから Sample Test・User Input・Stress を実行する。
 - `RunScope` は Contest ID と登録したメタデータの実行世代を表す。`WatchApp` は実行コンテキストと共有する `RunGeneration` から全実行種別に共通の `RunId` を取得する。同じ世代で画面を再構築しても採番が続き、User Input のリビジョンと起動ガードも task ID ごとに引き継ぐ。要求・イベント・完了・再キューは `RunTarget`（`RunScope` と task ID）と `RunId` で照合する。
 - `RunResultStore` は Workspace の実行状態の正本。`RunWorker` が受理・置換・取消・join 後の結果を反映し、`RunResults` が実行イベントを同じ世代の状態に適用する。`ExecutionState` と `UserInputRunState` が状態遷移を担い、`WatchApp` の即時の待機表示にも同じ遷移を使う。
-- 画面は `RunView` で同じ世代を購読する。購読の登録と初回更新対象の決定を同じロックで行い、通知が来たら変更された task の最新状態を取得する。`WatchApp` は表示位置への対応付けと、選択・スクロール・折りたたみ・編集中の内容を管理する。画面終了で購読が外れても正本への更新は続く。現行の手動切り替え、Workspace Home への復帰、Refresh では旧世代を明示的に失効させる。
+- 画面は `RunView` で同じ世代を購読する。購読の登録と初回更新対象の決定を同じロックで行い、通知が来たら変更された task の最新状態を取得する。`WatchApp` は表示位置への対応付けと、選択・スクロール・折りたたみ・編集中の内容を管理する。Cross-Contest Watch 有効時の通常の切り替えでは、画面の購読を解除し、実行世代・キュー・結果を保持する。単一 Contest モードの手動切り替え、Workspace Home への復帰、Refresh では対象の旧世代を明示的に失効させる。
 - 状態は実行要求を受理した task にだけ作る。登録時の `RunResultRetention` が完了結果の保持を決める。Cross-Contest Watch は Workspace 全体で完了済み 64 task・推計 64 MiB を上限とし、古い完了から取り除く。単体で上限を超えた結果はまず詳細テキストを外し、収まらなければ破棄する。実行中と待機中はこの上限から除外する。User Input は task ごとに最新 8 入力まで保持する。無効時と Standalone は、各 task と各 User Input の最新結果を従来の単一 Contest のライフサイクルで保持する。どのモードでも表示へ渡す出力文字列は共有する。
 
 #### Workspace 監視の内部経路

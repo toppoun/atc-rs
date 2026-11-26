@@ -1895,6 +1895,87 @@ mod tests {
     }
 
     #[test]
+    fn oversized_manifest_retires_only_its_generation_and_recovers_after_restoring() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        let a = fixture(root, "abc483", true);
+        let b = fixture(root, "abc480", true);
+        let active = root.join("abc483");
+        let other = root.join("abc480");
+        let manifest = active.join(".atc/contest.toml");
+        let original = fs::read(&manifest).unwrap();
+        let (worker, watcher) = start(root, python());
+        let (old, old_results) = watcher.attach_registration(&active, &a).unwrap();
+        let (other_generation, other_results) = watcher.attach_registration(&other, &b).unwrap();
+        let (mut healthy, _inbox) = display(&b, other_generation.clone(), &other_results);
+
+        let replacement = active.join(".atc/replacement.tmp");
+        let file = fs::File::create(&replacement).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        drop(file);
+        fs::rename(replacement, &manifest).unwrap();
+        watcher.reconcile(false).unwrap();
+        assert_eq!(watcher.status().indexed, 1);
+        assert!(
+            watcher
+                .status()
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("abc483")
+        );
+        assert!(watcher.attach_registration(&active, &a).is_err());
+        assert!(old_results.attach(mpsc::channel().0).is_err());
+
+        fs::write(active.join("A.py"), "print('expected-abc483')\n").unwrap();
+        fs::write(other.join("A.py"), "print('expected-abc480')\n").unwrap();
+        let receipt = wait_for(|| watcher.status().latest_save);
+        assert_eq!(receipt.target.scope, *other_generation.scope());
+        wait_for(|| {
+            healthy.apply_execution_updates();
+            (healthy.current_problem().unwrap().run.phase == RunPhase::Finished).then_some(())
+        });
+        assert_eq!(
+            healthy.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::Accepted
+        );
+        assert_eq!(watcher.status().accepted, 1);
+
+        fs::write(&manifest, original).unwrap();
+        watcher.reconcile(false).unwrap();
+        let (new, results) = watcher.attach_registration(&active, &a).unwrap();
+        assert_ne!(old.scope(), new.scope());
+        assert_eq!(watcher.status().indexed, 2);
+        assert_eq!(
+            watcher.attach_registration(&other, &b).unwrap().0.scope(),
+            other_generation.scope()
+        );
+        let (mut restored, _inbox) = display(&a, new.clone(), &results);
+        fs::write(
+            active.join("A.py"),
+            "print('expected-abc483')\n# restored\n",
+        )
+        .unwrap();
+        let receipt = wait_for(|| {
+            watcher
+                .status()
+                .latest_save
+                .filter(|save| save.sequence == 2)
+        });
+        assert_eq!(receipt.target.scope, *new.scope());
+        wait_for(|| {
+            restored.apply_execution_updates();
+            (restored.current_problem().unwrap().run.phase == RunPhase::Finished).then_some(())
+        });
+        assert_eq!(
+            restored.current_problem().unwrap().run.cases[0].verdict,
+            CaseVerdict::Accepted
+        );
+        stop(worker, watcher);
+    }
+
+    #[test]
     fn rescan_recovers_only_changed_sources_when_notifications_were_lost() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();

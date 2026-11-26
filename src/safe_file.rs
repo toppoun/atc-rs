@@ -568,7 +568,7 @@ pub(crate) fn read_regular_file_snapshot(path: &Path) -> io::Result<FileSnapshot
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    snapshot_regular_file(options.open(path)?, path).map(|(snapshot, _)| snapshot)
+    snapshot_regular_file(options.open(path)?, path)
 }
 
 pub(crate) fn read_regular_file_snapshot_at(
@@ -576,14 +576,6 @@ pub(crate) fn read_regular_file_snapshot_at(
     name: &OsStr,
     path: &Path,
 ) -> io::Result<FileSnapshot> {
-    read_regular_file_snapshot_with_metadata_at(directory, name, path).map(|(snapshot, _)| snapshot)
-}
-
-pub(crate) fn read_regular_file_snapshot_with_metadata_at(
-    directory: &Dir,
-    name: &OsStr,
-    path: &Path,
-) -> io::Result<(FileSnapshot, fs::Metadata)> {
     snapshot_regular_file(open_file_nofollow_at(directory, name)?, path)
 }
 
@@ -593,10 +585,7 @@ fn open_file_nofollow_at(directory: &Dir, name: &OsStr) -> io::Result<fs::File> 
     Ok(directory.open_with(name, &options)?.into_std())
 }
 
-fn snapshot_regular_file(
-    mut file: fs::File,
-    path: &Path,
-) -> io::Result<(FileSnapshot, fs::Metadata)> {
+fn snapshot_regular_file(mut file: fs::File, path: &Path) -> io::Result<FileSnapshot> {
     let metadata = file.metadata()?;
     require_regular_file(
         &cap_std::fs::Metadata::from_just_metadata(metadata.clone()),
@@ -605,7 +594,7 @@ fn snapshot_regular_file(
     let identity = file_identity(&file, path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok((FileSnapshot { bytes, identity }, metadata))
+    Ok(FileSnapshot { bytes, identity })
 }
 
 pub(crate) fn regular_file_exists_at(
@@ -635,7 +624,7 @@ pub(crate) fn read_bounded_regular_text_at(
             format!("failed to read {}: {error}", path.display()),
         )
     })?;
-    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
+    let (bytes, _) = read_bounded_regular_bytes(file, path, max_bytes)?;
     String::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -650,35 +639,65 @@ pub(crate) fn read_bounded_regular_file_snapshot_at(
     path: &Path,
     max_bytes: u64,
 ) -> io::Result<FileSnapshot> {
-    let file = open_file_nofollow_at(directory, name)?;
-    let identity = file_identity(&file, path)?;
-    let bytes = read_bounded_regular_bytes(file, path, max_bytes)?;
-    Ok(FileSnapshot { bytes, identity })
+    read_bounded_regular_file_snapshot_with_metadata_at(directory, name, path, max_bytes)
+        .map(|(snapshot, _)| snapshot)
 }
 
-fn read_bounded_regular_bytes(file: fs::File, path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let read_error = |error: io::Error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to read {}: {error}", path.display()),
-        )
-    };
-    let metadata = cap_std::fs::Metadata::from_just_metadata(file.metadata().map_err(read_error)?);
-    require_regular_file(&metadata, path)?;
+pub(crate) fn read_bounded_regular_file_snapshot_with_metadata_at(
+    directory: &Dir,
+    name: &OsStr,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<(FileSnapshot, fs::Metadata)> {
+    let file = open_file_nofollow_at(directory, name)?;
+    let identity = file_identity(&file, path)?;
+    let (bytes, metadata) = read_bounded_regular_bytes(file, path, max_bytes)?;
+    Ok((FileSnapshot { bytes, identity }, metadata))
+}
 
+fn read_bounded_regular_bytes(
+    file: fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<(Vec<u8>, fs::Metadata)> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| bounded_read_error(path, error))?;
+    require_regular_file(
+        &cap_std::fs::Metadata::from_just_metadata(metadata.clone()),
+        path,
+    )?;
+    let bytes = read_bounded_bytes(file, metadata.len(), path, max_bytes)?;
+    Ok((bytes, metadata))
+}
+
+fn bounded_read_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("failed to read {}: {error}", path.display()),
+    )
+}
+
+fn read_bounded_bytes(
+    reader: impl Read,
+    observed_size: u64,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
     let too_large = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("file exceeds {max_bytes} bytes: {}", path.display()),
         )
     };
-    if metadata.len() > max_bytes {
+    if observed_size > max_bytes {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
+    reader
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(read_error)?;
+        .map_err(|error| bounded_read_error(path, error))?;
     if bytes.len() as u64 > max_bytes {
         return Err(too_large());
     }
@@ -1164,6 +1183,39 @@ fn install_noclobber_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_read_stops_when_a_regular_file_grows_during_read() {
+        use std::io::Seek as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contest.toml");
+        fs::write(&path, [b'a'; 8]).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let observed_size = file.metadata().unwrap().len();
+        let mut first_read = true;
+        let reader = io::Read::by_ref(&mut file);
+        struct GrowOnRead<F>(F);
+        impl<F: FnMut(&mut [u8]) -> io::Result<usize>> Read for GrowOnRead<F> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                (self.0)(bytes)
+            }
+        }
+        let reader = GrowOnRead(|buffer: &mut [u8]| {
+            let read = reader.read(buffer)?;
+            if first_read {
+                assert!(read > 0);
+                writer.write_all(&[b'b'; 32])?;
+                first_read = false;
+            }
+            Ok(read)
+        });
+        let error = read_bounded_bytes(reader, observed_size, &path, 16).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(file.stream_position().unwrap(), 17);
+        assert_eq!(file.metadata().unwrap().len(), 40);
+    }
 
     #[test]
     fn tree_fingerprints_match_exact_snapshots_and_detect_content_structure_and_identity() {
