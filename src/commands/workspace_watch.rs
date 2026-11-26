@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -28,6 +29,8 @@ use super::watch_worker::RunWorker;
 const POLL: Duration = Duration::from_millis(20);
 const MANIFEST_POLL: Duration = Duration::from_secs(1);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+const SOURCE_SLICE_TIME: Duration = Duration::from_millis(2);
+const SOURCE_SLICE_CANDIDATES: usize = 24;
 
 pub(super) struct WorkspaceWatcher {
     stop: Arc<AtomicBool>,
@@ -160,22 +163,15 @@ impl WorkspaceWatcher {
         let handle = thread::Builder::new()
             .name("atc-workspace-watch".into())
             .spawn(move || {
-                let mut index = WatchIndex {
+                let mut index = WatchIndex::new(
                     root,
                     root_identity,
                     config,
                     worker,
                     file_watcher,
-                    stop: thread_stop,
-                    status: thread_status,
-                    contests: BTreeMap::new(),
-                    sources: HashMap::new(),
-                    installed: BTreeMap::new(),
-                    manifests: HashMap::new(),
-                    paused: HashSet::new(),
-                    next_epoch: 0,
-                    retry: false,
-                };
+                    thread_stop,
+                    thread_status,
+                );
                 let initial = index.initialize();
                 let _ = ready.send(
                     initial
@@ -290,12 +286,31 @@ struct WatchIndex {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<WatchStatus>>,
     contests: BTreeMap<String, WatchedContest>,
-    sources: HashMap<PathBuf, SourceEntry>,
+    sources: BTreeMap<PathBuf, SourceEntry>,
     installed: BTreeMap<PathBuf, WorkspaceRegistration>,
     manifests: HashMap<PathBuf, Option<WatchManifestStamp>>,
     paused: HashSet<String>,
     next_epoch: u64,
     retry: bool,
+    topology_dirty: bool,
+    recovery: Option<SourcePass>,
+    // Rescan and backend gaps provide no affected paths. Coalesce them into one
+    // follow-up pass over the live index without resetting the current cursor.
+    recovery_requested: bool,
+}
+
+struct SourcePass {
+    after: Option<PathBuf>,
+    through: PathBuf,
+    through_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SourceEvent {
+    Notification,
+    Recovery,
+    #[cfg(not(target_os = "macos"))]
+    InitialRecovery,
 }
 
 struct WatchedContest {
@@ -310,13 +325,42 @@ struct SourceEntry {
     language: Language,
     epoch: u64,
     stamp: Option<WatchedFileStamp>,
-    #[cfg(target_os = "macos")]
     require_new_write: bool,
 }
 
 impl WatchIndex {
+    fn new(
+        root: PathBuf,
+        root_identity: PhysicalDirectoryIdentity,
+        config: RunnerConfig,
+        worker: Arc<RunWorker>,
+        file_watcher: WorkspaceFileWatcher,
+        stop: Arc<AtomicBool>,
+        status: Arc<Mutex<WatchStatus>>,
+    ) -> Self {
+        Self {
+            root,
+            root_identity,
+            config,
+            worker,
+            file_watcher,
+            stop,
+            status,
+            contests: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            manifests: HashMap::new(),
+            paused: HashSet::new(),
+            next_epoch: 0,
+            retry: false,
+            topology_dirty: false,
+            recovery: None,
+            recovery_requested: false,
+        }
+    }
+
     fn initialize(&mut self) -> io::Result<()> {
-        self.reconcile(true, None)?;
+        self.reconcile(None)?;
         #[cfg(target_os = "macos")]
         if self.installed.is_empty() {
             let status = self
@@ -327,37 +371,88 @@ impl WatchIndex {
                 || "No FSEvents registration could be started".into(),
             )));
         }
+        // Keep the pre-Ready comparison on backends without deferred registration recovery.
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.recovery_requested = true;
+            while self.has_recovery_work() && !self.is_stopping() {
+                self.advance_recovery(SourceEvent::InitialRecovery)?;
+            }
+            self.topology_dirty = false;
+        }
         Ok(())
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Acquire) || self.worker.is_stopping()
     }
 
     fn run(&mut self, inbox: &mpsc::Receiver<Command>) -> io::Result<()> {
         let mut periodic = Instant::now() + RECONCILE_INTERVAL;
         let mut manifest_poll = Instant::now() + MANIFEST_POLL;
-        while !self.stop.load(Ordering::Acquire) && !self.worker.is_stopping() {
-            if let Some(batch) = self.file_watcher.take_ready() {
-                self.process(batch)?;
-            }
-            if Instant::now() >= periodic {
-                self.reconcile(true, None)?;
-                periodic = Instant::now() + RECONCILE_INTERVAL;
-            }
-            if Instant::now() >= manifest_poll {
-                if self
-                    .manifests
-                    .iter()
-                    .any(|(path, old)| workspace::watch_manifest_stamp(path) != *old)
-                {
-                    self.reconcile(false, None)?;
+        let mut command = None;
+        while !self.is_stopping() {
+            if command.is_none() {
+                match inbox.try_recv() {
+                    Ok(next) => command = Some(next),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-                manifest_poll = Instant::now() + MANIFEST_POLL;
             }
-            match inbox.recv_timeout(POLL) {
-                Ok(command) => self.handle(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            self.run_turn(command.take(), &mut periodic, &mut manifest_poll)?;
+            if !self.has_recovery_work() && !self.topology_dirty && !self.is_stopping() {
+                match inbox.recv_timeout(POLL) {
+                    Ok(next) => command = Some(next),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
         Ok(())
+    }
+
+    fn run_turn(
+        &mut self,
+        command: Option<Command>,
+        periodic: &mut Instant,
+        manifest_poll: &mut Instant,
+    ) -> io::Result<()> {
+        if self.is_stopping() {
+            return Ok(());
+        }
+        // One command per turn leaves time for ready notifications and for recovery
+        // even with a continuously full command channel.
+        if let Some(command) = command {
+            self.handle(command);
+        }
+        if self.is_stopping() {
+            return Ok(());
+        }
+        if let Some(batch) = self.file_watcher.take_ready() {
+            self.process(batch)?;
+        }
+        if self.is_stopping() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= *periodic {
+            self.reconcile(None)?;
+            self.recovery_requested |= !self.file_watcher.recovery_pending();
+            *periodic = Instant::now() + RECONCILE_INTERVAL;
+            *manifest_poll = Instant::now() + MANIFEST_POLL;
+        } else if self.topology_dirty {
+            self.reconcile(None)?;
+        } else if now >= *manifest_poll {
+            if self
+                .manifests
+                .iter()
+                .any(|(path, old)| workspace::watch_manifest_stamp(path) != *old)
+            {
+                self.reconcile(None)?;
+            }
+            *manifest_poll = Instant::now() + MANIFEST_POLL;
+        }
+        self.advance_recovery(SourceEvent::Recovery)
     }
 
     fn handle(&mut self, command: Command) {
@@ -368,28 +463,28 @@ impl WatchIndex {
                 reply,
             } => {
                 let found = self.open(&destination, &contest).or_else(|_| {
-                    self.reconcile(false, None)?;
+                    self.reconcile(None)?;
                     self.open(&destination, &contest)
                 });
                 let _ = reply.send(found);
             }
             Command::Pause { id, reply } => {
                 self.paused.insert(id.clone());
-                let _ = reply.send(self.retire(&id).and_then(|()| self.reconcile(false, None)));
+                let _ = reply.send(self.retire(&id).and_then(|()| self.reconcile(None)));
             }
             Command::Resume { id, reply } => {
                 self.paused.remove(&id);
-                let _ = reply.send(self.reconcile(false, None));
+                let _ = reply.send(self.reconcile(None));
             }
             #[cfg(test)]
             Command::Reconcile { rescan, reply } => {
-                let _ = reply.send(self.reconcile(rescan, None));
+                let result = self.reconcile(None);
+                self.recovery_requested |= rescan && result.is_ok();
+                let _ = reply.send(result);
             }
             #[cfg(test)]
             Command::DropNotifications(reply) => {
-                self.file_watcher.set_interests(WatchInterests::default());
-                #[cfg(target_os = "macos")]
-                self.file_watcher.clear_scheduled_recovery();
+                self.file_watcher.drop_notifications();
                 let _ = reply.send(Ok(()));
             }
             #[cfg(test)]
@@ -441,14 +536,11 @@ impl WatchIndex {
         // Refresh topology before applying saved paths. Their captured epoch must still match.
         let reconcile = batch.reconcile || batch.rescan || self.retry;
         if reconcile {
-            self.reconcile(false, batch.error.as_deref())?;
+            self.reconcile(batch.error.as_deref())?;
         }
         let mut verified = HashMap::new();
-        let mut delivered = HashSet::new();
         for (path, epoch) in batch.paths {
-            if self.source_event(&path, epoch, true, &mut verified)? {
-                delivered.insert(path);
-            }
+            self.source_event(&path, epoch, SourceEvent::Notification, &mut verified)?;
         }
         {
             let mut status = self
@@ -459,32 +551,67 @@ impl WatchIndex {
                 status.latest_notification = Some(save);
             }
         }
-        if (reconcile || batch.recover) && !self.file_watcher.recovery_pending() {
-            self.recover_sources(&delivered, &mut verified)?;
-        }
-        if verified.values().any(|valid| !valid) {
-            self.reconcile(false, None)?;
-        }
+        // A new registration may have opened a fresh fixed window. Its recovery
+        // marker will be delivered with that window's ordinary notifications.
+        self.recovery_requested |=
+            batch.recover || (reconcile && !self.file_watcher.recovery_pending());
+        self.topology_dirty |= verified.values().any(|valid| !valid);
         Ok(())
     }
 
-    fn recover_sources(
-        &mut self,
-        delivered: &HashSet<PathBuf>,
-        verified: &mut HashMap<u64, bool>,
-    ) -> io::Result<()> {
-        let mut candidates: Vec<_> = self
+    fn has_recovery_work(&self) -> bool {
+        self.recovery.is_some() || self.recovery_requested
+    }
+
+    fn advance_recovery(&mut self, event: SourceEvent) -> io::Result<()> {
+        let mut pass = match self.recovery.take() {
+            Some(pass) => pass,
+            None if self.has_recovery_work() => {
+                self.recovery_requested = false;
+                let Some((last, _)) = self.sources.last_key_value() else {
+                    return Ok(());
+                };
+                SourcePass {
+                    after: None,
+                    through: last.clone(),
+                    through_epoch: self.next_epoch,
+                }
+            }
+            None => return Ok(()),
+        };
+        let deadline = Instant::now() + SOURCE_SLICE_TIME;
+        let lower = pass.after.as_deref().map_or(Unbounded, Excluded);
+        let batch: Vec<_> = self
             .sources
-            .iter()
+            .range::<Path, _>((lower, Included(pass.through.as_path())))
+            .take(SOURCE_SLICE_CANDIDATES)
             .map(|(path, source)| (path.clone(), source.epoch))
             .collect();
-        // Missing OS events have no recoverable order. Use a stable path order for the recovered suffix.
-        candidates.sort_unstable();
-        for (path, epoch) in candidates {
-            if !delivered.contains(&path) {
-                self.source_event(&path, epoch, false, verified)?;
+        let hit_candidate_limit = batch.len() == SOURCE_SLICE_CANDIDATES;
+        let mut candidates = batch.into_iter();
+        // Recheck ownership within each slice. A successful check from an earlier
+        // turn cannot authorize work after a Refresh or external move.
+        let mut verified = HashMap::new();
+        for (path, epoch) in candidates.by_ref() {
+            if self.is_stopping() {
+                return Ok(());
+            }
+            // New registrations have their own baseline and a later recovery
+            // request. A replaced path must never be read on behalf of this pass.
+            if epoch <= pass.through_epoch {
+                self.source_event(&path, epoch, event, &mut verified)?;
+            }
+            pass.after = Some(path);
+            if Instant::now() >= deadline {
+                break;
             }
         }
+        if (hit_candidate_limit || candidates.len() > 0)
+            && pass.after.as_deref() != Some(pass.through.as_path())
+        {
+            self.recovery = Some(pass);
+        }
+        self.topology_dirty |= verified.values().any(|valid| !valid);
         Ok(())
     }
 
@@ -492,18 +619,19 @@ impl WatchIndex {
         &mut self,
         path: &Path,
         epoch: u64,
-        notified: bool,
+        event: SourceEvent,
         verified: &mut HashMap<u64, bool>,
-    ) -> io::Result<bool> {
-        if self.stop.load(Ordering::Acquire) || self.worker.is_stopping() {
-            return Ok(false);
+    ) -> io::Result<()> {
+        if self.is_stopping() {
+            return Ok(());
         }
+        let notified = matches!(event, SourceEvent::Notification);
         let Some(source) = self
             .sources
             .get_mut(path)
             .filter(|source| source.epoch == epoch)
         else {
-            return Ok(false);
+            return Ok(());
         };
         #[cfg(target_os = "macos")]
         if notified
@@ -512,15 +640,22 @@ impl WatchIndex {
                 .and_then(|parent| self.installed.get(parent))
                 .is_some_and(|registration| registration.epoch == Some(epoch))
         {
-            return Ok(false);
+            return Ok(());
         }
         let Some(contest) = self
             .contests
             .get(source.target.scope.contest_id())
             .filter(|contest| contest.epoch == epoch)
         else {
-            return Ok(false);
+            return Ok(());
         };
+        let pending_notification = || {
+            matches!(event, SourceEvent::Recovery)
+                && self.file_watcher.has_pending_source(path, epoch)
+        };
+        if pending_notification() {
+            return Ok(());
+        }
         let stamp = match contest.context.source_stamp(&source.path) {
             Ok(stamp) => stamp,
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => None,
@@ -528,7 +663,7 @@ impl WatchIndex {
                 // A write/rename can still be in progress. Leave the old fingerprint so
                 // another notification or reconciliation can recover the final state.
                 self.retry = true;
-                return Ok(false);
+                return Ok(());
             }
         };
         // FSEvents can repeat creation/data flags on a chmod. A ctime-only change with
@@ -536,35 +671,43 @@ impl WatchIndex {
         // so repeated notifications for that metadata state are ignored too.
         #[cfg(target_os = "macos")]
         if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
-            && (current.metadata_only_change_from(previous)
-                || (source.require_new_write && current.same_write_as(previous)))
+            && current.metadata_only_change_from(previous)
         {
-            return Ok(false);
+            return Ok(());
+        }
+        if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
+            && (!notified || source.require_new_write)
+            && current.same_write_as(previous)
+        {
+            return Ok(());
         }
         let fingerprint = stamp.as_ref().map(|stamp| &stamp.fingerprint);
         let previous_fingerprint = source.stamp.as_ref().map(|stamp| &stamp.fingerprint);
-        if fingerprint == previous_fingerprint && (!notified || stamp.is_none()) {
-            #[cfg(target_os = "macos")]
-            if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
-                && !current.same_write_as(previous)
-            {
-                source.require_new_write = false;
-            }
-            source.stamp = stamp;
-            return Ok(false);
+        if fingerprint.is_none() && previous_fingerprint.is_none() {
+            return Ok(());
         }
-        let valid = *verified
-            .entry(epoch)
-            .or_insert_with(|| contest.context.revalidate().is_ok());
-        if !valid {
-            return Ok(false);
+        let unchanged = !notified && fingerprint == previous_fingerprint;
+        if !unchanged
+            && !*verified
+                .entry(epoch)
+                .or_insert_with(|| contest.context.revalidate().is_ok())
+        {
+            return Ok(());
+        }
+        // A callback may have arrived while the file or ownership was being checked.
+        // Once this check passes, later delivery of the same write is deduplicated.
+        if self.stop.load(Ordering::Acquire) || self.worker.is_stopping() || pending_notification()
+        {
+            return Ok(());
+        }
+        if unchanged {
+            source.require_new_write = false;
+            source.stamp = stamp;
+            return Ok(());
         }
 
         source.stamp = stamp;
-        #[cfg(target_os = "macos")]
-        {
-            source.require_new_write = !notified;
-        }
+        source.require_new_write = !notified;
         let generation = &contest.context.generation;
         let gate = generation.source_gate(&source.target.task_id);
         let sender = self.worker.sender();
@@ -625,7 +768,7 @@ impl WatchIndex {
                 })
                 .map_err(|_| closed())?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn retire(&mut self, id: &str) -> io::Result<()> {
@@ -642,11 +785,14 @@ impl WatchIndex {
                 scopes.insert(contest.context.generation.scope().clone());
             }
         }
-        if scopes.is_empty() || self.worker.is_stopping() {
+        if scopes.is_empty() {
             return Ok(());
         }
         self.sources
             .retain(|_, source| !epochs.contains(&source.epoch));
+        if self.worker.is_stopping() {
+            return Ok(());
+        }
         match self.worker.invalidate_scopes_and_join(scopes) {
             Err(_) if self.worker.is_stopping() => Ok(()),
             result => result,
@@ -658,8 +804,8 @@ impl WatchIndex {
         self.retire_many(ids)
     }
 
-    fn reconcile(&mut self, rescan: bool, backend_error: Option<&str>) -> io::Result<()> {
-        if self.stop.load(Ordering::Acquire) || self.worker.is_stopping() {
+    fn reconcile(&mut self, backend_error: Option<&str>) -> io::Result<()> {
+        if self.is_stopping() {
             return Ok(());
         }
         if workspace::contest_directory_identity(&self.root)? != self.root_identity {
@@ -669,6 +815,9 @@ impl WatchIndex {
             ));
         }
         self.retry = false;
+        self.topology_dirty = false;
+        #[cfg(not(target_os = "macos"))]
+        let previous_epoch = self.next_epoch;
         let mut diagnostics = Diagnostics::default();
         if let Some(error) = backend_error {
             diagnostics.report(error.to_owned());
@@ -745,7 +894,7 @@ impl WatchIndex {
 
         let mut manifests = HashMap::new();
         for (id, route) in routes {
-            if self.stop.load(Ordering::Acquire) || self.worker.is_stopping() {
+            if self.is_stopping() {
                 return Ok(());
             }
             let path = route.destination.clone();
@@ -793,12 +942,12 @@ impl WatchIndex {
             |error| diagnostics.report_registration(error),
         )?;
         #[cfg(not(target_os = "macos"))]
-        self.update_registrations(desired, &mut diagnostics);
+        {
+            let changed = self.update_registrations(desired, &mut diagnostics);
+            self.recovery_requested |= changed || previous_epoch != self.next_epoch;
+        }
 
         self.publish_status(diagnostics);
-        if rescan && !self.file_watcher.recovery_pending() {
-            self.recover_sources(&HashSet::new(), &mut HashMap::new())?;
-        }
         Ok(())
     }
 
@@ -807,7 +956,8 @@ impl WatchIndex {
         &mut self,
         desired: BTreeMap<PathBuf, WorkspaceRegistration>,
         diagnostics: &mut Diagnostics,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         let removed: Vec<_> = self
             .installed
             .iter()
@@ -818,6 +968,7 @@ impl WatchIndex {
             match self.file_watcher.unregister(&path) {
                 Ok(()) => {
                     self.installed.remove(&path);
+                    changed = true;
                 }
                 Err(error) => diagnostics.report(format!("unwatch {}: {error}", path.display())),
             }
@@ -829,10 +980,12 @@ impl WatchIndex {
             match self.file_watcher.register(&path) {
                 Ok(()) => {
                     self.installed.insert(path, identity);
+                    changed = true;
                 }
                 Err(error) => diagnostics.report(format!("watch {}: {error}", path.display())),
             }
         }
+        changed
     }
 
     fn add_contest(
@@ -878,10 +1031,9 @@ impl WatchIndex {
                     language: source.language,
                     epoch,
                     stamp,
-                    #[cfg(target_os = "macos")]
                     // A native event with the baseline's file stamp can be a delayed
                     // coalesced FSEvents notification from before this watch existed.
-                    require_new_write: true,
+                    require_new_write: cfg!(target_os = "macos"),
                 },
             );
         }
@@ -1008,6 +1160,279 @@ mod tests {
             .expect("watcher joined before worker shutdown")
             .stop_and_join()
             .unwrap();
+    }
+
+    fn stepped_index(root: &Path) -> WatchIndex {
+        let mut index = WatchIndex::new(
+            std::path::absolute(root).unwrap(),
+            workspace::contest_directory_identity(root).unwrap(),
+            RunnerConfig::default(),
+            Arc::new(RunWorker::start_workspace().unwrap()),
+            WorkspaceFileWatcher::new().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(WatchStatus::default())),
+        );
+        index.initialize().unwrap();
+        index.file_watcher.drop_notifications();
+        index
+    }
+
+    fn step(index: &mut WatchIndex, command: Option<Command>) {
+        let mut periodic = Instant::now() + RECONCILE_INTERVAL;
+        let mut manifest_poll = Instant::now() + MANIFEST_POLL;
+        index
+            .run_turn(command, &mut periodic, &mut manifest_poll)
+            .unwrap();
+    }
+
+    fn finish_pass(index: &mut WatchIndex) {
+        for _ in 0..=index.sources.len() {
+            if index.recovery.is_none() {
+                return;
+            }
+            step(index, None);
+        }
+        panic!("recovery cursor failed to finish");
+    }
+
+    fn populate(root: &Path) -> Contest {
+        config(root, "");
+        for i in 1000..1039 {
+            fixture(root, &format!("abc{i}"), false);
+        }
+        fixture(root, "abc1039", false)
+    }
+
+    fn observed(path: &Path) -> PathBuf {
+        watcher::watch_directory(path.parent().unwrap())
+            .unwrap()
+            .join(path.file_name().unwrap())
+    }
+
+    #[test]
+    fn recovery_yields_to_open_and_ready_batches_under_continuous_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let contest = populate(root);
+        let mut index = stepped_index(root);
+        let saves = SaveReceipts(index.status.clone());
+        let destination = root.join(&contest.contest_id);
+        let ordinary = observed(&destination.join("A.py"));
+        let epoch = index.sources[&ordinary].epoch;
+        for entry in index.sources.values().filter(|entry| {
+            entry.language == Language::Python
+                && entry.target.scope.contest_id() != contest.contest_id
+        }) {
+            fs::write(&entry.path, "pass\n").unwrap();
+        }
+        index.recovery_requested = true;
+        for turn in 1..=index.sources.len() {
+            fs::write(&ordinary, format!("# save {turn}\n")).unwrap();
+            index.file_watcher.record_source_for_test(
+                &ordinary,
+                epoch,
+                Instant::now() - Duration::from_secs(1),
+            );
+            let (reply, result) = mpsc::channel();
+            step(
+                &mut index,
+                Some(Command::Open {
+                    destination: destination.clone(),
+                    contest: contest.clone(),
+                    reply,
+                }),
+            );
+            let (generation, _) = result.try_recv().unwrap().unwrap();
+            assert_eq!(generation.scope().contest_id(), contest.contest_id);
+            let (notification, pending) = saves.latest_after(0);
+            assert!(!pending);
+            let notification = notification.unwrap();
+            assert_eq!(notification.target.scope, *generation.scope());
+            assert_eq!(notification.origin, SaveOrigin::Notification);
+            if turn == 1 {
+                assert!(
+                    index.recovery.is_some(),
+                    "one turn must yield with work left"
+                );
+                if let Some(recovered) = index.status.lock().unwrap().latest_save.as_ref()
+                    && recovered.origin == SaveOrigin::Reconciliation
+                {
+                    assert!(recovered.sequence > notification.sequence);
+                }
+            }
+            if !index.has_recovery_work() {
+                assert_eq!(saves.accepted_sequence(), 39 + turn as u64);
+                return;
+            }
+        }
+        panic!("commands and saves prevented recovery from finishing");
+    }
+
+    #[test]
+    fn recovery_leaves_a_pending_save_for_its_fixed_notification_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        populate(root);
+        let mut index = stepped_index(root);
+        let saves = SaveReceipts(index.status.clone());
+        index.recovery_requested = true;
+        step(&mut index, None);
+        let path = observed(&root.join("abc1039/A.py"));
+        assert!(index.recovery.as_ref().unwrap().after.as_ref().unwrap() < &path);
+        fs::write(&path, "pass\n").unwrap();
+        let stamp = Instant::now() + Duration::from_secs(10);
+        index
+            .file_watcher
+            .record_source_for_test(&path, index.sources[&path].epoch, stamp);
+        finish_pass(&mut index);
+        assert_eq!(saves.accepted_sequence(), 0);
+        assert!(
+            index
+                .file_watcher
+                .take_ready_at(stamp + Duration::from_millis(149))
+                .is_none()
+        );
+        let ready = index
+            .file_watcher
+            .take_ready_at(stamp + Duration::from_millis(150))
+            .unwrap();
+        index.process(ready).unwrap();
+        assert_eq!(
+            saves.latest_after(0).0.unwrap().origin,
+            SaveOrigin::Notification
+        );
+        index.recovery_requested = true;
+        step(&mut index, None);
+        finish_pass(&mut index);
+        assert_eq!(saves.accepted_sequence(), 1);
+    }
+
+    #[test]
+    fn rescans_during_a_pass_coalesce_and_revisit_the_completed_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        populate(root);
+        let mut index = stepped_index(root);
+        let saves = SaveReceipts(index.status.clone());
+        index.recovery_requested = true;
+        step(&mut index, None);
+        let after = index.recovery.as_ref().unwrap().after.clone();
+        let first = index.sources.first_key_value().unwrap().1.path.clone();
+        fs::write(first, "int main() {}\n").unwrap();
+        fs::write(root.join("abc1039/A.py"), "pass\n").unwrap();
+        for _ in 0..3 {
+            index
+                .process(WorkspaceBatch {
+                    paths: Vec::new(),
+                    reconcile: false,
+                    rescan: true,
+                    recover: false,
+                    error: None,
+                    peak_paths: 0,
+                })
+                .unwrap();
+            index.file_watcher.drop_notifications();
+            assert_eq!(index.recovery.as_ref().unwrap().after, after);
+        }
+        finish_pass(&mut index);
+        assert!(index.recovery_requested);
+        assert_eq!(saves.accepted_sequence(), 1);
+        step(&mut index, None);
+        finish_pass(&mut index);
+        assert!(!index.has_recovery_work());
+        assert_eq!(saves.accepted_sequence(), 2);
+        assert!(saves.latest_after(0).0.is_none());
+    }
+
+    #[test]
+    fn a_resumed_pass_rejects_refreshed_deleted_and_moved_registrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut refreshed = populate(root);
+        let mut index = stepped_index(root);
+        let saves = SaveReceipts(index.status.clone());
+        let destination = root.join(&refreshed.contest_id);
+        let path = observed(&destination.join("A.py"));
+        let old_epoch = index.sources[&path].epoch;
+        let (old, old_results) = index.open(&destination, &refreshed).unwrap();
+        index.recovery_requested = true;
+        step(&mut index, None);
+        let (reply, result) = mpsc::channel();
+        index.handle(Command::Pause {
+            id: refreshed.contest_id.clone(),
+            reply,
+        });
+        result.try_recv().unwrap().unwrap();
+        assert!(old_results.attach(mpsc::channel().0).is_err());
+
+        refreshed.problems[0].title = "Refreshed".into();
+        workspace::save_metadata(&destination, &refreshed).unwrap();
+        fs::write(root.join("abc1037/A.py"), "pass\n").unwrap();
+        fs::write(root.join("abc1038/A.py"), "pass\n").unwrap();
+        fs::remove_dir_all(root.join("abc1037")).unwrap();
+        fs::rename(root.join("abc1038"), root.join("moved")).unwrap();
+        let (reply, result) = mpsc::channel();
+        index.handle(Command::Resume {
+            id: refreshed.contest_id.clone(),
+            reply,
+        });
+        result.try_recv().unwrap().unwrap();
+        index.file_watcher.drop_notifications();
+        let (new, _) = index.open(&destination, &refreshed).unwrap();
+        assert_ne!(old.scope(), new.scope());
+        assert!(index.sources[&path].epoch > old_epoch);
+        fs::write(&path, "pass\n").unwrap();
+        index
+            .process(WorkspaceBatch {
+                paths: vec![(path, old_epoch)],
+                reconcile: false,
+                rescan: false,
+                recover: false,
+                error: None,
+                peak_paths: 0,
+            })
+            .unwrap();
+        finish_pass(&mut index);
+        assert_eq!(saves.accepted_sequence(), 0);
+        index.recovery_requested = true;
+        step(&mut index, None);
+        finish_pass(&mut index);
+        let receipt = index.status.lock().unwrap().latest_save.clone().unwrap();
+        assert_eq!(receipt.target.scope, *new.scope());
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(receipt.origin, SaveOrigin::Reconciliation);
+    }
+
+    #[test]
+    fn stop_at_a_slice_boundary_discards_work_before_retiring_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let contest = populate(root);
+        let mut index = stepped_index(root);
+        let saves = SaveReceipts(index.status.clone());
+        let destination = root.join(&contest.contest_id);
+        let (_, results) = index.open(&destination, &contest).unwrap();
+        index.recovery_requested = true;
+        step(&mut index, None);
+        assert!(index.recovery.is_some());
+        fs::write(destination.join("A.py"), "pass\n").unwrap();
+        let (reply, result) = mpsc::channel();
+        index.stop.store(true, Ordering::Release);
+        step(
+            &mut index,
+            Some(Command::Open {
+                destination,
+                contest,
+                reply,
+            }),
+        );
+        assert!(matches!(
+            result.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        index.retire_all().unwrap();
+        assert!(results.attach(mpsc::channel().0).is_err());
+        assert_eq!(saves.accepted_sequence(), 0);
     }
 
     fn python() -> RunnerConfig {
@@ -1325,17 +1750,14 @@ mod tests {
         thread::sleep(Duration::from_millis(350));
         assert_eq!(watcher.status().accepted, 0);
         watcher.reconcile(true).unwrap();
-        let recovered = watcher.status().latest_save.unwrap();
+        let recovered = wait_for(|| watcher.status().latest_save);
         assert_eq!(recovered.target.scope.contest_id(), "abc480");
         assert_eq!(recovered.sequence, 1);
         assert_eq!(recovered.origin, SaveOrigin::Reconciliation);
         assert!(watcher.saves().latest_after(0).0.is_none());
-        watcher.reconcile(true).unwrap();
-        assert_eq!(watcher.status().accepted, 1);
         stop(worker, watcher);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn recovery_deduplicates_a_late_notification_but_keeps_a_same_content_resave() {
         let temp = tempfile::tempdir().unwrap();
@@ -1347,14 +1769,17 @@ mod tests {
         fs::write(&path, "print(0)\n").unwrap();
         let (worker, watcher) = start(root, RunnerConfig::default());
         watcher.request(Command::DropNotifications).unwrap();
-        watcher
-            .request(|reply| Command::SourceBatch(vec![path.clone()], reply))
-            .unwrap();
-        assert_eq!(watcher.status().accepted, 0);
+        #[cfg(target_os = "macos")]
+        {
+            watcher
+                .request(|reply| Command::SourceBatch(vec![path.clone()], reply))
+                .unwrap();
+            assert_eq!(watcher.status().accepted, 0);
+        }
         fs::write(&path, "print(1)\n").unwrap();
         watcher.reconcile(true).unwrap();
         assert_eq!(
-            watcher.status().latest_save.unwrap().origin,
+            wait_for(|| watcher.status().latest_save).origin,
             SaveOrigin::Reconciliation
         );
         watcher
@@ -1365,6 +1790,12 @@ mod tests {
 
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         fs::write(&path, "print(1)\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before + Duration::from_secs(2))
+            .unwrap();
         assert_ne!(before, fs::metadata(&path).unwrap().modified().unwrap());
         watcher
             .request(|reply| Command::SourceBatch(vec![path], reply))
@@ -1412,7 +1843,11 @@ mod tests {
         thread::sleep(Duration::from_millis(350));
         watcher.reconcile(true).unwrap();
         assert_eq!(
-            watcher.status().latest_save.unwrap().origin,
+            wait_for(|| watcher
+                .status()
+                .latest_save
+                .filter(|receipt| receipt.sequence == 3))
+            .origin,
             SaveOrigin::Reconciliation
         );
         assert_eq!(saves.accepted_sequence(), 3);

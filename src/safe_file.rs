@@ -219,7 +219,6 @@ pub(crate) struct FileFingerprint {
 
 pub(crate) struct WatchedFileStamp {
     pub(crate) fingerprint: FileFingerprint,
-    #[cfg(target_os = "macos")]
     modified: std::time::SystemTime,
     #[cfg(target_os = "macos")]
     changed: (i64, i64),
@@ -228,10 +227,9 @@ pub(crate) struct WatchedFileStamp {
 impl WatchedFileStamp {
     #[cfg(target_os = "macos")]
     pub(crate) fn metadata_only_change_from(&self, previous: &Self) -> bool {
-        self.same_write_as(previous) && self.changed != previous.changed
+        self.changed != previous.changed && self.same_write_as(previous)
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn same_write_as(&self, previous: &Self) -> bool {
         self.fingerprint == previous.fingerprint && self.modified == previous.modified
     }
@@ -308,7 +306,6 @@ pub(crate) fn read_watched_file_stamp_at(
         hash_reader(file.take(limit))
     })?;
     Ok(WatchedFileStamp {
-        #[cfg(target_os = "macos")]
         modified: file.modified,
         #[cfg(target_os = "macos")]
         changed: file.changed,

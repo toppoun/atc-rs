@@ -222,10 +222,23 @@ impl WorkspaceFileWatcher {
     }
 
     pub(crate) fn take_ready(&self) -> Option<WorkspaceBatch> {
+        self.take_ready_at(Instant::now())
+    }
+
+    pub(crate) fn take_ready_at(&self, now: Instant) -> Option<WorkspaceBatch> {
         self.inbox
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_ready(Instant::now())
+            .take_ready(now)
+    }
+
+    pub(crate) fn has_pending_source(&self, path: &Path, epoch: u64) -> bool {
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paths
+            .get(path)
+            .is_some_and(|(generation, _)| *generation == epoch)
     }
 
     pub(crate) fn recovery_pending(&self) -> bool {
@@ -238,12 +251,31 @@ impl WorkspaceFileWatcher {
             .recover
     }
 
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn clear_scheduled_recovery(&self) {
-        self.inbox
+    #[cfg(test)]
+    pub(crate) fn drop_notifications(&self) {
+        *self
+            .inbox
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recover = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = WorkspaceInbox::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_source_for_test(&self, path: &Path, epoch: u64, now: Instant) {
+        let mut inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Install the interest just for this callback, independent of native delivery.
+        assert!(!inbox.interests.paths.contains_key(path));
+        inbox
+            .interests
+            .paths
+            .insert(path.to_path_buf(), Some(epoch));
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.to_path_buf());
+        #[cfg(target_os = "macos")]
+        let event = event.set_user_data(epoch);
+        inbox.record(Ok(event), now);
+        inbox.interests.paths.remove(path);
     }
 }
 
