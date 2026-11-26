@@ -15,3 +15,6 @@ targets = [
     "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
 ]
+
+[xxhash-rust]
+accepted = ["BSL-1.0"]

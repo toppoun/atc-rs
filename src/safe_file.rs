@@ -228,9 +228,12 @@ pub(crate) struct WatchedFileStamp {
 impl WatchedFileStamp {
     #[cfg(target_os = "macos")]
     pub(crate) fn metadata_only_change_from(&self, previous: &Self) -> bool {
-        self.fingerprint == previous.fingerprint
-            && self.modified == previous.modified
-            && self.changed != previous.changed
+        self.same_write_as(previous) && self.changed != previous.changed
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn same_write_as(&self, previous: &Self) -> bool {
+        self.fingerprint == previous.fingerprint && self.modified == previous.modified
     }
 }
 

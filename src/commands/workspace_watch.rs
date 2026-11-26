@@ -13,7 +13,9 @@ use crate::safe_file::WatchedFileStamp;
 use crate::tui::message::{
     Message, RunGeneration, RunKind, RunRequest, RunResults, RunTarget, RunWorkerCommand,
 };
-use crate::watcher::{self, WatchInterests, WorkspaceBatch, WorkspaceFileWatcher};
+use crate::watcher::{
+    self, WatchInterests, WorkspaceBatch, WorkspaceFileWatcher, WorkspaceRegistration,
+};
 use crate::workspace::batch::BatchWorkspace;
 use crate::workspace::diagnosis::{ContestDiagnosis, diagnose_watch_contest};
 use crate::workspace::update_cancellation::UpdateCancellation;
@@ -168,13 +170,13 @@ impl WorkspaceWatcher {
                     status: thread_status,
                     contests: BTreeMap::new(),
                     sources: HashMap::new(),
-                    installed: HashMap::new(),
+                    installed: BTreeMap::new(),
                     manifests: HashMap::new(),
                     paused: HashSet::new(),
                     next_epoch: 0,
                     retry: false,
                 };
-                let initial = index.reconcile(true, None);
+                let initial = index.initialize();
                 let _ = ready.send(
                     initial
                         .as_ref()
@@ -289,7 +291,7 @@ struct WatchIndex {
     status: Arc<Mutex<WatchStatus>>,
     contests: BTreeMap<String, WatchedContest>,
     sources: HashMap<PathBuf, SourceEntry>,
-    installed: HashMap<PathBuf, PhysicalDirectoryIdentity>,
+    installed: BTreeMap<PathBuf, WorkspaceRegistration>,
     manifests: HashMap<PathBuf, Option<WatchManifestStamp>>,
     paused: HashSet<String>,
     next_epoch: u64,
@@ -308,9 +310,26 @@ struct SourceEntry {
     language: Language,
     epoch: u64,
     stamp: Option<WatchedFileStamp>,
+    #[cfg(target_os = "macos")]
+    require_new_write: bool,
 }
 
 impl WatchIndex {
+    fn initialize(&mut self) -> io::Result<()> {
+        self.reconcile(true, None)?;
+        #[cfg(target_os = "macos")]
+        if self.installed.is_empty() {
+            let status = self
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Err(io::Error::other(status.warning.clone().unwrap_or_else(
+                || "No FSEvents registration could be started".into(),
+            )));
+        }
+        Ok(())
+    }
+
     fn run(&mut self, inbox: &mpsc::Receiver<Command>) -> io::Result<()> {
         let mut periodic = Instant::now() + RECONCILE_INTERVAL;
         let mut manifest_poll = Instant::now() + MANIFEST_POLL;
@@ -369,6 +388,8 @@ impl WatchIndex {
             #[cfg(test)]
             Command::DropNotifications(reply) => {
                 self.file_watcher.set_interests(WatchInterests::default());
+                #[cfg(target_os = "macos")]
+                self.file_watcher.clear_scheduled_recovery();
                 let _ = reply.send(Ok(()));
             }
             #[cfg(test)]
@@ -384,6 +405,7 @@ impl WatchIndex {
                     paths,
                     reconcile: false,
                     rescan: false,
+                    recover: false,
                     error: None,
                     peak_paths: 0,
                 }));
@@ -437,7 +459,7 @@ impl WatchIndex {
                 status.latest_notification = Some(save);
             }
         }
-        if reconcile {
+        if (reconcile || batch.recover) && !self.file_watcher.recovery_pending() {
             self.recover_sources(&delivered, &mut verified)?;
         }
         if verified.values().any(|valid| !valid) {
@@ -483,6 +505,15 @@ impl WatchIndex {
         else {
             return Ok(false);
         };
+        #[cfg(target_os = "macos")]
+        if notified
+            && !path
+                .parent()
+                .and_then(|parent| self.installed.get(parent))
+                .is_some_and(|registration| registration.epoch == Some(epoch))
+        {
+            return Ok(false);
+        }
         let Some(contest) = self
             .contests
             .get(source.target.scope.contest_id())
@@ -505,13 +536,20 @@ impl WatchIndex {
         // so repeated notifications for that metadata state are ignored too.
         #[cfg(target_os = "macos")]
         if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
-            && current.metadata_only_change_from(previous)
+            && (current.metadata_only_change_from(previous)
+                || (source.require_new_write && current.same_write_as(previous)))
         {
             return Ok(false);
         }
         let fingerprint = stamp.as_ref().map(|stamp| &stamp.fingerprint);
         let previous_fingerprint = source.stamp.as_ref().map(|stamp| &stamp.fingerprint);
         if fingerprint == previous_fingerprint && (!notified || stamp.is_none()) {
+            #[cfg(target_os = "macos")]
+            if let (Some(current), Some(previous)) = (&stamp, &source.stamp)
+                && !current.same_write_as(previous)
+            {
+                source.require_new_write = false;
+            }
             source.stamp = stamp;
             return Ok(false);
         }
@@ -523,6 +561,10 @@ impl WatchIndex {
         }
 
         source.stamp = stamp;
+        #[cfg(target_os = "macos")]
+        {
+            source.require_new_write = !notified;
+        }
         let generation = &contest.context.generation;
         let gate = generation.source_gate(&source.target.task_id);
         let sender = self.worker.sender();
@@ -635,7 +677,10 @@ impl WatchIndex {
         let mut interests = WatchInterests::default();
         let mut routes = BTreeMap::new();
         let observed_root = watcher::watch_directory(&self.root)?;
-        desired.insert(observed_root.clone(), self.root_identity.clone());
+        desired.insert(
+            observed_root.clone(),
+            WorkspaceRegistration::for_parent(self.root_identity.clone()),
+        );
         interests.parents.insert(observed_root.clone());
         interests
             .paths
@@ -666,7 +711,7 @@ impl WatchIndex {
                         Ok(Some((observed, identity))) => {
                             known_parents.insert(path, observed.clone());
                             interests.parents.insert(observed.clone());
-                            desired.insert(observed, identity);
+                            desired.insert(observed, WorkspaceRegistration::for_parent(identity));
                         }
                         Ok(None) => {}
                         Err(error) => diagnostics.report(format!("{}: {error}", path.display())),
@@ -711,18 +756,27 @@ impl WatchIndex {
                     continue;
                 }
             };
-            desired.insert(observed.clone(), route.destination_identity().clone());
+            desired.insert(
+                observed.clone(),
+                WorkspaceRegistration::new(route.destination_identity().clone()),
+            );
             interests.paths.insert(observed.join(".atc"), None);
             interests.paths.insert(observed.join("tests"), None);
             interests.contests.insert(observed.clone());
             // Windows blocks rename of a directory with an open handle to a descendant,
             // even with FILE_SHARE_DELETE. Poll metadata without watching .atc itself.
             manifests.insert(path.clone(), workspace::watch_manifest_stamp(&path));
-            if self.contests.contains_key(&id) {
-                continue;
-            }
-            if let Err(error) = self.add_contest(&id, route, &observed) {
+            if !self.contests.contains_key(&id)
+                && let Err(error) = self.add_contest(&id, route, &observed)
+            {
                 diagnostics.report(format!("{}: {error}", path.display()));
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(contest) = self.contests.get(&id) {
+                desired
+                    .get_mut(&observed)
+                    .expect("contest directory is desired")
+                    .epoch = Some(contest.epoch);
             }
         }
         for (path, source) in &self.sources {
@@ -731,6 +785,29 @@ impl WatchIndex {
         self.manifests = manifests;
         self.file_watcher.set_interests(interests);
 
+        #[cfg(target_os = "macos")]
+        self.file_watcher.replace_registrations(
+            &mut self.installed,
+            desired,
+            &self.stop,
+            |error| diagnostics.report_registration(error),
+        )?;
+        #[cfg(not(target_os = "macos"))]
+        self.update_registrations(desired, &mut diagnostics);
+
+        self.publish_status(diagnostics);
+        if rescan && !self.file_watcher.recovery_pending() {
+            self.recover_sources(&HashSet::new(), &mut HashMap::new())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn update_registrations(
+        &mut self,
+        desired: BTreeMap<PathBuf, WorkspaceRegistration>,
+        diagnostics: &mut Diagnostics,
+    ) {
         let removed: Vec<_> = self
             .installed
             .iter()
@@ -756,11 +833,6 @@ impl WatchIndex {
                 Err(error) => diagnostics.report(format!("watch {}: {error}", path.display())),
             }
         }
-        self.publish_status(diagnostics);
-        if rescan {
-            self.recover_sources(&HashSet::new(), &mut HashMap::new())?;
-        }
-        Ok(())
     }
 
     fn add_contest(
@@ -806,6 +878,10 @@ impl WatchIndex {
                     language: source.language,
                     epoch,
                     stamp,
+                    #[cfg(target_os = "macos")]
+                    // A native event with the baseline's file stamp can be a delayed
+                    // coalesced FSEvents notification from before this watch existed.
+                    require_new_write: true,
                 },
             );
         }
@@ -849,6 +925,12 @@ impl Diagnostics {
     fn report(&mut self, message: String) {
         self.count += 1;
         self.first.get_or_insert(message);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn report_registration(&mut self, message: String) {
+        self.count += 1;
+        self.first = Some(message);
     }
 
     fn summary(self) -> Option<String> {
@@ -1250,6 +1332,48 @@ mod tests {
         assert!(watcher.saves().latest_after(0).0.is_none());
         watcher.reconcile(true).unwrap();
         assert_eq!(watcher.status().accepted, 1);
+        stop(worker, watcher);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_deduplicates_a_late_notification_but_keeps_a_same_content_resave() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        config(root, "");
+        fixture(root, "abc480", false);
+        let destination = watcher::watch_directory(&root.join("abc480")).unwrap();
+        let path = destination.join("A.py");
+        fs::write(&path, "print(0)\n").unwrap();
+        let (worker, watcher) = start(root, RunnerConfig::default());
+        watcher.request(Command::DropNotifications).unwrap();
+        watcher
+            .request(|reply| Command::SourceBatch(vec![path.clone()], reply))
+            .unwrap();
+        assert_eq!(watcher.status().accepted, 0);
+        fs::write(&path, "print(1)\n").unwrap();
+        watcher.reconcile(true).unwrap();
+        assert_eq!(
+            watcher.status().latest_save.unwrap().origin,
+            SaveOrigin::Reconciliation
+        );
+        watcher
+            .request(|reply| Command::SourceBatch(vec![path.clone()], reply))
+            .unwrap();
+        assert_eq!(watcher.status().accepted, 1);
+        assert!(watcher.saves().latest_after(0).0.is_none());
+
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "print(1)\n").unwrap();
+        assert_ne!(before, fs::metadata(&path).unwrap().modified().unwrap());
+        watcher
+            .request(|reply| Command::SourceBatch(vec![path], reply))
+            .unwrap();
+        assert_eq!(watcher.status().accepted, 2);
+        assert_eq!(
+            watcher.saves().latest_after(0).0.unwrap().origin,
+            SaveOrigin::Notification
+        );
         stop(worker, watcher);
     }
 

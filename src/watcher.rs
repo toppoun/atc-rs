@@ -9,6 +9,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod macos_workspace;
+
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
 const MAX_WORKSPACE_PATHS_PER_BATCH: usize = 4096;
 
@@ -17,6 +20,39 @@ const MAX_WORKSPACE_PATHS_PER_BATCH: usize = 4096;
 pub(crate) struct WorkspaceFileWatcher {
     watcher: RecommendedWatcher,
     inbox: Arc<Mutex<WorkspaceInbox>>,
+    #[cfg(all(test, target_os = "macos"))]
+    failed_start: bool,
+    #[cfg(all(test, target_os = "macos"))]
+    applied_batches: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceRegistration {
+    pub(crate) identity: crate::workspace::PhysicalDirectoryIdentity,
+    #[cfg(target_os = "macos")]
+    pub(crate) epoch: Option<u64>,
+    #[cfg(target_os = "macos")]
+    anchor: bool,
+}
+
+impl WorkspaceRegistration {
+    pub(crate) fn new(identity: crate::workspace::PhysicalDirectoryIdentity) -> Self {
+        Self {
+            identity,
+            #[cfg(target_os = "macos")]
+            epoch: None,
+            #[cfg(target_os = "macos")]
+            anchor: false,
+        }
+    }
+
+    pub(crate) fn for_parent(identity: crate::workspace::PhysicalDirectoryIdentity) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            anchor: true,
+            ..Self::new(identity)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -35,6 +71,7 @@ struct WorkspaceInbox {
     sequence: u64,
     reconcile: bool,
     rescan: bool,
+    recover: bool,
     error: Option<String>,
     peak_paths: usize,
 }
@@ -43,6 +80,7 @@ pub(crate) struct WorkspaceBatch {
     pub(crate) paths: Vec<(PathBuf, u64)>,
     pub(crate) reconcile: bool,
     pub(crate) rescan: bool,
+    pub(crate) recover: bool,
     pub(crate) error: Option<String>,
     pub(crate) peak_paths: usize,
 }
@@ -58,6 +96,8 @@ impl WorkspaceInbox {
                 if !is_path_change(event.kind) {
                     return;
                 }
+                #[cfg(target_os = "macos")]
+                let watch_epoch = event.user_data();
                 for path in event.paths {
                     let interest = self.interests.paths.get(&path).copied().or_else(|| {
                         let name = path.file_name()?.to_str()?;
@@ -72,6 +112,12 @@ impl WorkspaceInbox {
                     let Some(interest) = interest else {
                         continue;
                     };
+                    #[cfg(target_os = "macos")]
+                    if let Some(epoch) = interest
+                        && watch_epoch != Some(epoch)
+                    {
+                        continue;
+                    }
                     // FSEvents reports inode metadata separately from data changes. A generic
                     // modify or a write-time change can be the only signal of a write.
                     if interest.is_some()
@@ -121,6 +167,7 @@ impl WorkspaceInbox {
                 .collect(),
             reconcile: std::mem::take(&mut self.reconcile),
             rescan: std::mem::take(&mut self.rescan),
+            recover: std::mem::take(&mut self.recover),
             error: self.error.take(),
             peak_paths: self.peak_paths,
         })
@@ -130,15 +177,25 @@ impl WorkspaceInbox {
 impl WorkspaceFileWatcher {
     pub(crate) fn new() -> io::Result<Self> {
         let inbox = Arc::new(Mutex::new(WorkspaceInbox::default()));
-        let callback = inbox.clone();
-        let watcher = notify::recommended_watcher(move |result| {
-            callback
+        let watcher = Self::backend(inbox.clone())?;
+        Ok(Self {
+            watcher,
+            inbox,
+            #[cfg(all(test, target_os = "macos"))]
+            failed_start: false,
+            #[cfg(all(test, target_os = "macos"))]
+            applied_batches: 0,
+        })
+    }
+
+    fn backend(inbox: Arc<Mutex<WorkspaceInbox>>) -> io::Result<RecommendedWatcher> {
+        notify::recommended_watcher(move |result| {
+            inbox
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record(result, Instant::now());
         })
-        .map_err(io::Error::other)?;
-        Ok(Self { watcher, inbox })
+        .map_err(io::Error::other)
     }
 
     pub(crate) fn set_interests(&self, interests: WatchInterests) {
@@ -148,12 +205,14 @@ impl WorkspaceFileWatcher {
             .interests = interests;
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn register(&mut self, directory: &Path) -> io::Result<()> {
         self.watcher
             .watch(directory, RecursiveMode::NonRecursive)
             .map_err(io::Error::other)
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn unregister(&mut self, directory: &Path) -> io::Result<()> {
         match self.watcher.unwatch(directory) {
             Ok(()) => Ok(()),
@@ -167,6 +226,24 @@ impl WorkspaceFileWatcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_ready(Instant::now())
+    }
+
+    pub(crate) fn recovery_pending(&self) -> bool {
+        #[cfg(not(target_os = "macos"))]
+        return false;
+        #[cfg(target_os = "macos")]
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn clear_scheduled_recovery(&self) {
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover = false;
     }
 }
 
@@ -451,6 +528,13 @@ mod tests {
         Ok(Event::new(kind).add_path(path.to_path_buf()))
     }
 
+    fn source_event(kind: EventKind, path: &Path, _epoch: u64) -> notify::Result<Event> {
+        let event = Event::new(kind).add_path(path.to_path_buf());
+        #[cfg(target_os = "macos")]
+        let event = event.set_user_data(_epoch);
+        Ok(event)
+    }
+
     fn identity_mapper() -> EventPathMapper {
         EventPathMapper::new(PathBuf::new(), PathBuf::new())
     }
@@ -467,10 +551,13 @@ mod tests {
             inbox.interests.paths.insert(path.clone(), Some(7));
         }
         for path in &files {
-            inbox.record(event(EventKind::Modify(ModifyKind::Any), path), start);
+            inbox.record(
+                source_event(EventKind::Modify(ModifyKind::Any), path, 7),
+                start,
+            );
         }
         inbox.record(
-            event(EventKind::Modify(ModifyKind::Any), &files[0]),
+            source_event(EventKind::Modify(ModifyKind::Any), &files[0], 7),
             start + Duration::from_millis(149),
         );
         inbox.record(
@@ -503,20 +590,24 @@ mod tests {
         inbox.interests.paths.insert(marker.into(), None);
         let metadata = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any));
         let data = EventKind::Modify(ModifyKind::Data(DataChange::Content));
-        inbox.record(event(metadata, source), start);
+        inbox.record(source_event(metadata, source, 1), start);
         inbox.record(
-            event(
+            source_event(
                 EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
                 source,
+                1,
             ),
             start,
         );
         assert!(inbox.take_ready(start + DEBOUNCE_DURATION).is_none());
 
-        inbox.record(event(metadata, source), start);
-        inbox.record(event(data, source), start);
-        inbox.record(event(EventKind::Modify(ModifyKind::Any), other), start);
-        inbox.record(event(metadata, source), start);
+        inbox.record(source_event(metadata, source, 1), start);
+        inbox.record(source_event(data, source, 1), start);
+        inbox.record(
+            source_event(EventKind::Modify(ModifyKind::Any), other, 2),
+            start,
+        );
+        inbox.record(source_event(metadata, source, 1), start);
         inbox.record(event(metadata, marker), start);
         inbox.record(
             Ok(Event::new(metadata)
@@ -531,11 +622,40 @@ mod tests {
 
         let start = start + DEBOUNCE_DURATION;
         let write_time = EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime));
-        inbox.record(event(write_time, source), start);
+        inbox.record(source_event(write_time, source, 1), start);
         let batch = inbox.take_ready(start + DEBOUNCE_DURATION).unwrap();
         assert_eq!(batch.paths, [(source.into(), 1)]);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workspace_drops_old_registration_epochs_but_preserves_rescan() {
+        use notify::event::Flag;
+        let source = Path::new("/workspace/abc123/A.py");
+        let mut inbox = WorkspaceInbox::default();
+        inbox.interests.paths.insert(source.into(), Some(2));
+        let now = Instant::now();
+        inbox.record(
+            source_event(EventKind::Modify(ModifyKind::Any), source, 1),
+            now,
+        );
+        assert!(inbox.take_ready(now + DEBOUNCE_DURATION).is_none());
+        inbox.record(
+            Ok(Event::new(EventKind::Other)
+                .add_path("/".into())
+                .set_flag(Flag::Rescan)),
+            now,
+        );
+        inbox.record(
+            source_event(EventKind::Modify(ModifyKind::Any), source, 2),
+            now,
+        );
+        let batch = inbox.take_ready(now + DEBOUNCE_DURATION).unwrap();
+        assert_eq!(batch.paths, [(source.into(), 2)]);
+        assert!(batch.rescan);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn workspace_backend_keeps_healthy_registration_when_another_registration_fails() {
         let directory = tempfile::tempdir().unwrap();
