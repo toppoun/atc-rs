@@ -7,6 +7,7 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Current architecture map | 作成時点のコード構造、モジュールの責務、主要な処理フロー | [エントリーポイント](../../src/main.rs)、[コマンド実装](../../src/commands/) |
 | [INVARIANTS.md](INVARIANTS.md) | Current behavioral contracts | 動作の保証・拒否条件・非保証範囲を引くための索引。コード構造と処理フローは ARCHITECTURE.md を参照 | 各契約に記載した本番コードと回帰テスト |
 | [cross-contest-watch-validation.md](cross-contest-watch-validation.md) | Validation procedure | Cross-Contest Watch の OS 別の回帰・長時間検証手順 | [Workspace 監視](../../src/commands/workspace_watch.rs)、[notify のアダプター](../../src/watcher.rs) |
+| [local-source-execution-study.md](local-source-execution-study.md) | Deferred design study | 2026-11-26 の Phase 7C 調査。ローカル実行での主ソース取得、再現条件、互換性の課題 | [共通ランナー](../../src/runner.rs)、[実行単位](../../src/commands/attempt_executor.rs)、[安全なファイル読み込み](../../src/safe_file.rs) |
 | [SPEC.md](SPEC.md) | Historical design | 2026-08-11 の Rust 移行設計と当時の構想 | [CLI 定義](../../src/cli.rs)、[ワークスペース実装](../../src/workspace.rs) |
 | [pre-release-inventory.md](pre-release-inventory.md) | Historical audit | 2026-08-24 のリリース前監査で棚卸しした機能・操作・対応環境 | [CLI 定義](../../src/cli.rs)、[ヘルプの回帰テスト](../../tests/help_cli.rs)、[ユーザー向け README](../../README.md) |
 | [macos-settings-store-p1-validation.md](macos-settings-store-p1-validation.md) | Scope-limited validation record | 2026-09-21 の macOS arm64 / APFS における Global Settings の既存 Config 保存の検証。結果は当時の環境と対象経路に限る | [Settings Store](../../src/settings_store.rs)、[macOS 固有の実装](../../src/safe_file/macos_metadata.rs)、[macOS の回帰テスト](../../src/settings_store/tests/macos_tests.rs) |
