@@ -693,7 +693,12 @@ fn read_bounded_bytes(
     if observed_size > max_bytes {
         return Err(too_large());
     }
+    // Repeated snapshot reads can otherwise grow the buffer past the known file size.
+    let expected_size = usize::try_from(observed_size).map_err(io::Error::other)?;
     let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_size)
+        .map_err(|error| bounded_read_error(path, io::Error::other(error)))?;
     reader
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)

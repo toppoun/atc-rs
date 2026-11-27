@@ -7407,6 +7407,10 @@ mod tests {
                 let (snapshot, metadata) = snapshot.unwrap();
                 assert_eq!(snapshot.bytes.len() as u64, size);
                 assert_eq!(metadata.len(), size);
+                assert!(
+                    snapshot.bytes.capacity() < 2 * snapshot.bytes.len(),
+                    "the bounded read doubled the buffer for a {size}-byte manifest"
+                );
             } else {
                 assert_eq!(snapshot.unwrap_err().kind(), io::ErrorKind::InvalidData);
             }
